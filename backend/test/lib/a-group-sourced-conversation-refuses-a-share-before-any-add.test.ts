@@ -13,6 +13,12 @@ const mockCognito = jest.fn();
 const mockDdb = jest.fn();
 
 const tagged = (t: string) => class { __t = t; constructor(public input: any) {} };
+// The sharer is cleared for the premium conversation (`lib/conversation-access.ts`); an uncleared sharer's
+// refusal is proven in `lib/a-person-route-reaches-only-a-conversation-its-caller-reaches.test.ts`.
+jest.mock('../../lambda/src/lib/auth', () => ({
+  ...jest.requireActual('../../lambda/src/lib/auth'),
+  callerHolderToken: () => 'premium',
+}));
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn(() => ({ send: (...a: unknown[]) => mockChime(...a) })),
   CreateChannelMembershipCommand: tagged('CreateChannelMembership'),
@@ -50,7 +56,8 @@ const { handler } = require('../../lambda/share-conversation/index.js');
 const event = {
   httpMethod: 'POST',
   requestContext: { authorizer: edgeContext({ claims: { sub: 'caller', email: 'lead@example.com' } }) },
-  body: JSON.stringify({ conversationArn: 'arn:ch', recipientEmail: 'someone@example.com' }),
+  // A conversation of this deployment's app instance: one outside it is refused before anything is read.
+  body: JSON.stringify({ conversationArn: 'arn:aws:chime:us-east-1:1:app-instance/i/channel/c1', recipientEmail: 'someone@example.com' }),
 };
 
 beforeEach(() => {
@@ -72,5 +79,25 @@ describe('the share handler on a group-sourced conversation', () => {
     mockDdb.mockResolvedValue({ Item: {} });
     await handler(event).catch(() => undefined);
     expect(mockChime.mock.calls.some(([c]) => c.__t === 'CreateChannelMembership')).toBe(true);
+  });
+});
+
+describe('the share handler on a conversation whose type cannot be read (FR23)', () => {
+  it('answers 503 and adds nobody, because the issuers the type admits are unknown', async () => {
+    // The capability check reads the same row first and is answered, so the refusal under test is the
+    // read that decides the issuer narrowing.
+    let narrowingReads = 0;
+    mockDdb.mockImplementation(async (cmd: { input: { ProjectionExpression?: string } }) => {
+      if (/membershipSource/.test(cmd.input.ProjectionExpression ?? '')) {
+        narrowingReads += 1;
+        throw Object.assign(new Error('slow down'), { name: 'ProvisionedThroughputExceededException' });
+      }
+      return { Item: {} };
+    });
+    const res = await handler(event);
+    expect(narrowingReads).toBe(1);
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body).code).toBe('CONVERSATION_TYPE_UNREADABLE');
+    expect(mockChime.mock.calls.some(([c]) => c.__t === 'CreateChannelMembership')).toBe(false);
   });
 });

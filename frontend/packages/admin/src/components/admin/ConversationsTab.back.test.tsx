@@ -34,7 +34,6 @@ describe('ConversationsTab — global Back closes the detail first', () => {
     const registerBack = vi.fn();
     render(
       <ConversationsTab
-        summaryData={null}
         driftData={null}
         isLoading={false}
         deepLinkChannelArn={CHANNEL}
@@ -68,7 +67,6 @@ describe('ConversationsTab — global Back closes the detail first', () => {
     const onConversationChange = vi.fn();
     render(
       <ConversationsTab
-        summaryData={null}
         driftData={null}
         isLoading={false}
         deepLinkChannelArn={CHANNEL}

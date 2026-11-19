@@ -237,7 +237,8 @@ describe('the answering assistant spends nothing on a rename it would be refused
     const router = read('router-agent-handler.ts');
     expect(router.match(/\.\.\.roomNamingFields,/g)).toHaveLength(2);
     expect(router.match(/const \[dispatched\] = await Promise\.all\(\[invokeAsync\(asyncProcessorArn, \{/g)).toHaveLength(2);
-    expect(router.match(/\}, turnRoster\), askRoomToBeNamed\(asyncProcessorArn\)\]\);/g)).toHaveLength(2);
+    // Beside each dispatch; the ordinary turn's also waits on a single-turn intent's workflow, run alongside it.
+    expect(router.match(/\}, turnRoster\), askRoomToBeNamed\(asyncProcessorArn\)(, sideRun)?\]\);/g)).toHaveLength(2);
     expect(router).not.toMatch(/await askRoomToBeNamed/);
     expect(router).not.toMatch(/UpdateChannelCommand\(\{[^}]*Name:/);
   });

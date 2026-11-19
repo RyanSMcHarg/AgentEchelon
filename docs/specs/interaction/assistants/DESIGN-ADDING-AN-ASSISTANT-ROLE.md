@@ -326,8 +326,8 @@ flowchart LR
 | Step | Gate |
 |---|---|
 | 1 | The alt record for each battle-capable classification names the alt bot, an assistant and an assistant role the acting role's trust accepts |
-| 2 | A session vended for the alt can send bearing the alt bot and is denied bearing the classification's live bot (a live deny-test, **NOT YET RUN**) |
-| 3 | A real duel logs each side acting as its own assistant, and both sides post (**NOT YET RUN** against the acting role) |
+| 2 | A session vended for the alt can send bearing the alt bot and is denied bearing the classification's live bot. **UNPROVEN:** no live deny-test of the alt's vended session exists |
+| 3 | A real duel logs each side acting as its own assistant, and both sides post. **UNPROVEN:** no dated run of a duel against the acting role is recorded |
 
 **Definition of done for this section:** a duel runs with each side bearing its own identity on its own vended session, proven by the three gates above rather than by a green test run.
 

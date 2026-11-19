@@ -31,9 +31,9 @@ export const WizardSteps: React.FC<{
           </li>
         ))}
       </ol>
-      <h5 ref={heading} tabIndex={-1} data-testid={headingTestId}>
+      <h4 ref={heading} tabIndex={-1} data-testid={headingTestId}>
         {t('admin.create.stepOf', { n: current + 1, total: steps.length, name: steps[current]?.label ?? '' })}
-      </h5>
+      </h4>
     </>
   );
 };

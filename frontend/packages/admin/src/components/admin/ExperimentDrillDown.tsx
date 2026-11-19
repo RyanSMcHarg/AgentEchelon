@@ -337,9 +337,9 @@ export default function ExperimentDrillDown({
     <div className="exp-drill">
       <div className="exp-drill-head">
         <div>
-          <h5 className="exp-drill-title">
+          <h4 className="exp-drill-title">
             {translate(axisKey(target.axis, 'title'))} · <span className="exp-drill-variant">{target.variantId}</span>
-          </h5>
+          </h4>
           <p className="exp-drill-population">{translate(axisKey(target.axis, 'population'))}</p>
         </div>
         <button className="btn-secondary" onClick={onClose}>Close</button>

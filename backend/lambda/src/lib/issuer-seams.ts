@@ -11,7 +11,7 @@
  *    `claims` reads the contact copy of the last sign-in (`lib/claims-directory.ts`), `none` reads
  *    nothing. The other adapters the plan names are refused at synth as NOT BUILT.
  *  - a CLEARANCE SOURCE, per the entry's Q5 source (`lib/clearance-source.ts`): the pool's groups, a
- *    mapping, a fixed set, or the one-conversation session.
+ *    mapping, or a fixed set.
  *
  * So a second issuer is one registry entry, and nothing above the directory branches on which issuer a
  * person came from. A test selects a stub factory once (`__selectSeamsForTests`) and every consumer
@@ -29,11 +29,19 @@ import {
   groupsClearanceSource,
   translatedGroupsClearanceSource,
   mappingClearanceSource,
-  oneChannelClearanceSource,
   type ClearanceSource,
   type IssuerClearanceSource,
 } from './clearance-source.js';
 import { claimsDirectory, type ClaimsDirectory } from './claims-directory.js';
+
+/**
+ * VERIFICATION IS THE ISSUER'S, the same rule for every kind of issuer. An address its issuer marks unverified receives no
+ * notification; the only mail it gets is the issuer's own verification mail. An issuer that sends no such mark has
+ * verified the address itself, as a corporate directory does from the start.
+ */
+export function verifiedAddress<T>(email: T, verified: unknown): T | undefined {
+  return String(verified).toLowerCase() === 'false' ? undefined : email;
+}
 
 /** What an issuer's store says about one subject. Display attributes and state, never an identity. */
 export interface SubjectRecord {
@@ -106,8 +114,10 @@ export function cognitoAdapter(issuerId: string, pool: CognitoPoolDirectory, gro
     async contactOf(subject) {
       const record = await pool.record(subject);
       // AN ACCOUNT THE POOL DISABLED IS REACHED BY NOTHING: no notice is sent to it, and a reply from its
-      // address is refused, because a reply is accepted only from the address this answers.
-      return record && record.enabled ? { email: record.email, name: nameFrom(record) } : null;
+      // address is refused, because a reply is accepted only from the address this answers. An address
+      // the issuer marks unverified is not reached either (`verifiedAddress`).
+      if (!record || !record.enabled) return null;
+      return { email: verifiedAddress(record.email, record.attributes?.email_verified) ?? null, name: nameFrom(record) };
     },
     async record(subject) {
       const r = await pool.record(subject);
@@ -119,7 +129,12 @@ export function cognitoAdapter(issuerId: string, pool: CognitoPoolDirectory, gro
     listGroups: (prefix) => pool.groupNames(prefix),
     groupsOf: (subject) => groups.groupsFor(subject),
     async subjectsByAddress(address) {
-      return (await pool.byEmail(address)).map(subjectRecordOf);
+      // AN ADDRESS FINDS ONLY AN ACCOUNT THE ISSUER STANDS BEHIND. A person can write their own `email`, which the pool
+      // marks unverified until they prove it, so an address they have only claimed names nobody, and the account
+      // that holds it verified stays the one match.
+      return (await pool.byEmail(address))
+        .filter((r) => r.enabled && verifiedAddress(address, r.attributes.email_verified))
+        .map(subjectRecordOf);
     },
   };
 }
@@ -156,8 +171,7 @@ export function clearanceSourceFor(issuer: TrustedIssuer, adapter: DirectoryAdap
       : mappingClearanceSource(issuer.id);
   }
   if ('mapping' in c) return mappingClearanceSource(issuer.id);
-  if ('fixed' in c) return fixedClearanceSource(issuer.id, c.fixed);
-  return oneChannelClearanceSource(issuer.id, c.oneChannel);
+  return fixedClearanceSource(issuer.id, c.fixed);
 }
 
 // ── THE DEPLOYED FACTORY ─────────────────────────────────────────────────────────────────────────

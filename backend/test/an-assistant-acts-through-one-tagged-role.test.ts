@@ -18,14 +18,16 @@ import {
   assistantRolePath,
   ASSISTANT_TURN_CHANNEL_ACTIONS,
   CLASSIFICATION_GATED_CHANNEL_ACTIONS,
-  capabilityAlarmNamePrefixes,
   coreAlarmNamePrefixes,
   deploymentAlarmNamePrefixes,
 } from '../lib/stacks/agent-classification-common';
 import { defaultProfileRegistry } from '../lib/profile-registry';
 
 const APP_INSTANCE = 'arn:aws:chime:us-east-1:123456789012:app-instance/abc';
-const BUCKET = 'arn:aws:s3:::context-bucket';
+const ATTACHMENTS = 'arn:aws:s3:::attachments-bucket';
+const COMPANY = 'arn:aws:s3:::company-bucket';
+const PROFILE = 'arn:aws:s3:::profile-bucket';
+const BUCKETS = { attachmentsBucketArn: ATTACHMENTS, companyBucketArn: COMPANY, profileBucketArn: PROFILE };
 
 function synth(roles: string[] = ['primary', 'ops'], capabilities?: string[]) {
   const app = new cdk.App();
@@ -38,7 +40,7 @@ function synth(roles: string[] = ['primary', 'ops'], capabilities?: string[]) {
     vendRole,
     roles,
     sessionChannelActions: ASSISTANT_TURN_CHANNEL_ACTIONS,
-    contextBucketArn: BUCKET,
+    buckets: BUCKETS,
     capabilities,
   });
   return { template: Template.fromStack(stack), stack, vendRole, turnRole };
@@ -128,46 +130,31 @@ describe('an assistant acts through one tagged role', () => {
     expect(actingStatements(synth(['primary']).template).find((s) => s.Sid === 'RoleObservabilityAlarmRead')).toBeUndefined();
   });
 
-  it('grants DescribeAlarms on this deployment\'s alarm ARNs only, never on `*`', () => {
+  // ANY ALARM, READ BY NAME (SPEC-WORKFLOWS-AND-TASKS WT120): an incident is opened by whichever alarm its team attached, which
+  // need not be this deployment's, and its first look reads that alarm. So the alarm read reaches the account's alarms, read by
+  // name (`deployment-health.ts` names the published alarms and the one its conversation watches, and never lists), and it
+  // stays an observability role's alone: the role condition here and the boundary's Deny below.
+  it('grants DescribeAlarms on the account\'s alarms to an observability role alone, and nothing else on that statement', () => {
     const statements = actingStatements(synth().template);
     const metrics = statements.find((s) => s.Sid === 'RoleObservabilityRead');
     expect([].concat(metrics.Action)).not.toContain('cloudwatch:DescribeAlarms');
-    const alarms = statements.find((s) => s.Sid === 'RoleObservabilityAlarmRead');
-    expect([].concat(alarms.Action)).toEqual(['cloudwatch:DescribeAlarms']);
-    expect(alarms.Condition.StringEquals['aws:PrincipalTag/role']).toEqual(['ops']);
-    const resources = JSON.stringify(alarms.Resource);
-    expect(alarms.Resource).not.toContain('*');
-    // One ARN per prefix of the core, from the one function the tool reads too. No optional capability's stack is
-    // named in a deployment that declares none.
-    expect(alarms.Resource).toHaveLength(coreAlarmNamePrefixes().length);
-    for (const p of coreAlarmNamePrefixes()) {
-      expect(resources).toContain(`:cloudwatch:us-east-1:123456789012:alarm:${p}*`);
-    }
-    for (const capability of ['battle', 'experiments', 'notifications']) {
-      for (const p of capabilityAlarmNamePrefixes(capability)) expect(resources).not.toContain(`alarm:${p}`);
-    }
-    // The prefixes name this instance's stacks, so a look-alike instance's alarms are outside the grant.
-    expect(deploymentAlarmNamePrefixes()).toEqual(expect.arrayContaining(['AgentEchelon-', 'AgentEchelonArchive-', 'AgentEchelonAssistants-']));
-    expect(deploymentAlarmNamePrefixes().every((p) => p.endsWith('-'))).toBe(true);
+    const alarms = statements.filter((s) => ([] as string[]).concat(s.Action).includes('cloudwatch:DescribeAlarms'));
+    expect(alarms).toHaveLength(1);
+    expect(alarms[0].Sid).toBe('RoleObservabilityAlarmRead');
+    expect([].concat(alarms[0].Action)).toEqual(['cloudwatch:DescribeAlarms']);
+    expect(alarms[0].Condition.StringEquals['aws:PrincipalTag/role']).toEqual(['ops']);
+    expect(JSON.stringify(alarms[0].Resource)).toContain(':cloudwatch:us-east-1:123456789012:alarm:*');
+    expect(alarms[0].Resource).not.toContain('*');
   });
 
-  it('reads a declared capability\'s alarms through a policy of its own, and an undeclared one\'s not at all', () => {
+  it('holds one alarm read whatever capabilities are declared, and none without an observability role', () => {
     const capabilityPolicies = (template: Template) => Object.entries(template.findResources('AWS::IAM::Policy'))
       .filter(([id]) => id.startsWith('AssistantAlarmRead'));
-    // Declared: one policy per capability, on its stacks' alarms, for the observability role alone.
-    const declared = capabilityPolicies(synth(['primary', 'ops'], ['battle', 'notifications']).template);
-    expect(declared).toHaveLength(2);
-    for (const [capability, prefix] of [['battle', 'AgentEchelonBattle-'], ['notifications', 'AgentEchelonNotifications-']]) {
-      const [, policy] = declared.find(([id]) => id.startsWith(`AssistantAlarmRead${capability}`)) as [string, any];
-      const [statement] = policy.Properties.PolicyDocument.Statement;
-      expect([].concat(statement.Action)).toEqual(['cloudwatch:DescribeAlarms']);
-      expect(JSON.stringify(statement.Resource)).toContain(`:alarm:${prefix}*`);
-      expect(statement.Condition.StringEquals['aws:PrincipalTag/role']).toEqual(['ops']);
-    }
-    // Undeclared, or no observability role: none.
-    expect(capabilityPolicies(synth().template)).toEqual([]);
-    expect(capabilityPolicies(synth(['primary'], ['battle']).template)).toEqual([]);
-    // Every capability's stacks together with the core's are every alarm the deployment can declare.
+    expect(capabilityPolicies(synth(['primary', 'ops'], ['battle', 'notifications']).template)).toEqual([]);
+    expect(actingStatements(synth(['primary'], ['battle']).template).some((s) => ([] as string[]).concat(s.Action).includes('cloudwatch:DescribeAlarms'))).toBe(false);
+    // The published names the tool reads still name every stack this instance can create, and no look-alike's.
+    expect(deploymentAlarmNamePrefixes()).toEqual(expect.arrayContaining(['AgentEchelon-', 'AgentEchelonArchive-', 'AgentEchelonAssistants-']));
+    expect(deploymentAlarmNamePrefixes().every((p) => p.endsWith('-'))).toBe(true);
     expect(deploymentAlarmNamePrefixes().length).toBeGreaterThan(coreAlarmNamePrefixes().length);
   });
 
@@ -189,13 +176,16 @@ describe('an assistant acts through one tagged role', () => {
 
   it('denies, in the boundary, acting in a channel or as a bot outside this classification', () => {
     const b = boundaryStatements(synth().template);
-    const channel = b.find((s) => s.Sid === 'BoundaryNoChannelOutsideThisClassification');
-    expect(channel.Effect).toBe('Deny');
-    expect(channel.Action).toEqual(CLASSIFICATION_GATED_CHANNEL_ACTIONS);
+    // Premium acts in its own channels alone, so one statement refuses a channel and a bot outside it.
+    const both = b.find((s) => s.Sid === 'BoundaryNoChannelOrBotOutsideThisClassification');
+    expect(both.Effect).toBe('Deny');
+    expect(both.Action).toEqual(CLASSIFICATION_GATED_CHANNEL_ACTIONS);
+    const covered = JSON.stringify(both.Resource);
+    expect(covered).toContain('/channel/*');
+    expect(covered).toContain('/bot/*');
     // A negated operator also matches when the key is absent, so an untagged channel is refused.
-    expect(channel.Condition.StringNotEquals['aws:ResourceTag/classification']).toEqual(['premium']);
-    const bot = b.find((s) => s.Sid === 'BoundaryNoBotOutsideThisClassification');
-    expect(bot.Condition.StringNotEquals['aws:ResourceTag/classification']).toBe('premium');
+    expect([].concat(both.Condition.StringNotEquals['aws:ResourceTag/classification'])).toEqual(['premium']);
+    expect(b.some((s) => s.Sid === 'BoundaryNoChannelOutsideThisClassification' || s.Sid === 'BoundaryNoBotOutsideThisClassification')).toBe(false);
   });
 
   it('denies telemetry to every session that is not an observability role, in the boundary too', () => {
@@ -211,7 +201,7 @@ describe('an assistant acts through one tagged role', () => {
     const vendRole = new iam.Role(stack, 'VendRole', { assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com') });
     assistantActingRole(stack, {
       classification: 'basic', appInstanceArn: APP_INSTANCE, vendRole, roles: ['primary'],
-      sessionChannelActions: ASSISTANT_TURN_CHANNEL_ACTIONS, contextBucketArn: BUCKET,
+      sessionChannelActions: ASSISTANT_TURN_CHANNEL_ACTIONS, buckets: BUCKETS,
     });
     const managed = Template.fromStack(stack).findResources('AWS::IAM::ManagedPolicy');
     const statements = (Object.values(managed)[0] as any).Properties.PolicyDocument.Statement as any[];
@@ -219,16 +209,25 @@ describe('an assistant acts through one tagged role', () => {
     const services = statements.find((s) => s.Sid === 'BoundaryTheServicesATurnUses');
     expect(JSON.stringify(services.Action)).not.toContain('s3:');
     const s3 = statements.filter((s) => JSON.stringify(s.Action).includes('s3:'));
-    expect(s3.every((s) => s.Effect === 'Allow' && !JSON.stringify(s.Resource).includes('"*"'))).toBe(true);
+    expect(s3.every((s) => !JSON.stringify(s.Resource).includes('"*"'))).toBe(true);
+    // The one Deny narrows a dashboard write to the roles a dashboard tool is offered to.
+    expect(s3.filter((s) => s.Effect !== 'Allow').map((s) => s.Sid)).toEqual(['BoundaryDashboardsOnlyForDashboardRoles']);
+    // WHAT CONVERSATIONS PRODUCE, read and written, in the attachments bucket and nowhere else.
     const objects = statements.find((s) => s.Sid === 'BoundaryObjectsATurnUses');
+    // Its own classification's dashboards share the statement: the classification is in the key.
+    expect([].concat(objects.Resource).sort()).toEqual([`${ATTACHMENTS}/attachments/*`, `${ATTACHMENTS}/battle-images/*`, `${ATTACHMENTS}/dashboards/basic/*`, `${ATTACHMENTS}/generated-docs/*`]);
+    // WHAT THE ASSISTANT IS AND WHAT ITS CLASSIFICATION KNOWS, read only: profile bodies and its pack in the profile
+    // bucket, its granted context and self-knowledge in the company bucket.
+    const reads = statements.find((s) => s.Sid === 'BoundaryWhatATurnReads');
     const granted = defaultProfileRegistry.grantsFor('basic');
-    expect(objects.Resource).toEqual(expect.arrayContaining([
-      `${BUCKET}/attachments/*`, `${BUCKET}/generated-docs/*`, `${BUCKET}/profiles/*`,
-      ...granted.map((g) => `${BUCKET}/context/${g}/*`),
-      ...granted.map((g) => `${BUCKET}/platform-knowledge/${g}/*`),
+    expect([].concat(reads.Action)).toEqual(['s3:GetObject']);
+    expect(reads.Resource).toEqual(expect.arrayContaining([
+      `${PROFILE}/profiles/*`,
+      ...granted.map((g) => `${COMPANY}/context/${g}/*`),
+      ...granted.map((g) => `${COMPANY}/platform-knowledge/${g}/*`),
     ]));
     const listing = statements.find((s) => s.Sid === 'BoundaryListingItsOwnPrefixes');
-    expect(listing.Resource).toBe(BUCKET);
+    expect(listing.Resource).toBe(COMPANY);
     expect([].concat(listing.Condition.StringLike['s3:prefix']).sort())
       .toEqual([...granted.map((g) => `context/${g}/*`), ...granted.map((g) => `platform-knowledge/${g}/*`)].sort());
     // NAMES NO OTHER CLASSIFICATION: every classified prefix the boundary holds is one this classification
@@ -238,7 +237,7 @@ describe('an assistant acts through one tagged role', () => {
     for (const p of classified) expect(granted).toContain(p.split('/')[1]);
     // ITS OWN INTENT-PACK BODIES and no other classification's, granted or not: a pack is the
     // classification's own configuration, not context it shares down.
-    expect(objects.Resource).toContain(`${BUCKET}/classification-packs/basic/*`);
+    expect(reads.Resource).toContain(`${PROFILE}/classification-packs/basic/*`);
     expect(JSON.stringify(s3).match(/classification-packs\/[^"]*/g)).toEqual(['classification-packs/basic/*']);
     expect(statements.some((s) => /NoOtherClassificationsContext/.test(String(s.Sid)))).toBe(false);
   });
@@ -249,7 +248,7 @@ describe('an assistant acts through one tagged role', () => {
     const vendRole = new iam.Role(stack, 'VendRole', { assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com') });
     const { boundary } = assistantActingRole(stack, {
       classification: 'basic', appInstanceArn: APP_INSTANCE, vendRole, roles: ['primary'],
-      sessionChannelActions: ASSISTANT_TURN_CHANNEL_ACTIONS, contextBucketArn: BUCKET,
+      sessionChannelActions: ASSISTANT_TURN_CHANNEL_ACTIONS, buckets: BUCKETS,
     });
     allowContextSourceObjects(boundary, ['arn:aws:s3:::catalog-bucket/digests/*']);
     const statements = (Object.values(Template.fromStack(stack).findResources('AWS::IAM::ManagedPolicy'))[0] as any).Properties.PolicyDocument.Statement as any[];
@@ -309,16 +308,16 @@ describe('the catalog of session policies a vended session is narrowed to', () =
     expect(base.some((s) => s.Effect !== 'Allow')).toBe(false);
   });
 
-  it('the telemetry edge narrows DescribeAlarms to this instance\'s alarm ARNs, naming no capability', () => {
-    // The session edge only narrows the acting role, whose grant names each declared stack's alarms, so the edge
-    // names the instance's stack-name family and stays the same whatever a deployment declares.
+  it('the telemetry edge reaches the account\'s alarms, as the acting role does, and nothing wider', () => {
+    // The session edge only narrows the acting role, whose alarm read reaches the account's alarms by name
+    // (WT120), so the edge names the same: an alarm ARN, never `*`.
     const { template } = catalogTemplate();
     const telemetry = policyNamed(template, 'AgentEchelonAssistantGrant-standard-telemetry');
     const alarms = telemetry.find((s) => [].concat(s.Action).includes('cloudwatch:DescribeAlarms' as never));
     expect([].concat(alarms.Action)).toEqual(['cloudwatch:DescribeAlarms']);
     expect(alarms.Resource).not.toContain('*');
     expect([].concat(alarms.Resource)).toHaveLength(1);
-    expect(JSON.stringify(alarms.Resource)).toMatch(/:cloudwatch:us-east-1:123456789012:alarm:AgentEchelon\*"/);
+    expect(JSON.stringify(alarms.Resource)).toMatch(/:cloudwatch:us-east-1:123456789012:alarm:\*"/);
   });
 
   it('each model edge grants only its own model', () => {

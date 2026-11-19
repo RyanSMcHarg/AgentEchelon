@@ -36,7 +36,8 @@ export async function requestMarkerClear(args: {
   markers: WaitingMarker[];
   wait: boolean;
 }): Promise<number> {
-  if (!args.markers.length) return 0;
+  // AN EMPTY LIST STILL ASKS: the router closes the duel's tasks on the same call (`clearDuelMarkers`), and a duel with
+  // no side waiting still has its sides' tasks open.
   const fn = await resolveRouterArn(args.classification);
   if (!fn) {
     console.warn('[battle-marker-clear] no router wired for this classification; the waiting markers stay', { channelArn: args.channelArn });

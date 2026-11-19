@@ -19,7 +19,7 @@ export function testIssuerPoolName(id: string): string {
   return `${RES_PREFIX}-test-issuer-${id}`;
 }
 
-/** `h1-one-channel` -> `H1OneChannel`, for output keys. */
+/** `h1-host-pool` -> `H1HostPool`, for output keys. */
 const pascal = (id: string): string => id.split('-').filter(Boolean).map((w) => w[0].toUpperCase() + w.slice(1)).join('');
 
 export interface TestIssuerStackProps extends cdk.StackProps {

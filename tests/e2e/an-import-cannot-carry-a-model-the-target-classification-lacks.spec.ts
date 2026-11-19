@@ -36,6 +36,8 @@ import { signedAnalyticsPost } from './helpers/signed-analytics';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 import { SSM_ROOT } from './helpers/stack-prefix';
 import { ADMIN_API_URL, adminUrl, profileActionUrl } from './helpers/api-urls';
+import { replacingDraft, draftIdOf } from './helpers/profile-draft';
+import { defaultProfileRegistry } from '../../backend/lib/profile-registry';
 
 guardConsoleErrors();
 
@@ -105,6 +107,13 @@ test.describe.serial('an import cannot carry a model the target classification l
     // model standard lacks, the refusal below would be testing nothing - and the manifest's model can
     // be the `'default'` sentinel, which is legal on any target by design. Fail loudly instead of
     // passing an empty test.
+    // The live premium version's base model is whatever the last edit left, possibly one standard also selects (such as
+    // `sonnet`), in which case the import is rightly accepted and the test would assert nothing true. The manifest is given a base
+    // model premium selects and standard does not, so the refusal is the one under test whatever the live version holds.
+    const premiumOnly = 'opus';
+    expect(defaultProfileRegistry.selectsModel('premium', premiumOnly) && !defaultProfileRegistry.selectsModel('standard', premiumOnly),
+      `the premise: premium selects '${premiumOnly}' and standard does not`).toBe(true);
+    manifest.body = { ...manifest.body, modelKey: premiumOnly, models: { ...(manifest.body?.models ?? {}), default: premiumOnly } };
     const named = [manifest.body?.modelKey, manifest.body?.models?.default].filter(Boolean);
     expect(
       named.some((m: string) => m && m !== 'default'),
@@ -112,7 +121,8 @@ test.describe.serial('an import cannot carry a model the target classification l
       + 'cannot exercise the target model check and this test proves nothing',
     ).toBe(true);
 
-    const imported = await api(idToken, '/import', { manifest, targetProfileName: STANDARD });
+    // A draft left on the target is named, so the refusal below is the model's and never the draft's.
+    const imported = await replacingDraft((b) => api(idToken, '/import', b), { manifest, targetProfileName: STANDARD });
     const text = JSON.stringify(imported);
 
     expect(
@@ -140,7 +150,7 @@ test.describe.serial('an import cannot carry a model the target classification l
     const manifest = exported.manifest;
     expect(manifest, 'export must return a manifest').toBeTruthy();
 
-    const imported = await api(idToken, '/import', { manifest, targetProfileName: STANDARD });
+    const imported = await replacingDraft((b) => api(idToken, '/import', b), { manifest, targetProfileName: STANDARD });
     expect(
       JSON.stringify(imported),
       `importing ${BASIC} onto ${STANDARD} was refused. Every model it names is one standard also `
@@ -161,7 +171,7 @@ test.describe.serial('an import cannot carry a model the target classification l
     // activation does not promote the basic definition this suite landed. Verified by read-back for
     // the reason the lifecycle suite gives: a cleanup that swallowed its error leaves the trap.
     if (!idToken || !STANDARD) return;
-    const reset = await api(idToken, '/version', { profileName: STANDARD });
+    const reset = await replacingDraft((b) => api(idToken, '/version', b), { profileName: STANDARD });
     expect(JSON.stringify(reset), `failed to reset ${STANDARD}'s draft to a copy of active`).not.toMatch(/__error/);
     expect(activeVersionOf(STANDARD), 'cleanup moved the active pointer').toBe(targetActiveBefore);
   });

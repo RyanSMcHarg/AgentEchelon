@@ -15,8 +15,8 @@
  *     -> "Respond in Simplified Chinese (简体中文) unless the user writes to you in a different
  *        language" injected into the system prompt (lib/async-processor-core.ts).
  *
- * In a host integration `userLanguage` is written by the context create, which a one-conversation
- * issuer's people reach and this deployment's trusted-issuer registry does not declare. So the test writes the store row itself. The
+ * In a host integration `userLanguage` is written by the host's membership function, which stands up only
+ * where the trusted-issuer registry declares a one-conversation issuer, and this deployment's does not. So the test writes the store row itself. The
  * path from the store onwards is untouched production code.
  *
  * IT ALSO DRIVES THE NEGATIVE CONTROL, and that is the more valuable half. `userLanguage` used to be

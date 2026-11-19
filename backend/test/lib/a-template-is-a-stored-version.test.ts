@@ -26,7 +26,7 @@ import {
 import { contentIdOf } from '../../lambda/src/lib/profile-bodies';
 import { DEFAULT_TASK_STATE_MACHINES, type TaskStateMachine } from '../../lambda/src/lib/task-state-machines';
 
-const V1 = readFileSync(join(__dirname, '..', '..', 'demo', 'templates', 'quarterly-account-review.md'), 'utf8');
+const V1 = readFileSync(join(__dirname, '..', '..', '..', 'demo', 'stratum-company', 'templates', 'quarterly-account-review.md'), 'utf8');
 const V2 = V1.replace('## Next steps', '## Next steps\n\n## Owners');
 const H1 = contentIdOf(V1);
 const H2 = contentIdOf(V2);

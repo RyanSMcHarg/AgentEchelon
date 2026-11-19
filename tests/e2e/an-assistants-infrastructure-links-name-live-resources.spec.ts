@@ -38,8 +38,8 @@ async function openInfrastructure(page: Page, assistant: string): Promise<string
   const row = page.locator(`tr[data-assistant="${assistant}"]`);
   await expect(row, `${assistant} is listed`).toBeVisible({ timeout: 20000 });
   await row.locator('button.btn-link').first().click();
-  // The infrastructure is in the page's Tools and context section.
-  await page.getByTestId('assistant-nav-tools').click();
+  // The infrastructure has a section of its own.
+  await page.getByTestId('assistant-nav-infrastructure').click();
   const section = page.getByTestId('assistant-infrastructure');
   await expect(section).toBeVisible({ timeout: 20000 });
   return section.locator('a.doc-link').evaluateAll((as) => as.map((a) => a.getAttribute('href') ?? ''));

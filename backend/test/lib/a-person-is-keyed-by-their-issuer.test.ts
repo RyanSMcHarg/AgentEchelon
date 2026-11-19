@@ -23,6 +23,12 @@ jest.mock('@aws-sdk/lib-dynamodb', () => ({
   QueryCommand: jest.fn((input: unknown) => ({ __type: 'Query', input })),
 }));
 jest.mock('@aws-sdk/client-dynamodb', () => ({ DynamoDBClient: jest.fn(() => ({})) }));
+// The console role is rechecked against the person's live groups (R6). These issuers keep no group source the
+// platform reads (`okta` declares `directory: 'none'`), so the recheck has nothing to read and the token's role stands.
+jest.mock('../../lambda/src/lib/membership-source', () => {
+  const actual = jest.requireActual('../../lambda/src/lib/membership-source');
+  return { ...actual, defaultDirectory: (...args: unknown[]) => Object.assign(Object.create(Object.getPrototypeOf(actual.defaultDirectory(...args))), actual.defaultDirectory(...args), { groupsFor: async () => null }) };
+});
 jest.mock('@aws-sdk/client-sts', () => ({
   STSClient: jest.fn(() => ({ send: mockStsSend })),
   AssumeRoleCommand: jest.fn((input: unknown) => ({ __type: 'AssumeRole', input })),
@@ -57,7 +63,7 @@ const ALL = ['basic', 'standard', 'premium', 'admin'];
 const REGISTRY: TrustedIssuer[] = [
   { id: 'deployment', kind: 'cognito-pool', pool: POOL, iss: POOL_ISS, subject: ['sub'], clearance: { groups: true, classifications: ALL }, admin: true, groupsClaim: 'cognito:groups', directory: 'cognito' },
   { id: 'okta-saml', kind: 'cognito-federated', pool: POOL, iss: POOL_ISS, providerName: 'Okta', subject: ['sub'], clearance: { mapping: { claim: 'custom:roles', values: { analyst: 'standard' } }, classifications: ['basic', 'standard'] }, admin: false, groupsClaim: 'cognito:groups', directory: 'cognito' },
-  { id: 'host', kind: 'cognito-pool', pool: HOST_POOL, iss: HOST_ISS, subject: ['sub'], clearance: { oneChannel: 'basic', classifications: ['basic'] }, admin: false, groupsClaim: 'cognito:groups', directory: 'cognito' },
+  { id: 'host', kind: 'cognito-pool', pool: HOST_POOL, iss: HOST_ISS, subject: ['sub'], clearance: { fixed: ['basic'], classifications: ['basic'] }, admin: false, groupsClaim: 'cognito:groups', directory: 'cognito' },
   { id: 'okta', kind: 'oidc', iss: OIDC_ISS, subject: ['sub'], clearance: { groups: { map: { 'ae-admin': 'admins', viewer: 'basic' } }, classifications: ALL }, admin: true, groupsClaim: 'roles', directory: 'none' },
   { id: 'entra', kind: 'oidc-entra', tenants: [TENANT], tokenVersion: 2, subject: ['tid', 'oid'], clearance: { fixed: ['basic'], classifications: ['basic'] }, admin: false, groupsClaim: 'groups', directory: 'none' },
 ];
@@ -96,7 +102,7 @@ describe('each kind matches its own tokens and no other (a unit table)', () => {
     expect(holderTokenOf(saml, { 'custom:roles': 'ceo' }, profiles)).toBeUndefined();
     // The issuer's classifications bind whatever the groups say: a host-pool group named premium grants nothing here.
     expect(holderTokenOf({ ...pool, clearance: { groups: true, classifications: ['basic'] } }, { 'cognito:groups': '[basic premium]' }, profiles)).toBe('basic');
-    expect(holderTokenOf(hostApp, { 'cognito:groups': 'premium' }, profiles)).toBeUndefined();
+    expect(holderTokenOf(hostApp, { 'cognito:groups': 'premium' }, profiles)).toBe('basic');
     expect(holderTokenOf(okta, { roles: ['ae-admin'] }, profiles)).toBe('admin');
     expect(holderTokenOf(entra, {}, profiles)).toBe('basic');
   });
@@ -262,7 +268,7 @@ describe('an OIDC admin (A6)', () => {
     expect(mockStsSend).not.toHaveBeenCalled();
   });
 
-  it('refuses a one-conversation issuer the admin console', async () => {
+  it('refuses a host pool that does not declare admin: true the admin console', async () => {
     const { handler } = loadExchange();
     const res = await handler(consoleRequest({ iss: HOST_ISS, sub: 'host-user', 'cognito:groups': 'admins' }));
     expect(res.statusCode).toBe(403);

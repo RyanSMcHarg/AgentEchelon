@@ -11,7 +11,7 @@
  * rule, and each case is unit-testable on real personas.
  *
  * THE HEADING IS THE PLATFORM'S OWN MARKER (tenet D11). `HOW_TO_ANSWER_HEADING` is the line the shipped personas
- * (`backend/demo/personas.ts`) open that section with, so finding it is matching what the platform wrote, the same
+ * (`demo/stratum-company/personas.ts`) open that section with, so finding it is matching what the platform wrote, the same
  * kind of match as a `<!--corr:-->` marker. Nothing here reads what a person wrote to decide anything: a persona that
  * names its section in other words, or in another language, keeps every word it has, and the moved instruction lands
  * at its end under the platform's heading, where the person sees it in the draft before activating.

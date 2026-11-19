@@ -27,7 +27,7 @@ import { getAdminUser, getTestCredentials, hasTestCredentials } from '../test-cr
 import { idTokenFor } from '../person';
 import { exchange } from '../admin-api';
 import { STACK_PREFIX, SSM_ROOT, classificationStacks, instanceStacks, physicalIdsIn, ANY_FUNCTION } from '../stack-prefix';
-import { TURN_PATH_FAMILIES } from '../backend-errors';
+import { CAPABILITY_FAMILIES, TURN_PATH_FAMILIES } from '../backend-errors';
 import { type AwsCredentials, type CredentialSource, REGION, credentialsFrom, operatorCredentials, operatorCredentialsPresent } from './aws-signing';
 import { ChimeMessagingSession, closeAllSessions, listChannelMessages, type ListedMessage } from './chime-session';
 import { LiveTail, type TailLine } from './live-tail';
@@ -319,6 +319,9 @@ export class RunWatch {
       const stacks = instanceStacks();
       const turnStacks = [...new Set([...classificationStacks(), ...stacks.filter((s) => /Archive$|ChannelFlow$/.test(s))])];
       const fns = physicalIdsIn(turnStacks, ANY_FUNCTION).filter((fn) => TURN_PATH_FAMILIES.some((f) => fn.includes(f)));
+      // A declared capability's own functions are watched too (`CAPABILITY_FAMILIES`): every function of its stack.
+      const capabilityStacks = stacks.filter((s) => CAPABILITY_FAMILIES.some((f) => `${s}-`.includes(f)));
+      fns.push(...physicalIdsIn(capabilityStacks, ANY_FUNCTION));
       for (const family of TURN_PATH_FAMILIES) {
         if (!fns.some((fn) => fn.includes(family))) this.note(`no live function of the "${family}" family in ${STACK_PREFIX}: that part of the turn path is UNWATCHED live`);
       }

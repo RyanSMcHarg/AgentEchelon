@@ -99,8 +99,8 @@ describe('MessageInput — sticky mention vs slash command', () => {
     render(<MessageInput />);
     const sent = await send('what do you think?');
 
-    // The exemption must be narrow — sticky targeting is the feature, not the bug.
-    expect(sent).toBe('@Assistant-premium what do you think?');
+    // The exemption must be narrow — sticky targeting is the feature, not the bug. The prefix carries the member's id.
+    expect(sent).toBe('@<Assistant-premium|assistant-premium> what do you think?');
   });
 
   it('leaves a message that already carries its own mention alone', async () => {

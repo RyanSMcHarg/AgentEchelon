@@ -332,7 +332,7 @@ flowchart LR
 
 ## Next increments
 
-[SPEC-EVALUATION](./SPEC-EVALUATION.md) Appendix C orders the increments. Everything in this section is built with unit tests and deployed to dev on 2026-10-27 (Aurora mode), **NOT VERIFIED** on a deployment. The non-posting answer run the gate needs is built and unit-tested on each classification's GoldenRun function, and verified on dev on 2026-10-31 by the `golden-set` e2e phase ([ADR-065](../../../design/decisions/065-a-draft-answers-the-golden-set-before-it-is-activated.md)). Each increment reads a record the platform already writes, or adds that record before anything judges it, and lands beside the passes above rather than as a parallel system.
+[SPEC-EVALUATION](./SPEC-EVALUATION.md) Appendix C orders the increments. Everything in this section is built (Aurora mode) and proven by the unit tests each increment names there. The non-posting answer run the gate needs runs on each classification's GoldenRun function and is also proven on dev on 2026-10-31 by the `golden-set` e2e phase for text entries (tool-using entries are counted, not exercised; [ADR-065](../../../design/decisions/065-a-draft-answers-the-golden-set-before-it-is-activated.md)). Each increment reads a record the platform already writes, or adds that record before anything judges it, and lands beside the passes above rather than as a parallel system.
 
 ```mermaid
 flowchart LR

@@ -149,8 +149,9 @@ test.describe('a replayed turn claims once', () => {
 
   test('a replay that straddles the window boundary is still recognized', async () => {
     // The bucket is why the id is stable, and also the one way it can fail: a retry seconds later
-    // can land in the next bucket. `previousBucket` is what the router checks for that, so the
-    // adjacent bucket must reproduce the original id rather than minting a new one.
+    // can land in the next bucket. `previousBucket` is the helper that would recover it: this proves the helper
+    // reproduces the original id from the adjacent bucket. No production caller passes it yet (ADR-022 section 4), so
+    // a deployed retry that straddles a boundary is not recognized; this case does not prove the router does.
     const channelArn = `arn:aws:chime:${REGION}:000000000000:app-instance/e2e/channel/conv-b-${Date.now()}`;
     const senderArn = `arn:aws:chime:${REGION}:000000000000:app-instance/e2e/user/e2e-b-${Date.now()}`;
     const userMessage = `Boundary probe ${Date.now()}`;

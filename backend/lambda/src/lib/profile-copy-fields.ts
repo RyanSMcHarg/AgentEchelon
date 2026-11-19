@@ -95,14 +95,18 @@ function messageEntryShapeErrors(at: string, v: unknown): string[] {
 export function patchShapeErrors(
   patch: Partial<ProfileDefinitionBody> | Record<string, unknown>,
   /** The task machines the runtime runs (ADR-063), which a task step's machine is checked against. Absent, the platform's. */
-  opts: { machines?: Readonly<Record<string, import('./task-state-machines.js').TaskStateMachine>> } = {},
+  opts: {
+    machines?: Readonly<Record<string, import('./task-state-machines.js').TaskStateMachine>>;
+    /** The lookup a workflow's conditions are read through: the version's variables, as the router evaluates them. */
+    lookup?: import('./variables.js').SourceLookup;
+  } = {},
 ): string[] {
   const p = patch as Record<string, unknown>;
   return [
     ...retiredCopyErrors(p.copy),
     ...retiredWelcomeErrors(p.welcome),
     ...(p.messages !== undefined && p.messages !== null ? messagesShapeErrors(p.messages) : []),
-    ...(p.eventWorkflows !== undefined && p.eventWorkflows !== null ? versionEventWorkflowsErrors(p.eventWorkflows, opts.machines ? { machines: opts.machines } : {}) : []),
+    ...(p.eventWorkflows !== undefined && p.eventWorkflows !== null ? versionEventWorkflowsErrors(p.eventWorkflows, { ...(opts.machines ? { machines: opts.machines } : {}), ...(opts.lookup ? { lookup: opts.lookup } : {}) }) : []),
     // What each variable's source publishes is checked at validate, activate and import, where the catalog is read.
     ...(p.variables !== undefined && p.variables !== null ? versionVariablesShapeErrors(p.variables) : []),
   ];

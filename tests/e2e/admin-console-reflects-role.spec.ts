@@ -238,7 +238,7 @@ test.describe.serial('a team member whose team owns an assistant', () => {
     // Latency, a drill of the same Performance view: its own numbers, and no refusal for a query
     // that is not attributed per assistant (the console does not ask for those on a team's behalf).
     await page.getByRole('button', { name: 'Full flow and latency' }).click();
-    await expect(page.locator('h3:has-text("Response Latency")')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('h2:has-text("Response Latency")')).toBeVisible({ timeout: 15000 });
     await page.waitForLoadState('networkidle');
     await expect(page.getByText(/not attributed per assistant|was refused|does not hold/)).toHaveCount(0);
   });

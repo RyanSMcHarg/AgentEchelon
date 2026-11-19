@@ -32,6 +32,10 @@ export const TEAM_QUERY_TYPES: ReadonlySet<string> = new Set([
   'intent_effectiveness',
   // One intent's step and model breakdown, over the same filters.
   'intent_steps',
+  'workflow_editions',
+  'task_rework',
+  // A process's runs (SPEC-PROCESSES P9), over the same assistant and classification filters.
+  'process_runs',
   'latency_exchanges',
   'latency_metrics',
   // Attributed per turn through the exchange that assistant answered.

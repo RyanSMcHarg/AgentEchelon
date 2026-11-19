@@ -47,8 +47,8 @@ process.env.USER_TASKS_TABLE = 'user-tasks-test';
 const { recordNoTransitionTurn } = require('../../lambda/src/lib/task-tracking') as
   typeof import('../../lambda/src/lib/task-tracking');
 
-const REQUESTER = '44581468-f091-704d-3f8e-4d41f866a0b4';
-const ASSISTANT = 'ed31ac66-21f5-41d0-9fdf-faf1da43869c';
+const REQUESTER = '00000000-0000-4000-8000-0000000000a1';
+const ASSISTANT = '00000000-0000-4000-8000-0000000000b1';
 const CHANNEL = 'arn:aws:chime:us-east-1:123456789012:app-instance/i/channel/c1';
 
 const taskOf = (over: Partial<Task>): Task => ({

@@ -137,3 +137,4 @@
 .admin-help-toggle-panel > p {
   margin: 0;
 }
+.metric-provenance-text { color: var(--text-secondary); font-family: var(--font-mono); }

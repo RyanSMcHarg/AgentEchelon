@@ -1,0 +1,43 @@
+/* A MEETING'S STARTED CARD (MeetingStartedCard.tsx): a title, a secondary wrapped detail, and Join while it runs. Colors
+   are design-system tokens with their light value as the fallback. */
+.ae-meeting-card {
+  display: grid;
+  gap: 8px;
+  max-width: 560px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--control-border-strong, #71717A);
+  background: var(--surface-0, #FFFFFF);
+  color: var(--text-primary, #09090B);
+}
+.ae-meeting-card--live { border-color: var(--toggle-on-border, #6D28D9); }
+.ae-meeting-card-head { display: flex; align-items: flex-start; gap: 10px; min-width: 0; }
+.ae-meeting-card-dot { flex: none; width: 8px; height: 8px; margin-top: 8px; border-radius: 50%; background: var(--text-secondary, #71717A); }
+.ae-meeting-card--live .ae-meeting-card-dot { background: var(--danger-fill, #B91C1C); }
+.ae-meeting-card-title { flex: 1 1 auto; font-size: 15px; font-weight: 600; line-height: 24px; min-width: 0; overflow-wrap: anywhere; }
+/* WHAT THE MESSAGE RENDERER DRAWS INSIDE IS NORMALIZED: no paragraph or list spacing of its own, and bold text keeps the
+   card's weight rather than a second one. */
+.ae-meeting-card-title *, .ae-meeting-card-detail * { margin: 0; padding: 0; line-height: inherit; }
+.ae-meeting-card-title strong, .ae-meeting-card-title b { font-weight: inherit; }
+.ae-meeting-card-detail {
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--text-secondary, #71717A);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.ae-meeting-card-actions { display: flex; gap: 8px; padding-left: 18px; }
+.ae-meeting-card-actions .ae-meeting-join-btn { min-height: 36px; padding: 0 16px; font-size: 14px; }
+.ae-meeting-card-state {
+  flex: none;
+  align-self: center;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid var(--control-border-strong, #71717A);
+  color: var(--text-secondary, #52525B);
+}
+.ae-meeting-card-state--live { border-color: var(--danger-fill, #B91C1C); color: var(--danger-fill, #B91C1C); }

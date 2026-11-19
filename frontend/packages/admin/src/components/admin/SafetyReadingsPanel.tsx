@@ -60,16 +60,16 @@ const SafetyReadingsPanel: React.FC<{
 
   return (
     <div className="admin-section" role="region" aria-label={t('admin.safetyReadings.title')}>
-      <h4>
+      <h3>
         {t('admin.safetyReadings.title')}{' '}
         <InfoTooltip label={t('admin.safetyReadings.title')} content={t('admin.safetyReadings.tip')} />
-      </h4>
+      </h3>
       {error && <p className="admin-error" role="alert">{error}</p>}
       {!error && rows === null && <p className="admin-help-text">{t('admin.safetyReadings.loading')}</p>}
       {!error && rows !== null && rows.length === 0 && <p className="admin-tab-empty">{t('admin.safetyReadings.empty')}</p>}
       {refusals.length > 0 && (
         <>
-          <h5>{t('admin.safetyReadings.refusals')}</h5>
+          <h4>{t('admin.safetyReadings.refusals')}</h4>
           <DataTable
             data={refusals}
             columns={[
@@ -89,7 +89,7 @@ const SafetyReadingsPanel: React.FC<{
       )}
       {guardrail.length > 0 && (
         <>
-          <h5>{t('admin.safetyReadings.guardrail')}</h5>
+          <h4>{t('admin.safetyReadings.guardrail')}</h4>
           <DataTable
             data={guardrail}
             columns={[
@@ -102,7 +102,7 @@ const SafetyReadingsPanel: React.FC<{
       )}
       {rules.length > 0 && (
         <>
-          <h5>{t('admin.safetyReadings.rules')}</h5>
+          <h4>{t('admin.safetyReadings.rules')}</h4>
           <DataTable
             data={rules}
             columns={[

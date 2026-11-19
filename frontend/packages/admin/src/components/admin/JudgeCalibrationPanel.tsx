@@ -55,10 +55,10 @@ const JudgeCalibrationPanel: React.FC<{ dateRange?: AnalyticsDateRange }> = ({ d
 
   return (
     <div className="admin-section" role="region" aria-label={t('admin.judgeCalibration.title')}>
-      <h4>
+      <h3>
         {t('admin.judgeCalibration.title')}{' '}
         <InfoTooltip label={t('admin.judgeCalibration.title')} content={t('admin.judgeCalibration.tip')} />
-      </h4>
+      </h3>
       {error && <p className="admin-error" role="alert">{error}</p>}
       {!error && rows === null && <p className="admin-help-text">{t('admin.judgeCalibration.loading')}</p>}
       {!error && rows !== null && judge.length === 0 && <p className="admin-tab-empty">{t('admin.judgeCalibration.empty')}</p>}

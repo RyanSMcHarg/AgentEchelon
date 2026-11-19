@@ -22,7 +22,7 @@ import {
   WORK_MANAGEMENT_INTENT_KEYS,
   canOpenWork,
 } from '../../lambda/src/lib/intent-pack';
-import { STRATUM_INLINE_INTENTS, stratumIntentPack } from '../../demo/intent-packs';
+import { STRATUM_INLINE_INTENTS, stratumIntentPack } from '../../../demo/stratum-company/intent-packs';
 
 function resolveFrom(pack: unknown) {
   process.env.ASSISTANT_INTENT_PACK = JSON.stringify(pack);

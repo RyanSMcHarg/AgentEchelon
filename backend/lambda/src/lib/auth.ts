@@ -16,14 +16,13 @@
  */
 
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry';
+import { defaultProfileRegistry as profiles, loadProfileRegistry } from '../../../lib/profile-registry';
 import { personIdFromArn, userArnFor } from './person-arn.js';
 import { issuerById } from './trusted-issuers.js';
 import {
   claimValues,
   groupsOf,
   holderTokenOf,
-  oneChannelOf,
   isGuestIssuer,
   type TrustedIssuer,
 } from '../../../lib/config/issuers.js';
@@ -188,7 +187,7 @@ function readEdgeCaller(event: APIGatewayProxyEvent): EdgeCaller | null {
 /**
  * The groups the caller's verified token names, read from the claim their issuer declares. `[]` on a
  * request the edge did not authorize, and for an issuer whose clearance is not its groups: a host pool
- * declaring a mapping or the one-conversation session holds no group this deployment reads.
+ * declaring a mapping or a fixed set holds no group this deployment reads.
  */
 function edgeGroups(event: APIGatewayProxyEvent): string[] {
   const caller = edgeCallerOf(event);
@@ -198,19 +197,11 @@ function edgeGroups(event: APIGatewayProxyEvent): string[] {
 /**
  * The one declared classification the caller's token is cleared for, through their issuer's clearance
  * source and within its declared classifications (`holderTokenOf`, `lib/config/issuers.ts`). Undefined when nothing
- * is declared for what they hold, and for a one-conversation issuer, whose people hold no classification.
+ * is declared for what they hold.
  */
 export function callerHolderToken(event: APIGatewayProxyEvent): string | undefined {
   const caller = edgeCallerOf(event);
   return caller ? holderTokenOf(caller.issuer, caller.claims, profiles) : undefined;
-}
-
-/**
- * The classification a one-conversation caller's conversations are created at, or null for any other
- * caller. Set when the caller's issuer declares `clearance: { oneChannel }`.
- */
-export function callerOneChannel(event: APIGatewayProxyEvent): string | null {
-  return oneChannelOf(edgeCallerOf(event)?.issuer);
 }
 
 export type CallerSource = 'console-session' | 'edge';
@@ -268,15 +259,8 @@ export function signedAsPerson(event: APIGatewayProxyEvent): boolean {
 
 /**
  * What a handler admits beyond the ordinary person.
- *
- * `oneChannel`: a person whose issuer declares the one-conversation session. They reach the credential
- * exchange (which vends them one conversation) and the conversation they open, and nothing else, so
- * every other handler gets null for them without asking. A handler opts in only where what it does
- * next is decided by that person's one-conversation reach. The edge refuses them on every other route
- * first; this is the second layer (tenet D3).
  */
 export interface CallerAdmission {
-  oneChannel?: boolean;
   /**
    * A guest: the guest issuer's visitor. One handler admits one: path B's registration (`guest-upgrade.ts`).
    * The edge allows a guest token on `GUEST_ROUTES` alone, and every handler that does not ask resolves
@@ -293,10 +277,7 @@ export async function callerPerson(event: APIGatewayProxyEvent, admit: CallerAdm
     person = resolveCaller(event);
     resolvedCallers.set(event, person);
   }
-  // A ONE-CONVERSATION PERSON REACHES ONLY WHAT ADMITS THEM. Refused by default, so a route that never
-  // considered them cannot be reached with a token whose reach is one conversation.
-  if (person && oneChannelOf(person.issuer) && !admit.oneChannel) return null;
-  // A GUEST REACHES ONLY WHAT ADMITS THEM, the same way.
+  // A GUEST REACHES ONLY WHAT ADMITS THEM: the second layer behind the edge's route check (tenet D3).
   if (person && isGuestIssuer(person.issuer) && !admit.guest) return null;
   // A HOST ASSERTION IS A BEARER ON THE EXCHANGE ALONE (A9), which reads the edge context itself, so no
   // handler resolves anybody from one: the second layer behind the edge's route check.
@@ -305,8 +286,8 @@ export async function callerPerson(event: APIGatewayProxyEvent, admit: CallerAdm
 }
 
 /** The caller's person id (their AppInstanceUser id), or null. */
-export async function callerPersonId(event: APIGatewayProxyEvent, admit: CallerAdmission = {}): Promise<string | null> {
-  return (await callerPerson(event, admit))?.personId ?? null;
+export async function callerPersonId(event: APIGatewayProxyEvent): Promise<string | null> {
+  return (await callerPerson(event))?.personId ?? null;
 }
 
 /**
@@ -399,7 +380,8 @@ function iamPrincipal(event: APIGatewayProxyEvent): string | null {
  * behind an IAM authorizer and only a trusted backend principal (your proxy's
  * role, granted `execute-api:Invoke`) can reach the handler. In that mode there
  * is no Cognito JWT; the caller has already enforced "is this operator an
- * admin?" in its own pool, so AgentEchelon trusts the signed principal.
+ * admin?" in its own pool, so AgentEchelon trusts the signed principal, unless it is a session this
+ * platform mints that is not this instance's own (`trustedIamAdminPrincipal`).
  *
  * `ADMIN_AUTH_MODE` is set by the CDK admin-auth-mode helper. The presence of
  * an IAM identity (userArn / caller / accountId) is what API Gateway populates
@@ -440,13 +422,82 @@ export function consoleSessionOf(userArn: string | null | undefined): ConsoleSes
 }
 
 /**
- * True when the request is signed by an ADMIN console session (`<prefix>-admin-console`). A team console
- * session, an Identity-Pool principal and any other signed principal are not, so a handler serving a
- * route with no team route can refuse them itself rather than relying on the gateway alone.
+ * THE ROLES THIS INSTANCE MINTS AN ADMIN SESSION ON, by name, as the stack told the handler
+ * (`adminSessionRoleEnv`, `backend/lib/constructs/admin-role-grants.ts`): its admin console, its team console
+ * and its admin plane. Read per call, and empty when unset, so a handler that was not told recognizes no
+ * session as this instance's and admits none of them.
+ */
+const thisInstanceRole = {
+  adminConsole: () => process.env.ADMIN_CONSOLE_ROLE_NAME || '',
+  teamConsole: () => process.env.TEAM_CONSOLE_ROLE_NAME || '',
+  adminPlane: () => process.env.ADMIN_PLANE_ROLE_NAME || '',
+};
+
+/**
+ * THE ROLE NAMES ANY INSTANCE OF THIS PLATFORM MINTS A SESSION ON: a console role, the admin plane, and a
+ * person's vend role (`<instance>-exchange-<classification>`). A signed caller on one of these that is not
+ * this instance's own console or admin plane is another instance's session, or a person's chat credential,
+ * and neither is an administrator here.
+ */
+const MINTED_ROLE = /-(?:admin-console|team-console|admin-plane)$|-exchange-[a-z0-9-]+$/;
+
+/**
+ * A TEAM ROUTE: one that names the assistant or the team it serves (`.../assistants/{assistant}/...`,
+ * `.../teams/{team}/...`), the only routes the team console role is granted and the only ones its session
+ * policy names (`teamSessionPolicy`). Read from the route the gateway matched (`resource`), else the path.
+ */
+const TEAM_ROUTE = /\/(?:assistants|teams)\/[^/]+(?:\/|$)/;
+
+/** The role name of an assumed-role caller, or null for any other principal (an IAM user, the root). */
+function assumedRoleName(userArn: string | null | undefined): string | null {
+  const m = /^arn:aws:sts::\d+:assumed-role\/([^/]+)\//.exec(userArn || '');
+  return m ? m[1] : null;
+}
+
+/**
+ * WHO AN IAM-SIGNED ADMIN CALL IS, AS THIS INSTANCE SEES IT: `admin`, `team`, or null when it is not one of
+ * this instance's administrators. The second layer behind the gateway (tenet D3): the gateway refused any
+ * principal without `execute-api:Invoke` on the route, and this refuses a principal the grant could still
+ * admit but this instance never issued.
+ *
+ *  - this instance's admin console session, or a session on this instance's admin plane: `admin`;
+ *  - this instance's team console session, on a team route: `team`, and on any other route, null;
+ *  - any other console, admin-plane or vend role (another instance's, or a person's chat credential): null;
+ *  - any other signed principal: `admin`. That is an operator's own credential (`npm run assistant`, the
+ *    ops scripts) or, under `adminAuthMode=service`, the deployer's proxy, which reach an admin route only
+ *    through a grant the account's own IAM administrator made.
+ *
+ * Null as well when the call is not a trusted IAM call at all (no `ADMIN_IAM_ENFORCEMENT` and not service
+ * mode, or no signed identity).
+ */
+export function trustedIamAdminPrincipal(event: APIGatewayProxyEvent): 'admin' | 'team' | null {
+  if (!isServiceAdminCall(event) && !isAdminIamEnforcedCall(event)) return null;
+  const userArn = (event.requestContext?.identity as { userArn?: string | null } | undefined)?.userArn;
+  const roleName = assumedRoleName(userArn);
+  if (!roleName) return 'admin';
+  const session = consoleSessionOf(userArn);
+  if (roleName === thisInstanceRole.adminConsole() && session?.kind === 'admin') return 'admin';
+  if (roleName === thisInstanceRole.teamConsole() && session?.kind === 'team') {
+    return TEAM_ROUTE.test(event.resource || event.path || '') ? 'team' : null;
+  }
+  if (roleName === thisInstanceRole.adminPlane()) return 'admin';
+  if (MINTED_ROLE.test(roleName)) {
+    console.warn('[auth][SecurityEvent] an admin route refused a session this instance did not issue', { roleName });
+    return null;
+  }
+  return 'admin';
+}
+
+/**
+ * True when the request is signed by THIS INSTANCE'S admin console session (its `<prefix>-admin-console`
+ * role, by name). A team console session, another instance's admin console session and any other signed
+ * principal are not, so a handler serving a route with no team route can refuse them itself rather than
+ * relying on the gateway alone.
  */
 export function isAdminConsoleSession(event: APIGatewayProxyEvent): boolean {
   const userArn = (event.requestContext?.identity as { userArn?: string | null } | undefined)?.userArn;
-  return consoleSessionOf(userArn)?.kind === 'admin';
+  const own = thisInstanceRole.adminConsole();
+  return Boolean(own) && assumedRoleName(userArn) === own && consoleSessionOf(userArn)?.kind === 'admin';
 }
 
 /**
@@ -467,12 +518,12 @@ export function isAdminIamEnforcedCall(event: APIGatewayProxyEvent): boolean {
 }
 
 /**
- * An IAM-signed admin call the handler may trust because a gateway IAM
- * authorizer already vetted it — either service mode (a trusted upstream proxy)
- * or A14 per-resource enforcement (the signed principal held the capability).
+ * An IAM-signed admin call the handler may trust: a gateway IAM authorizer already vetted it (service mode,
+ * or A14 per-resource enforcement), AND the signed principal is one of this instance's administrators
+ * (`trustedIamAdminPrincipal`), so one grant that reaches too far is not on its own an admission.
  */
 function isTrustedIamAdminCall(event: APIGatewayProxyEvent): boolean {
-  return isServiceAdminCall(event) || isAdminIamEnforcedCall(event);
+  return trustedIamAdminPrincipal(event) !== null;
 }
 
 /** Synthesize admin claims for a trusted IAM-signed call (service or A14 mode),
@@ -484,6 +535,9 @@ function isTrustedIamAdminCall(event: APIGatewayProxyEvent): boolean {
  *  classification field, and it was the default group name at that - a deployment that set
  *  `ADMIN_GROUP_NAMES` got claims naming a group it does not have. */
 async function iamPrincipalClaims(event: APIGatewayProxyEvent): Promise<AuthorizedClaims> {
+  // THE CLEARANCE IS READ FROM THE DEPLOYMENT'S REGISTRY, loaded here where it is read, so every admin route resolves its
+  // caller whatever its handler loads first. The load is cached, so a handler that loaded it already pays nothing.
+  await loadProfileRegistry();
   const groups = [...ADMIN_GROUPS];
   // THE PERSON, NOT THE ROLE. A console session names the person the exchange vended it for, and every
   // admin route is IAM-authorized, so this is the actor an audit line must name. The principal ARN is

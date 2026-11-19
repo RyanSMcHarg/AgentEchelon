@@ -80,6 +80,37 @@ describe('scopeAnalyticsRows', () => {
     const rows = [{ date: '2026-07-01', total: 42 }];
     expect(scopeAnalyticsRows(rows, 'basic')).toEqual(rows);
   });
+
+  it('DROPS a row whose classification axis names no declared classification, for a scoped caller', () => {
+    // ADR-045 decision 4: a row nobody classified is a row whose audience nobody established.
+    const rows = [
+      { conversation_classification: null, n: 1 },
+      { conversation_classification: '', n: 2 },
+      { conversation_classification: 'unknown', n: 3 },
+      { tier: 'not-a-classification', n: 4 },
+      { user_type: null, n: 5 },
+      { conversation_classification: 'basic', n: 6 },
+    ];
+    expect(scopeAnalyticsRows(rows, 'standard')).toEqual([{ conversation_classification: 'basic', n: 6 }]);
+    // A scope that resolved to nothing sees none of them, classified or not.
+    expect(scopeAnalyticsRows(rows, undefined)).toEqual([]);
+    // Full access is not narrowed at all.
+    expect(scopeAnalyticsRows(rows, null)).toBe(rows);
+  });
+
+  it('a content read keeps a row only when its classification is established and in reach', () => {
+    const rows = [
+      { message_id: 'm1', content: 'no classification on this row' },
+      { message_id: 'm2', conversation_classification: 'premium', content: 'out of reach' },
+      { message_id: 'm3', conversation_classification: 'basic', content: 'in reach' },
+      // A quality grade establishes nothing.
+      { message_id: 'm4', classification: 'excellent', content: 'graded, unclassified' },
+    ];
+    expect(scopeAnalyticsRows(rows, 'standard', { requireClassification: true }).map((r) => r.message_id)).toEqual(['m3']);
+    // The same rows read as aggregates keep the dimensionless ones.
+    expect(scopeAnalyticsRows(rows, 'standard').map((r) => r.message_id)).toEqual(['m1', 'm3', 'm4']);
+    expect(scopeAnalyticsRows(rows, null, { requireClassification: true })).toBe(rows);
+  });
 });
 
 describe('scopeForRequest — role-ARN resolution (fail-closed, no fail-open)', () => {

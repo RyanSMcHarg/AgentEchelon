@@ -73,7 +73,7 @@ const EvaluationsTab: React.FC<EvaluationsTabProps> = ({ data, isLoading, dateRa
     <div className="admin-tab">
       {/* How the judge is prompted is a hint a reader needs once; the passes, the rubrics and the
           selection behind every figure belong to SPEC-EVALUATION and DESIGN-EVALUATION. */}
-      <h3>
+      <h2>
         {t('admin.evaluations.evaluationScores')}
         <InfoTooltip
           label={t('admin.evaluations.howTheseScoresAreProduced')}
@@ -88,7 +88,7 @@ const EvaluationsTab: React.FC<EvaluationsTabProps> = ({ data, isLoading, dateRa
             </>
           }
         />
-      </h3>
+      </h2>
       <p className="admin-tab-description">{t('admin.evaluations.description')}</p>
       <GuideLinks guides={[
         guide(t('admin.guides.evaluations.spec'), 'evaluationSpec'),

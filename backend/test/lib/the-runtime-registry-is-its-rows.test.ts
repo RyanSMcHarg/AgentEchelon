@@ -54,7 +54,7 @@ describe('a deployment\'s rows assemble to the set it declares', () => {
     const premium = registryRowOf(DEFAULT_PROFILES_CONFIG, 'premium');
     expect(premium.profiles.map((p) => p.name).sort()).toEqual(['advisor', 'ops-premium']);
     expect(premium.groupClearance).toEqual({ premium: 'premium' });
-    expect(premium.membershipGroups).toEqual({ ops: 'premium' });
+    expect(premium.membershipGroups).toEqual({ ops: 'premium', 'ops-on-call': 'premium', 'ops-secondary': 'premium', 'account-management': 'premium', 'account-team-lead': 'premium' });
     expect(registryRowOf(DEFAULT_PROFILES_CONFIG, 'basic').membershipGroups).toBeUndefined();
   });
 

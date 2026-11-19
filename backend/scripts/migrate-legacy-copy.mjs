@@ -13,7 +13,7 @@
  * and reported. A template the assistant already holds as its own is kept, so a second run writes nothing.
  *
  * Writes run as the operator's own AWS credentials, as `npm run template` does. The bucket is `--bucket <name>`, else
- * TEMPLATE_BUCKET, else the `AttachmentsBucketName` output of this instance's Conversations stack. The deployment's
+ * TEMPLATE_BUCKET, else the `ProfileBucketName` output of this instance's Conversations stack. The deployment's
  * classifications are read from `backend/deploy.config.json` (`profiles`); a console-created assistant's from the
  * assistant directory.
  *
@@ -50,8 +50,8 @@ async function resolveBucket() {
   const stack = `${resolveStackPrefix(process.env)}Conversations`;
   const cfn = new CloudFormationClient({ region: REGION });
   const resp = await cfn.send(new DescribeStacksCommand({ StackName: stack }));
-  const out = resp.Stacks?.[0]?.Outputs?.find((o) => o.OutputKey === 'AttachmentsBucketName')?.OutputValue;
-  if (!out) throw new Error(`${stack} has no AttachmentsBucketName output; pass --bucket <name>.`);
+  const out = resp.Stacks?.[0]?.Outputs?.find((o) => o.OutputKey === 'ProfileBucketName')?.OutputValue;
+  if (!out) throw new Error(`${stack} has no ProfileBucketName output; pass --bucket <name>.`);
   return out;
 }
 

@@ -156,9 +156,11 @@ describe('every shipped machine says who it awaits, in the declared form', () =>
    */
   // `incident_first_look` is opened by an event, which has no requester, so no step of it waits on one (ADR-061
   // decision 8, `EVENT_TASK_MACHINES`); it rests as the room's work.
-  const NEVER_WAITS = ['queue_drain', 'incident_first_look'];
+  // `dashboard_refresh` is a workflow's required refresh: its one step's action publishes on entry, so nobody is waited on.
+  const NEVER_WAITS = ['queue_drain', 'incident_first_look', 'dashboard_refresh'];
 
-  const WORKER_MACHINES = ['approval', 'acknowledgement'];
+  // `incident_ownership` awaits its worker too: the team room's on-call resolves it (WT122).
+  const WORKER_MACHINES = ['approval', 'acknowledgement', 'incident_ownership', 'drift_offer', 'meeting_offer', 'meeting_action_item', 'customer_impact', 'customer_updates', 'final_notice'];
   it('resolves a party for every waiting state in every shipped machine', () => {
     for (const [name, machine] of Object.entries(DEFAULT_TASK_STATE_MACHINES)) {
       const waiting = Object.entries(machine.states).filter(([, def]) => awaitedPartyOf(def));

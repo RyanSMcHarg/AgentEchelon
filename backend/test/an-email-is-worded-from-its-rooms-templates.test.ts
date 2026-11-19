@@ -15,13 +15,13 @@ import { NotificationStack } from '../lib/stacks/notification-stack';
 import { assistantClassifications } from '../lib/config/profiles';
 import { emailTemplatesFor, emailCopyFromTemplates, emailLine, defaultEmailVoice, DEFAULT_EMAIL_COPY, type EmailVoice } from '../lambda/src/lib/email-copy';
 import { composeEmail } from '../lambda/src/lib/notification';
-import { shippedMessageTemplates } from '../lambda/src/lib/shipped-message-templates';
+import { legacyHomeOf, shippedMessageTemplates } from '../lambda/src/lib/shipped-message-templates';
 import { putTemplate, activateTemplate, _resetTemplateCache } from '../lambda/src/lib/template-store';
 
 const APP = 'arn:aws:chime:us-east-1:111122223333:app-instance/i';
-const BUCKET = { bucketName: 'attachments', bucketArn: 'arn:aws:s3:::attachments' };
+const BUCKET = { bucketName: 'profiles', bucketArn: 'arn:aws:s3:::profiles' };
 
-describe('the Notifications stack reads the template store for its emails, and nothing else of the bucket', () => {
+describe('the Notifications stack reads the template store for its emails, and nothing else of the profile bucket', () => {
   const app = new cdk.App();
   const env = { account: '111122223333', region: 'us-east-1' };
   const host = new cdk.Stack(app, 'Host', { env });
@@ -42,13 +42,13 @@ describe('the Notifications stack reads the template store for its emails, and n
     // The bridge, the transactional mail and the proactive briefing.
     expect(reads.length).toBeGreaterThanOrEqual(2);
     expect(pointers.length).toBe(reads.length);
-    expect(fnEnv.filter((v) => v.TEMPLATE_BUCKET === 'attachments').length).toBe(reads.length);
+    expect(fnEnv.filter((v) => v.TEMPLATE_BUCKET === 'profiles').length).toBe(reads.length);
   });
 
   it('DENIED: the read is GetObject on `templates/*` and GetParameter on template pointers, and nothing wider', () => {
     for (const s of reads) {
       expect(s.Action).toBe('s3:GetObject');
-      expect(s.Resource).toBe('arn:aws:s3:::attachments/templates/*');
+      expect(s.Resource).toBe('arn:aws:s3:::profiles/templates/*');
     }
     for (const s of pointers) {
       expect(s.Action).toBe('ssm:GetParameter');
@@ -114,5 +114,27 @@ describe('the emails are worded from the selected templates', () => {
   it('the preference line keeps its link as the only markup in the HTML part', () => {
     const html = composeEmail({ email: 'r@example.com', name: 'Riley', unsubscribeUrl: 'https://app.example.com/p?t=abc' }, { subject: 's', bodyText: 'b' }).html;
     expect(html).toContain('Manage which emails you receive: <a href="https://app.example.com/p?t=abc">https://app.example.com/p?t=abc</a>');
+  });
+});
+
+describe('a stored template saved before a section was shipped still words that line', () => {
+  const shipped = Object.fromEntries(['notification-email', 'email-preferences', 'invitation', 'claim', 'briefing']
+    .map((n) => [n, shippedMessageTemplates().get(n)!.template])) as any;
+  const home = legacyHomeOf('email.joinMeeting')!;
+  const homeOpen = legacyHomeOf('email.openConversation')!;
+  const older = { ...shipped[home.name], messageSections: { ...shipped[home.name].messageSections, [homeOpen.section]: 'Go to the room' } };
+  delete older.messageSections[home.section];
+  const templates = { ...shipped, [home.name]: older };
+
+  it('reads the meeting button from the shipped template, and every line the stored template has from it', () => {
+    const copy = emailCopyFromTemplates(templates);
+    expect(copy.joinMeeting).toBe(DEFAULT_EMAIL_COPY.joinMeeting);
+    expect(copy.joinMeeting.trim()).not.toBe('');
+    expect(copy.openConversation).toBe('Go to the room');
+  });
+
+  it('renders the line through emailLine too', () => {
+    const voice: EmailVoice = { copy: emailCopyFromTemplates(templates), assistantName: 'Ops', templates };
+    expect(emailLine(voice, 'joinMeeting')).toBe(DEFAULT_EMAIL_COPY.joinMeeting);
   });
 });

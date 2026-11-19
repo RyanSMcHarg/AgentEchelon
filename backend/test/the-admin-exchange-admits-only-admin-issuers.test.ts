@@ -1,6 +1,6 @@
 /**
  * The admin exchange's console session admits, at the edge, only a token whose issuer declares
- * `admin: true`. A one-conversation pool and a full-reach pool without `admin` are refused there, before
+ * `admin: true`. A pool without `admin` is refused there, before
  * the handler's own refusal on the registry entry (tenet D3: two layers).
  *
  * Synthesized as the whole app, so the route set is every route `AdminApi` serves and the route lists are
@@ -10,7 +10,6 @@
 import * as path from 'path';
 import { synthesizeApp } from '../lib/docs/api-contract';
 import { ADMIN_SESSION_ROUTE } from '../lib/constructs/edge-authorizer';
-import { ONE_CHANNEL_ROUTES } from '../lib/constructs/trusted-issuers';
 import { edgeRoutesOf, reachableRoutes, routesOf, runtimeEntries } from './helpers/edge-policy';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -18,7 +17,7 @@ const SYNTH_TIMEOUT_MS = 600_000;
 
 const ISSUERS = [
   { id: 'deployment', kind: 'cognito-pool', pool: 'self', clearance: { groups: true, classifications: ['basic', 'standard', 'premium', 'admin'] }, admin: true },
-  { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', audience: 'host-client', clearance: { oneChannel: 'basic', classifications: ['basic'] } },
+  { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', audience: 'host-client', clearance: { fixed: ['basic'], classifications: ['basic'] } },
   { id: 'partner', kind: 'cognito-pool', pool: 'us-east-1_Partner', audience: 'partner-client', clearance: { fixed: ['basic'], classifications: ['basic'] } },
   { id: 'operators', kind: 'cognito-pool', pool: 'us-east-1_Operators', audience: 'operators-client', clearance: { groups: true, classifications: ['basic', 'admin'] }, admin: true },
 ];
@@ -46,7 +45,7 @@ describe('the admin exchange admits only the issuers that declare admin', () => 
   it('takes a token on one admin route, the console session, never answered from the cache', () => {
     const tokenRoutes = adminRoutes.filter((r) => r.auth !== 'AWS_IAM');
     expect(tokenRoutes.map((r) => [r.key, r.auth, r.authorizerTtl])).toEqual([[ADMIN_SESSION_ROUTE, 'CUSTOM', 0]]);
-    expect(adminEdge).toEqual({ plane: 'admin', exchange: [], oneChannel: [], guest: [], admin: [ADMIN_SESSION_ROUTE] });
+    expect(adminEdge).toEqual({ plane: 'admin', exchange: [], guest: [], admin: [ADMIN_SESSION_ROUTE] });
   });
 
   it('admits an admin issuer on the console session and on no other admin route', async () => {
@@ -58,16 +57,16 @@ describe('the admin exchange admits only the issuers that declare admin', () => 
     }
   });
 
-  it('refuses the one-conversation and the full-reach issuer on every admin route', async () => {
+  it('refuses every issuer without admin on every admin route', async () => {
     for (const id of ['host', 'partner']) {
       expect({ id, reached: await reachableRoutes(entry(id), PERSON, adminEdge, adminKeys, ADMIN_SESSION_ROUTE) }).toEqual({ id, reached: [] });
     }
   });
 
-  it('admits the admin issuer on the person routes too, and still keeps the one-conversation issuer to its allowlist', async () => {
+  it('admits an admin issuer and a host pool alike on the person routes', async () => {
     // An admin issuer's people are people: they reach the person routes like any full-reach issuer.
     expect(await reachableRoutes(entry('operators'), PERSON, personEdge, personKeys)).toEqual(personKeys);
-    expect(await reachableRoutes(entry('host'), PERSON, personEdge, personKeys)).toEqual([...ONE_CHANNEL_ROUTES].sort());
+    expect(await reachableRoutes(entry('host'), PERSON, personEdge, personKeys)).toEqual(personKeys);
   });
 
   it('scans a realistic admin route set', () => {

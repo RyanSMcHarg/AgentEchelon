@@ -178,8 +178,8 @@ describe('the per-classification driver', () => {
   });
 
   it('reconciles every sourced group on the backstop schedule and on a deleted or disabled user', () => {
-    expect(groupsToReconcile(undefined, 'premium')).toEqual(['ops']);
-    expect(groupsToReconcile({ detail: { eventName: 'AdminDisableUser' } }, 'premium')).toEqual(['ops']);
+    expect(groupsToReconcile(undefined, 'premium')).toEqual(['account-management', 'account-team-lead', 'ops', 'ops-on-call', 'ops-secondary']);
+    expect(groupsToReconcile({ detail: { eventName: 'AdminDisableUser' } }, 'premium')).toEqual(['account-management', 'account-team-lead', 'ops', 'ops-on-call', 'ops-secondary']);
     expect(groupsToReconcile(undefined, 'basic')).toEqual([]);
   });
 

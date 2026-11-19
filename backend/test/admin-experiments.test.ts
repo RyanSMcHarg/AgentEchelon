@@ -130,7 +130,7 @@ const pinnedTreatment = (alt = 'alt-primary-premium', modelKey = 'opus') => ({
 });
 const ALT_RECORD = { classification: 'premium', botArn: 'arn:bot/alt-premium', lexBotId: 'LEXALT' };
 function armedSsm(
-  alt: { classification: string; botArn: string; lexBotId?: string } | null = ALT_RECORD,
+  alt: { classification: string; botArn: string; lexBotId?: string; heldBy?: string } | null = ALT_RECORD,
   derivedFrom: Record<string, string> = { experimentId: 'exp-1', variantId: 'treatment' },
 ) {
   mockSsmSend.mockImplementation(async (cmd: { __t?: string; input?: { Name?: string } }) => {
@@ -147,7 +147,8 @@ function armedSsm(
         throw Object.assign(new Error('not found'), { name: 'ParameterNotFound' });
       }
       return { Parameter: { Value: JSON.stringify({
-        classification: alt.classification, role: 'primary', occupancy: 'alt', assistant: null,
+        classification: alt.classification, role: 'primary', occupancy: 'alt',
+        assistant: alt.heldBy ? 'alt-primary-premium' : null, experimentId: alt.heldBy ?? null,
         botArn: alt.botArn, lexBotId: alt.lexBotId ?? 'LEXALT',
       }) } };
     }
@@ -397,6 +398,44 @@ describe('admin-experiments handler', () => {
     expect(JSON.parse(put.input.Value).assistant).toBeNull();
     expect(JSON.parse(put.input.Value).experimentId).toBeNull();
     expect(JSON.parse(put.input.Value).lexBotId).toBe(ALT_RECORD.lexBotId);
+  });
+
+  describe('an experiment releases only the alt it holds', () => {
+    // An image battle takes the alt a second before the text battle it displaces is paused; that pause leaves the
+    // image battle's record in place, so the image duel's alt is still served by the vend.
+    const pause = async () => {
+      mockDdbSend.mockResolvedValueOnce({ Items: [] });
+      mockDdbSend.mockResolvedValueOnce({});
+      return handler(evt({
+        httpMethod: 'POST',
+        body: {
+          ...baseExp,
+          status: 'paused',
+          battleEnabled: true,
+          challengerAssistant: 'alt-primary-premium',
+          variants: [
+            { variantId: 'control', modelKey: 'sonnet', weight: 50 },
+            { variantId: 'treatment', modelKey: 'opus', weight: 50 },
+          ],
+        },
+      }));
+    };
+    const altWrites = () => mockSsmSend.mock.calls.map((c) => c[0])
+      .filter((c) => c?.__t === 'PutParam' && /\/assistant-assignments\/premium\/primary\/alt$/.test(c.input.Name));
+
+    it('DENIED: pausing an experiment leaves the alt with the experiment that holds it', async () => {
+      armedSsm({ ...ALT_RECORD, heldBy: 'exp-image' });
+      expect((await pause()).statusCode).toBe(200);
+      expect(altWrites()).toEqual([]);
+    });
+
+    it('pausing the experiment that holds the alt releases it', async () => {
+      armedSsm({ ...ALT_RECORD, heldBy: baseExp.experimentId });
+      expect((await pause()).statusCode).toBe(200);
+      const writes = altWrites();
+      expect(writes).toHaveLength(1);
+      expect(JSON.parse(writes[0].input.Value)).toMatchObject({ assistant: null, experimentId: null, lexBotId: ALT_RECORD.lexBotId });
+    });
   });
 
   it('REFUSES a battle in a classification that provisions no alt, and writes nothing', async () => {

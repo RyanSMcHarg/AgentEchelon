@@ -81,7 +81,7 @@ const { signInAndExchange } = require('./lib/sign-in-exchange.cjs');
 const region = process.env.AWS_REGION || 'us-east-1';
 const DRY_RUN = process.argv.includes('--dry-run');
 /**
- * `--cast ops-demo` provisions the PEOPLE of the new-assistant demo instead of the e2e users: the
+ * `--cast ops-demo` provisions the PEOPLE of the portable-assistants demo instead of the e2e users: the
  * on-call engineer who leads, two platform engineers and their engineering manager, all premium-cleared
  * and in NO membership group (the presenter ticks `ops` in the console on camera). Same mechanism and
  * the same ordering guarantees as the e2e set, written to its OWN secret so a demo login can never be
@@ -174,13 +174,13 @@ const E2E_USERS = [
   // `ops-team` conversation types add their people from. Premium FIRST, because `ops` grants nothing
   // and requires premium (DESIGN-CONVERSATION-TYPES §6). The lead is the person an `ops` event names; the
   // engineer is a second member, so a room the group populates is visibly a group.
-  { key: 'opsLeadUser', email: `testuser-ops-lead@${EMAIL_DOMAIN}`, tier: 'premium', groups: ['premium', 'ops'], name: 'Test Ops Lead' },
+  { key: 'opsLeadUser', email: `testuser-ops-lead@${EMAIL_DOMAIN}`, tier: 'premium', groups: ['premium', 'ops', 'ops-on-call'], name: 'Test Ops Lead' },
   { key: 'opsEngineerUser', email: `testuser-ops-engineer@${EMAIL_DOMAIN}`, tier: 'premium', groups: ['premium', 'ops'], name: 'Test Ops Engineer' },
   // A TEAM MEMBER (SPEC-ADMIN-CONSOLE "Admin and team-member groups"). `team-members` is the admin role and
-  // `team-ops` is the team; the team reaches the assistants whose AppInstanceBot carries `owner-team=ops`,
+  // `team-ops` is the team (`team-platform` a second, so a move between the member's own teams is testable); the team reaches the assistants whose AppInstanceBot carries `owner-team=ops`,
   // which is the ops assistant. It signs in to the admin console and can manage, and read analytics for,
   // that assistant only. The admin capability deny-test signs in as this user.
-  { key: 'teamOpsUser', email: `testuser-team-ops@${EMAIL_DOMAIN}`, tier: 'premium', groups: ['premium', 'team-members', 'team-ops'], name: 'Test Team Ops' },
+  { key: 'teamOpsUser', email: `testuser-team-ops@${EMAIL_DOMAIN}`, tier: 'premium', groups: ['premium', 'team-members', 'team-ops', 'team-platform'], name: 'Test Team Ops' },
   // In `team-members` with NO team group: the case that must reach nothing rather than everything
   // (SPEC-ADMIN-CONSOLE acceptance criterion (c)). The deny-test asks for its console session and expects
   // the refusal.

@@ -9,6 +9,12 @@ import { ArrivalNotice } from './components/ArrivalNotice';
 import { AwsClientProvider, useAwsClient } from './providers/AwsClientProvider';
 import { MessagingProvider } from './providers/MessagingProvider';
 import { ConversationProvider, useConversations } from './providers/ConversationProvider.chime';
+import { MeetingProvider } from './providers/MeetingProvider';
+import { MeetingSignalsProvider } from './providers/meetingSignals';
+import MeetingWindow from './components/meeting/MeetingWindow';
+import IncomingRing from './components/meeting/IncomingRing';
+import { isMeetingEnabled } from './services/meetingService';
+import { meetingWindowRequest } from './utils/meetingWindow';
 import RegistrationScreen from './components/RegistrationScreen';
 import EmailVerificationScreen from './components/EmailVerificationScreen';
 import Header from './components/Header';
@@ -21,7 +27,7 @@ import DeploymentStatusBanner from './components/DeploymentStatusBanner';
 import AccountSettingsModal from './components/AccountSettingsModal';
 import { isEmailPreferencesConfigured } from './services/noticePreferencesService';
 import '@ae/shared/styles/App.css';
-import { requestMessageFocus } from './utils/focusMessage';
+import { useConversationDeepLink } from './hooks/useConversationDeepLink';
 
 type AuthView = 'login' | 'register' | 'verify' | 'success' | 'forgot';
 
@@ -51,34 +57,13 @@ function AppContent() {
   // preference page carries, which lands on the email section. Email is offered only when the deployment sends it.
   const emailPreferencesOffered = isEmailPreferencesConfigured();
   const [settingsOpen, setSettingsOpen] = useState<null | 'account' | 'email'>(null);
+  // THE MEETING WINDOW (`?meeting=<conversation id>`): read once at load and kept through sign-in, where the deployment
+  // serves meetings.
+  const [meetingWindowFor] = useState(() => (isMeetingEnabled() ? meetingWindowRequest() : null));
 
-  // Deep link: auto-select conversation from the `?conversation=<id>` query
-  // param (share + proactive-briefing emails). selectConversation resolves the
-  // id against the loaded list and falls back to describing the channel
-  // directly, so the link works even when the channel isn't in the recipient's
-  // sidebar yet (past the first page, or freshly shared).
-  useEffect(() => {
-    // Wait until the Chime client is initialized — selectConversation's
-    // describe-channel fallback needs it, and attempting (then cleaning the
-    // URL) before it's ready would lose the deep link.
-    if (!isAuthenticated || !isInitialized) return;
-    const params = new URLSearchParams(window.location.search);
-    const conversationId = params.get('conversation');
-    if (!conversationId) return;
-    // `#message=<id>` deep-links to a SPECIFIC message, not just the conversation. A drift-created
-    // conversation links back to the message that caused it, so landing at the bottom of a long thread
-    // would leave the reader to hunt for it. Read before the URL is cleaned below.
-    const messageId = decodeURIComponent((window.location.hash.match(/message=([^&]+)/) || [])[1] || '');
-    // Recorded BEFORE selecting, because the target's history has not loaded yet. ConversationInterface
-    // scrolls to it in an effect once the message renders, so nothing here waits or polls. The request is
-    // scoped to this conversation and gives up after a bounded wait, so a target that never renders (deleted,
-    // redacted, past the loaded page) cannot keep suppressing auto-scroll.
-    if (messageId) requestMessageFocus(messageId, conversationId);
-    void selectConversation(conversationId).finally(() => {
-      // Clean up URL once selection has been attempted.
-      window.history.replaceState({}, '', window.location.pathname);
-    });
-  }, [isAuthenticated, isInitialized, selectConversation]);
+  // A link that names a conversation opens it, once (share and proactive-briefing emails), and a conversation link in a
+  // message opens in place. The meeting window shows its one meeting's conversation, so it opens neither.
+  useConversationDeepLink(isAuthenticated && isInitialized && !meetingWindowFor, selectConversation);
 
   // `?settings=email-preferences` opens the screen once the person is signed in, and the URL is cleaned.
   useEffect(() => {
@@ -232,9 +217,12 @@ function AppContent() {
     );
   }
 
+  if (meetingWindowFor) return <MeetingWindow conversationId={meetingWindowFor} />;
+
   return (
     <div className="app">
       <Header onOpenSettings={() => setSettingsOpen('account')} />
+      {isMeetingEnabled() && <IncomingRing />}
       <ArrivalNotice
         invitation={invitationOutcome}
         upgrade={upgradeOutcome}
@@ -297,7 +285,13 @@ function App() {
         <AwsClientProvider>
           <MessagingProvider>
             <ConversationProvider>
-              <AppContent />
+              {/* Inside the conversation providers: a meeting belongs to a conversation, and the chat runs beside it. It
+                  holds no session until somebody joins, so a deployment without meetings spends nothing on it. */}
+              <MeetingProvider>
+                <MeetingSignalsProvider>
+                  <AppContent />
+                </MeetingSignalsProvider>
+              </MeetingProvider>
             </ConversationProvider>
           </MessagingProvider>
         </AwsClientProvider>

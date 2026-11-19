@@ -174,7 +174,13 @@ describe('work in this conversation suppresses drift', () => {
     process.env.CLASSIFICATION = 'premium';
     delete process.env.ABUSE_CONTROLS_TABLE;
 
-    mockSsmSend.mockImplementation(async () => ({ Parameter: { Value: BOT_SELF } }));
+    // An assistant with no activated version runs on its seed; any other read names this assistant's bot.
+    mockSsmSend.mockImplementation(async (cmd: { input?: { Name?: string } }) => {
+      if (/\/definition(:|$)/.test(cmd?.input?.Name ?? '')) {
+        throw Object.assign(new Error('not found'), { name: 'ParameterNotFound' });
+      }
+      return { Parameter: { Value: BOT_SELF } };
+    });
 
     mockMessagingSend.mockImplementation(async (cmd: { __type?: string }) => {
       if (cmd?.__type === 'ListTags') return { Tags: [{ Key: 'classification', Value: 'premium' }] };

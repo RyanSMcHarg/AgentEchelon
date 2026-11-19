@@ -140,13 +140,26 @@ export interface EmailConsentAccess {
   /** Whether the function's mail is about conversations, so it reads the conversation assistant's voice. */
   conversationVoice: boolean;
   /**
-   * The template store (the attachments bucket), where the conversation assistant's and its classification's
+   * The template store (the profile bucket), where the conversation assistant's and its classification's
    * message templates are: a function with a conversation's voice reads them (ADR-062 decision 2).
    */
   templates?: { bucketName: string; bucketArn: string };
 }
 
 /** The one SES grant: the fan-out's send on the sender identity, with the directory reads it needs. */
+/** The environment flag that turns on the live clearance recheck in the shared conversation check. */
+export const LIVE_CLEARANCE_ENV = 'LIVE_CLEARANCE';
+
+/**
+ * A ROUTE THAT RECHECKS CLEARANCE LIVE (DESIGN-REVOCATION-WINDOWS R4): the read of the person's current groups the
+ * shared conversation check makes (`callerReachesConversation`, lib/conversation-access.ts), and the flag that turns
+ * it on. Without both, the route is held to the clearance in the token, which a downgrade reaches at renewal.
+ */
+export function grantLiveClearance(fn: lambda.Function, access: Omit<DirectoryAccess, 'poolReads'>): void {
+  grantDirectoryRead(fn, { ...access, poolReads: ['cognito-idp:AdminListGroupsForUser'] });
+  fn.addEnvironment(LIVE_CLEARANCE_ENV, 'directory');
+}
+
 export function grantEmailFanOut(
   fn: lambda.Function,
   access: Omit<DirectoryAccess, 'poolReads'> & { senderEmail: string; poolReads?: PoolRead[]; consent: EmailConsentAccess },

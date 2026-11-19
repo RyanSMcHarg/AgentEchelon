@@ -26,12 +26,17 @@ function requireAnalyticsApi(): void {
  * gateway denies a persona role that lacks the capability's resource.
  */
 const ANALYTICS_SUBPATH_FOR_QUERY: Record<string, string> = {
+  // CONVERSATION CONTENT (`view-events`): every read that returns what was said - the event log,
+  // conversation summaries and transcripts, and the person's message and the assistant's answer beside
+  // a score, a flag, a label or a rating. Each is read with a stated reason (`queryAnalytics`).
   channel_events: 'events-log',
-  // Content, not an aggregate: it returns the first 100 characters of a person's message as `topic`
-  // and the first 500 as `summary`. It used to be unlisted on both sides, which meant the root
-  // resource - the low-sensitivity bundle - served message content. Posting it here now would 403
-  // under IAM enforcement, which is the point.
   cross_conversation_context: 'events-log',
+  conversation_summaries: 'events-log',
+  evaluation_exchanges: 'events-log',
+  flagged_responses: 'events-log',
+  ground_truth: 'events-log',
+  label_queue: 'events-log',
+  user_ratings: 'events-log',
   user_activity: 'user-activity',
   active_users_daily: 'user-activity',
   active_messaging_users_daily: 'user-activity',
@@ -66,19 +71,27 @@ const ANALYTICS_SUBPATH_FOR_WRITE: Record<string, { actions: string[]; path: str
   golden_set: { actions: ['nominate', 'retire', 'promote'], path: 'ground-truth' },
 };
 
-function analyticsPathForQuery(queryType: string, action?: unknown): string {
+/** The capability sub-path a queryType (and, for a write, its action) posts to; undefined for the root. */
+function analyticsSubpathFor(queryType: string, action?: unknown): string | undefined {
   const write = ANALYTICS_SUBPATH_FOR_WRITE[queryType];
-  const sub = write && typeof action === 'string' && write.actions.includes(action)
+  return write && typeof action === 'string' && write.actions.includes(action)
     ? write.path
     : ANALYTICS_SUBPATH_FOR_QUERY[queryType];
+}
+
+function analyticsPathForQuery(queryType: string, action?: unknown): string {
+  const sub = analyticsSubpathFor(queryType, action);
   requireAnalyticsApi();
   // A team member's queries and writes go to their assistant's routes, which bind each to that assistant.
   // The team routes are the query and the two quality writes; a team never asks for another
   // (`teamCanQuery`), and an unscoped route a team session does not hold is refused at the gateway.
+  // A team's response lists are content, read on its query route bound to its assistant.
   const team = teamAssistant();
   if (team) {
     const a = encodeURIComponent(team);
-    if (!sub) return adminUrl('analytics', `/analytics/assistants/${a}/query`);
+    if (!sub || (sub === 'events-log' && TEAM_REASONED_QUERIES.has(queryType))) {
+      return adminUrl('analytics', `/analytics/assistants/${a}/query`);
+    }
     if (sub === 'triage') return adminUrl('analytics', `/analytics/assistants/${a}/triage`);
     if (sub === 'ground-truth') return adminUrl('analytics', `/analytics/assistants/${a}/ground-truth`);
   }
@@ -165,6 +178,10 @@ export async function writeAnalytics(
   if (refusal) throw new Error(refusal);
 }
 
+/** How many times, and how far apart, a moderation attribution is sent while the archive catches up. */
+export const MODERATION_RECORD_ATTEMPTS = 6;
+export const MODERATION_RECORD_SPACING_MS = 2000;
+
 /**
  * Record a moderation action for attribution. The analytics Lambda stamps the SERVER-VERIFIED
  * admin identity (from the JWT) into moderation_actions — the client only names the target, never
@@ -173,17 +190,30 @@ export async function writeAnalytics(
  * DELIBERATELY NOT `writeAnalytics`: its contract is that it cannot fail the operation it audits, and
  * the redact or delete has already happened by the time it runs. Raising here would turn a completed
  * moderation into a visible error with nothing for the operator to do about it.
+ *
+ * THE SERVER RECORDS ONLY A MODERATION THE ARCHIVE HOLDS, and the archive receives the redact or
+ * delete event from the message stream moments after it happens. So the write runs in the background
+ * and is retried while the server answers 409 `MODERATION_NOT_RECORDED`, a bounded number of times;
+ * the returned promise settles at once and never holds up the caller.
  */
 export async function recordModeration(
   channelArn: string,
   messageId: string,
-  moderation: 'redact' | 'delete'
+  moderation: 'redact' | 'delete',
+  wait: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 ): Promise<void> {
-  await queryAnalytics('record_moderation', undefined, {
-    channelArn,
-    messageId,
-    moderation,
-  });
+  void (async () => {
+    for (let attempt = 1; attempt <= MODERATION_RECORD_ATTEMPTS; attempt += 1) {
+      try {
+        await queryAnalytics('record_moderation', undefined, { channelArn, messageId, moderation });
+        return;
+      } catch (err) {
+        const pending = (err as { status?: unknown })?.status === 409;
+        if (!pending || attempt === MODERATION_RECORD_ATTEMPTS) return;
+        await wait(MODERATION_RECORD_SPACING_MS);
+      }
+    }
+  })();
 }
 
 /**
@@ -257,6 +287,14 @@ export async function queryAnalytics(
   const team = teamAssistant();
   if (team && TEAM_REASONED_QUERIES.has(String(queryType)) && !extra?.action) {
     body.accessReason = await reasonFor({ capability: 'view-analytics', kind: 'read', subject: 'responses', readKey: `responses:${team}` });
+  } else if (!team && analyticsSubpathFor(String(queryType), extra?.action) === 'events-log') {
+    // A READ OF CONVERSATION CONTENT carries a stated reason, which the server records. A read of one
+    // conversation reuses the reason that conversation was opened for; the content lists share one
+    // reason for the session.
+    const channelArn = typeof extra?.channelArn === 'string' && extra.channelArn ? extra.channelArn : undefined;
+    body.accessReason = await reasonFor(channelArn
+      ? { capability: 'view-events', kind: 'read', channelArn }
+      : { capability: 'view-events', kind: 'read', subject: 'content', readKey: 'analytics-content' });
   }
   // SigV4-sign with the operator's console-session credentials and post to the capability resource the
   // queryType (and, for a write, its action) belongs to. The gateway refuses a role that lacks it.

@@ -24,9 +24,18 @@ const mockDispatchFailure = jest.fn().mockResolvedValue(undefined);
 
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: class { send = (...a: unknown[]) => mockChime(...a); },
-  DescribeChannelCommand: class { __t = 'Describe'; constructor(public input: any) {} },
+  DescribeChannelMembershipCommand: class { __t = 'DescribeMembership'; constructor(public input: any) {} },
+  ListTagsForResourceCommand: class { __t = 'ListTags'; constructor(public input: any) {} },
   GetChannelMessageCommand: class { __t = 'GetMessage'; constructor(public input: any) {} },
 }));
+// The caller is cleared for the conversation's classification (`lib/conversation-access.ts`); an uncleared
+// caller's refusal is proven in `lib/a-person-route-reaches-only-a-conversation-its-caller-reaches.test.ts`.
+jest.mock('../lambda/src/lib/auth', () => ({
+  ...jest.requireActual('../lambda/src/lib/auth'),
+  callerHolderToken: () => 'premium',
+}));
+/** The service's answer to anything this file does not refuse: the conversation's classification tag, or nothing. */
+const answerOf = (cmd: any) => (cmd.__t === 'ListTags' ? { Tags: [{ Key: 'classification', Value: 'premium' }] } : {});
 // SPREAD, NOT ENUMERATE. A mock that LISTS a first-party module's exports is a snapshot
 // of it: adding one export to `turn-lock` made this file fail at import, in tests that have nothing to
 // say about the new function. Worse than a failed assertion, because it reports one error instead of N
@@ -62,7 +71,7 @@ beforeEach(() => {
   mockRead.mockReset();
   mockDispatchFailure.mockReset();
   mockRead.mockResolvedValue({ busy: true, queued: ['m1', 'm2'], noticeId: 'n1' });
-  mockChime.mockResolvedValue({});
+  mockChime.mockImplementation((cmd: any) => Promise.resolve(answerOf(cmd)));
   // No failure by default, so "did this endpoint ask?" is a real question in every test below.
   mockDispatchFailure.mockResolvedValue(undefined);
 });
@@ -76,9 +85,17 @@ describe('who may ask', () => {
   it('refuses a caller who is not a member, WITHOUT reading the record', async () => {
     // The order is the point. A 403 that had already read the queue would have loaded a
     // non-member's conversation state into this process to decide not to send it.
-    mockChime.mockRejectedValue(new Error('Forbidden'));
+    mockChime.mockRejectedValue(Object.assign(new Error('Forbidden'), { name: 'ForbiddenException' }));
     const res = await api.handler(req());
     expect(res.statusCode).toBe(403);
+    expect(mockRead).not.toHaveBeenCalled();
+  });
+
+  it('a conversation that is gone, refused by the tag-conditioned membership read, is NOT_A_MEMBER rather than a 503', async () => {
+    mockChime.mockRejectedValue(Object.assign(new Error('denied'), { name: 'AccessDeniedException' }));
+    const res = await api.handler(req());
+    expect(res.statusCode).toBe(403);
+    expect(body(res).code).toBe('NOT_A_MEMBER');
     expect(mockRead).not.toHaveBeenCalled();
   });
 
@@ -114,7 +131,7 @@ describe('what comes back', () => {
     mockChime.mockImplementation((cmd: any) => (
       cmd.__t === 'GetMessage' && cmd.input.MessageId === 'm2'
         ? Promise.reject(new Error('Forbidden'))
-        : Promise.resolve({})
+        : Promise.resolve(answerOf(cmd))
     ));
     expect(body(await api.handler(req())).queued).toEqual(['m1']);
   });
@@ -123,7 +140,7 @@ describe('what comes back', () => {
     // The case worth naming rather than hiding: a member can see the assistant is busy without
     // seeing what it is busy WITH. That is what targeting means.
     mockChime.mockImplementation((cmd: any) => (
-      cmd.__t === 'GetMessage' ? Promise.reject(new Error('Forbidden')) : Promise.resolve({})
+      cmd.__t === 'GetMessage' ? Promise.reject(new Error('Forbidden')) : Promise.resolve(answerOf(cmd))
     ));
     const out = body(await api.handler(req()));
     expect(out.busy).toBe(true);
@@ -132,14 +149,16 @@ describe('what comes back', () => {
 
   it('reads the caller as the bearer, never the assistant', async () => {
     await api.handler(req());
-    const bearers = mockChime.mock.calls.map(([c]: any[]) => c.input.ChimeBearer);
+    // Every call that takes a bearer; the tag read takes none.
+    const bearers = mockChime.mock.calls.filter(([c]: any[]) => c.__t !== 'ListTags').map(([c]: any[]) => c.input.ChimeBearer);
+    expect(bearers.length).toBeGreaterThan(0);
     expect(bearers.every((b: string) => b === `${APP}/user/alice`)).toBe(true);
   });
 
   it('reads as the PERSON the token resolves to, never the token sub', async () => {
     const PERSON = '0190f5c2-7b3a-7c11-9d2e-5a6b7c8d9e0f';
     await api.handler(asPerson(req(), PERSON));
-    const bearers = mockChime.mock.calls.map(([c]: any[]) => c.input.ChimeBearer);
+    const bearers = mockChime.mock.calls.filter(([c]: any[]) => c.__t !== 'ListTags').map(([c]: any[]) => c.input.ChimeBearer);
     expect(bearers.length).toBeGreaterThan(0);
     expect(bearers.every((b: string) => b === `${APP}/user/${PERSON}`)).toBe(true);
   });
@@ -200,7 +219,7 @@ describe('why this caller\'s turn never ran', () => {
   });
 
   it('is read only AFTER membership, so a non-member learns nothing - not even that a dispatch failed', async () => {
-    mockChime.mockRejectedValue(new Error('Forbidden'));
+    mockChime.mockRejectedValue(Object.assign(new Error('Forbidden'), { name: 'ForbiddenException' }));
     const res = await api.handler(req());
     expect(res.statusCode).toBe(403);
     expect(mockDispatchFailure).not.toHaveBeenCalled();

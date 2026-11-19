@@ -26,3 +26,21 @@ describe('displayText', () => {
     expect(displayText(undefined)).toBe('');
   });
 });
+
+describe('displayText shows a mention by name', () => {
+  it('reads `@<Name|id>` and `.<Name|id>` as the name, with no id, pipe or brackets', () => {
+    const shown = displayText(encodeURIComponent('.<Alice|alice-sub> ask @<Ryan McHarg|ryan-sub> today'));
+    expect(shown).toBe('.Alice ask @Ryan McHarg today');
+    expect(shown).not.toMatch(/sub|\||<|>/);
+  });
+});
+
+describe("displayText hides an assistant's leading @humans, as the chat app does", () => {
+  it('on a message an assistant sent', () => {
+    expect(displayText('@humans The deploy finished.', true)).toBe('The deploy finished.');
+  });
+  it("not on a person's message, and not on a longer word", () => {
+    expect(displayText('@humans who has the numbers?', false)).toBe('@humans who has the numbers?');
+    expect(displayText('@humans-team owns this', true)).toBe('@humans-team owns this');
+  });
+});

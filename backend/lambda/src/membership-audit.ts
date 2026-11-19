@@ -525,6 +525,7 @@ async function handleViolation(
   subjectId: string,
   subjectClearance: string,
   channelClassification: string,
+  opts: EvaluateOptions = {},
 ): Promise<void> {
   const adminArn = await getAdminArn();
   // A FINDING IS ABOUT THE ROOM AS IT IS NOW: a member who has already left it is no finding, whatever the event said.
@@ -534,7 +535,7 @@ async function handleViolation(
     });
     return;
   }
-  const enforcing = await isEnforcing();
+  const enforcing = opts.removeOverReach === true || await isEnforcing();
   const noun = kind === 'assistant' ? 'assistant' : 'member';
 
   // REVOKE FIRST, THEN SAY WHAT HAPPENED. The alert used to go out before the revoke and say
@@ -605,7 +606,16 @@ function parseRecord(record: KinesisStreamRecord): ChimeKinesisEvent | null {
  * rule lives in exactly one place. Best-effort per pair - a resolution error for one member never aborts
  * the batch/sweep.
  */
-async function evaluateMembership(channelArn: string, memberArn: string, adminArn: string): Promise<void> {
+/**
+ * How one evaluation acts on a finding. `removeOverReach` removes the membership whatever the enforce setting: the
+ * on-downgrade re-evaluation passes it, because a downgrade an operator made is not a detection that may be a false
+ * positive (DESIGN-REVOCATION-WINDOWS R1). The event stream and the sweep keep the configured mode.
+ */
+export interface EvaluateOptions {
+  removeOverReach?: boolean;
+}
+
+async function evaluateMembership(channelArn: string, memberArn: string, adminArn: string, opts: EvaluateOptions = {}): Promise<void> {
   const { kind, sub } = classifyMember(memberArn);
   if (kind !== 'user' && kind !== 'bot') return; // admin service user, unknown
 
@@ -639,7 +649,7 @@ async function evaluateMembership(channelArn: string, memberArn: string, adminAr
       // A member holding the admin plane beside their token reaches an admin conversation.
       const reachesAdminPlane = adminPlane === true && profiles.adminPlaneValues().includes(channelClassification);
       if (!reachesAdminPlane && isClassificationViolation(memberClearance, channelClassification)) {
-        await handleViolation('member', channelArn, memberArn, sub, memberClearance, channelClassification);
+        await handleViolation('member', channelArn, memberArn, sub, memberClearance, channelClassification, opts);
       }
     } else if (kind === 'bot') {
       // An assistant the room's classification does not reach is the leak: it answers with its own
@@ -827,7 +837,8 @@ async function sweepChannelMemberships(channelArn: string, adminArn: string): Pr
  * Trigger #3 (SPEC-CONVERSATION-SECURITY §11): re-evaluate ONE user's existing memberships immediately
  * after their clearance changes (a Cognito-group downgrade emits no Chime membership event, so the
  * event stream never re-checks them). Invoked async by user-management on downgrade. Lists the user's
- * channels and evaluates each against the user's new clearance.
+ * channels and evaluates each against the user's new clearance, and REMOVES each membership the new clearance does
+ * not reach, whatever the enforce setting: a downgrade is the operator's decision, not a detection.
  */
 async function reevalUser(userArn: string, adminArn: string): Promise<void> {
   let nextToken: string | undefined;
@@ -841,7 +852,7 @@ async function reevalUser(userArn: string, adminArn: string): Promise<void> {
     }));
     for (const m of resp.ChannelMemberships || []) {
       const channelArn = m.ChannelSummary?.ChannelArn;
-      if (channelArn) { await evaluateMembership(channelArn, userArn, adminArn); scanned += 1; }
+      if (channelArn) { await evaluateMembership(channelArn, userArn, adminArn, { removeOverReach: true }); scanned += 1; }
     }
     nextToken = resp.NextToken;
   } while (nextToken);

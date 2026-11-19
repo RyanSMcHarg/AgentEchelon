@@ -17,8 +17,9 @@
  */
 const OPS_DEMO_CAST = [
   // The on-call engineer who leads Act 3.2: the person an ops event names, and the login the presenter uses.
-  { key: 'onCallLead', local: 'demo-oncall', plus: 'oncall', emailVar: 'DEMO_LEAD_EMAIL', nameVar: 'DEMO_LEAD_NAME', tier: 'premium', groups: ['premium'], name: 'Jordan Reyes' },
-  { key: 'platformEngA', local: 'demo-priya', plus: 'priya', emailVar: 'DEMO_ENG_A_EMAIL', tier: 'premium', groups: ['premium'], name: 'Priya Raman' },
+  { key: 'onCallLead', local: 'demo-oncall', plus: 'oncall', emailVar: 'DEMO_LEAD_EMAIL', nameVar: 'DEMO_LEAD_NAME', tier: 'premium', groups: ['premium', 'ops-on-call'], name: 'Jordan Reyes' },
+  // The secondary on-call, who hosts an ops room's meetings beside the on-call (`ops-secondary`).
+  { key: 'platformEngA', local: 'demo-priya', plus: 'priya', emailVar: 'DEMO_ENG_A_EMAIL', tier: 'premium', groups: ['premium', 'ops-secondary'], name: 'Priya Raman' },
   { key: 'platformEngB', local: 'demo-marcus', plus: 'marcus', emailVar: 'DEMO_ENG_B_EMAIL', tier: 'premium', groups: ['premium'], name: 'Marcus Lee' },
   { key: 'engManager', local: 'demo-dana', plus: 'dana', emailVar: 'DEMO_MANAGER_EMAIL', tier: 'premium', groups: ['premium'], name: 'Dana Whitfield' },
   // THE DEMO OPERATOR (DEMO-SCRIPT Act 1.0 to 1.6): one identity in `premium` and `admins`, so the same
@@ -27,7 +28,8 @@ const OPS_DEMO_CAST = [
   // THE BASIC LOGIN (DEMO-SCRIPT Act 1.7): public access only, someone evaluating Stratum from outside.
   { key: 'basicDemo', local: 'demo-basic', plus: 'basic', emailVar: 'DEMO_BASIC_EMAIL', tier: 'basic', groups: ['basic'], name: 'Sam Rivera' },
   // THE FIRST HALF'S PERSON (DEMO-SCRIPT Act 1, deck slides 1 and 2): James Okafor, VP Sales, who asks
-  // Advisor for the Q2 board report.
+  // Advisor for the Q2 board report. He is sales, not the account team: the seed's CSM Maria Santos leads the account team
+  // and approves an incident's customer notices (`demo/stratum-company/account-teams.ts`).
   { key: 'salesVp', local: 'demo-sales', plus: 'sales', emailVar: 'DEMO_SALES_EMAIL', tier: 'premium', groups: ['premium'], name: 'James Okafor' },
 ];
 

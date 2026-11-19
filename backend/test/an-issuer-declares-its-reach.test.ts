@@ -42,7 +42,7 @@ const self = (extra: Record<string, unknown> = {}) => ({
   id: 'deployment', kind: 'cognito-pool', pool: 'self', clearance: { groups: true, classifications: ALL }, admin: true, ...extra,
 });
 const host = (extra: Record<string, unknown> = {}) => ({
-  id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', clearance: { oneChannel: 'basic', classifications: ['basic'] }, ...extra,
+  id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', clearance: { fixed: ['basic'], classifications: ['basic'] }, ...extra,
 });
 const errorsOf = (list: unknown[], capabilities: string[] = []) => issuerErrors(list, profiles, capabilities);
 const refusedWith = (list: unknown[], pattern: RegExp, capabilities: string[] = []) => {
@@ -78,35 +78,23 @@ describe('no fallback reach', () => {
   });
 
   it('refuses an entry that names two sources, which is not one declaration', () => {
-    refusedWith([self(), host({ clearance: { oneChannel: 'basic', fixed: ['basic'], classifications: ['basic'] } })], /declares no clearance source/);
+    refusedWith([self(), host({ clearance: { mapping: { claim: 'roles', values: { analyst: 'basic' } }, fixed: ['basic'], classifications: ['basic'] } })], /declares no clearance source/);
   });
 
   it('refuses a source with no classifications, and classifications naming an undeclared one', () => {
     // A groups source may list none: it reaches whatever its groups clear for. Every other source lists them.
     expect(errorsOf([self({ clearance: { groups: true } })])).toEqual([]);
-    refusedWith([host({ clearance: { oneChannel: 'basic' } })], /declares no classifications/);
+    refusedWith([host({ clearance: { fixed: ['basic'] } })], /declares no classifications/);
     refusedWith([self({ clearance: { groups: true, classifications: [] } })], /declares no classifications/);
     refusedWith([self({ clearance: { groups: true, classifications: ['basic', 'legal'] } })], /classifications name "legal"/);
   });
 
   it('refuses a source that reaches outside its classifications', () => {
     refusedWith([self(), host({ clearance: { fixed: ['premium'], classifications: ['basic'] } })], /fixed names "premium", outside the issuer's classifications/);
-    refusedWith([self(), host({ clearance: { oneChannel: 'standard', classifications: ['basic'] } })], /oneChannel names "standard", outside the issuer's classifications/);
     refusedWith([self(), {
       id: 'okta', kind: 'oidc-entra', tenants: ENTRA_TENANTS, tokenVersion: 2, discoveryUrl: ENTRA_DISCOVERY, audience: 'ae',
       clearance: { mapping: { claim: 'roles', values: { analyst: 'premium' } }, classifications: ['basic'] },
     }], /mapping value "analyst" maps to "premium", outside the issuer's classifications/);
-  });
-
-  it("refuses oneChannel on this deployment's own pool, whose routes leave the gateway no second layer", () => {
-    refusedWith([self({ clearance: { oneChannel: 'basic', classifications: ['basic'] }, admin: false })],
-      /oneChannel cannot be declared on this deployment's own pool: that pool serves every person route, so the gateway cannot be a second layer/);
-    refusedWith([self(), { id: 'saml', kind: 'cognito-federated', pool: 'self', providerName: 'Okta', clearance: { oneChannel: 'basic', classifications: ['basic'] } }],
-      /must be its own pool/);
-  });
-
-  it('refuses a oneChannel classification no conversation can be created at', () => {
-    refusedWith([self(), host({ clearance: { oneChannel: 'admin', classifications: ['admin'] } })], /not a classification a conversation can be created at/);
   });
 
   it('refuses a pool\'s own groups on a kind whose groups are its provider\'s: those are translated', () => {
@@ -116,9 +104,50 @@ describe('no fallback reach', () => {
     }], /groups: true is a cognito-pool's own groups/);
   });
 
-  it('refuses oneChannel issuers naming different classifications', () => {
-    refusedWith([self(), host(), host({ id: 'host-two', pool: 'us-east-1_HostTwo', clearance: { oneChannel: 'standard', classifications: ['standard'] } })],
-      /context conversations at more than one classification are NOT BUILT/);
+  it('refuses a clearance source the registry does not know, alone and beside one it does', () => {
+    const errors = refusedWith([self(), host({ clearance: { oneChannel: 'basic', classifications: ['basic'] } })], /clearance\.oneChannel is not a clearance source; the sources are groups, mapping, fixed/);
+    expect(errors.some((e) => /declares no clearance source/.test(e))).toBe(true);
+    refusedWith([self(), host({ clearance: { oneChannel: 'basic', fixed: ['basic'], classifications: ['basic'] } })], /clearance\.oneChannel is not a clearance source/);
+  });
+});
+
+describe('the classification a host\'s context conversations are created at', () => {
+  const standardHost = (extra: Record<string, unknown> = {}) => host({
+    id: 'host-two', pool: 'us-east-1_HostTwo', clearance: { fixed: ['standard'], classifications: ['standard'] }, contextClassification: 'standard', ...extra,
+  });
+
+  it('accepts one of the issuer\'s own classifications, and contextClassification() reads it', () => {
+    const list = [self(), host({ contextClassification: 'basic' })];
+    expect(errorsOf(list)).toEqual([]);
+    expect(issuerRegistry(list, profiles).contextClassification()).toBe('basic');
+  });
+
+  it('reads a groups source with no list against what its groups can reach', () => {
+    expect(errorsOf([self({ clearance: { groups: true }, contextClassification: 'standard' })])).toEqual([]);
+  });
+
+  it('refuses a classification outside the issuer\'s own', () => {
+    refusedWith([self(), host({ contextClassification: 'standard' })], /issuer "host": contextClassification names "standard", outside the issuer's classifications/);
+  });
+
+  it('refuses a classification no conversation can be created at', () => {
+    refusedWith([self(), host({ clearance: { fixed: ['admin'], classifications: ['admin'] }, contextClassification: 'admin' })],
+      /contextClassification names "admin", which is not a classification a conversation can be created at/);
+  });
+
+  it('refuses a value that names no classification', () => {
+    refusedWith([self(), host({ contextClassification: 7 })], /contextClassification names the classification a host's context conversations are created at/);
+  });
+
+  it('refuses two distinct values across the registry, and takes the same value twice', () => {
+    refusedWith([self(), host({ contextClassification: 'basic' }), standardHost()],
+      /issuers name contextClassification basic and standard: context conversations at more than one classification are NOT BUILT/);
+    expect(errorsOf([self(), host({ contextClassification: 'basic' }), standardHost({ clearance: { fixed: ['basic'], classifications: ['basic'] }, contextClassification: 'basic' })])).toEqual([]);
+  });
+
+  it('stays out of what a Lambda is handed', () => {
+    const runtime = runtimeIssuers(issuerRegistry([self(), host({ contextClassification: 'basic' })], profiles), 'us-east-1_Self', 'us-east-1');
+    expect(runtime.find((t) => t.id === 'host')).not.toHaveProperty('contextClassification');
   });
 });
 
@@ -140,8 +169,7 @@ describe('admin (A6, D10, L18)', () => {
     expect(errorsOf([self({ admin: false })])).toEqual([]);
   });
 
-  it('refuses admin on a oneChannel issuer, and adminGroups without admin', () => {
-    refusedWith([self(), host({ admin: true })], /a oneChannel issuer cannot declare admin: true/);
+  it('refuses adminGroups without admin', () => {
     refusedWith([self({ admin: false, adminGroups: ['ops'] })], /adminGroups is meaningful only with admin: true/);
   });
 });
@@ -156,13 +184,12 @@ describe('what parses and is NOT BUILT', () => {
     expect(errorsOf([self({ provisioning: 'on-first-sign-in' })])).toEqual([]);
   });
 
-  it('takes provisioned-only on another issuer, never on this deployment\'s own pool or a oneChannel issuer (P-13)', () => {
+  it('takes provisioned-only on another issuer, never on this deployment\'s own pool (P-13)', () => {
     const oidc = { id: 'partner', kind: 'oidc-entra', tenants: ENTRA_TENANTS, tokenVersion: 2, discoveryUrl: ENTRA_DISCOVERY, audience: 'ae', clearance: { fixed: ['basic'], classifications: ['basic'] } };
     expect(errorsOf([self(), { ...oidc, provisioning: 'provisioned-only' }])).toEqual([]);
     expect(issuerRegistry([self(), { ...oidc, provisioning: 'provisioned-only' }], profiles).provisionedOnly().map((e) => e.id)).toEqual(['partner']);
     // The first administrator signs in through the one minter, so the deployment's own pool mints.
     refusedWith([self({ provisioning: 'provisioned-only' })], /this deployment's own pool mints its people at their first sign-in/);
-    refusedWith([self(), host({ provisioning: 'provisioned-only' })], /a oneChannel issuer mints its people at their first sign-in/);
   });
 
   it('refuses a scim or connector lifecycle as NOT BUILT', () => {
@@ -263,13 +290,13 @@ describe('the kinds built here', () => {
   });
 
   it('writes the runtime form with each pool resolved and each subject declared', () => {
-    const registry = issuerRegistry([self(), host(), saml, entra], profiles, ['admin']);
+    const registry = issuerRegistry([self(), host({ contextClassification: 'basic' }), saml, entra], profiles, ['admin']);
     const runtime = runtimeIssuers(registry, 'us-east-1_Self', 'us-east-1');
     expect(runtime.find((t) => t.id === 'deployment')).toMatchObject({ iss: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_Self', subject: ['sub'], groupsClaim: 'cognito:groups' });
     expect(runtime.find((t) => t.id === 'host')).toMatchObject({ iss: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_HostApp', admin: false });
     expect(runtime.find((t) => t.id === 'entra')).toMatchObject({ subject: ['tid', 'oid'], admin: true });
     expect(registry.contextClassification()).toBe('basic');
-    expect(registry.foreignPools()).toEqual([{ id: 'host', pool: 'us-east-1_HostApp', oneChannelOnly: true, admin: false }]);
+    expect(registry.foreignPools()).toEqual([{ id: 'host', pool: 'us-east-1_HostApp', admin: false }]);
     expect(registry.identityProviderLabel()).toBe('Okta');
   });
 
@@ -279,7 +306,7 @@ describe('the kinds built here', () => {
     const runtime = runtimeIssuers(issuerRegistry([self(), host(), saml, entra], profiles), 'us-east-1_Self', 'us-east-1');
     const compact = compactIssuers(runtime);
     // A Cognito entry's iss is derived from its pool id, so it does not travel.
-    expect(compact.find((t) => t.id === 'host')).toEqual({ id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', clearance: { oneChannel: 'basic', classifications: ['basic'] } });
+    expect(compact.find((t) => t.id === 'host')).toEqual({ id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', clearance: { fixed: ['basic'], classifications: ['basic'] } });
     expect(compact.map(expandIssuer)).toEqual(runtime);
     expect(JSON.stringify(compact).length).toBeLessThan(JSON.stringify(runtime).length);
   });

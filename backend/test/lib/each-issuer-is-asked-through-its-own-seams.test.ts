@@ -24,7 +24,7 @@ import { compactIssuers, type TrustedIssuer } from '../../lib/config/issuers';
 import type { DirectoryAdapter, IssuerSeam, SeamFactory } from '../../lambda/src/lib/issuer-seams';
 import type { HeldBySource } from '../../lambda/src/lib/clearance-source';
 import { oidcIssuer, poolIssuer, testDirectory } from '../helpers/directory';
-import { claimsAdapter } from '../../lambda/src/lib/issuer-seams';
+import { claimsAdapter, cognitoAdapter, verifiedAddress } from '../../lambda/src/lib/issuer-seams';
 import {
   claimsDirectory,
   contactCopyKey,
@@ -125,15 +125,21 @@ describe('a stub adapter is selected once and used by every consumer (C1)', () =
   });
 
   it('team ownership lists the teams through the selected adapters', async () => {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { edgeContext } = require('../helpers/edge-context');
+    // The ownership routes are the console's, so the caller is this instance's admin console session for the person.
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { handler } = require('../../lambda/src/assistant-ownership');
-    const res = await handler({
-      httpMethod: 'GET', headers: {},
-      requestContext: { authorizer: edgeContext({ claims: { iss: DEPLOYMENT.iss, sub: 'owner' }, personId: ALICE }) },
-    });
-    expect(JSON.parse(res.body).teams).toEqual(['deployment']);
+    // The stack runs this function with ADMIN_IAM_ENFORCEMENT on (adminAuthEnv), so the IAM-signed session is admitted here.
+    const before = process.env.ADMIN_IAM_ENFORCEMENT;
+    process.env.ADMIN_IAM_ENFORCEMENT = 'true';
+    try {
+      const res = await handler({
+        httpMethod: 'GET', headers: {},
+        requestContext: { identity: { userArn: `arn:aws:sts::1:assumed-role/${process.env.ADMIN_CONSOLE_ROLE_NAME}/console-${ALICE}` } },
+      });
+      expect(JSON.parse(res.body).teams).toEqual(['deployment']);
+    } finally {
+      if (before === undefined) delete process.env.ADMIN_IAM_ENFORCEMENT; else process.env.ADMIN_IAM_ENFORCEMENT = before;
+    }
   });
 
   it('an email recipient is reached through the selected adapter', async () => {
@@ -303,15 +309,63 @@ describe('the claims copy (C5)', () => {
   });
 });
 
+describe('verification is the issuer\'s, whichever issuer holds the address', () => {
+  it.each([[true], ['true'], [undefined]])('an issuer that says %s gives the address: one that sends no mark has verified it itself', (said) => {
+    expect(verifiedAddress('a@example.com', said)).toBe('a@example.com');
+  });
+
+  it.each([[false], ['false'], ['False']])('an issuer that says %s gives none', (said) => {
+    expect(verifiedAddress('a@example.com', said)).toBeUndefined();
+  });
+});
+
+describe('an address finds only an account the issuer stands behind', () => {
+  const row = (subject: string, emailVerified: string | undefined, enabled = true) => ({
+    subject, username: subject, enabled, email: 'alice@corp.example', name: null,
+    attributes: emailVerified === undefined ? {} : { email_verified: emailVerified },
+  });
+  const found = async (...rows: ReturnType<typeof row>[]) => {
+    const pool = { byEmail: async () => rows } as never;
+    const subjects = await cognitoAdapter('deployment', pool, {} as never).subjectsByAddress!('alice@corp.example');
+    return subjects.map((s) => s.subject);
+  };
+
+  it('an address someone has only claimed finds nobody', async () => {
+    expect(await found(row('mallory', 'false'))).toEqual([]);
+  });
+
+  it('the account holding the address verified stays the one match, beside one that claims it', async () => {
+    expect(await found(row('mallory', 'false'), row('alice', 'true'))).toEqual(['alice']);
+  });
+
+  it('an issuer that sends no mark has verified the address', async () => {
+    expect(await found(row('alice', undefined))).toEqual(['alice']);
+  });
+
+  it('a disabled account is found by nothing', async () => {
+    expect(await found(row('alice', 'true', false))).toEqual([]);
+  });
+});
+
 describe('a recipient resolves from the AppInstanceUser ARN for each adapter kind (C5)', () => {
   it('cognito: the pool record of the subject Identities names', async () => {
-    const pool = { send: async (cmd: any) => ({ Username: cmd.input.Username, UserAttributes: [{ Name: 'email', Value: `${cmd.input.Username}@home.example` }] }) };
+    const pool = { send: async (cmd: any) => ({ Username: cmd.input.Username, UserAttributes: [{ Name: 'email', Value: `${cmd.input.Username}@home.example` }, { Name: 'email_verified', Value: 'true' }] }) };
     const d = testDirectory({
       appInstanceArn: APP,
       issuers: [{ issuer: DEPLOYMENT, client: pool }],
       identities: { resolve: async () => null, subjectsOf: async () => [{ issuer: 'deployment', subject: 'alice-sub' }] },
     });
     expect(await d.contactFor(person(ALICE), 'email')).toMatchObject({ address: 'alice-sub@home.example' });
+  });
+
+  it('cognito: an address the pool has not verified is reached by nothing', async () => {
+    const pool = { send: async (cmd: any) => ({ Username: cmd.input.Username, UserAttributes: [{ Name: 'email', Value: 'unproven@home.example' }, { Name: 'email_verified', Value: 'false' }] }) };
+    const d = testDirectory({
+      appInstanceArn: APP,
+      issuers: [{ issuer: DEPLOYMENT, client: pool }],
+      identities: { resolve: async () => null, subjectsOf: async () => [{ issuer: 'deployment', subject: 'alice-sub' }] },
+    });
+    expect(await d.contactFor(person(ALICE), 'email')).toBeNull();
   });
 
   it('claims: the contact copy of the person\'s last sign-in', async () => {

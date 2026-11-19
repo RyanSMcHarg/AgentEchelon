@@ -1,0 +1,16 @@
+{
+  // What ts-jest compiles the tests with: the deployable build's options, transpiled one file at a
+  // time. With `isolatedModules`, ts-jest transpiles each file on its own instead of holding the
+  // whole program in every worker for a type check, which kept each worker near 2.5 GB of heap.
+  // Types are checked once, by `npm run typecheck` (tsconfig.test.json), in CI and before a push.
+  //
+  // CommonJS, because Jest runs the tests as CommonJS: under NodeNext a file transpiled on its own
+  // keeps a native `import()`, which Jest refuses without --experimental-vm-modules, while CommonJS
+  // compiles it to `require`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "isolatedModules": true,
+    "module": "CommonJS",
+    "moduleResolution": "Node10"
+  }
+}

@@ -6,6 +6,11 @@
  *   - Deletes the demo cast's conversations created in the same window, with their tasks, through
  *     delete-conversations.mjs. Rooms a person outside the cast is in are kept. The archive keeps every
  *     event, so history and analytics are unaffected.
+ *   - Clears the standing team rooms only the cast is in (`team-<type>-<classification>`): the messages the cast
+ *     and the assistants posted and the task rows created in the window go, and the room stays. A team room a person
+ *     outside the cast is in is kept as it is, and a message anyone outside the cast posted never goes. The dry run
+ *     lists, per author, how many messages would go and how many stay. A room with an open task from the
+ *     window is left as it is and named, so no workflow run is left waiting on a task that is gone.
  *
  * A dry run is the default and changes nothing. `--apply` makes the changes.
  *
@@ -18,6 +23,7 @@
  *   --apply                  make the changes (default: list what would change)
  *   --skip-assistants        leave assistants as they are
  *   --skip-conversations     leave conversations as they are
+ *   --skip-team-rooms        leave the team rooms' messages and tasks as they are
  *   --secret=<name>          the people whose conversations go (default agent-interface/demo-credentials)
  *   --reason=<text>          the reason recorded on each retire
  */
@@ -107,6 +113,7 @@ async function resetAssistants() {
 function resetConversations(poolId) {
   console.log(`\nConversations the demo cast (${opts.secret}) created since ${opts.since.toISOString()}:`);
   const args = [path.join(HERE, 'delete-conversations.mjs'), `--created-since=${opts.since.toISOString()}`, '--only-test-people'];
+  if (opts.teamRooms) args.push('--clear-team-rooms');
   if (opts.apply) args.push('--apply');
   const r = spawnSync(process.execPath, args, {
     stdio: 'inherit',

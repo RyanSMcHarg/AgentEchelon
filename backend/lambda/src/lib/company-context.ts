@@ -2,7 +2,7 @@
  * Company-context retrieval (shared)
  *
  * Classification-scoped company/product/pricing/FAQ/financial document retrieval from
- * the attachments bucket under `context/{classification}/*`, one prefix per declared classification.
+ * the company bucket under `context/{classification}/*`, one prefix per declared classification.
  *
  * **Defense-in-depth is enforced at IAM, not here.** The caller's execution
  * role grants `s3:GetObject` only for the prefixes its classification's `grants` set names. This module

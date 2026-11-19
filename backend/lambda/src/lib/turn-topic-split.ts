@@ -20,6 +20,7 @@
  * did not ask for, holding messages they did not send there.
  */
 
+import type { ConversationSplitResult } from '../conversation-split.js';
 import type { PendingSplitOffer } from './turn-lock.js';
 import { sessionClient } from './assistant-session.js';
 
@@ -187,6 +188,7 @@ export function parseSplitSelection(reply: string, offered: OfferedTopic[]): Spl
  */
 export function splitOfferDirective(offered: OfferedTopic[]): string {
   if (!offered.length) return '';
+  const privateTopics = offered.filter((topic) => topic.private);
   return [
     '',
     '',
@@ -211,8 +213,29 @@ export function splitOfferDirective(offered: OfferedTopic[]): string {
     'Only if this message has nothing to do with the offer, write no SPLIT line at all and simply',
     'carry on - the offer stays open and you can ask again later.',
     'After that line, reply to them normally, in your own voice. Do not mention the SPLIT line.',
+    ...(privateTopics.length
+      ? [
+        '',
+        'THESE SUBJECTS CAME FROM THIS PERSON\'S PRIVATE MESSAGES, so the conversation has not seen them:',
+        ...privateTopics.map((topic) => '  ' + topic.label),
+        'Name them only in the SPLIT line. Never name one in a reply the conversation can read: say only that you are moving what they asked.',
+      ]
+      : []),
     '',
   ].join('\n');
+}
+
+/**
+ * WHO IS TOLD THAT A SUBJECT DID NOT MOVE: a label taken from somebody's private messages is told to them alone, and only
+ * the rest may be said in the reply the room reads. Read from the offer, which the split function and every failure path
+ * name labels against.
+ */
+export function refusedByAudience(refused: string[], offered: OfferedTopic[]): { room: string[]; privately: string[] } {
+  const isPrivate = new Set(offered.filter((t) => t.private).map((t) => t.label.trim().toLowerCase()));
+  return {
+    room: refused.filter((label) => !isPrivate.has(label.trim().toLowerCase())),
+    privately: refused.filter((label) => isPrivate.has(label.trim().toLowerCase())),
+  };
 }
 
 /** The reply with the machine line removed, so the person never reads the contract. */
@@ -240,7 +263,7 @@ export async function requestConversationSplit(args: {
   classification: string;
   labels: string[];
   originatingMessageId: string;
-}): Promise<{ created: Array<{ label: string; channelArn: string }>; refused: string[] }> {
+}): Promise<ConversationSplitResult> {
   const fn = process.env.CONVERSATION_SPLIT_FUNCTION_ARN;
   if (!fn || !args.labels.length) return { created: [], refused: args.labels };
 

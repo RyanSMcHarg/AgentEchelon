@@ -72,7 +72,7 @@ Composition root: `interaction/conversation/SPEC-CONVERSATION-TYPES`. Cross-pill
 | Connectors | core | `communication/SPEC-CONNECTORS` (the connector contract - integrate, don't migrate; governed MCP seam), declared per experience in `interaction/conversation/SPEC-CONVERSATION-TYPES`, under "The experiences the model is built for" |
 | Auditing (the access record) | core + admin | `interaction/governance/SPEC-ACCESS-AND-CONTROLS-AUDITING` |
 
-**Conversation substrate** (`interaction/conversation/`) - the Amazon Chime SDK Messaging fabric the engine composes over, distinct from the five config pillars: durable conversation & membership - the memory is the channel (`interaction/conversation/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP`), the per-message metadata pipeline (`communication/SPEC-MESSAGE-METADATA-CODEBOOK`), the notification bridge for email / SMS / voice out (`communication/SPEC-NOTIFICATION-BRIDGE`), and cross-channel task carry (`interaction/conversation/CROSS-CHANNEL-TASKS`).
+**Conversation substrate** (`interaction/conversation/`) - the Amazon Chime SDK Messaging fabric the engine composes over, distinct from the five config pillars: durable conversation & membership - the memory is the channel (`interaction/conversation/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP`), the per-message metadata pipeline (`communication/SPEC-MESSAGE-METADATA-CODEBOOK`), the notification bridge for email / SMS / voice out (`communication/SPEC-NOTIFICATION-BRIDGE`), cross-channel task carry (`interaction/conversation/CROSS-CHANNEL-TASKS`), and workflows and tasks, the one place their status is recorded (`interaction/conversation/SPEC-WORKFLOWS-AND-TASKS`, `interaction/conversation/DESIGN-WORKFLOWS-AND-TASKS`), and processes that link workflows across teams and classifications (`interaction/conversation/SPEC-PROCESSES`, `interaction/conversation/DESIGN-PROCESSES`).
 
 ## Core platform - ops (cross-cutting; not a pillar) - `ops`
 
@@ -84,6 +84,7 @@ Infrastructure, control, and telemetry that cut across the layers.
 | Aurora + VPC analytics engine (opt-in) | `foundations/SPEC-AURORA-VPC-MODE` |
 | Idle auto-pause of the data plane | `foundations/SPEC-COST-SLEEP-MODE` |
 | Spend budgets, rate limits, dedup, length caps | `interaction/governance/SPEC-ABUSE-CONTROLS` |
+| Where user input is stored, how long it is kept, who can reach it, and what export and erasure reach | [`DATA-INVENTORY.md`](DATA-INVENTORY.md) |
 
 ## Core platform - capabilities (platform features; not a pillar) - `capabilities`
 

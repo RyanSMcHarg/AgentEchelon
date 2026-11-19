@@ -20,7 +20,9 @@
 import { LambdaClient, InvokeCommand, InvocationType } from '@aws-sdk/client-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { recordTurnRouting } from './lib/turn-routing.js';
-import { sessionClient, speakAsRoutedAssistant, releaseAssistantSession, releaseAfterHeldWork } from './lib/assistant-session.js';
+import { sessionClient, speakAsRoutedAssistant, releaseAfterHeldWork, keepingTheTurnsSession } from './lib/assistant-session.js';
+import { chimeMessagingClient, chimeIdentityClient } from './lib/chime/clients.js';
+import { startedProcess } from './lib/process-start.js';
 import { SSMClient, GetParameterCommand, GetParametersByPathCommand } from '@aws-sdk/client-ssm';
 import {
   ChimeSDKMessagingClient,
@@ -39,12 +41,18 @@ import {
   classifyIntentByKeyword,
   IntentType,
   intentToDeliveryOption,
+  type IntentClassification,
+  type WaitingWork,
 } from './lib/intent-classifier.js';
 import { hydrateIntentPackFromSsm, responseSettingsForIntent, activeIntentPackRaw, taskStateMachines, getIntentPack, refusedPlatformIntents, needsOf, knownIntentKeys, type IntentPack } from './lib/intent-pack.js';
+import { machinesForVersion, machinesForTask, resolveTaskMachines, originConfigIdOf, declaredMachineFor, machineHashOf, versionDeclaredMachines } from './lib/version-machines.js';
+import type { RunOrigin, RunTrigger } from './lib/task-tracking.js';
+import type { AskedTurn } from './lib/asked-turn.js';
+import { MAX_ASK_CHAIN } from './lib/task-tracking.js';
 import { classificationAllows, modelFits } from '../../lib/config/model-availability.js';
 import { composeRefusal } from './lib/capability-refusal.js';
 import type { TaskStateMachine } from './lib/task-state-machines.js';
-import { awaitedPartyOf, assistantOwesTheStep, machineHasAssistantStep, PLATFORM_TASK_MACHINE_KEYS, reopenTargetsFrom } from './lib/task-state-machines.js';
+import { actionRunKey, entrySequenceOf, anyRequesterMoves, recordedRunValues, withRecordedRunValues, awaitedPartyOf, assistantOwesTheStep, machineHasAssistantStep, PLATFORM_TASK_MACHINE_KEYS, reopenTargetsFrom } from './lib/task-state-machines.js';
 import { componentVersion } from './lib/config-identity.js';
 import {
   DeliveryOption,
@@ -53,23 +61,24 @@ import {
   getTaskPlaceholder,
 } from './lib/delivery-options.js';
 // TASKS GO THROUGH THE STORE SEAM, not the table. Same signatures; the boundary is inside.
-import { createTask, getTask } from './lib/task-store.js';
+import { createTask, getTask, attachRequestRun, requesterMovableTask, advanceAsAssignee } from './lib/task-store.js';
 import { isPrivateVisibility } from './lib/task-visibility.js';
 // THE SEAM, NOT THE TABLE, for every task read on this path (ADR-033). What stays imported from
 // `task-tracking` below is pure: an id derivation, a window constant, a TTL, and types - none of
 // them touches DynamoDB, and none needs the boundary the service provides.
-import { applyUserResponseToTask, cancelStoppedTasks, getActiveTask, getActiveTaskForOwner, getAssigneeChannelTasks, selectStoppableTasks } from './lib/task-store.js';
+import { applyUserResponseToTask, cancelStoppedTasks, endDuelTasks, getActiveTask, getActiveTaskForOwner, getAssigneeChannelTasks, selectStoppableTasks } from './lib/task-store.js';
 import { principalIdFromArn, RECENTLY_ENDED_TASK_WINDOW_MINUTES, taskEndedAt, TRIP_TASK_TTL_SECONDS, type TaskCreateOptions, type UserTask } from './lib/task-tracking.js';
 import { BOUNDED_REQUEST_HANDLER } from './lib/bounded-request-handler.js';
 import {
   buildStopAnswerReading,
   dispatchStopEvaluationTurn,
+  type StopEvaluationDispatch,
   parseStopAnswer,
   parseStopEvaluationContext,
   restartedRequest,
   type StopEvaluationContext,
 } from './lib/stop-evaluation.js';
-import { sendChannelMessage, sendInParts } from './lib/chime/send.js';
+import { CHIME_CONTENT_SAFE, CHIME_METADATA_MAX, sendChannelMessage, sendInParts } from './lib/chime/send.js';
 
 /**
  * How long after a task ends the conversation is still treated as being about it, in milliseconds.
@@ -83,11 +92,11 @@ const RECENTLY_ENDED_WINDOW_MS = RECENTLY_ENDED_TASK_WINDOW_MINUTES * 60 * 1000;
 // waiting duel side's chain is resumed through the ORDINARY Lex turn, so the handler is where the
 // battle row has to be moved off `WAITING_FOR_USER`.
 import { resolveActiveBattle, readBattleRows, resumeBotFromWaiting, battleChannelFrom, botRowsOnly, duelWasAbandoned } from './lib/battle-state.js';
-import { clearBattleWaitingMarker } from './lib/battle-waiting-marker.js';
+import { clearBattleWaitingMarker, declareDuelEnded } from './lib/battle-waiting-marker.js';
 import { evaluateAbuseGate, capUserMessage, claimCorrelation, hasCorrelationClaim, claimPlaceholderMapping } from './lib/abuse-controls.js';
 import { turnCorrelationId, mentionCorrelationId, correlationMarkerOf } from './lib/correlation.js';
 import { resolveChannelSize } from './lib/channel-size.js';
-import { roommatesInConversation, type Roommate } from './lib/assistant-advertisement.js';
+import { readAdvertisement, roommatesInConversation, type Roommate } from './lib/assistant-advertisement.js';
 import { whoIsHereFrom, rosterForDispatch, type ReadRoster } from './lib/who-is-here.js';
 import { decideDelegation, intentKeptHere, parseDelegationKey, withRoommateCategories } from './lib/delegation.js';
 import { liveAssistantsForClassification } from './lib/default-agents.js';
@@ -112,7 +121,12 @@ import { inboundTarget, inboundWasTargeted, lexEntryAnswersCommand } from './lib
 import { resolveUserClearance } from './lib/user-clearance.js';
 import { assembleHostGrounding } from './lib/host-grounding.js';
 import { defaultDirectory } from './lib/membership-source.js';
-import { conversationRef, notifyDirective } from './lib/notify-directive.js';
+import { conversationRef, meetingRef, notifyDirective, withinMetadataCap } from './lib/notify-directive.js';
+import { EVENT_RULE_TAG_PREFIX, TEAM_ROOM_TAG, TRIGGER_RULE_ID, WATCH_TAG, eventTriggerWindow } from './lib/event-triggers.js';
+import { identifierWords } from './lib/conversation-name.js';
+import { EventBridgeClient, ListTagsForResourceCommand as ListRuleTagsCommand } from '@aws-sdk/client-eventbridge';
+import { refId, refKey } from '../../lib/config/event-openers.js';
+import { eventTypeAllowed, readEventPolicy } from './lib/event-policy.js';
 // SPEC-CAPABILITY-PROFILES: the single interpreter of classification tags + group clearance.
 // Replaces the local CLASSIFICATION_RANK / CLEARANCE_GROUPS / minRank / isAdvancedClassification / classificationScope constants.
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
@@ -121,8 +135,9 @@ import { turnAssistantProfile, logAssistantDecline, type TurnAssistantProfile } 
 import { isServingRecord, runtimeSeedFor, type AssignmentRecord } from './lib/runtime-assistant.js';
 import type { AssistantProfile } from '../../lib/config/profiles.js';
 import { classificationEnvName } from './lib/classification-env.js';
-import { CLASSIFICATION_TAG, readChannelClassificationTag, readChannelTags } from './lib/channel-classification.js';
+import { CLASSIFICATION_TAG, conversationClosedTo, readChannelClassificationTag, readChannelTags } from './lib/channel-classification.js';
 import { primaryAssistantOf } from './lib/conversation-primary.js';
+import { workflowOwnerOf, type WorkflowOwner, type WorkflowOwnerRefused } from './lib/workflow-owner.js';
 // The handler stays non-VPC (ADR-013). It reaches the VPC-attached data-plane Lambda only for drift
 // detection; retrieval runs in the async processor (lib/turn-grounding.ts).
 import { resolveExperimentModel, resolveClassificationExperiment, resolveBattleTreatment, resolveEnrollment, countsTowardExperiment, experimentArmOf, resolveTaskArm } from './lib/experiment-manager.js';
@@ -130,16 +145,16 @@ import { taskIntentOf } from './lib/step-models.js';
 import { imagePrimaryForIntent } from './lib/image-route.js';
 import { enrollmentMayApply, enrollmentOf } from './lib/experiment-enrollment.js';
 import { normaliseLegacyTrigger, type InteractionKind } from './lib/interaction-kinds.js';
-import { claimTurn, turnQueueEnabled, enqueueMessage, recordStop, claimNotice, releaseNoticeClaim, readTurnState, releaseLock, rememberStopDecision, readStopDecision, clearStopDecision, recordDispatchFailure } from './lib/turn-lock.js';
+import { claimTurn, turnQueueEnabled, enqueueMessage, recordStop, claimNotice, releaseNoticeClaim, readTurnState, releaseLock, rememberStopDecision, deferStopEvaluation, readStopDecision, clearStopDecision, recordDispatchFailure } from './lib/turn-lock.js';
 import { adminNotice, postAdminNotice } from './lib/admin-notice.js';
 import { openDrainTask } from './lib/queue-drain-task.js';
 import { parseStopCommand, resolveStopTarget } from './lib/stop-target.js';
 import { showQueueNotice, noticeText, findHolderPlaceholder } from './lib/turn-queue-notice.js';
 import { parseTriageTurnContext } from './lib/turn-triage-proposal.js';
-import { withTurnDeclaration, isDeclarableValue } from './lib/turn-declaration.js';
+import { withTurnDeclaration, isDeclarableValue, type TurnDeclaration } from './lib/turn-declaration.js';
 import type { TriageTurnContext } from './lib/turn-triage-proposal.js';
 import { getModelCatalog, bedrockInvokeId } from '../../lib/config/model-strategy.js';
-import { resolveActiveProfile, resolveFromDefinition, concreteModel, rememberRuntimeSeed } from './lib/active-profile.js';
+import { resolveActiveProfile, resolveProfileVersion, resolveFromDefinition, concreteModel, rememberRuntimeSeed } from './lib/active-profile.js';
 import { botMessageMetadata, type BotMessageAttribution } from './lib/bot-message-attribution.js';
 import { noticeLine, noticeUse, noticeMentionsForMembers, isNoticeCopyKey, noticeTurnKind, checkNoticeVars, noticeMetadata, type NoticeCopyKey, type NoticeEvent, type NoticeRequest, type NoticeOutcome } from './lib/assistant-notice.js';
 import {
@@ -151,6 +166,7 @@ import {
   resolveTemplateFields,
   versionLookup,
   withUnreadCatalog,
+  routerHeldVariables,
   type SourceLookup,
   type VariableValue,
   type VersionVariable,
@@ -168,23 +184,25 @@ import {
   arrivalWelcomeOwner,
   conversationKey,
   declaredWorkflowOn,
-  eventNaturalKey,
   eventRunKey,
   INVITATION_ID,
-  assistantForStep,
+  holderOfRole,
+  RunAbandoned,
   personJoinedWorkflowOf,
+  subjectChangedWorkflowOf,
   runEventWorkflow,
   verifiedJoiners,
   workflowFor,
   welcomeWorkflowOf,
   openedWorkflowOf,
+  alongsideSteps,
   welcomePlan,
   type WelcomePlan,
   type PromptWelcomeStep,
   workflowSendEmailKind,
   isInvitationEvent,
   ALARM_NAME,
-  alarmWatchKey,
+  alarmWatchKey, refWatchKey,
   isAlarmState,
   type AlarmChange,
   type AgentStep,
@@ -195,15 +213,33 @@ import {
   type EventWorkflow,
   type WorkflowEvent,
 } from './lib/event-workflow.js';
-import { workerAssistantRole, type TaskStep } from './lib/task-step.js';
+import { runNaturalKey } from './lib/event-natural-key.js';
+import { DEFAULT_TASK_REMINDERS, MAX_TASK_DEADLINE_MINUTES, MIN_TASK_DEADLINE_MINUTES, TASK_STEP_OUTCOMES, assignedTemplateFor, workerAssistantRole, type TaskStep } from './lib/task-step.js';
+import { asRun, canonicalIntentWorkflow, intentRunKey, intentTaskStep } from './lib/intent-workflow.js';
 import { eventTaskId } from './lib/event-task.js';
-import { audienceOf, inertMention as workflowMention, type EventAudience } from './lib/event-workflow.js';
+import {
+  MEETING_ACTION_ITEM_MACHINE, MEETING_SUMMARY_RUN, actionItemHolder, actionItemStep, dueAtOf, fitSummaryCard, meetingSummaryCorrelationId,
+  meetingSummaryRunKey, planActionItems, readMeetingSummaryWritten, type StoredMeetingSummary, type SummaryCardParts,
+} from './lib/meeting-summary-turn.js';
+import { MEETING_DURATION_VALUE, MEETING_EVENT_VALUES, MEETING_INCIDENT_TEMPLATE, MEETING_LINK_VALUE, MEETING_NOTICE_TEMPLATE, isMeetingEvent, type MeetingAction } from './lib/event-workflow.js';
+import { parseRing, ringLeft, ringOnStart, ringUntilOf, RING_OFF } from './lib/meeting-ring.js';
+import { MEETING_RUN_TIMEOUT_SECONDS, endConversationMeeting, meetingRunsNow, startConversationMeeting, summarizeConversationMeeting, transcribeEndedMeeting, type MeetingRunAnswer } from './lib/meeting-run.js';
+import { parseTranscriptKey, transcriptLink } from './lib/meeting-transcript.js';
+import { meetingMediaRecordingEnabled, recordingCardValues } from './lib/meeting-recording.js';
+import { MEETING_TIMEOUT_TEMPLATES, MEETING_WATCH_MINUTES, meetingMaxMinutes, meetingWatchDecision } from './lib/meeting-watch.js';
+import { ALONGSIDE_RELEASED, JOIN_PART, type RunProcess, customerImpactOf, isCustomerImpact, joinedSteps, openedLinkValue, processOfWorkflow, runProcessOf } from './lib/event-workflow.js';
+import { writeMessageAnalytics } from './lib/message-analytics.js';
+import { taskOutcomeOf } from './lib/task-step.js';
+import type { ChimeSDKIdentityClient } from '@aws-sdk/client-chime-sdk-identity';
+import { ownerTeamOf } from './lib/assistant-ownership.js';
+import { type RuleEventRef, type ChildEnding, INTENT_TRIGGER, MAX_WAIT_MINUTES, audienceOf, childEndedOutcome, continuationClaim, inertMention as workflowMention, type EventAudience, type OpenStep, CHILD_LINK_VALUE, OPENED_BY_VALUES, OPEN_STEP_OPENED, incidentFactsOf, incidentFactsOfEvent, WAIT_CAME, continuableStep, RUN_END_CLAIM, endingTerminal, runStanding, runStandingClaims, stepLabel } from './lib/event-workflow.js';
 import {
   createTaskDeadlineSchedule, deleteTaskDeadlineSchedule, taskDeadlineFiringOf, type TaskDeadlineFiring,
 } from './lib/event-deadlines.js';
-import { cancelForDeadline, workflowTaskIds as workflowTasksOf } from './lib/task-store.js';
+import { cancelForDeadline, holdRunWait, readRunWait, recordRunEnded, workflowTaskIds as workflowTasksOf, openTasksOpenedFrom, settleArchivedTasks, endRunTasks, readEventSteps } from './lib/task-store.js';
+import { contentHash12 } from './lib/canonical-json.js';
 import {
-  pickupBudget, pickupCorrelationId, pickupReadiness, settlementOutcome, taskCardOf, type TaskCard, type TaskPickupRequest,
+  pickupBudget, pickupCorrelationId, pickupReadiness, requestAwaitingRun, settlementOutcome, stateNoticeRun, taskCardOf, type TaskCard, type TaskPickupRequest,
 } from './lib/workflow-task.js';
 // The lock a pickup turn takes is the turn's own lock (ADR-033); named apart so a turn's claim reads as one place.
 import { notePickupPending, claimTurn as claimLockForPickup } from './lib/turn-lock.js';
@@ -218,48 +254,53 @@ import { holdersByRole, hostRoleHoldings, rolesOfPerson, withHostHoldings } from
 import { resolvePerson } from './lib/person-identity.js';
 import { issuerIdOf } from './lib/trusted-issuers.js';
 import { CloudWatchClient, DescribeAlarmsCommand } from '@aws-sdk/client-cloudwatch';
-import { hostSourcedRoles, participantRoleOf, participantRolesOf, roleSaidInRoom } from '../../lib/config/participant-roles.js';
+import { PARTICIPANT_ROLE_AUDIENCE_CAP, groupSourcedRoles, hostSourcedRoles, participantRoleOf, participantRolesOf, roleSaidInRoom } from '../../lib/config/participant-roles.js';
 import { claimEventRun, claimEventStep, recordEventGreeting } from './lib/task-store.js';
 import { eventDispatchId } from './lib/event-dispatch-id.js';
 import type { ConversationOpenedNaming, EventContinuation, InvitationSentNaming, PersonJoinedNaming } from './lib/say-through-router.js';
 import { INVITATION_KEY, everyInvitation, pendingInvitation, type InvitationRecord } from './lib/invitations.js';
 import {
   DEADLINE_METRIC_NAMESPACE, DEADLINE_SCHEDULE_FAILED_METRIC, createDeadlineSchedule, deadlineAt, deadlineCancelOf, deadlineFiringOf, deleteDeadlineSchedule, deadlineWiringFromEnv,
-  type DeadlineCancel, type DeadlineFiring, type DeadlineWiring,
+  runWaitFiringOf, taskReminderFiringOf, meetingSummaryFiringOf, meetingWatchFiringOf, MEETING_SUMMARY_DELAY_SECONDS, type MeetingSummaryFiring, type MeetingWatchFiring, type RunWaitFiring, type TaskReminderFiring, type DeadlineCancel, type DeadlineFiring, type DeadlineWiring,
 } from './lib/event-deadlines.js';
 import { emitEmfMetric } from './lib/emf-metrics.js';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { MAX_PEOPLE_JOINED } from './lib/say-through-router.js';
+import { meetingPlaceFields, meetingRunsFor as meetingPlaceOfTurn, type MeetingPlace } from './lib/meeting-invite-offer.js';
 import { loadNamedTemplate } from './lib/message-template-selection.js';
-import { renderMessageTemplate } from './lib/message-template.js';
+import { renderMessageTemplate, MESSAGE_VALUE_CAPS } from './lib/message-template.js';
 import { chooseLanguage } from './lib/message-language.js';
 import { resolveLanguageTag } from '../../lib/config/languages.js';
-import { getConversationTypeConfig } from '../../lib/config/conversation-types.js';
-import { noticeTemplateName } from './lib/shipped-message-templates.js';
+import { getConversationTypeConfig, isLeafType, meetingSettingsOf, opensWithARun } from '../../lib/config/conversation-types.js';
+import { noticeTemplateName, shippedMessageTemplate } from './lib/shipped-message-templates.js';
+import type { TaskStateDef } from './lib/task-state-machines.js';
 import type { ParsedTemplate } from './lib/document-template.js';
 import type { AssistantCopy, ProfileDefinition } from './lib/active-profile.js';
 import { joinRecapRequestFor } from './lib/join-recap.js';
 import { NOTHING_TO_POST } from './lib/lex-envelope.js';
 import { randomUUID } from 'crypto';
-import { runLiveDriftFlow, resolveOriginatingMessage, type TurnSubjectDecision, type HeldQuestion } from './lib/live-drift-flow.js';
+import { runLiveDriftFlow, resolveOriginatingMessage, moveSubject, type SubjectChange, type SubjectChangeRaised, type SubjectOffer, type OfferAnswered, type TurnSubjectDecision, type HeldQuestion } from './lib/live-drift-flow.js';
+import { threadRelatives, MAX_RELATIVES_NAMED, type RelatedConversation } from './lib/related-conversations.js';
 import { variantGrantOf, SPEAK_ROUTE_PREFIX, type GrantVariant } from './lib/assistant-grant.js';
 import { startRouterSteps } from './lib/router-steps.js';
 // Whether a turn continues in this conversation rather than being offered a new one. One named
 // decision, so the two-axis rule that replaces it (task-relatedness, then conversation-relatedness)
 // changes that function's body and no call site here.
-import { isStalledStepCandidate, opensOtherWorkThan, reopenableFollowUpSubject, resolveTaskContinuity, resumesAStalledStep } from './lib/task-continuity.js';
+import { type WaitingWorkDecision, classifierPlacement, isStalledStepCandidate, opensOtherWorkThan, reopenableFollowUpSubject, resolveTaskContinuity, resumesAStalledStep, routedAsOf } from './lib/task-continuity.js';
 import {
   parseWelcomeOrientationDetailed,
   composeOpening,
   selectOpening,
+  withDeploymentOpening,
   type WelcomeOpeningStep,
   type WelcomeOrientation,
 } from './lib/welcome-orientation.js';
 import { recordWelcomeConfigDefect, welcomeConfigDefects } from './lib/welcome-metrics.js';
 import {
-  getParticipantContext, getChannelContext, putChannelContext, advanceOnboardingIntake, startOnboardingIntake, alarmWatchOf,
-  claimRoomNaming, releaseRoomNaming, markRoomNamed, roomNamingOf, ROOM_NAMING_LEASE_MS,
+  getParticipantContext, getChannelContext, putChannelContext, advanceOnboardingIntake, startOnboardingIntake, alarmWatchOf, refWatchOf,
+  claimRoomNaming, releaseRoomNaming, markRoomNamed, roomNamingOf, ROOM_NAMING_LEASE_MS, recordEndedMeetingCard, recordMeetingFact, readChannelContext, releaseActiveMeeting,
 } from './lib/channel-context-client.js';
+import { durationMinutes, endedAt, isMeetingId, readLifecycleHandoff } from './lib/meeting-lifecycle.js';
 import { askRoomPrimaryToName, namingDecisionFor, type NamingDecision, type RoomNamingMemory } from './lib/room-naming.js';
 import {
   participantContextFor,
@@ -285,7 +326,8 @@ import { extractAttachment, type MessageAttachment } from './lib/battle-attachme
 import {
   rankReferentCandidates, MAX_REFERENT_CANDIDATES, type ReferentCandidate,
 } from './lib/task-referent.js';
-import { referentCandidates as referentCandidatesFor } from './lib/task-store.js';
+import { answerableTaskById, referentCandidates as referentCandidatesFor } from './lib/task-store.js';
+import { lexEnteredFacts } from './lib/lex-entered-message.js';
 import {
   findReferencedTask, formatReferenceNotFound, parseTaskReference,
   type TaskResolution,
@@ -302,6 +344,9 @@ import {
 import { endBattle, type BattleEndReason } from './lib/battle-end.js';
 import { hydrateBodies } from './lib/profile-bodies.js';
 import { appInstanceArnOf, botArnFor, botIdFromArn, isPersonArn, personIdFromArn, userArnFor } from './lib/person-arn.js';
+import { CHILD_WAIT_PREFIX, CONVERSATION_PROCESS_WAIT_ID, OPEN_HAND_BACK_MINUTES, OPEN_WAIT_PREFIX, alongsideEndWaitId, childEndWaitId, holdUntilEnded, joinDeadlineWaitId, joinPartWaitId, meetHeldRun, openBackstopWaitId, openedConversation, openedConversationOf, openerConversation, parentConversationOf, type HeldRunRecords } from './lib/held-run.js';
+import { openIsNestedBy } from './lib/conversation-nesting.js';
+import { recordedHostIds } from './lib/meeting-host.js';
 import { parseChannelMetadata } from './lib/chime/channel-meta.js';
 import { recentChannelMessages, decodeContent } from './lib/chime/history.js';
 import { loadProfileRegistry } from '../../lib/profile-registry';
@@ -346,6 +391,9 @@ const ssmClient = new SSMClient({ region: AWS_REGION, requestHandler: BOUNDED_RE
 // session once the turn has resolved which bot answers (`speakAsRoutedAssistant` in `runTurn`), and on
 // the router's own role before then, which can read but cannot post as any bot.
 const chimeClient = sessionClient(ChimeSDKMessagingClient, { region: AWS_REGION, requestHandler: BOUNDED_REQUEST_HANDLER });
+// THE CLASSIFICATION BOUNDARY IS THE ROUTER'S OWN READ, on its own role whichever assistant the turn is speaking as: a run that
+// goes on inside a turn is on that turn's speak session, which reads no tags. It can read and cannot post.
+const routerRoleChimeClient = chimeMessagingClient({ region: AWS_REGION, requestHandler: BOUNDED_REQUEST_HANDLER });
 
 // ============================================================
 // Caches (persist across warm invocations)
@@ -767,7 +815,32 @@ async function resolveChannelClassification(channelArn: string, botArn: string):
  * `CLASSIFICATION`, and it refuses on `undefined`.
  */
 async function resolveChannelClassificationTag(channelArn: string): Promise<string | undefined> {
-  return readChannelClassificationTag(chimeClient, channelArn, '[Router]');
+  return readChannelClassificationTag(routerRoleChimeClient, channelArn, '[Router]');
+}
+
+/**
+ * WHETHER THE CLASSIFIER'S DECISION SETS A WAITING TASK ASIDE, where it was offered the task (`classifierPlacement`), or
+ * undefined where it was not and the structural rule decides. A placement elsewhere that names the waiting task's own work
+ * is that task: the classifier answered with the work's label rather than its place, and the task is continued rather than
+ * a second one of its kind opened beside it. Only where it named no place: a message the classifier placed in one offered
+ * task is that task's, never another of its kind.
+ */
+export function placementSetsAside(
+  decision: WaitingWorkDecision, task: { taskId?: string; taskType?: string }, turn: { opens?: string; keptHere: string },
+): boolean | undefined {
+  const placed = classifierPlacement(decision, task.taskId);
+  if (!placed) return undefined;
+  const sameWork = !decision.continuesTask && !!task.taskType && (turn.opens === task.taskType || turn.keptHere === task.taskType);
+  return placed === 'elsewhere' && !sameWork;
+}
+
+/**
+ * A conversation's classification by its immutable tag, read as the router's own role, for a caller that is retried: a
+ * read that fails throws, and undefined means only that the tag names no known classification.
+ */
+async function classificationTagOf(channelArn: string): Promise<string | undefined> {
+  const tag = (await readChannelTags(routerRoleChimeClient, channelArn))[CLASSIFICATION_TAG];
+  return profiles.isKnownClassification(tag) ? profiles.resolveClassification(tag) : undefined;
 }
 
 /** Pull the channel's full Metadata JSON (modelTier, topic, triggerContext,
@@ -963,14 +1036,8 @@ function routerVariables(
   variables: Readonly<Record<string, VersionVariable>> | undefined,
   held: { conversationType?: string } = {},
 ): { lookup: SourceLookup; variables?: Readonly<Record<string, VersionVariable>>; values: Record<string, VariableValue | undefined> } {
-  return {
-    lookup: withUnreadCatalog(versionLookup(buildSourceTable({ catalog: [] }), variables)),
-    ...(variables ? { variables } : {}),
-    values: {
-      ...(STATIC_CLASSIFICATION ? { 'conversation:classification': STATIC_CLASSIFICATION } : {}),
-      ...(held.conversationType ? { 'conversation:type': held.conversationType } : {}),
-    },
-  };
+  // One resolver, which the console's welcome preview calls too (`routerHeldVariables`).
+  return routerHeldVariables(variables, { ...(STATIC_CLASSIFICATION ? { classification: STATIC_CLASSIFICATION } : {}), ...held });
 }
 
 /**
@@ -1081,6 +1148,7 @@ async function loadWelcomeFor(
   let welcome = welcomeWorkflowOf(undefined, conversationType);
   let plan = welcomePlan(welcome.workflow);
   let served: ServedWelcomeVersion | undefined;
+  let own: ReturnType<typeof selectOpening> = null;
   if (profileName) {
     try {
       served = await servedWelcomeVersion(profileName, channelArn);
@@ -1101,16 +1169,10 @@ async function loadWelcomeFor(
       // THE ASSISTANT'S OPENING FOR THIS KIND OF ROOM: the template step of the welcome its type selects. An opening
       // step with no field of its own falls through to the deployment copy. The console's preview reads an opening
       // through the same function, so it shows what this posts.
-      const own = selectOpening(plan.opening);
-      if (own?.template) {
-        return { orientation: own.orientation, expected: true, issues: own.issues, template: own.template, welcome, plan, served };
-      }
-      if (own?.orientation) {
-        if (own.issues.length) {
-          console.warn('[Router] the assistant\'s own welcome carries fields it may not set; they are '
-            + 'ignored and the rest is used', { profileName, issues: own.issues });
-        }
-        return { orientation: own.orientation, expected: true, issues: own.issues, welcome, plan, served };
+      own = selectOpening(plan.opening);
+      if (own?.issues.length) {
+        console.warn('[Router] the assistant\'s own welcome carries fields it may not set; they are '
+          + 'ignored and the rest is used', { profileName, issues: own.issues });
       }
     } catch (err) {
       // Falls through to the classification's copy rather than failing the greeting: a welcome that
@@ -1134,10 +1196,22 @@ async function loadWelcomeFor(
   // declare, and the channel tag is an outside value, so the absence is a real answer here. A throw
   // would kill a welcome over a question that has a perfectly good "unknown".
   const classificationPrimary = classification ? profiles.profileFor(classification)?.name : undefined;
-  if (profileName && classificationPrimary && !deploymentCopyAppliesTo(profileName, classificationPrimary)) {
-    console.log(deploymentCopySkipped('welcome orientation', profileName, classificationPrimary));
-    return { orientation: null, expected: false, issues: [], welcome, plan, served };
+  const primary = !(profileName && classificationPrimary && !deploymentCopyAppliesTo(profileName, classificationPrimary));
+  if (!primary) console.log(deploymentCopySkipped('welcome orientation', profileName!, classificationPrimary!));
+  // THE OPENING'S OWN FIELDS LAYER OVER THE DEPLOYMENT'S, field by field (`withDeploymentOpening`): an opening that sets
+  // only its suggested prompts keeps the deployment's company, access line and note, and a field it leaves blank is the
+  // deployment's. The console's preview composes through the same function, so it shows what this posts.
+  if (own?.template || own?.orientation) {
+    const deployment = primary ? await loadWelcomeOrientation() : undefined;
+    return {
+      orientation: withDeploymentOpening(own.orientation, deployment?.orientation),
+      expected: true,
+      issues: [...own.issues, ...(deployment?.issues ?? [])],
+      ...(own.template ? { template: own.template } : {}),
+      welcome, plan, served,
+    };
   }
+  if (!primary) return { orientation: null, expected: false, issues: [], welcome, plan, served };
   return { ...(await loadWelcomeOrientation()), welcome, plan, served };
 }
 
@@ -1917,6 +1991,16 @@ function bypassBattleContext(event: LexEvent): BattleTurnContext | undefined {
   }
 }
 
+/**
+ * A TURN THAT ARRIVED THROUGH AMAZON LEX CARRIES ONLY WHAT LEX SENDS. The `AE.*` attributes are this
+ * system's own declarations about a turn it dispatched to itself, and only `bypassToLexEvent` writes them.
+ */
+function withoutDeclaredTurnAttributes(event: LexEvent): LexEvent {
+  const attributes = event.requestAttributes;
+  if (!attributes || !Object.keys(attributes).some((k) => k.startsWith('AE.'))) return event;
+  return { ...event, requestAttributes: Object.fromEntries(Object.entries(attributes).filter(([k]) => !k.startsWith('AE.'))) };
+}
+
 /** True when the channel flow invoked this turn rather than Lex. */
 function isFlowEntry(event: LexEvent): boolean {
   return event.requestAttributes?.[FLOW_ENTRY_ATTR] === FLOW_ENTRY_VALUE;
@@ -2681,9 +2765,23 @@ function bypassAttachment(event: LexEvent): MessageAttachment | undefined {
  * said with `templateLine` in the selection order. A version that cannot be read words its lines from the store
  * and the shipped templates.
  */
-async function wordsOf(profileName: string): Promise<{ copy: AssistantCopy; templates: MessageTemplateSet }> {
+async function wordsOf(profileName: string, at: { channelArn?: string; conversationType?: string } = {}): Promise<{ copy: AssistantCopy; templates: MessageTemplateSet }> {
   const version = await resolveActiveProfile(profileName, { ssm: ssmClient, ssmRoot: SSM_ROOT }).catch(() => undefined);
-  const templates = await loadMessageTemplateSet({ classification: STATIC_CLASSIFICATION, assistant: profileName, messages: version?.messages });
+  // THE ROOM'S TYPE, which a message alternative's condition may read: given, else the conversation's own, read only
+  // where the version chooses its messages (a version that names none has no condition to read it).
+  const conversationType = at.conversationType
+    ?? (at.channelArn && version?.messages ? (await getChannelContext(at.channelArn).catch(() => null))?.conversationType : undefined);
+  const loaded = await loadMessageTemplateSet({
+    classification: STATIC_CLASSIFICATION, assistant: profileName, messages: version?.messages,
+    ...(version?.variables ? { variables: version.variables } : {}),
+  });
+  // THE ROUTER'S LINES RESOLVE THROUGH WHAT IT HOLDS (`routerVariables`), as the processor's lines resolve through its
+  // turn's: a field bound to a source or a version variable is inserted, or its fallback, and a message alternative's
+  // condition is read, rather than every line falling to its unconditioned, unbound template.
+  const templates: MessageTemplateSet = {
+    ...loaded,
+    resolver: { ...routerVariables(version?.variables, conversationType ? { conversationType } : {}), callSite: turnCallSite(undefined, at.channelArn) },
+  };
   return { copy: withMessageTemplates<AssistantCopy>(templates), templates };
 }
 
@@ -2723,6 +2821,132 @@ interface WorkflowRunner {
   variantProfile?: import('./lib/active-profile.js').ProfileDefinition;
   variables?: Readonly<Record<string, VersionVariable>>;
   welcome?: { opening: string; promptValues: Record<string, string> };
+  /** The version the run is on (ADR-067 stage 2): its task steps open its own machines, and the run records it as its origin. */
+  version?: ServedWelcomeVersion['version'];
+}
+
+/** A run's assistant as the served version names it: the arm, the version's values, and the version itself. */
+/**
+ * THE ASSISTANT WHOSE WORKFLOW AN EVENT IN THIS ROOM RUNS (`workflowOwnerOf`, ADR-061 decision 2): the one a trigger was
+ * attached for, else the role the room's type names, else the room's primary, and always one of this router's
+ * classification. An owner other than the primary is a member, read live as the primary; every event handler asks here.
+ */
+async function eventWorkflowOwner(
+  channelArn: string, logPrefix: string, args: { conversationType?: string; attachedBy?: string },
+): Promise<WorkflowOwner | WorkflowOwnerRefused> {
+  const owner = await workflowOwnerOf(channelArn, chimeClient, { ...args, logPrefix }, {
+    botsInRoom: async (arn, bearer) => {
+      const size = await resolveChannelSize(chimeClient, arn, bearer);
+      return size.refused || size.unknown ? null : (size.members ?? []).filter((m) => m.isBot).map((m) => m.arn);
+    },
+  });
+  if (!('refused' in owner) && owner.classification !== STATIC_CLASSIFICATION) return { refused: 'primary is another classification' };
+  return owner;
+}
+
+/**
+ * THE RUN'S IDENTITY, copied the one way onto every record that continues it (its held continuation, a step's task, an agent
+ * step's dispatch, a child's hand-back): the fields its natural key is computed from again (`runNaturalKey`) and those its
+ * continuation reads back, each where the run holds it. A field added to a run is added here, and reaches every copy.
+ */
+function runIdentity(ctx: EventRunContext): Pick<EventRunContext, 'eventPerson' | 'subject' | 'invitationId' | 'alarm' | 'runTaskId' | 'reopened' | 'ruleEvent' | 'meeting' | 'process'> {
+  return {
+    ...(ctx.eventPerson ? { eventPerson: ctx.eventPerson } : {}), ...(ctx.subject ? { subject: ctx.subject } : {}),
+    ...(ctx.invitationId ? { invitationId: ctx.invitationId } : {}), ...(ctx.alarm ? { alarm: ctx.alarm } : {}),
+    ...(ctx.runTaskId ? { runTaskId: ctx.runTaskId } : {}), ...(ctx.reopened ? { reopened: ctx.reopened } : {}),
+    ...(ctx.ruleEvent ? { ruleEvent: ctx.ruleEvent } : {}), ...(ctx.meeting ? { meeting: ctx.meeting } : {}),
+    ...(ctx.process ? { process: ctx.process } : {}),
+  };
+}
+
+/**
+ * THE PROCESS A RUN BELONGS TO (SPEC-PROCESSES P2): the one it inherited (an `open` step's child), else
+ * the one its version links its workflow into, started now. Either way it names the team that owns this run's assistant.
+ */
+async function runProcessFor(ctx: EventRunContext, who: WorkflowRunner, name: string, runKey: string): Promise<RunProcess | undefined> {
+  const proc = ctx.process ?? startedProcess(who.version?.processes, name, runKey);
+  if (!proc) return undefined;
+  const { ownerTeam: _inherited, ...rest } = proc;
+  // READ LIVE FROM THE ASSISTANT'S OWN `owner-team` TAG (O16), as every other reader does. A read that fails names no team and
+  // never holds up the run (D5): the run's process stands, and its records name no team.
+  identityClient = identityClient ?? chimeIdentityClient();
+  const team = await ownerTeamOf(identityClient, who.botArn).catch((err) => {
+    console.warn('[Router][process] the owner team could not be read', { err: (err as Error)?.name });
+    return undefined;
+  });
+  return { ...rest, ...(team ? { ownerTeam: team } : {}) };
+}
+let identityClient: ChimeSDKIdentityClient | null = null;
+
+/**
+ * THE PROCESS A REQUEST'S RUN BELONGS TO (SPEC-PROCESSES P2), only where its version links the intent's workflow into one (a
+ * request-started workflow, keyed by the intent). A run another assistant's run asked for JOINS the asking run's process, read
+ * from the asking run's own record the platform wrote on the request's task (`askedBy`); any other run STARTS the process its
+ * version links, keyed by the process and the run as an event run's is (`startedProcess`). Nothing is read from what anyone said.
+ */
+async function intentRunProcessFor(
+  ctx: EventRunContext, who: WorkflowRunner, intent: string, runKey: string, askedBy: Pick<WorkflowRunRef, 'process'> | undefined,
+): Promise<RunProcess | undefined> {
+  // AN EVENT WORKFLOW OF THE SAME NAME IS THE ONE A PROCESS LINKS (`linkableWorkflows`), so a request's run is never taken for it.
+  if (who.version?.eventWorkflows?.[intent] || !processOfWorkflow(who.version?.processes, intent)) return undefined;
+  // THE PROCESS IT JOINS: the asking run's, else the process that opened the conversation the request arrives in, read from
+  // the record the router wrote there as the opening run started (`recordConversationProcess`). Neither is read from what
+  // anyone said. A record that cannot be read joins nothing, and the run starts its own process (D5).
+  const asking = runProcessOf(askedBy?.process) ?? await conversationProcessOf(ctx.channelArn);
+  return runProcessFor(asking ? { ...ctx, process: asking } : ctx, who, intent, runKey);
+}
+
+/** The process that opened this conversation (`CONVERSATION_PROCESS_WAIT_ID`), or undefined where none is recorded. */
+async function conversationProcessOf(channelArn: string): Promise<RunProcess | undefined> {
+  const held = await readRunWait({ waitId: CONVERSATION_PROCESS_WAIT_ID, channelArn }).catch(() => null);
+  return runProcessOf(held?.process);
+}
+
+/**
+ * RECORD THE PROCESS THAT OPENED A CONVERSATION (SPEC-PROCESSES P15), once, before the opening run starts, so a request a
+ * person makes there joins it. The team is left off: each run names its own owner team. Best-effort (D5): a record not
+ * written leaves such a request to start its own process, and the opening run goes on regardless.
+ */
+async function recordConversationProcess(channelArn: string, proc: RunProcess): Promise<void> {
+  const { ownerTeam: _team, ...named } = proc;
+  const out = await holdRunWait({ waitId: CONVERSATION_PROCESS_WAIT_ID, channelArn, continuation: { process: named } })
+    .catch(() => ({ claimed: false, reason: 'failed' }));
+  if (!out.claimed && out.reason !== 'already_claimed') {
+    console.warn('[Router][process] the opened conversation\'s process could not be recorded', { reason: out.reason });
+  }
+}
+
+/** A run's process as its run-end fact records it (SPEC-PROCESSES P8). */
+function processFactFields(proc: RunProcess | undefined): { processId?: string; process?: string; processEdition?: string; ownerTeam?: string } {
+  return proc ? { processId: proc.id, process: proc.name, ...(proc.edition ? { processEdition: proc.edition } : {}), ...(proc.ownerTeam ? { ownerTeam: proc.ownerTeam } : {}) } : {};
+}
+
+/**
+ * A RUN MESSAGE'S PROCESS, ON ITS OUT-OF-BAND ANALYTICS RECORD (SPEC-PROCESSES P8, DESIGN-PROCESSES section 6), keyed by the id the
+ * send returned: never on the Amazon Chime SDK Metadata, which stays as it is. Best-effort, and never holds up the run (D5).
+ */
+async function recordRunMessageProcess(sent: { MessageId?: string } | undefined, channelArn: string, proc: RunProcess | undefined): Promise<void> {
+  if (!proc || !sent?.MessageId) return;
+  await writeMessageAnalytics({ messageId: sent.MessageId, channelArn, analytics: { processRun: processFactFields(proc) } });
+}
+
+function runnerOf(botArn: string, assistant: string, served: ServedWelcomeVersion | undefined): WorkflowRunner {
+  return { botArn, assistant, variantProfile: served?.variantProfile, variables: served?.version.variables, ...(served?.version ? { version: served.version } : {}) };
+}
+
+/**
+ * THE EDITION OF THE WORKFLOW A RUN RUNS (WT60): the content hash of the workflow, by name, on the run's version, an
+ * intent's in `intentWorkflows` and an event's in `eventWorkflows` or the platform's. Undefined where it names none.
+ */
+function runWorkflowHash(version: WorkflowRunner['version'], event: WorkflowEvent, name: string): string | undefined {
+  const wf = event === INTENT_TRIGGER ? version?.intentWorkflows?.[name] : workflowFor(version?.eventWorkflows, name);
+  return wf ? contentHash12(wf) : undefined;
+}
+
+/** The origin a run records (ADR-067 stage 2): the version's `configId`, and its parameter version where it has one. */
+function runOriginOf(version: WorkflowRunner['version']): RunOrigin | undefined {
+  const configId = originConfigIdOf(version);
+  return configId ? { configId, ...(version?.version !== undefined ? { version: version.version } : {}) } : undefined;
 }
 
 /**
@@ -2737,16 +2961,18 @@ async function runWorkflowFor(
   ctx: EventRunContext,
   who: WorkflowRunner,
   held: RouterGateHeld = {},
-): Promise<{ ran: boolean }> {
-  const naturalKey = eventNaturalKey(ctx.event, ctx.channelArn, ctx.eventPerson, ctx.invitationId, ctx.alarm);
-  if (!naturalKey) return { ran: false };
+): Promise<{ ran: boolean; steps: Array<{ step: string; outcome: string }> }> {
+  const naturalKey = runNaturalKey(ctx.event, ctx.channelArn, { ...ctx, subjectMessageId: ctx.values?.message, meetingId: ctx.meeting?.meetingId });
+  if (!naturalKey) return { ran: false, steps: [] };
   const runKey = eventRunKey(ctx.event, naturalKey, who.assistant);
+  const proc = await runProcessFor(ctx, who, name, runKey);
+  if (proc) ctx = { ...ctx, process: proc };
   const roles = await participantRolesForRun(name, wf, ctx, who, held);
   const withRoles: EventRunContext = roles.roles ? { ...ctx, roles: roles.roles, roleSaidInRoom: roles.saidInRoom, ...(roles.deciding ? { decidingRoles: roles.deciding } : {}), ...(roles.conversationType ? { conversationType: roles.conversationType } : {}) } : ctx;
   const heldNow: RouterGateHeld = { ...held, ...(roles.members ? { members: roles.members } : {}), ...(roles.conversationType ? { conversationType: roles.conversationType } : {}) };
   const gated: EventRunContext = { ...withRoles, gate: await routerGate(wf, withRoles, who.variables, heldNow) };
   const result = await runEventWorkflow(name, wf, gated, eventRunDeps(name, gated, who, runKey, heldNow.members, held.invitationReason, held.invitationRole, held.invitationPrompt));
-  return { ran: result.ran };
+  return { ran: result.ran, steps: result.steps };
 }
 
 /**
@@ -2851,8 +3077,17 @@ function eventSourceValues(ctx: EventRunContext, invitationReason?: string, invi
     ...(invitation && ctx.eventPerson ? { 'invitation:invitee': [ctx.eventPerson] } : {}),
     ...(invitation && ctx.inviter ? { 'invitation:inviter': [ctx.inviter] } : {}),
     ...(invitation && invitationReason ? { 'invitation:reason': invitationReason } : {}),
+    // WHAT OPENED THE ROOM, as its creator named it to `conversation-opened`.
+    ...(ctx.event === 'conversation-opened' && ctx.values?.openedBy ? { 'event:openedBy': ctx.values.openedBy } : {}),
+    // THE CUSTOMER IMPACT THE OPENING RUN'S TRIAGE RECORDED (O27), as the creator named it.
+    ...(ctx.event === 'conversation-opened' && isCustomerImpact(ctx.values?.customerImpact) ? { 'event:customerImpact': ctx.values.customerImpact } : {}),
     // THE ALARM AND THE STATE IT ENTERED, as the router read them back from CloudWatch (the incident watch).
     ...(ctx.alarm ? { 'event:alarmName': ctx.alarm.name, 'event:alarmState': ctx.alarm.state } : {}),
+    // THE MEETING'S LINK, OR HOW LONG IT RAN, as the router built them from the meeting's own record.
+    ...(() => {
+      const m = isMeetingEvent(ctx.event) ? MEETING_EVENT_VALUES[ctx.event] : undefined;
+      return m && ctx.values?.[m.value] ? { [m.field]: ctx.values[m.value] } : {};
+    })(),
   };
 }
 
@@ -2947,6 +3182,17 @@ export function eventRunDeps(
   invitationPrompt?: RouterGateHeld['invitationPrompt'],
 ): EventRunDeps {
   const eventValues = eventSourceValues(ctx, invitationReason, invitationRole);
+  // WHICH EDITION THE RUN IS (WT60), and what started it (WT118), on every message it says.
+  const edition = runEdition(who, ctx, name);
+  /** The run's continuation at a step, as a held record keeps it: references and the run's values, never a message. */
+  const runContinuation = (step: string, transitions: EventTransition[]): Record<string, unknown> => ({
+    runKey, workflow: name, step, event: ctx.event, channelArn: ctx.channelArn, botArn: who.botArn, values: ctx.values, transitions,
+    ...runIdentity(ctx),
+    ...(edition.origin ? { origin: edition.origin } : {}),
+  });
+  const runEditionFields = {
+    ...(edition.origin ? { originConfigId: edition.origin.configId } : {}), ...(edition.workflowHash ? { workflowHash: edition.workflowHash } : {}), trigger: edition.trigger,
+  };
   const members = new Map<string, string>();
   // READ ON FIRST USE, AND AWAITED BY ITS USER: a run that mentions nobody reads no roster, and no read outlives the
   // invocation that started it.
@@ -2964,43 +3210,63 @@ export function eventRunDeps(
       await readMembers();
       return members.get(personArn) ?? '';
     },
-    send: (args) => sayWorkflowSend({ ...args, runKey, channelArn: ctx.channelArn, botArn: who.botArn, assistant: who.assistant, workflow: name, event: ctx.event, variables: who.variables, eventValues }),
+    send: ({ in: where, ...args }) => {
+      const said = {
+        ...args, runKey, channelArn: ctx.channelArn, botArn: who.botArn, assistant: who.assistant, workflow: name, event: ctx.event, variables: who.variables, eventValues,
+        edition: runEditionFields, process: ctx.process,
+      };
+      // SAID IN THE CONVERSATION THAT OPENED THIS ONE (O24), by the parent link this conversation's row records.
+      // SAID IN THE CONVERSATION THIS RUN'S OWN OPEN STEP OPENED (O33), by the link the step handed back.
+      if (where !== 'opened') return where === 'opener' ? sayInOpener(said) : sayWorkflowSend(said);
+      const wf = workflowFor(who.version?.eventWorkflows, name);
+      return sayInOpened({ ...said, openTypes: Object.values(wf?.states ?? {}).flatMap((s) => (s.open ? [s.open.type] : [])) });
+    },
     // A ROLE'S LIST OF NAMES IN ITS READERS' LANGUAGE (ADR-062 decision 4): the order a send's template is chosen in.
     listLanguage: async (to) => {
       const langs = await sendLanguages(ctx.channelArn, [...to]);
       return (to.length === 1 ? langs.preferred : undefined) ?? langs.conversation;
     },
     dispatchAgent: async (step, _def: AgentStep, values, transitions) => {
-      // THE STEP'S ASSISTANT (`as`): the room's assistant holding the step's role takes this one turn as itself, on its
-      // own session, so a primary never reads what only that role is granted. None in the room: nothing is dispatched.
-      const taker = _def.as ? await stepTaker(_def, ctx.channelArn, who.botArn) : { botArn: who.botArn };
-      if (!taker) {
-        console.log('[Router][event-workflow] no assistant holding the step\'s role is in the room; its absent message is said', { step, role: _def.as?.role, channelArn: ctx.channelArn });
-        return 'absent' as const;
+      // AN AGENT STEP IS THE RUN'S OWN ASSISTANT'S TURN, ONLY (WT118): a stored step that still names another assistant's
+      // role (`as`, retired) runs no turn and calls nothing; its fallback is said and the run takes its failure edge.
+      if (_def.as) {
+        console.warn('[Router][event-workflow][SecurityEvent] a retired step names another assistant\'s role; no step runs as another assistant', { step, role: _def.as.role });
+        return false;
       }
       return dispatchEventAgentStep({
-      runKey, workflow: name, step, event: ctx.event, channelArn: ctx.channelArn, botArn: taker.botArn,
-      // A STEP ANOTHER ASSISTANT TAKES names the run's assistant, whose version declares the step, and hands back to it.
-      ...(taker.assistant ? { workflowOwner: who.assistant, ownerBotArn: who.botArn } : {}),
-      ...(ctx.alarm ? { alarm: ctx.alarm } : {}),
-      ...(ctx.eventPerson ? { eventPerson: ctx.eventPerson } : {}), ...(ctx.subject ? { subject: ctx.subject } : {}), values, transitions,
-      ...(ctx.invitationId ? { invitationId: ctx.invitationId } : {}), ...(ctx.inviter ? { inviter: ctx.inviter } : {}),
+      runKey, workflow: name, step, event: ctx.event, channelArn: ctx.channelArn, botArn: who.botArn,
+      ...runIdentity(ctx),
+      values, transitions,
+      ...(ctx.inviter ? { inviter: ctx.inviter } : {}),
       ...(ctx.roles ? { roles: stepRoles(_def, ctx) } : {}), ...(ctx.conversationType ? { conversationType: ctx.conversationType } : {}),
       // The arm's version is the run's assistant's; a step another assistant takes runs on that assistant's own.
-      ...(who.variantProfile && !taker.assistant ? { variantProfile: who.variantProfile } : {}),
+      ...(who.variantProfile ? { variantProfile: who.variantProfile } : {}),
       // A NARROWED STEP'S DATA (decision 8, rule 6), for an agent step at an invitation's event only.
       ...(invitationPrompt ? { promptValues: invitationPrompt.values, proposalNotAfter: invitationPrompt.expiresAt } : {}),
+      ...(edition.origin ? { origin: edition.origin } : {}),
+      ...(edition.workflowHash ? { workflowHash: edition.workflowHash } : {}),
+      runTrigger: edition.trigger,
       });
     },
     greeted: (personArn) => recordEventGreeting({ channelArn: ctx.channelArn, personArn }),
-    openTask: (step, def, transitions) => openWorkflowTaskStep({ name, step, def, ctx, who, runKey, transitions, eventValues }),
+    openChild: (step, def, transitions) => (def.mode === 'move'
+      ? openMovedSubject({ name, step, def, ctx, who, runKey, transitions, edition })
+      : openChildConversation({ name, step, def, ctx, who, runKey, transitions, edition })),
+    openTask: (step, def, transitions, opts) => openWorkflowTaskStep({ name, step, def, ctx, who, runKey, transitions, eventValues, edition, ...(opts?.joined ? { joined: true } : {}) }),
+    // A MEETING STEP, only where the deployment declares meetings: the router names the run entry it may invoke.
+    ...(process.env.MEETING_RUN_FUNCTION ? {
+      startMeeting: (step: string, def: MeetingAction, transitions: EventTransition[]) => startMeetingStep({
+        channelArn: ctx.channelArn, botArn: who.botArn, assistant: who.assistant, workflow: name, step, event: ctx.event, runKey, transitions, def,
+        variables: who.variables, eventValues, edition: runEditionFields, process: ctx.process,
+      }),
+    } : {}),
     startIntake: (personArn, step, transitions) => offerIntakeStep({
-      channelArn: ctx.channelArn, botArn: who.botArn, assistant: who.assistant, personArn, workflow: name, step, event: ctx.event, runKey, transitions,
+      channelArn: ctx.channelArn, botArn: who.botArn, assistant: who.assistant, personArn, workflow: name, step, event: ctx.event, runKey, transitions, process: ctx.process,
     }),
     // THE WELCOME'S OWN STEPS (W1), only where `WelcomeIntent` runs it: the opening it composed, and the prompt turn.
     ...(who.welcome ? {
       opening: (step: string, _def: WelcomeOpeningStep, transitions: EventTransition[]) => postWelcomeOpening({
-        channelArn: ctx.channelArn, botArn: who.botArn, assistant: who.assistant, content: who.welcome!.opening, workflow: name, step, event: ctx.event, runKey, transitions,
+        channelArn: ctx.channelArn, botArn: who.botArn, assistant: who.assistant, content: who.welcome!.opening, workflow: name, step, event: ctx.event, runKey, transitions, process: ctx.process,
       }),
       prompt: async (_step: string, def: PromptWelcomeStep) => {
         await dispatchWelcomePrompt({ channelArn: ctx.channelArn, botArn: who.botArn, request: { template: def.template, tools: def.tools ?? [], values: who.welcome!.promptValues } });
@@ -3008,7 +3274,227 @@ export function eventRunDeps(
       },
     } : {}),
     log: (entry) => console.log('[Router][event-workflow]', JSON.stringify({ ...entry, channelArn: ctx.channelArn })),
+    ...(who.version ? { machines: machinesForVersion(who.version) } : {}),
+    // A RUN'S WAIT (WT20): its continuation held on a record of the run, and a one-shot schedule naming it by id, on this
+    // classification's group. Ids only on the schedule; the record holds references and the run's values, never a message.
+    wait: async (step, def, transitions) => {
+      // A WAIT ON THE CONVERSATION THIS RUN OPENED holds the run's continuation under that conversation's record, where its
+      // own run's end meets it (`held-run.ts`). No schedule: the opened conversation's run ending is what it waits for.
+      if (def.child) {
+        const child = openedConversationOf(ctx.values[CHILD_LINK_VALUE], ctx.channelArn);
+        if (!child) {
+          console.warn('[Router][event-workflow] a wait on the opened conversation names no conversation this run opened; the step fails', { step });
+          return 'failed';
+        }
+        const waitId = childEndWaitId(child);
+        const met = await holdUntilEnded(HELD_RUN_RECORDS, waitId, ctx.channelArn, runContinuation(step, transitions));
+        if ('came' in met) return { came: met.came };
+        if (!('held' in met)) return 'failed';
+        // ITS OWN ONE-SHOT BACKSTOP (tenet D6): an opened conversation lives at most `MAX_WAIT_MINUTES`, so a day past that the
+        // wait's record is read once; a run still held there was never told how its child ended, and goes on as timed out.
+        const wiring = deadlineWiringFor(ctx.channelArn);
+        if (wiring) {
+          await createTaskDeadlineSchedule(wiring, { kind: 'wait', channelArn: ctx.channelArn, taskId: waitId }, new Date(Date.now() + (MAX_WAIT_MINUTES + 24 * 60) * 60_000))
+            .catch((err) => console.warn('[Router][event-workflow] a wait on the opened conversation has no backstop; its end still continues it', { step, errName: (err as Error)?.name }));
+        }
+        return 'waiting';
+      }
+      const wiring = deadlineWiringFor(ctx.channelArn);
+      if (!wiring) return 'failed';
+      // WHEN IT COMES DUE (WT20): its minutes from now, or a time an earlier task of the run recorded. A recorded time that
+      // is missing or unreadable fails the step; one already past comes due in a minute, as soon as the scheduler can.
+      const fireAt = def.until !== undefined ? Date.parse(ctx.values[def.until] ?? '') : Date.now() + (def.minutes ?? 0) * 60_000;
+      if (!Number.isFinite(fireAt) || fireAt > Date.now() + MAX_WAIT_MINUTES * 60_000) {
+        console.warn('[Router][event-workflow] a wait has no time it can be scheduled at; the step fails', { step });
+        return 'failed';
+      }
+      const waitId = `wait-${contentHash12({ runKey, step })}`;
+      if (!(await holdRunWait({ waitId, channelArn: ctx.channelArn, continuation: runContinuation(step, transitions) })).claimed) return 'failed';
+      try {
+        await createTaskDeadlineSchedule(wiring, { kind: 'wait', channelArn: ctx.channelArn, taskId: waitId }, new Date(Math.max(fireAt, Date.now() + 60_000)));
+        return 'waiting';
+      } catch (err) {
+        console.error('[Router][event-workflow] a wait could not be scheduled; the step fails', { step, errName: (err as Error)?.name });
+        return 'failed';
+      }
+    },
+    // THE RUN'S END WAITS ON THE TASKS IT OPENED ALONGSIDE (`continue: 'alongside'`): each still open holds the end under its
+    // own record, where its settlement meets it (`releaseHeldEnd`). A task this run never opened, or one already settled,
+    // holds nothing. A record that cannot be written ends the run now rather than leave it never ending.
+    // A TASK THE RUN RECORDS AS OPENED IS HELD ON WITHOUT A READ: its record meets its settlement in either order, so a read
+    // that fails is never taken for a task that is gone.
+    holdEnd: async (step, alongside, transitions) => {
+      const settled: string[] = [];
+      // HOW EACH SETTLED, BY ITS STEP, so a resolve that moved the run on decides its ending (`runEndingAfterMove`).
+      const by: Record<string, string> = {};
+      for (const held of alongside) {
+        const taskId = eventTaskId(runKey, held);
+        if (!transitions.some((t) => t.step === held && t.outcome === TASK_STEP_OUTCOMES.opened)) {
+          const task = await getTask(taskId, ctx.channelArn, { consistent: true }).catch(() => null);
+          if (!task) continue;
+          const ended = settlementOutcome(task, machinesForTask(task));
+          if (ended) { settled.push(ended); by[held] = ended; continue; }
+        }
+        const met = await holdUntilEnded(HELD_RUN_RECORDS, alongsideEndWaitId(taskId), ctx.channelArn, runContinuation(step, transitions));
+        if ('held' in met) return 'held';
+        if ('came' in met) { settled.push(met.came); by[held] = met.came; continue; }
+        console.error('[Router][event-workflow] the run\'s end could not be held on its open task; the run ends now', { step: held });
+      }
+      return { free: settled, by };
+    },
+    // A JOIN HOLDS ON EACH PART ON THAT PART'S OWN RECORD (`wait: { join }`), its continuation marked with the part: an opened
+    // conversation's on the record its run's end meets (`tellOpener`), found by the link that step's hand-back carried; a task's
+    // on its join record, which its settlement meets (`meetJoin`). Ids only: the record holds references and the run's values.
+    holdJoinPart: async (step, part, kind, transitions) => {
+      let waitId: string;
+      if (kind === 'open') {
+        const child = openedConversationOf(ctx.values[openedLinkValue(part)], ctx.channelArn);
+        if (!child) {
+          console.warn('[Router][event-workflow] a join names an opened conversation this run holds no link to; the join fails', { step, part });
+          return 'failed';
+        }
+        waitId = childEndWaitId(child);
+      } else waitId = joinPartWaitId(eventTaskId(runKey, part));
+      const met = await holdUntilEnded(HELD_RUN_RECORDS, waitId, ctx.channelArn, runContinuation(step, [...transitions, { step: part, outcome: JOIN_PART }]));
+      if ('came' in met) return { came: met.came };
+      return 'held' in met ? 'held' : 'failed';
+    },
+    // A JOIN'S DEADLINE (tenet D6, one-shot, never a poll): its minutes, else the backstop a wait on an opened conversation has.
+    joinDeadline: async (step, join, transitions) => {
+      const wiring = deadlineWiringFor(ctx.channelArn);
+      if (!wiring) return false;
+      const waitId = joinDeadlineWaitId(runKey, step);
+      if (!(await holdRunWait({ waitId, channelArn: ctx.channelArn, continuation: runContinuation(step, transitions) })).claimed) return false;
+      const minutes = join.minutes ?? MAX_WAIT_MINUTES + 24 * 60;
+      await createTaskDeadlineSchedule(wiring, { kind: 'wait', channelArn: ctx.channelArn, taskId: waitId }, new Date(Date.now() + minutes * 60_000))
+        .catch((err) => console.warn('[Router][event-workflow] a join has no deadline; its parts still continue it', { step, errName: (err as Error)?.name }));
+      return true;
+    },
+    readClaims: (names) => readEventSteps({ runKey, channelArn: ctx.channelArn, steps: names }),
+    // A RUN A TASK ENDED MID-WAY (`endsRun`) IS ASKED ABOUT FROM ITS OWN END CLAIM, through the task service.
+    hasEnded: async () => (await readEventSteps({ runKey, channelArn: ctx.channelArn, steps: [RUN_END_CLAIM] }))?.[RUN_END_CLAIM] !== undefined,
+    // ONE ARCHIVE FACT PER RUN'S END (WT62), put by the task service, the one holder of the stream's grant.
+    ended: async (disposition, steps, ending) => {
+      const origin = edition.origin;
+      await recordRunEnded({
+        channelArn: ctx.channelArn, runKey, workflow: name, trigger: ctx.event, disposition, steps,
+        ...(origin ? { originConfigId: origin.configId } : {}),
+        ...(ctx.requester ? { personId: personIdFromArn(ctx.requester) } : {}),
+        ...processFactFields(ctx.process),
+      });
+      // A CONVERSATION A WORKFLOW OPENED TELLS THE ONE THAT OPENED IT that its run ended (`wait: { child: 'ended' }`).
+      if (ctx.event === 'conversation-opened' && ctx.values.openedBy === 'workflow') await tellOpener(ctx.channelArn, ending);
+    },
+    // A RUN A RESOLVE MOVED ON ENDS HOLDING NOTHING OPEN: its end claimed, each live task it opened is cancelled `run-ended`
+    // through the task service, and none of their settlements continues it (`hasEnded`).
+    endTasks: async () => {
+      const cancelled = await endRunTasks(ctx.channelArn, runKey);
+      if (!cancelled) console.error('[Router][event-workflow] a run that moved on ended and could not cancel its open tasks', { classification: STATIC_CLASSIFICATION });
+    },
+    // A PRIVATE REQUEST'S WITHHELD STEP IS TOLD TO THE PERSON WHO ASKED, AND TO NOBODY ELSE (ADR-067 WT110).
+    withheld: async (step, transitions) => {
+      if (!ctx.requester) return;
+      await sayWorkflowSend({
+        channelArn: ctx.channelArn, botArn: who.botArn, assistant: who.assistant, workflow: name, event: ctx.event, step,
+        template: 'workflow-step-withheld', values: {}, to: [ctx.requester], runKey, transitions, variables: who.variables, eventValues, process: ctx.process,
+      }).catch(() => undefined);
+    },
   };
+}
+
+/**
+ * THE MEETING A WORKFLOW'S START BEGAN IN THIS ROOM, read from the records after a start that was not answered: the room's
+ * meeting conversation, and its running meeting where this assistant's workflow started it within the start's own time.
+ * Null where none is recorded, or the records cannot be read.
+ */
+async function meetingThisStepStarted(room: string, botId: string): Promise<{
+  meetingId: string; meetingConversationArn: string; meeting: { createdAt: string; ringSeconds?: number };
+} | null> {
+  if (!botId) return null;
+  const roomRow = await getChannelContext(room, { consistent: true }).catch(() => null);
+  const meetingConversationArn = roomRow?.meetingConversation?.channelArn || room;
+  const row = meetingConversationArn === room ? roomRow : await getChannelContext(meetingConversationArn, { consistent: true }).catch(() => null);
+  const a = row?.activeMeeting;
+  const fresh = a && Date.now() - Date.parse(a.createdAt) < 2 * MEETING_RUN_TIMEOUT_SECONDS * 1000;
+  if (!a || !fresh || a.startedVia !== 'workflow' || a.createdBy !== botId) return null;
+  return { meetingId: a.meetingId, meetingConversationArn, meeting: { createdAt: a.createdAt, ...(a.ringSeconds !== undefined ? { ringSeconds: a.ringSeconds } : {}) } };
+}
+
+/**
+ * A WORKFLOW STARTS THE CONVERSATION'S MEETING (`start_meeting`). Three acts, in order:
+ *  1. The meeting is started, or the running one found, by the Meetings stack's run entry (`MEETING_RUN_FUNCTION`), which
+ *     reads the conversation's classification itself and holds the meeting in its own conversation, opened from this one
+ *     for nobody (FR27); this room's members join it from here.
+ *  2. When this start created the meeting, every member with the app open hears a ring: a non-persistent control message
+ *     as this assistant (`meeting-ring.ts`), in the meeting's own conversation, which the parent conversation's people are members of. A meeting already running rings nobody again. A ring that cannot be sent is
+ *     logged and the step goes on, because the room's notice says the same thing.
+ *  3. The room is told, in the step's message template, with the link to the meeting's conversation as `meeting_link`, and with `email` every
+ *     member is emailed it through the notification bridge, its button opening the meeting window.
+ * Answers the link once the meeting runs and the room was told, else `failed`.
+ */
+async function startMeetingStep(args: {
+  channelArn: string; botArn: string; assistant: string; workflow: string; event: WorkflowEvent; step: string; runKey: string;
+  transitions: EventTransition[]; def: MeetingAction; variables?: Readonly<Record<string, VersionVariable>>;
+  eventValues?: Readonly<Record<string, VariableValue>>; edition?: { originConfigId?: string; workflowHash?: string; trigger?: RunTrigger };
+  process?: RunProcess;
+}): Promise<{ link: string } | 'failed'> {
+  const fn = process.env.MEETING_RUN_FUNCTION;
+  if (!fn) return 'failed';
+  let started: MeetingRunAnswer = {};
+  let reached = true;
+  try {
+    started = await startConversationMeeting(fn, args.channelArn, botIdFromArn(args.botArn), args.def.ringSeconds);
+  } catch (err) {
+    console.error('[Router][event-workflow] the meeting start was not answered', { step: args.step, errName: (err as Error)?.name });
+    reached = false;
+  }
+  // A START THAT WAS NOT ANSWERED MAY HAVE STARTED THE MEETING: the step's claim keeps it from running again, so the
+  // record decides. A meeting this assistant's workflow started in this room is announced as this step's, with what is
+  // left of its ring; with none, the step fails.
+  let recovered: Awaited<ReturnType<typeof meetingThisStepStarted>> = null;
+  if (!reached || (!started.ok && started.code === 'ENTRY_FAILED')) {
+    recovered = await meetingThisStepStarted(args.channelArn, botIdFromArn(args.botArn) ?? '');
+    if (recovered) started = { ok: true, created: false, meetingId: recovered.meetingId, meetingConversationArn: recovered.meetingConversationArn };
+  }
+  if (!started.ok) {
+    console.warn('[Router][event-workflow] the meeting was not started', { step: args.step, code: started.code });
+    return 'failed';
+  }
+  // THE RING IS THE LENGTH THE MEETING RECORDS (the run entry's answer), or what is left of it for a start found in the record.
+  const ring = recovered ? ringLeft(recovered.meeting) : ringOnStart(started.created, started.ringSeconds);
+  // THE RING IS THE MEETING'S, in its own conversation, which everyone in the parent conversation is a member of from its opening.
+  const ringIn = started.meetingConversationArn || args.channelArn;
+  if (ring) try {
+    // THE RING IS SPOKEN AS THIS ASSISTANT, which the router records before it sends, as every message a run posts is.
+    await speakingAs({ botArn: args.botArn, channelArn: ringIn, purpose: 'event' }, () => sendChannelMessage(chimeClient, {
+      ChannelArn: ringIn,
+      Content: ring,
+      Type: ChannelMessageType.CONTROL,
+      Persistence: ChannelMessagePersistenceType.NON_PERSISTENT,
+      ChimeBearer: args.botArn,
+      ClientRequestToken: randomUUID(),
+    }));
+  } catch (err) {
+    console.warn('[Router][event-workflow] the meeting ring could not be sent; the room is still told', { step: args.step, errName: (err as Error)?.name });
+  }
+  // The room is told as a person's start tells it: an incident room's call by its alarm, unless the step names its notice.
+  const record = await getChannelContext(args.channelArn, { consistent: true }).catch(() => null);
+  const meetingArn = started.meetingConversationArn || args.channelArn;
+  const card = await meetingStartedCard(meetingArn, record);
+  // THE NOTICE IS THE MEETING'S STARTED CARD, as a person's start posts it, so an app open in the room reads the meeting
+  // as running after its ring ends. Its id is the one the run entry started or found.
+  const meetingId = started.meetingId;
+  // THE RING'S END, where this start rang: the card rings a person of the room the ring did not reach.
+  const ringSeconds = ring ? parseRing(ring) : null;
+  const ringUntil = ringSeconds ? new Date(Date.now() + ringSeconds * 1000).toISOString() : undefined;
+  const told = await sayWorkflowSend({
+    channelArn: args.channelArn, botArn: args.botArn, assistant: args.assistant, workflow: args.workflow, event: args.event, step: args.step,
+    template: args.def.notice ?? card.template, values: card.values, to: [], runKey: args.runKey,
+    transitions: args.transitions, variables: args.variables, eventValues: args.eventValues, edition: args.edition, process: args.process,
+    ...(args.def.email ? { emailKind: 'conversation' as const, emailRoom: true, emailLink: 'meeting' as const } : {}),
+    ...(isMeetingId(meetingId) ? { cardMetadata: meetingCardMetadata('meeting-started', meetingId, meetingArn, ringUntil ? { ringUntil } : {}) } : {}),
+  });
+  return told ? { link: card.values[MEETING_LINK_VALUE] } : 'failed';
 }
 
 /**
@@ -3022,7 +3508,7 @@ export function eventRunDeps(
  */
 async function offerIntakeStep(args: {
   channelArn: string; botArn: string; assistant: string; personArn: string; workflow: string; step: string;
-  event: WorkflowEvent; runKey: string; transitions: EventTransition[];
+  event: WorkflowEvent; runKey: string; transitions: EventTransition[]; process?: RunProcess;
 }): Promise<'started' | 'skipped' | 'failed'> {
   try {
     const personId = personIdFromArn(args.personArn);
@@ -3040,7 +3526,7 @@ async function offerIntakeStep(args: {
     if (!gate || gate.onboarded) return 'skipped';
     const toAsk = intakeAfterChecking(config, { ...facts, profileFacts: gate.facts, profilePreferences: gate.preferences });
     if (!toAsk) return 'skipped';
-    const started = startIntake({ ...toAsk, words: await wordsOf(args.assistant) }, '');
+    const started = startIntake({ ...toAsk, words: await wordsOf(args.assistant, { channelArn: args.channelArn }) }, '');
     const recorded = await startOnboardingIntake(args.channelArn, { ...started.state, subject: personId });
     if (recorded === 'busy') {
       console.log('[Router][event-workflow] another person\'s intake is in progress here; this one is offered in their next conversation', { step: args.step });
@@ -3049,23 +3535,21 @@ async function offerIntakeStep(args: {
     if (recorded !== 'started') return 'failed';
     const content = started.reply.trim();
     if (!content) return 'failed';
-    await speakAsRoutedAssistant(
-      { routeId: `${SPEAK_ROUTE_PREFIX}event-${randomUUID()}`, botArn: args.botArn, classification: STATIC_CLASSIFICATION, tableName: TURN_ROUTING_TABLE, channelArn: args.channelArn },
-      { ddb: routingDdb },
-    );
-    await sendInParts(chimeClient, {
+    const sent = await speakingAs({ botArn: args.botArn, channelArn: args.channelArn, purpose: 'event' }, () => sendInParts(chimeClient, {
       ChannelArn: args.channelArn,
       text: content,
       Type: ChannelMessageType.STANDARD,
       Persistence: ChannelMessagePersistenceType.PERSISTENT,
       ChimeBearer: args.botArn,
-      Metadata: JSON.stringify({
+      // A RUN CARD IS HELD WITHIN THE SERVICE'S METADATA CAP (`withinMetadataCap`): its oldest moves give way.
+      Metadata: JSON.stringify(withinMetadataCap({
         ...JSON.parse(botMessageMetadata({ agentType: args.assistant, classification: STATIC_CLASSIFICATION, turnKind: 'notification' }, { targetedSender: args.personArn })),
         eventStep: { workflow: args.workflow, step: args.step, event: args.event, outcome: 'posted' },
         eventRun: { runKey: args.runKey, transitions: args.transitions },
-      }),
+      }, CHIME_METADATA_MAX)),
       Target: [{ MemberArn: args.personArn }],
-    });
+    }));
+    await recordRunMessageProcess(sent, args.channelArn, args.process);
     return 'started';
   } catch (err) {
     console.warn('[Router][event-workflow] the intake could not be offered', { step: args.step, errName: (err as Error)?.name });
@@ -3081,27 +3565,25 @@ async function offerIntakeStep(args: {
  */
 async function postWelcomeOpening(args: {
   channelArn: string; botArn: string; assistant: string; content: string; workflow: string; step: string;
-  event: WorkflowEvent; runKey: string; transitions: EventTransition[];
+  event: WorkflowEvent; runKey: string; transitions: EventTransition[]; process?: RunProcess;
 }): Promise<boolean> {
   try {
     const content = args.content.trim();
     if (!content) return false;
-    await speakAsRoutedAssistant(
-      { routeId: `${SPEAK_ROUTE_PREFIX}event-${randomUUID()}`, botArn: args.botArn, classification: STATIC_CLASSIFICATION, tableName: TURN_ROUTING_TABLE, channelArn: args.channelArn },
-      { ddb: routingDdb },
-    );
-    await sendInParts(chimeClient, {
+    const sent = await speakingAs({ botArn: args.botArn, channelArn: args.channelArn, purpose: 'event' }, () => sendInParts(chimeClient, {
       ChannelArn: args.channelArn,
       text: content,
       Type: ChannelMessageType.STANDARD,
       Persistence: ChannelMessagePersistenceType.PERSISTENT,
       ChimeBearer: args.botArn,
-      Metadata: botMessageMetadata({ agentType: args.assistant, classification: STATIC_CLASSIFICATION }, {
+      // A RUN CARD IS HELD WITHIN THE SERVICE'S METADATA CAP (`withinMetadataCap`): its oldest moves give way.
+      Metadata: JSON.stringify(withinMetadataCap(JSON.parse(botMessageMetadata({ agentType: args.assistant, classification: STATIC_CLASSIFICATION }, {
         turnKind: 'welcome',
         eventStep: { workflow: args.workflow, step: args.step, event: args.event, outcome: 'posted' },
         eventRun: { runKey: args.runKey, transitions: args.transitions },
-      }),
-    });
+      })), CHIME_METADATA_MAX)),
+    }));
+    await recordRunMessageProcess(sent, args.channelArn, args.process);
     return true;
   } catch (err) {
     console.warn('[Router][event-workflow] the opening of the welcome could not be posted', { step: args.step, errName: (err as Error)?.name });
@@ -3110,16 +3592,481 @@ async function postWelcomeOpening(args: {
 }
 
 /**
- * A TASK STEP OPENS ITS TASK (ADR-063 decisions 1 and 2). The references resolve as the run's audiences do: `for` and a
- * person `by` to exactly one member, an assistant role to the room's live assistant of this classification holding it
- * (`stepTaker`, as an agent step's `as`). Nobody to resolve is `no-worker`, and nothing is written. The task service
- * writes the task, and refuses an assistant outside this classification. Where its first holder is a person, they are
- * told privately in the run assistant's `workflow-task-assigned` template, with the card when the state offers
- * choices, and emailed as a `task` notice; an assistant holder is named ready by the task service itself.
+ * WHAT A TASK STEP'S DEADLINE MEANS FOR THE TASK IT OPENS (WT21), read once for every task step, the request's own included.
+ * Its kind decides what the time does: a timeout ends the task (`deadlineAt`), a due time is shown on it (`dueBy`), and
+ * a reminder repeats (`remind`). At a recorded time, the time is one an earlier task of the run recorded, at least the
+ * shortest deadline from now; a time the run does not hold is `unreadable`, and the step fails. The row outlives a timeout by
+ * a day, so its firing and the settlement find it, and a due time or a reminder keeps it 45 days (WT26). A step with no
+ * deadline sets no lifetime: its row keeps the task's default.
  */
+export function taskStepDeadline(def: Pick<TaskStep, 'deadline'>, values: Record<string, string>, nowSeconds = Math.floor(Date.now() / 1000)):
+  | 'unreadable'
+  | { kind: 'timeout' | 'due' | 'remind'; dueAt?: number; deadlineAt?: number; dueBy?: string; remind?: { everyMinutes: number; times: number }; ttlSeconds?: number } {
+  const kind = def.deadline?.kind ?? 'timeout';
+  if (!def.deadline) return { kind };
+  const recordedAt = def.deadline.at !== undefined ? Date.parse(values[def.deadline.at] ?? '') : undefined;
+  if (recordedAt !== undefined && !Number.isFinite(recordedAt)) return 'unreadable';
+  // A RECORDED TIME FALLS WITHIN THE STEP'S BOUNDS: no sooner than the shortest deadline, no later than the longest, so the
+  // row, its run's claims and its schedule all outlive it (WT26).
+  const dueAt = recordedAt !== undefined
+    ? Math.min(Math.max(Math.floor(recordedAt / 1000), nowSeconds + MIN_TASK_DEADLINE_MINUTES * 60), nowSeconds + MAX_TASK_DEADLINE_MINUTES * 60)
+    : nowSeconds + (def.deadline.afterMinutes ?? 0) * 60;
+  return {
+    kind, dueAt,
+    ...(kind === 'timeout' ? { deadlineAt: dueAt, ttlSeconds: Math.max(60, dueAt - nowSeconds) + 24 * 3600 } : { ttlSeconds: 45 * 24 * 3600 }),
+    ...(kind === 'due' ? { dueBy: new Date(dueAt * 1000).toISOString() } : {}),
+    ...(kind === 'remind' && def.deadline.afterMinutes ? { remind: { everyMinutes: def.deadline.afterMinutes, times: def.deadline.times ?? DEFAULT_TASK_REMINDERS } } : {}),
+  };
+}
+
+/**
+ * THE RUN'S EDITION, computed once wherever the run records itself (WT60, WT118): the version it started on, its
+ * workflow's hash, and what started it, which each declared intent's population is broken down by.
+ */
+function runEdition(who: WorkflowRunner, ctx: EventRunContext, name: string): { origin?: RunOrigin; workflowHash?: string; trigger: RunTrigger } {
+  const origin = runOriginOf(who.version);
+  const hash = runWorkflowHash(who.version, ctx.event, name);
+  const trigger: RunTrigger = ctx.event === INTENT_TRIGGER ? (ctx.trigger ?? 'person') : 'event';
+  return { ...(origin ? { origin } : {}), ...(hash ? { workflowHash: hash } : {}), trigger };
+}
+
+/** The edition's fields a run reference carries. */
+const runRefEdition = (e: ReturnType<typeof runEdition>) => ({ ...(e.origin ? { origin: e.origin } : {}), ...(e.workflowHash ? { workflowHash: e.workflowHash } : {}), trigger: e.trigger });
+
+/**
+ * A CALL TRIED AGAIN ONLY ON A FAULT: `undefined` is a fault (the answer was lost) and is tried again, with backoff, up to
+ * `attempts` times; anything else, `null` (a refusal) included, is the answer.
+ */
+async function retryOnFault<T>(call: () => Promise<T | undefined>, attempts = 3): Promise<T | undefined> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt) await new Promise<void>((r) => setTimeout(r, 200 * attempt));
+    const out = await call();
+    if (out !== undefined) return out;
+  }
+  return undefined;
+}
+
+/** What started a run another assistant's run asked for (WT118): a run trigger, not a turn's trigger kind. */
+const ASKED_BY_ASSISTANT: RunTrigger = 'assistant';
+
+/** The id an asked run is keyed by (WT118): the asking run and its step, so one step asks once. */
+const askedRunCorrelation = (askedBy: Pick<WorkflowRunRef, 'runKey' | 'step'>): string => `${askedBy.runKey}#${askedBy.step}`;
+
+/**
+ * THE RUN THAT ASKS, as the owning assistant's task records it (WT118): its ids, the values its own sends render, and when it
+ * goes on. Nothing here shapes the owner's work: no deadline, no reminder, no form.
+ */
+function askingRunOf(args: { name: string; step: string; def: TaskStep; ctx: EventRunContext; who: WorkflowRunner; runKey: string; edition: ReturnType<typeof runEdition> }): WorkflowRunRef {
+  const { ctx, who } = args;
+  return {
+    runKey: args.runKey, workflow: args.name, step: args.step, event: ctx.event, botArn: who.botArn,
+    ...runIdentity(ctx),
+    values: ctx.values, ...runRefEdition(args.edition),
+    ...(args.def.continue === 'opened' ? { continueOn: 'entered' as const } : {}),
+  };
+}
+
+/**
+ * WHAT THE ASKING ASSISTANT SAYS IT NEEDS (WT118): its own message template, rendered with the run's values in the
+ * conversation's language, as a send to the room would be. Undefined where the step names no ask or it renders nothing.
+ */
+async function renderAsk(args: {
+  channelArn: string; assistant: string; template: string; values: Record<string, string>;
+  variables?: Readonly<Record<string, VersionVariable>>; eventValues?: Readonly<Record<string, VariableValue>>;
+}): Promise<string | undefined> {
+  const held = routerVariables(args.variables);
+  const resolver = { ...held, values: { ...held.values, ...(args.eventValues ?? {}) } };
+  const template = await loadNamedTemplate({ classification: STATIC_CLASSIFICATION, assistant: args.assistant, name: args.template }, 'message', undefined,
+    { lookup: resolver.lookup, audience: 'room', mentions: [], holds: routerHolds(resolver, args.channelArn, 'room') });
+  if (!template) return undefined;
+  const languages = template.variants ? await sendLanguages(args.channelArn, []) : {};
+  const { content } = await renderRunWritten({ written: chooseLanguage(template, { audience: 'room', ...languages }).written, resolver, audience: 'room', channelArn: args.channelArn, to: [], values: args.values });
+  return content || undefined;
+}
+
+/**
+ * A RUN'S WRITTEN TEMPLATE, RENDERED (ADR-060, ADR-062): its fields resolved under the readers' audience, with the role a
+ * creating application asserted for the one person it is addressed to (`host:role`, member trust, inserted for that person
+ * and never deciding), then the run's own values. Shared by a send and an ask, so both say a template the same way.
+ */
+async function renderRunWritten(args: {
+  written: Parameters<typeof renderMessageTemplate>[0]; resolver: ReturnType<typeof routerVariables>; audience: 'addressed' | 'room';
+  channelArn: string; to: string[]; values: Record<string, string>;
+}): Promise<{ rendered: ReturnType<typeof renderMessageTemplate>; content: string }> {
+  const hostRole = args.to.length === 1 && Object.values(args.written.fields ?? {}).includes('host:role')
+    ? await hostRoleOf(args.channelArn, args.to[0]) : undefined;
+  const withHost = hostRole ? { ...args.resolver, values: { ...args.resolver.values, 'host:role': hostRole } } : args.resolver;
+  const resolved = resolveTemplateFields(args.written.fields ?? {}, { ...withHost, site: { callSite: turnCallSite(undefined, args.channelArn), audience: args.audience, section: 'chat' } });
+  const rendered = renderMessageTemplate(args.written, { ...resolved, ...args.values }, { refusedValue: 'empty' });
+  return { rendered, content: rendered.ok ? (rendered.sections.chat ?? '').trim() : '' };
+}
+
+/**
+ * A REQUEST TO ANOTHER ASSISTANT'S ROLE (WT118, DESIGN-WORKFLOWS-AND-TASKS section 1). The owning assistant's own run does
+ * the work: its served version's workflow for the intent (or the standard one, where it declares none), its task steps,
+ * its deadline, models, tools and grants, started as a request whose trigger is another assistant's run. The task its own
+ * step opens carries what was asked and the asking run, which is continued on how the task ended and handed nothing it
+ * recorded. Who sees the work follows the asking run's privacy, as a person's request follows their message's.
+ */
+async function askAnother(args: {
+  name: string; step: string; def: TaskStep; ctx: EventRunContext; who: WorkflowRunner; runKey: string;
+  transitions: EventTransition[]; eventValues?: Readonly<Record<string, VariableValue>>;
+  taker: { botArn: string; assistant: string }; requesterArn: string | undefined; edition: ReturnType<typeof runEdition>;
+  /** Whether the intent opens a task, as its owner advertises it; a single-turn intent is one turn of the owner's. */
+  multiStep: boolean;
+}): Promise<'opened' | 'failed'> {
+  const { def, ctx, who, taker } = args;
+  // NO REQUEST LOOPS (WT118): an assistant this chain already asked for the same intent is not asked again, and a chain
+  // never grows past its bound, so two assistants can never ask each other without end, nor run up a model bill doing so.
+  const chain = [...(ctx.askChain ?? []), `${who.assistant}:${args.name}`];
+  const target = `${taker.assistant}:${def.machine}`;
+  if (chain.includes(target) || chain.length >= MAX_ASK_CHAIN) {
+    console.warn('[Router][event-workflow] a request would loop or go past the longest chain of requests; nobody is asked, and the step fails', { step: args.step, depth: chain.length, repeats: chain.includes(target) });
+    return 'failed';
+  }
+  if (ctx.event === INTENT_TRIGGER && !ctx.runTaskId) {
+    console.warn('[Router][intent-run] a request to another assistant comes before the run\'s own task; the step fails', { step: args.step });
+    return 'failed';
+  }
+  const served = await servedWelcomeVersion(taker.assistant, ctx.channelArn).catch(() => undefined);
+  if (!served) return 'failed';
+  const asked = def.ask ? await renderAsk({
+    channelArn: ctx.channelArn, assistant: who.assistant, template: def.ask.template, values: ctx.values, variables: who.variables,
+    ...(args.eventValues ? { eventValues: args.eventValues } : {}),
+  }).catch(() => undefined) : undefined;
+  if (def.ask && !asked) console.warn('[Router][event-workflow] the ask names no message template this assistant can say; the request is the intent alone', { step: args.step, template: def.ask.template });
+  const askedBy = askingRunOf(args);
+  // A SINGLE-TURN INTENT IS ONE TURN OF THE OWNER'S (WT118): its own session, version, instructions and tools, answering in
+  // the conversation, with its own workflow for the intent run beside it where it declares one. The turn hands the asking
+  // run how it went. It opens no task, so nothing rests in the room afterwards.
+  if (!args.multiStep) {
+    const correlation = askedRunCorrelation(askedBy);
+    if (served.version.intentWorkflows?.[def.machine]) {
+      await startIntentRun({
+        intent: def.machine, channelArn: ctx.channelArn, botArn: taker.botArn, assistant: taker.assistant, version: served.version, requesterArn: args.requesterArn,
+        correlationId: correlation, privateRun: !!ctx.privateRun, askedBy, trigger: ASKED_BY_ASSISTANT, served, askChain: chain,
+        open: async () => { throw new Error('a single-turn intent opens no task'); },
+      }).catch(() => undefined);
+    }
+    // A PRIVATE RUN'S ANSWER REACHES ONLY ITS REQUESTER, and one with none has nobody to answer, so nobody is asked.
+    if (ctx.privateRun && !ctx.requester) return 'failed';
+    const origin = runOriginOf(served.version);
+    const dispatched = await dispatchEventAgentStep({
+      runKey: args.runKey, workflow: args.name, step: args.step, event: ctx.event, channelArn: ctx.channelArn, botArn: taker.botArn,
+      ...runIdentity(ctx),
+      values: ctx.values, transitions: args.transitions,
+      ...(ctx.inviter ? { inviter: ctx.inviter } : {}),
+      ...(served.variantProfile ? { variantProfile: served.variantProfile } : {}),
+      ...(args.edition.origin ? { origin: args.edition.origin } : {}),
+      asked: {
+        intent: def.machine, ask: asked ?? '', askerBotArn: who.botArn, to: ctx.privateRun && ctx.requester ? [ctx.requester] : [],
+        // THE PERSON THE REQUEST IS FOR (the step's `for`, resolved from this run's own recorded holders): the one person a
+        // proposal card the asked turn makes is addressed to, so the incident's lead confirms adding its account teams.
+        ...(args.requesterArn ? { for: args.requesterArn } : {}),
+        run: { runKey: intentRunKey(correlation, taker.assistant), ...(origin ? { origin } : {}), trigger: ASKED_BY_ASSISTANT },
+      },
+    });
+    return dispatched ? 'opened' : 'failed';
+  }
+  const ownerId = principalIdFromArn(taker.botArn);
+  const machineDef = versionDeclaredMachines(served.version.intentPack)?.[def.machine];
+  const originConfigId = originConfigIdOf(served.version);
+  const task = await startIntentRun({
+    intent: def.machine, channelArn: ctx.channelArn, botArn: taker.botArn, assistant: taker.assistant, version: served.version,
+    requesterArn: args.requesterArn, correlationId: askedRunCorrelation(askedBy), privateRun: !!ctx.privateRun,
+    askedBy, trigger: ASKED_BY_ASSISTANT, served, askChain: chain,
+    open: async (run, extra) => {
+      const opened = await openWorkflowTask({
+        channelArn: ctx.channelArn, taskId: eventTaskId(args.runKey, args.step), machine: def.machine,
+        ...(machineDef ? { machineDef } : {}), ...(originConfigId ? { originConfigId } : {}),
+        ...(extra.dueBy ? { dueBy: extra.dueBy } : {}),
+        ...(extra.ttlSeconds && run.deadlineAt === undefined ? { keepForSeconds: extra.ttlSeconds } : {}),
+        ...(args.requesterArn ? { requesterArn: args.requesterArn } : {}),
+        worker: { id: ownerId, type: 'assistant' }, assistantId: ownerId,
+        visibility: ctx.privateRun ? 'private' : 'conversation',
+        workflowRun: run, askedBy, ...(asked ? { requestExcerpt: asked } : {}),
+      });
+      if (!opened) throw new Error('the request\'s task was not written');
+      return opened;
+    },
+  });
+  return task ? 'opened' : 'failed';
+}
+
+/**
+ * A TASK STEP OPENS ITS TASK (ADR-063 decisions 1 and 2). The references resolve as the run's audiences do: `for` and a
+ * person `by` to exactly one member, an assistant role to the room's one live assistant of this classification holding
+ * it (`roleHolder`). Nobody to resolve is `no-worker`, and nothing is written. Another assistant's role is asked
+ * (`askAnother`, WT118). The task service writes the task, and refuses an assistant outside this classification. Where
+ * its first holder is a person, they are told privately in the run assistant's `workflow-task-assigned` template, with
+ * the card when the state offers choices, and emailed as a `task` notice; an assistant holder is named ready by the
+ * task service itself.
+ */
+/**
+ * A WORKFLOW'S MOVE STEP (WT90): the subject the run's message changed leaves this room, through the move the platform's
+ * answer makes (`moveSubject`), as the step's type, with the message's audience (WT92): the room's people now, or the
+ * sender alone where their message was private. The person is told where, privately, since the link navigates whoever
+ * receives it. It acts on a speak session of its own, as every step that posts does, because a run also reaches it from a
+ * continuation that no turn holds a session for; that session's routing record is what the move's data-plane record names.
+ * The move stands at once, so the run goes on carrying the child's link.
+ */
+async function openMovedSubject(args: {
+  name: string; step: string; def: OpenStep; ctx: EventRunContext; who: WorkflowRunner; runKey: string;
+  transitions: EventTransition[]; edition: ReturnType<typeof runEdition>;
+}): Promise<'no-person' | 'failed' | { opened: string }> {
+  const { def, ctx, who } = args;
+  const sender = ctx.eventPerson;
+  const messageId = ctx.values.message;
+  if (!sender || !messageId) return 'no-person';
+  const kind: SubjectChange['kind'] = ctx.values.kind === 'redirect' && ctx.values.rival ? 'redirect' : 'confirm';
+  try {
+    return await speakingAs({ botArn: who.botArn, channelArn: ctx.channelArn, purpose: 'event' }, async (): Promise<'failed' | { opened: string }> => {
+      let memberArns: string[] = [];
+      if (kind === 'confirm') {
+        const size = await resolveChannelSize(chimeClient, ctx.channelArn, who.botArn).catch(() => null);
+        if (!size || size.refused || size.unknown) return 'failed';
+        const privately = ctx.values.private === '1';
+        // EVERY PERSON OR NONE ON THE ROOM'S MOVE: a roster cut at its page bound would leave people out of their own subject's
+        // conversation. A private move carries only its sender, so a cut roster that holds them is enough.
+        if (size.truncated && !privately) return 'failed';
+        // THE PERSON IT MOVES IS STILL HERE: a run can reach its move long after the message, and creating a room adds them to it.
+        if (!(size.members ?? []).some((m) => m.arn === sender)) return 'failed';
+        if (!privately) memberArns = (size.members ?? []).filter((m) => !m.isBot && m.arn !== sender).map((m) => m.arn);
+      }
+      // THE REPLY THAT SAID MOVE, read from the run's own offer step: the moved exchange is the message, the offer and it.
+      const answer = await offerAnswerOf(workflowFor(who.version?.eventWorkflows, args.name), args.runKey, args.transitions, ctx.channelArn);
+      const moved = await moveSubject({
+        kind, channelArn: ctx.channelArn, classification: STATIC_CLASSIFICATION, botArn: who.botArn, senderArn: sender,
+        originatingMessageId: messageId, answeringMessageId: answer?.messageId ?? '',
+        // NO OFFER IN THE RUN: the workflow moved it unasked, and the record says so (migration 101).
+        ...(answer ? {} : { unasked: true }),
+        ...(ctx.values.private === '1' ? { privateMessage: true } : {}),
+        ...(ctx.values.driftEvent ? { driftEventId: ctx.values.driftEvent } : {}),
+        ...(kind === 'redirect' ? { rivalConversationArn: ctx.values.rival } : {}),
+        words: await wordsOf(who.assistant, { channelArn: ctx.channelArn }).catch(() => undefined),
+        ...(def.type ? { typeKey: def.type } : {}),
+        ...(memberArns.length ? { memberArns } : {}),
+        // THE NEW CONVERSATION'S FIRST TOPIC IS WRITTEN ON A ROUTE THAT NAMES IT, since the turn data plane holds a route to its own room.
+        inNewConversation: (child, work) => speakingAs({ botArn: who.botArn, channelArn: child, purpose: 'event' }, work),
+      });
+      if (!moved) return 'failed';
+      // THE MOVE HAS HAPPENED: nothing after it may report it as failed. The person is told where, best-effort, and the run
+      // goes on carrying the link whatever that does.
+      const link = `?${conversationRef(moved.channelArn.split('/').pop() || moved.channelArn)}`;
+      try {
+        const sent = await sendInParts(chimeClient, {
+          ChannelArn: ctx.channelArn,
+          text: moved.reply,
+          Type: ChannelMessageType.STANDARD,
+          Persistence: ChannelMessagePersistenceType.PERSISTENT,
+          ChimeBearer: who.botArn,
+          // A RUN CARD IS HELD WITHIN THE SERVICE'S METADATA CAP (`withinMetadataCap`): its oldest moves give way.
+          Metadata: JSON.stringify(withinMetadataCap({
+            ...JSON.parse(botMessageMetadata({ agentType: who.assistant, classification: STATIC_CLASSIFICATION, turnKind: 'notification' }, { targetedSender: sender })),
+            eventStep: { workflow: args.name, step: args.step, event: ctx.event, outcome: 'opened' },
+            eventRun: { runKey: args.runKey, transitions: args.transitions, ...runRefEdition(args.edition) },
+          }, CHIME_METADATA_MAX)),
+          Target: [{ MemberArn: sender }],
+        });
+        await recordRunMessageProcess(sent, ctx.channelArn, ctx.process);
+      } catch (err) {
+        console.warn('[Router][event-workflow] the subject moved, and the person could not be told where; the move stands', { step: args.step, message: (err as Error)?.message });
+      }
+      return { opened: link };
+    });
+  } catch (err) {
+    console.warn('[Router][event-workflow] the subject could not be moved; the step fails', { step: args.step, message: (err as Error)?.message });
+    return 'failed';
+  }
+}
+
+/**
+ * Whether the run asked before it moved, and the message that answered: its own task step's task, read by the id the run
+ * gives it. Undefined where the run took no task step, so the move was made unasked. A task that cannot be read still
+ * counts as asked, with no answering message known.
+ */
+async function offerAnswerOf(wf: EventWorkflow | undefined, runKey: string, transitions: EventTransition[], channelArn: string): Promise<{ messageId: string } | undefined> {
+  const offerStep = [...transitions].reverse().find((t) => wf?.states[t.step]?.task?.notice)?.step;
+  if (!offerStep) return undefined;
+  const offer = await getTask(eventTaskId(runKey, offerStep), channelArn);
+  return { messageId: [...(offer?.stateHistory ?? [])].reverse().find((h) => h.messageId)?.messageId ?? '' };
+}
+
+/** An open offer of a subject change: its task, where it waits, and what the run recorded. */
+interface OpenSubjectOffer extends SubjectOffer { channelArn: string; state: string }
+
+/** Whether a task's current state offers `move` and `keep`, read from what the state declares and never a machine's name. */
+function offersMoveOrKeep(t: Parameters<typeof machinesForTask>[0] & { taskType?: string; taskState?: string }): boolean {
+  if (!t?.taskType || !t.taskState) return false;
+  const choices = machinesForTask(t)[t.taskType]?.states?.[t.taskState]?.choices ?? [];
+  return choices.includes('move') && choices.includes('keep');
+}
+/** IS THIS TASK AN OFFER A REPLY ANSWERS (WT89)? One a `subject-changed` run opened whose state offers the two, so a version's own offer machine is answered as the platform's is. */
+function isSubjectOffer(t: Task): boolean {
+  return t.workflowRun?.event === 'subject-changed' && offersMoveOrKeep(t);
+}
+
+/**
+ * The person's open offer in this conversation, from the live work the turn already read for them: a workflow task here
+ * whose state offers move and keep, read in full once to confirm it is a subject change's and to take what its run recorded.
+ */
+async function openSubjectOfferOf(live: readonly UserTask[] | undefined, personId: string, channelArn: string): Promise<OpenSubjectOffer | undefined> {
+  // EVERY TASK OFFERING THE TWO IS READ UNTIL ONE IS THIS PERSON'S SUBJECT CHANGE, since another workflow's may be listed first.
+  let t: Task | null = null;
+  for (const m of live ?? []) {
+    if (m.channelArn !== channelArn || !m.taskId.startsWith('evt-') || !offersMoveOrKeep(m)) continue;
+    const read = await getTask(m.taskId, channelArn);
+    if (read && isSubjectOffer(read) && read.assigneeType === 'user' && read.assigneeId === personId) { t = read; break; }
+  }
+  if (!t) return undefined;
+  const v = t.workflowRun?.values ?? {};
+  if (!t.taskState || typeof v.message !== 'string') return undefined;
+  return {
+    taskId: t.taskId, channelArn: t.channelArn, state: t.taskState, originatingMessageId: v.message,
+    kind: v.kind === 'redirect' ? 'redirect' : 'confirm',
+    ...(t.createdAt ? { createdAt: t.createdAt } : {}),
+    ...(typeof v.driftEvent === 'string' ? { driftEventId: v.driftEvent } : {}),
+    ...(typeof v.correlation === 'string' ? { correlationId: v.correlation } : {}),
+    ...(v.private === '1' ? { privateMessage: true } : {}),
+  };
+}
+
+/**
+ * RAISE `subject-changed` (WT88) as the room's assistant: the version's workflow for the room's type, else the platform's
+ * `drift`, run for the person whose message changed the subject. The run's values carry what detection found, and
+ * whether the message was private, which keeps the offer and the move to its sender (WT92). WHAT THE RUN DID IS READ FROM
+ * ITS OWN STEPS: an offer it opened, or the subject it moved. A run that did neither leaves the turn to be answered.
+ */
+async function raiseSubjectChanged(args: {
+  channelArn: string; botArn: string; assistant: string; senderArn: string; change: SubjectChange; privateMessage: boolean;
+  conversationType?: string;
+}): Promise<SubjectChangeRaised> {
+  const served = await servedWelcomeVersion(args.assistant, args.channelArn).catch(() => undefined);
+  const chosen = subjectChangedWorkflowOf(served?.version.eventWorkflows, args.conversationType);
+  const { change } = args;
+  const values: Record<string, string> = {
+    message: change.messageId, kind: change.kind,
+    ...(change.rivalConversationArn ? { rival: change.rivalConversationArn } : {}),
+    ...(change.driftEventId ? { driftEvent: change.driftEventId } : {}),
+    ...(change.correlationId ? { correlation: change.correlationId } : {}),
+    ...(args.privateMessage ? { private: '1' } : {}),
+  };
+  const out = await runWorkflowFor(chosen.name, chosen.workflow, {
+    event: 'subject-changed', channelArn: args.channelArn, eventPerson: args.senderArn, values,
+    // A PRIVATE MESSAGE'S CHANGE IS A PRIVATE RUN: a step that would reach anyone but its sender is withheld (decision 8).
+    ...(args.privateMessage ? { privateRun: true, requester: args.senderArn } : {}),
+  }, runnerOf(args.botArn, args.assistant, served), args.conversationType ? { conversationType: args.conversationType } : {});
+  if (!out.ran) return 'none';
+  // AN OFFER IS A TASK STEP WITH A NOTICE, which validation holds to the sender: another kind of task tells them nothing.
+  const opened = (taken: (step: typeof chosen.workflow.states[string] | undefined) => boolean) => out.steps.some((st) => st.outcome === 'opened' && taken(chosen.workflow.states[st.step]));
+  return opened((d) => !!d?.open) ? 'moved' : opened((d) => !!d?.task?.notice) ? 'offered' : 'none';
+}
+
+/**
+ * THE PERSON'S ANSWER TO THEIR OFFER (WT89), relayed to their task as a card press is (`advanceAsAssignee`): the task service
+ * takes it only for the task's assignee, in the state the offer was read in, along a choice that state declares, and closes
+ * the task. A move goes on IN THIS TURN, alone, so it is made and said before the turn ends and only a real failure is told;
+ * a kept subject is the task service's to continue, so the reply waits on nothing. The turn keeps its own session after.
+ */
+async function answerSubjectOffer(offer: OpenSubjectOffer, personId: string, answer: 'move' | 'keep', messageId: string): Promise<OfferAnswered> {
+  const relayed = await advanceAsAssignee({
+    taskId: offer.taskId, channelArn: offer.channelArn, callerPersonId: personId, state: offer.state, choice: answer,
+    ...(messageId ? { messageId } : {}),
+    ...(answer === 'move' ? { continuedByCaller: true } : {}),
+  });
+  // A YES THE SERVICE COULD NOT TAKE IS A FAILED MOVE, said as one. Any other refusal means no offer is open to answer.
+  if (!relayed.ok) return relayed.error === 'REFUSED' && answer === 'move' ? 'not-moved' : 'gone';
+  if (answer === 'keep') return 'kept';
+  const went = await keepingTheTurnsSession(() => handleTaskNaming({ kind: 'settled', channelArn: offer.channelArn, taskId: offer.taskId }));
+  return went.ran && !went.moveFailed ? 'moved' : 'not-moved';
+}
+
+/**
+ * WHETHER AN OPEN ASKED FROM THIS CONVERSATION IS REFUSED AS NESTED (WT120, DESIGN-PROCESSES O32): a leaf opens nothing; a
+ * conversation another one opened (a child) opens only a leaf; and a conversation whose opener was itself opened (a
+ * grandchild) opens nothing. A row that cannot be read throws (the step fails), and a child whose opener has no row is
+ * nested, so neither grows a chain. The one rule (`openIsNestedBy`), which the typed creator asks again for every open.
+ */
+export async function openIsNested(channelArn: string, openedType: string): Promise<boolean> {
+  return openIsNestedBy(channelArn, openedType, (arn) => readChannelContext(arn, { consistent: true }));
+}
+
+/**
+ * ASK THE CLASSIFICATION'S TYPED CREATOR FOR A STEP'S CHILD CONVERSATION (WT120), asynchronously: creating a room and
+ * filling it from its type outlasts what a turn may wait for, so the creator hands the run back (`continueRun`) when the
+ * child stands or could not. The creator takes no classification from here: it is pinned at deploy, and it refuses a
+ * parent at any other. A CHILD OPENS NO FURTHER CHILD BUT ONE OF A LEAF TYPE (`openIsNested`), and a leaf opens nothing, so
+ * no chain of rooms grows past one leaf below a child. An alarm's watch moves to the child, so the alarm's later changes run
+ * there and not here.
+ */
+
+async function openChildConversation(args: {
+  name: string; step: string; def: OpenStep; ctx: EventRunContext; who: WorkflowRunner; runKey: string;
+  transitions: EventTransition[]; edition: ReturnType<typeof runEdition>;
+}): Promise<'requested' | 'no-person' | 'nested' | 'failed'> {
+  const { def, ctx, who } = args;
+  const creator = process.env.TYPED_CREATOR_NAME;
+  if (!creator) return 'failed';
+  // THE TYPE'S OWN ROLE IS READ BY THE CREATOR, which holds the directory read; a person the run names is named here.
+  const typeRole = typeof def.for === 'object' && 'typeRole' in def.for ? def.for.typeRole : undefined;
+  const lead = typeRole ? undefined : audienceOf(def.for as EventAudience, ctx);
+  if (!typeRole && (!lead || lead === 'room' || lead.length !== 1)) return 'no-person';
+  try {
+    if (await openIsNested(ctx.channelArn, def.type)) return 'nested';
+    // THE CUSTOMER IMPACT A CARD OF THIS RUN RECORDED (O27) rides to the opened conversation's run, which reads it as data.
+    const impact = customerImpactOf(args.transitions, workflowFor(who.version?.eventWorkflows, args.name));
+    const continueRun: Omit<EventContinuation, 'outcome'> = {
+      runKey: args.runKey, workflow: args.name, step: args.step, event: ctx.event as WorkflowEvent, channelArn: ctx.channelArn, botArn: who.botArn,
+      values: impact ? { ...ctx.values, customerImpact: impact } : ctx.values, transitions: args.transitions,
+      ...runIdentity(ctx),
+      ...(runRefEdition(args.edition).origin ? { origin: runRefEdition(args.edition).origin } : {}),
+    };
+    await lambdaClient.send(new InvokeCommand({
+      FunctionName: creator,
+      InvocationType: InvocationType.Event,
+      Payload: Buffer.from(JSON.stringify({
+        detail: {
+          conversationType: def.type, concernedChannelArn: ctx.channelArn, continueRun,
+          ...(typeRole ? { forRole: typeRole } : { forUserArn: (lead as string[])[0] }),
+          ...(ctx.values.label ? { topicLabel: ctx.values.label } : {}), ...(ctx.values.summary ? { summary: ctx.values.summary } : {}),
+          // A LEAF TAKES NO WATCH: the alarm stays with the conversation working the incident, never its customer messaging.
+          ...(isLeafType(def.type) ? {} : ctx.alarm ? { watchesAlarm: ctx.alarm.name } : ctx.values.resource?.includes(':alarm:') ? { watchesAlarm: ctx.values.resource.split(':alarm:')[1] } : {}),
+        },
+      })),
+    }));
+    await scheduleOpenBackstop(ctx.channelArn, args.runKey, args.step, continueRun as unknown as Record<string, unknown>);
+    return 'requested';
+  } catch (err) {
+    console.warn('[Router][event-workflow] the child conversation could not be asked for; the step fails', { step: args.step, message: (err as Error)?.message });
+    return 'failed';
+  }
+}
+
+/**
+ * AN OPEN STEP'S BACKSTOP (DESIGN-PROCESSES section 10): the run waits on the creator's hand-back, and a creator that stops outside its own
+ * failure path hands nothing back. So the step's continuation is held on its own wait record, with a one-shot schedule
+ * `OPEN_HAND_BACK_MINUTES` out, on the scheduler every timed wait uses (tenet D6): the hand-back and the backstop both go on
+ * under the step's one continuation claim, so whichever comes first decides, and the other continues nothing. A backstop that
+ * cannot be scheduled is logged and leaves the step waiting on the hand-back, as before it existed.
+ */
+async function scheduleOpenBackstop(channelArn: string, runKey: string, step: string, continuation: Record<string, unknown>): Promise<void> {
+  const wiring = deadlineWiringFor(channelArn);
+  if (!wiring) return;
+  const waitId = openBackstopWaitId(runKey, step);
+  try {
+    if (!(await holdRunWait({ waitId, channelArn, continuation })).claimed) return;
+    await createTaskDeadlineSchedule(wiring, { kind: 'wait', channelArn, taskId: waitId }, new Date(Date.now() + OPEN_HAND_BACK_MINUTES * 60_000));
+  } catch (err) {
+    console.warn('[Router][event-workflow] an open step has no backstop; its hand-back still continues it', { step, errName: (err as Error)?.name });
+  }
+}
+
 async function openWorkflowTaskStep(args: {
   name: string; step: string; def: TaskStep; ctx: EventRunContext; who: WorkflowRunner; runKey: string;
   transitions: EventTransition[]; eventValues?: Readonly<Record<string, VariableValue>>;
+  edition: ReturnType<typeof runEdition>;
+  /** A join of the run waits on this task (`wait: { join }`). */
+  joined?: boolean;
 }): Promise<'opened' | 'no-worker' | 'failed'> {
   const { def, ctx, who } = args;
   const one = (ref: unknown): string | undefined => {
@@ -3132,27 +4079,76 @@ async function openWorkflowTaskStep(args: {
     const role = workerAssistantRole(def.by);
     let worker: TaskAssignee;
     let workerArn: string | undefined;
+    /** The version whose machine the task runs: the run's own (a request to another assistant's role is that one's run). */
+    const machineVersion: WorkflowRunner['version'] = who.version;
     if (def.by === undefined) worker = { id: principalIdFromArn(who.botArn), type: 'assistant' };
     else if (role) {
-      const taker = await stepTaker({ as: { role } } as AgentStep, ctx.channelArn, who.botArn);
+      const taker = await roleHolder(role, ctx.channelArn, who.botArn);
       if (!taker) return 'no-worker';
+      if (taker === 'ambiguous') {
+        console.warn('[Router][event-workflow] more than one assistant in the room holds the role; the request names nobody, and the step fails', { role, step: args.step });
+        return 'failed';
+      }
       worker = { id: principalIdFromArn(taker.botArn), type: 'assistant' };
+      // ANOTHER ASSISTANT'S WORK IS A REQUEST (WT118, DESIGN-WORKFLOWS-AND-TASKS section 1): this run decides from that
+      // assistant's advertisement alone (keys and lines, tenet D3), says what it needs, and is continued on how the work
+      // ended. The owning assistant's own run does the work its own way (`askAnother`): the router starts it from that
+      // assistant's served version, as it starts any assistant's run, and nothing of that version reaches this run. Where the
+      // run's own assistant holds the role (a workflow the ops assistant owns asking the ops role), it is asked the same way,
+      // so its advertised intent runs its turn in the room.
+      const takerAssistant = taker.assistant || (taker.botArn === who.botArn ? who.assistant : undefined);
+      if (takerAssistant) {
+        const ad = await readAdvertisement(takerAssistant).catch(() => null);
+        const advertised = ad?.intents.find((i) => i.key === def.machine);
+        if (!advertised) {
+          console.warn('[Router][event-workflow] the role\'s assistant advertises no intent by the step\'s name; the step fails', { role, machine: def.machine });
+          return 'failed';
+        }
+        return askAnother({ ...args, taker: { botArn: taker.botArn, assistant: takerAssistant }, requesterArn, multiStep: advertised.multiStep === true });
+      }
     } else {
       workerArn = one(def.by);
       const id = workerArn ? personIdFromArn(workerArn) : null;
       if (!id) return 'no-worker';
       worker = { id, type: 'user' };
     }
-    const machines = taskStateMachines();
-    const deadlineAt = Math.floor(Date.now() / 1000) + def.deadline.afterMinutes * 60;
+    // A STEP THAT GOES ON ONCE ITS TASK OPENS HAS NO DEADLINE: the run waits on nothing, and the row's expiry bounds the task.
+    const deadline = taskStepDeadline(def, ctx.values);
+    if (deadline === 'unreadable') {
+      console.warn('[Router][event-workflow] a task step\'s deadline names a time the run does not hold; the step fails', { step: args.step });
+      return 'failed';
+    }
+    const { kind, dueAt, deadlineAt } = deadline;
     const workflowRun: WorkflowRunRef = {
       runKey: args.runKey, workflow: args.name, step: args.step, event: ctx.event, botArn: who.botArn,
-      ...(ctx.eventPerson ? { eventPerson: ctx.eventPerson } : {}), ...(ctx.subject ? { subject: ctx.subject } : {}),
-      ...(ctx.invitationId ? { invitationId: ctx.invitationId } : {}), ...(ctx.alarm ? { alarm: ctx.alarm } : {}),
-      values: ctx.values, deadlineAt,
+      ...runIdentity(ctx),
+      values: ctx.values, ...(deadlineAt !== undefined ? { deadlineAt } : {}),
+      ...runRefEdition(args.edition),
+      // THE RUN GOES ON ONCE THE TASK LEAVES ITS FIRST STATE (`continue: opened`, WT18): the task service names that move.
+      ...(def.continue === 'opened' ? { continueOn: 'entered' as const } : {}),
+      // THE RUN GOES ON ALONGSIDE THE TASK, and its settlement takes the run's end (`releaseHeldEnd`).
+      ...(def.continue === 'alongside' ? { holdsEnd: true as const } : {}),
+      // A JOIN WAITS ON IT TOO, and its settlement meets that join's record as well as the end's (`meetJoin`).
+      ...(def.continue === 'alongside' && args.joined ? { joined: true as const } : {}),
+      // ITS SETTLEMENT ENDS THE RUN WHERE IT STANDS (`endsRun`), confirmed first where the run is mid-way (`confirmEnd`).
+      ...(def.continue === 'alongside' && def.endsRun ? { endsRun: true as const, ...(def.movesTo ? { movesTo: def.movesTo } : {}), ...(def.confirmEnd ? { confirmEnd: def.confirmEnd } : {}) } : {}),
+      ...(deadline.remind ? { remind: deadline.remind } : {}),
+      ...(def.fields?.length ? { fields: def.fields } : {}),
     };
+    // THE RUN'S VERSION'S OWN MACHINE (ADR-067 stage 2, WT17): the task opens on it and carries it, so a card press, a
+    // deadline and the continuation move the task on the steps it opened on, whatever the version serves next.
+    const machineDef = versionDeclaredMachines(machineVersion?.intentPack)?.[def.machine];
+    const originConfigId = originConfigIdOf(machineVersion);
+    // THE CONVERSATION THAT OPENED THIS ONE, where a workflow did: read from this conversation's own parent link, so the
+    // opener reads the open work of the conversations it opened in one query (`openIncidents`).
+    const openedFrom = ctx.event === 'conversation-opened' && ctx.values.openedBy === 'workflow'
+      ? parentConversationOf((await tryThrice(() => readChannelContext(ctx.channelArn, { consistent: true })))?.parentRef, ctx.channelArn) : undefined;
     const task = await openWorkflowTask({
       channelArn: ctx.channelArn, taskId: eventTaskId(args.runKey, args.step), machine: def.machine,
+      ...(machineDef ? { machineDef } : {}), ...(originConfigId ? { originConfigId } : {}),
+      ...(deadline.dueBy ? { dueBy: deadline.dueBy } : {}),
+      ...(kind !== 'timeout' ? { keepForSeconds: 45 * 24 * 3600 } : {}),
+      ...(openedFrom ? { openedFrom } : {}),
       ...(requesterArn ? { requesterArn } : {}), worker,
       assistantId: worker.type === 'assistant' ? worker.id : principalIdFromArn(who.botArn),
       ...(def.visibility ? { visibility: def.visibility } : {}), ...(def.priority ? { priority: def.priority } : {}),
@@ -3161,7 +4157,27 @@ async function openWorkflowTaskStep(args: {
     if (!task) return 'failed';
     // THE TASK'S END IS SCHEDULED NOW, on this classification's group (decision 4); a schedule that could not be made is
     // counted and leaves the task to its person and its row's expiry.
-    await scheduleTaskDeadline(ctx.channelArn, task.taskId, deadlineAt);
+    if (deadlineAt !== undefined) await scheduleTaskDeadline(ctx.channelArn, task.taskId, deadlineAt);
+    // THE FIRST REMINDER (WT21), on this classification's group; each reminder schedules the next, up to the step's cap.
+    if (kind === 'remind' && dueAt !== undefined) await scheduleTaskReminder(ctx.channelArn, task.taskId, 1, dueAt);
+    // THE STEP'S OWN NOTICE (WT89), in place of the assignment notice: to the room, or to the person alone where the
+    // event's message was private. A drift offer declares what it answers, so it is told apart from an answer.
+    if (def.notice) {
+      const template = ctx.values.kind === 'redirect' && def.notice.redirect ? def.notice.redirect : def.notice.template;
+      const to = ctx.values.private === '1' && ctx.eventPerson ? [ctx.eventPerson] : [];
+      const said = await sayWorkflowSend({
+        channelArn: ctx.channelArn, botArn: who.botArn, assistant: who.assistant, workflow: args.name, event: ctx.event, step: args.step,
+        template, values: ctx.values, to, runKey: args.runKey, transitions: args.transitions, variables: who.variables, process: ctx.process,
+        ...(args.eventValues ? { eventValues: args.eventValues } : {}),
+        ...(ctx.event === 'subject-changed' ? { declare: { kind: 'drift', ...(ctx.values.message ? { answers: ctx.values.message } : {}) } } : {}),
+      });
+      // A TASK NOBODY WAS TOLD OF IS NOT LEFT OPEN: it is withdrawn, and the step fails.
+      if (!said) {
+        await cancelForDeadline({ taskId: task.taskId, channelArn: ctx.channelArn }).catch(() => undefined);
+        return 'failed';
+      }
+      return 'opened';
+    }
     // THE PERSON WHO HOLDS ITS FIRST STEP IS TOLD, PRIVATELY, AND EMAILED (decision 2).
     if (task.assigneeType === 'user' && task.assigneeId) {
       const holder = [requesterArn, workerArn].find((arn) => arn && personIdFromArn(arn) === task.assigneeId);
@@ -3169,10 +4185,10 @@ async function openWorkflowTaskStep(args: {
         const name = await resolveUserName(holder).then((n) => (n === 'there' ? '' : n)).catch(() => '');
         await sayWorkflowSend({
           channelArn: ctx.channelArn, botArn: who.botArn, assistant: who.assistant, workflow: args.name, event: ctx.event, step: args.step,
-          template: 'workflow-task-assigned', values: { ...ctx.values, ...(name ? { name: workflowMention(name) } : {}) }, to: [holder],
-          runKey: args.runKey, transitions: args.transitions, mentions: ['name'], variables: who.variables,
+          template: assignedTemplateFor(def.assigned, !!process.env.MEETING_RUN_FUNCTION) ?? 'workflow-task-assigned', values: { ...ctx.values, ...(name ? { name: workflowMention(name) } : {}) }, to: [holder],
+          runKey: args.runKey, transitions: args.transitions, mentions: ['name'], variables: who.variables, process: ctx.process,
           ...(args.eventValues ? { eventValues: args.eventValues } : {}),
-          ...(() => { const card = taskCardOf(task, machines); return card ? { taskCard: card } : {}; })(),
+          ...(() => { const card = taskCardOf(task, machinesForTask(task)); return card ? { taskCard: card } : {}; })(),
           emailKind: 'task',
         });
       }
@@ -3190,26 +4206,220 @@ async function openWorkflowTaskStep(args: {
  * settled task a run waits on continues that run, once, on the edge its ending chose; a task now an assistant's to take
  * up is taken up where that assistant is idle (`handleTaskReady`).
  */
-export async function handleTaskNaming(raw: unknown): Promise<{ ran: boolean; reason?: string }> {
+export async function handleTaskNaming(raw: unknown): Promise<{ ran: boolean; reason?: string; moved?: boolean; moveFailed?: boolean }> {
   const r = raw as Partial<TaskNaming> | null;
-  if (!r || (r.kind !== 'settled' && r.kind !== 'ready') || typeof r.channelArn !== 'string' || !r.channelArn.includes('/channel/') || typeof r.taskId !== 'string' || !r.taskId) {
+  if (!r || (r.kind !== 'settled' && r.kind !== 'ready' && r.kind !== 'entered' && r.kind !== 'reopened' && r.kind !== 'notice' && r.kind !== 'request') || typeof r.channelArn !== 'string' || !r.channelArn.includes('/channel/') || typeof r.taskId !== 'string' || !r.taskId) {
     return { ran: false, reason: 'malformed' };
   }
   if ((await resolveChannelClassificationTag(r.channelArn)) !== STATIC_CLASSIFICATION) return { ran: false, reason: 'not this classification' };
-  const task = await getTask(r.taskId, r.channelArn);
+  // A SETTLEMENT IS READ AS WRITTEN: it is named straight after the write, and a stale row would read as nothing having settled.
+  const task = await getTask(r.taskId, r.channelArn, r.kind === 'settled' ? { consistent: true } : {});
   if (!task) return { ran: false, reason: 'no such task' };
   if (r.kind === 'ready') return handleTaskReady(task);
-  const run = task.workflowRun;
-  const outcome = settlementOutcome(task, taskStateMachines());
-  if (!run || !outcome) return { ran: false, reason: 'the task names no run, or is still open' };
+  if (r.kind === 'reopened') return handleTaskReopened(task);
+  if (r.kind === 'notice') return handleStateNotice(task);
+  if (r.kind === 'request') return handleRequestAwaitingRun(task);
+  const machines = machinesForTask(task);
+  const initial = task.taskType ? machines[task.taskType]?.initial : undefined;
+  const settledMachine = machines[task.taskType ?? ''];
+  // THE TASK THAT SETTLED IS READ ON THE MACHINE IT RAN, whichever step of the run opened it (an accepted queued request's
+  // own task runs `queued_request`, a request to another assistant runs that assistant's machine).
+  const settled = settledMachine ? { settledMachine } : {};
+  // ENTERED (WT18): read back, the task is out of the state it opened in, and a run that goes on then goes on once.
+  const outOfFirstStep = r.kind === 'entered' && !!initial && !!task.taskState && task.taskState !== initial;
+  const outcomeFor = (ref: WorkflowRunRef | undefined) => {
+    if (!ref) return undefined;
+    if (r.kind === 'entered') return outOfFirstStep && ref.continueOn === 'entered' ? TASK_STEP_OUTCOMES.opened : undefined;
+    // A SETTLEMENT CONTINUES ANY RUN STILL AT THE STEP, one that goes on once the work starts included: a task that ended
+    // before it left its first step was never named entered. The step's one continuation claim (`continueAfter`) keeps a
+    // run that already went on from going on twice.
+    return r.kind === 'settled' ? settlementOutcome(task, machines) : undefined;
+  };
+  // A MEETING'S ACTION ITEM (FR67) belongs to the meeting's summary, which is no workflow, so its settlement continues no run.
+  const own = task.workflowRun?.workflow === MEETING_SUMMARY_RUN ? undefined : task.workflowRun;
+  const ownOutcome = outcomeFor(own);
+  // OWNERSHIP IS NEVER BROKEN (WT118): the run that asked for this work is continued on how it ended, and handed nothing it
+  // recorded, which is the owning assistant's to share.
+  const asker = task.askedBy;
+  const askerOutcome = outcomeFor(asker);
+  if (!ownOutcome && !askerOutcome) return { ran: false, reason: 'the task names no run, or is still open' };
   // THE SCHEDULE IS NO LONGER NEEDED (decision 4): settled, it would fire, find the task settled and start nothing.
-  await deleteTaskDeadline(r.channelArn, task.taskId);
+  if (r.kind === 'settled') await deleteTaskDeadline(r.channelArn, task.taskId);
+  const results = await Promise.all([
+    // A TASK THE RUN WENT ON ALONGSIDE continues no step: its settlement takes the run's end, wherever the run now is.
+    own && ownOutcome && own.holdsEnd ? releaseHeldEnd(task.taskId, r.channelArn, ownOutcome, own) : undefined,
+    own && ownOutcome && own.holdsEnd && own.joined ? meetJoin(task.taskId, r.channelArn, ownOutcome) : undefined,
+    own && ownOutcome && !own.holdsEnd ? continueRunOn(own, ownOutcome, withRecordedRunValues(own.values, task, settledMachine), r.channelArn, task.taskId, settled) : undefined,
+    asker && askerOutcome ? continueRunOn(asker, askerOutcome, { ...(asker.values ?? {}) }, r.channelArn, task.taskId, settled) : undefined,
+  ]);
+  const ran = results.filter((x): x is { ran: boolean; reason?: string; moved?: boolean; moveFailed?: boolean } => !!x);
+  return ran.some((x) => x.ran) ? { ran: true, ...(ran.some((x) => x.moved) ? { moved: true } : {}), ...(ran.some((x) => x.moveFailed) ? { moveFailed: true } : {}) } : ran[0] ?? { ran: false };
+}
+
+/**
+ * A RUN GOES ON FROM THE STEP ITS TASK ENDED (ADR-063 decision 3): an intent's run through its own handler, which reads the
+ * run's own task row for everything that identifies it, and an event's run through the event handler.
+ */
+function continueRunOn(
+  run: WorkflowRunRef, outcome: string, values: Record<string, string>, channelArn: string, taskId: string,
+  settled: { settledMachine?: TaskStateMachine },
+  /** The step a resolve moves the run on to (`movesTo`, O15). */
+  moveTo?: string,
+): Promise<{ ran: boolean; reason?: string; moved?: boolean; moveFailed?: boolean }> {
+  if (run.event === INTENT_TRIGGER) {
+    return handleIntentContinuation({
+      runKey: run.runKey, workflow: run.workflow, step: run.step, outcome, event: INTENT_TRIGGER,
+      channelArn, botArn: run.botArn, values, ...(run.origin ? { origin: run.origin } : {}),
+      runTaskId: run.runTaskId ?? taskId,
+    }, settled);
+  }
   return handleEventContinuation({
     runKey: run.runKey, workflow: run.workflow, step: run.step, outcome, event: run.event as WorkflowEvent,
-    channelArn: r.channelArn, botArn: run.botArn, values: run.values ?? {},
+    channelArn, botArn: run.botArn, values, ...(run.origin ? { origin: run.origin } : {}),
     ...(run.eventPerson ? { eventPerson: run.eventPerson } : {}), ...(run.subject ? { subject: run.subject } : {}),
     ...(run.invitationId ? { invitationId: run.invitationId } : {}), ...(run.alarm ? { alarm: run.alarm as AlarmChange } : {}),
-  });
+    ...(run.reopened ? { reopened: run.reopened } : {}), ...(run.ruleEvent ? { ruleEvent: run.ruleEvent } : {}), ...(run.meeting ? { meeting: run.meeting } : {}),
+    ...(run.process ? { process: run.process } : {}),
+  }, { ...settled, ...(moveTo ? { moveTo } : {}) });
+}
+
+/** A held run's record, read and written through the task service (`held-run.ts`). */
+const HELD_RUN_RECORDS: HeldRunRecords = { hold: holdRunWait, read: readRunWait };
+
+/**
+ * A TASK THE RUN WENT ON ALONGSIDE SETTLED (`continue: 'alongside'`): where the run's end is already held on it, the run ends
+ * now, through the continuation path every run takes (its key checked, its end claimed once); where the run has not reached
+ * its end, the settlement is recorded, and the run ends as soon as it does.
+ */
+async function releaseHeldEnd(taskId: string, channelArn: string, outcome: string, run?: WorkflowRunRef): Promise<{ ran: boolean; reason?: string }> {
+  const met = await meetHeldRun(HELD_RUN_RECORDS, alongsideEndWaitId(taskId), channelArn, outcome);
+  if ('failed' in met) {
+    console.error('[Router][event-workflow] a task the run went on alongside settled and its end could not be recorded', { classification: STATIC_CLASSIFICATION });
+    return { ran: false, reason: 'the end could not be recorded' };
+  }
+  // A TASK WHOSE SETTLEMENT ENDS THE RUN (`endsRun`) ends it where it stands; any other is recorded, and the run ends when it
+  // reaches its end.
+  // A SUCCESS THAT MOVES THE RUN ON (`movesTo`, O15) moves it; any other settlement of such a task ends it as `endsRun` does.
+  if ('recorded' in met) {
+    if (!run?.endsRun) return { ran: false, reason: 'the run has not reached its end' };
+    return run.movesTo && taskOutcomeOf(outcome).edge === 'success' ? moveRunOn(run, channelArn, taskId, outcome) : endRunWhereItStands(run, channelArn, taskId, outcome);
+  }
+  if (met.run.channelArn !== channelArn) return { ran: false, reason: 'the held run is another conversation\'s' };
+  // A RESOLVE THAT MOVES THE RUN ON moves it from its held end too: the runbook may have finished before it (O15).
+  if (run?.endsRun && run.movesTo && taskOutcomeOf(outcome).edge === 'success') return moveRunOn(run, channelArn, taskId, outcome);
+  // THE RUN ENDS BY HOW ITS TASK ENDED, which its end tells the conversation that opened it (`runEnding`), once every other
+  // task it went on alongside has settled: the release names this one, so the end holds on any other still open.
+  const held = met.run as unknown as EventContinuation;
+  return handleEventContinuation({ ...held, outcome, ...(run?.step ? { transitions: [...(held.transitions ?? []), { step: run.step, outcome: ALONGSIDE_RELEASED }] } : {}) });
+}
+
+/**
+ * A TASK A JOIN WAITS ON SETTLED (`wait: { join }`): where the join already holds on it, the run is handed back with how it
+ * settled, through the continuation path every run takes (its key checked, the part claimed once); where the join has not
+ * been reached, the settlement is recorded, and the join reads it when it comes.
+ */
+async function meetJoin(taskId: string, channelArn: string, outcome: string): Promise<{ ran: boolean; reason?: string }> {
+  const met = await meetHeldRun(HELD_RUN_RECORDS, joinPartWaitId(taskId), channelArn, outcome);
+  if ('failed' in met) {
+    console.error('[Router][event-workflow] a task a join waits on settled and its ending could not be recorded; the deadline of the join continues it', { classification: STATIC_CLASSIFICATION });
+    return { ran: false, reason: 'the ending could not be recorded' };
+  }
+  if (!('run' in met)) return { ran: false, reason: 'the join has not been reached' };
+  if (met.run.channelArn !== channelArn) return { ran: false, reason: 'the held run is in another conversation' };
+  return handleEventContinuation({ ...(met.run as unknown as EventContinuation), outcome });
+}
+
+/**
+ * A TASK THAT ENDS ITS RUN SETTLED WHILE THE RUN WAS MID-WAY (`endsRun`, owner decision 2026-11-14): the run ends now, on its
+ * success terminal, through the continuation path every run takes (its key checked, its end claimed once, its one archive
+ * fact, WT62), and its end tells the conversation that opened this one how it ended, which is how the task ended
+ * (`runEnding`). Its end claimed, the run's open tasks are cancelled with the run's end as their reason, so none is left
+ * pending and none of their settlements continues it.
+ */
+async function endRunWhereItStands(run: WorkflowRunRef, channelArn: string, taskId: string, outcome: string): Promise<{ ran: boolean; reason?: string }> {
+  const assistant = await assistantOfBot(run.botArn, STATIC_CLASSIFICATION, await getBotArn());
+  if (assistant.decision === 'decline') return { ran: false, reason: assistant.reason };
+  const served = await runOriginVersion(assistant.profile.name, channelArn, run.origin);
+  const wf = workflowFor(served?.version.eventWorkflows, run.workflow);
+  const terminal = wf ? endingTerminal(wf) : undefined;
+  if (!wf || !terminal) return { ran: false, reason: 'the run declares no end' };
+  const ended = await continueRunOn({ ...run, step: terminal }, outcome, { ...(run.values ?? {}) }, channelArn, taskId, {});
+  const cancelled = await endRunTasks(channelArn, run.runKey);
+  if (!cancelled) console.error('[Router][event-workflow] a run that ended mid-way could not cancel its open tasks', { classification: STATIC_CLASSIFICATION });
+  else console.log('[Router][event-workflow] a run ended mid-way and cancelled its open tasks', { workflow: run.workflow, cancelled: cancelled.length });
+  return ended;
+}
+
+/**
+ * A RESOLVE THAT MOVES THE RUN ON (DESIGN-PROCESSES O15): the steps the run waits at are claimed first, so the cancellation of
+ * their tasks continues nothing; then the run's open tasks are cancelled with the run's end as their reason, except those it
+ * went on alongside (the investigation), and the run goes on at `movesTo`, once, through the continuation path every run takes.
+ */
+async function moveRunOn(run: WorkflowRunRef, channelArn: string, taskId: string, outcome: string): Promise<{ ran: boolean; reason?: string }> {
+  for (const id of (await workflowTasksOf(channelArn).catch(() => [])) ?? []) {
+    const r = (await getTask(id, channelArn).catch(() => null))?.workflowRun;
+    if (r?.runKey === run.runKey && !r.holdsEnd && r.step) await claimEventStep({ runKey: run.runKey, channelArn, step: continuationClaim(r.step), outcome: 'moved' }).catch(() => false);
+  }
+  const cancelled = await endRunTasks(channelArn, run.runKey, { keepAlongside: true });
+  if (!cancelled) console.error('[Router][event-workflow] a run moved on and could not cancel its open tasks', { classification: STATIC_CLASSIFICATION });
+  const moved = await continueRunOn(run, outcome, { ...(run.values ?? {}) }, channelArn, taskId, {}, run.movesTo);
+  // THE CONVERSATION THAT OPENED THIS ONE STOPS WAITING ON IT AT THE RESOLVE (DESIGN-PROCESSES O19, O24): its wait goes on as a
+  // success, which says nothing there, since the run's own `tell-team` step has just said "resolved". So a resolved incident
+  // counts as open there no longer (`openIncidents`) while its run goes on to the review, and the run's end, told again,
+  // finds that wait already gone on and says nothing more.
+  if (run.event === 'conversation-opened' && run.values?.openedBy === 'workflow') await tellOpener(channelArn, 'success');
+  return moved;
+}
+
+/**
+ * WHERE A RUN STANDS, by its steps' labels (`runStanding`): read from the run's own claims through the task service, never
+ * from a message. Null where they cannot be read.
+ */
+async function standingOf(wf: EventWorkflow, runKey: string, channelArn: string): Promise<{ current: string[]; next: string[]; ended: boolean } | null> {
+  const claims = await readEventSteps({ runKey, channelArn, steps: runStandingClaims(wf) }).catch(() => null);
+  if (!claims) return null;
+  const at = runStanding(wf, claims);
+  return { current: at.current.map((k) => stepLabel(wf, k)), next: at.next.map((k) => stepLabel(wf, k)), ended: at.ended };
+}
+
+/** A call made again, up to three times in all, while it throws; the last failure throws. */
+async function tryThrice<T>(call: () => Promise<T>, pauseMs = 250): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await call();
+    } catch (err) {
+      if (attempt >= 3) throw err;
+      await new Promise((resolve) => { setTimeout(resolve, pauseMs * attempt); });
+    }
+  }
+}
+
+/**
+ * A CONVERSATION A WORKFLOW OPENED TELLS THE ONE THAT OPENED IT THAT ITS RUN ENDED (`wait: { child: 'ended' }`), through the
+ * parent link its own row records. Where the opener's run already waits, it goes on now; where it has not reached its wait,
+ * the ending is recorded, and its wait goes on as soon as it comes. How the run ended goes with it (`childEndedOutcome`), so
+ * the opener is told whether it succeeded or why not. A read or a record that fails is tried again; one that keeps failing
+ * leaves the opener's wait to its one-shot backstop. Never throws: the opener's run is the opener's.
+ */
+async function tellOpener(childArn: string, ending: ChildEnding): Promise<void> {
+  try {
+    const row = await tryThrice(() => readChannelContext(childArn, { consistent: true }));
+    const parent = parentConversationOf(row?.parentRef, childArn);
+    if (!parent) {
+      console.warn('[Router][event-workflow] a conversation a workflow opened records no conversation that opened it; nobody is told its run ended');
+      return;
+    }
+    const outcome = childEndedOutcome(ending);
+    const met = await tryThrice(async () => {
+      const m = await meetHeldRun(HELD_RUN_RECORDS, childEndWaitId(childArn), parent, outcome);
+      if ('failed' in m) throw new Error('the end of a run its opener waits on could not be recorded');
+      return m;
+    });
+    if (!('run' in met) || met.run.channelArn !== parent) return;
+    await handleEventContinuation({ ...(met.run as unknown as EventContinuation), outcome });
+  } catch (err) {
+    console.error('[Router][event-workflow] the opener could not be told its child\'s run ended; its wait\'s backstop continues it', { errName: (err as Error)?.name, classification: STATIC_CLASSIFICATION });
+  }
 }
 
 /**
@@ -3226,7 +4436,7 @@ async function handleTaskReady(task: Task): Promise<{ ran: boolean; reason?: str
   const botArn = botArnFor(instance, assistantId);
   const assistant = await assistantOfBot(botArn, STATIC_CLASSIFICATION, await getBotArn());
   if (assistant.decision === 'decline') return { ran: false, reason: assistant.reason };
-  if (!pickupReadiness(task, taskStateMachines(), assistantId).ready) return { ran: false, reason: 'not ready' };
+  if (!pickupReadiness(task, await resolveTaskMachines(task, { profileName: assistant.profile.name }), assistantId).ready) return { ran: false, reason: 'not ready' };
   const correlationId = pickupCorrelationId(task);
   if (!turnQueueEnabled()) {
     if (taskHasBeenGivenATurn(task)) return { ran: false, reason: 'the turn queue is off; a later step waits for a message' };
@@ -3259,7 +4469,7 @@ export async function handleTaskPickup(raw: unknown): Promise<{ ran: boolean; re
   const assistant = await assistantOfBot(botArn, STATIC_CLASSIFICATION, await getBotArn());
   if (assistant.decision === 'decline') { await release(); return { ran: false, reason: assistant.reason }; }
   const task = await getTask(str(r?.taskId), channelArn);
-  if (!task || !pickupReadiness(task, taskStateMachines(), responderId).ready || pickupCorrelationId(task) !== correlationId) {
+  if (!task || !pickupReadiness(task, await resolveTaskMachines(task, { profileName: assistant.profile.name }), responderId).ready || pickupCorrelationId(task) !== correlationId) {
     await release();
     return { ran: false, reason: 'the task is no longer ready for this assistant' };
   }
@@ -3332,18 +4542,14 @@ async function dispatchTaskPickup(task: Task, botArn: string, profile: { name: s
   const ownerArn = instance && task.ownerPersonId ? userArnFor(instance, task.ownerPersonId) : '';
   const privately = isPrivateVisibility(task.visibility);
   if (privately && !ownerArn) return { ran: false, reason: 'a private task with no owner has nobody to answer' };
-  const machines = taskStateMachines();
+  const machines = await resolveTaskMachines(task, { profileName: profile.name });
   const placeholder = getTaskPlaceholder(DeliveryOption.TASK_MULTI_STEP, task.taskType, task.taskState, {
-    words: await wordsOf(profile.name), declared: machines[task.taskType]?.states?.[task.taskState]?.placeholder,
+    words: await wordsOf(profile.name, { channelArn: task.channelArn }), declared: machines[task.taskType]?.states?.[task.taskState]?.placeholder,
   });
   let placeholderMessageId = '';
   try {
-    await speakAsRoutedAssistant(
-      { routeId: `${SPEAK_ROUTE_PREFIX}pickup-${randomUUID()}`, botArn, classification: STATIC_CLASSIFICATION, tableName: TURN_ROUTING_TABLE, channelArn: task.channelArn },
-      { ddb: routingDdb },
-    );
     // ONE MESSAGE BY CONSTRUCTION: a placeholder, short platform text the answer later replaces in place.
-    const sent = await sendChannelMessage(chimeClient, {
+    const sent = await speakingAs({ botArn, channelArn: task.channelArn, purpose: 'pickup' }, () => sendChannelMessage(chimeClient, {
       ChannelArn: task.channelArn,
       // DECLARED A TASK STEP from its first message, as a join recap declares itself, so it pairs with nothing.
       Content: withTurnDeclaration(`${placeholder} <!--corr:${correlationId}-->`, { kind: 'task_step' }),
@@ -3352,7 +4558,7 @@ async function dispatchTaskPickup(task: Task, botArn: string, profile: { name: s
       ChimeBearer: botArn,
       Metadata: botMessageMetadata({ agentType: profile.name, classification: STATIC_CLASSIFICATION }, privately ? { targetedSender: ownerArn } : undefined),
       ...(privately ? { Target: [{ MemberArn: ownerArn }] } : {}),
-    });
+    }));
     placeholderMessageId = sent.MessageId ?? '';
     if (placeholderMessageId) await claimPlaceholderMapping(correlationId, placeholderMessageId).catch(() => undefined);
   } catch (err) {
@@ -3361,6 +4567,7 @@ async function dispatchTaskPickup(task: Task, botArn: string, profile: { name: s
   }
   const handed = await invokeAsync(processorArn, {
     channelArn: task.channelArn,
+    ...await roomGroundingFields(task.channelArn),
     correlationId,
     userMessage: startLine.prompt,
     // THE INSTRUCTION IS THE PLATFORM'S OWN, not a person's words, so the input guardrail screens nothing.
@@ -3390,7 +4597,8 @@ async function dispatchTaskPickup(task: Task, botArn: string, profile: { name: s
  * and the assistant is one of this classification's. The run key is recomputed from those, never taken from the
  * payload, and the continuation is claimed once, so a redelivered hand-back or one for a finished run posts nothing.
  */
-export async function handleEventContinuation(req: EventContinuation): Promise<{ ran: boolean; reason?: string }> {
+export async function handleEventContinuation(req: EventContinuation, opts: { settledMachine?: TaskStateMachine; moveTo?: string } = {}): Promise<{ ran: boolean; reason?: string; moved?: boolean; moveFailed?: boolean }> {
+  if (req?.event === INTENT_TRIGGER) return handleIntentContinuation(req, opts);
   const refuse = (reason: string) => {
     console.warn('[Router][event] continuation refused', { reason, classification: STATIC_CLASSIFICATION });
     return { ran: false, reason };
@@ -3402,18 +4610,35 @@ export async function handleEventContinuation(req: EventContinuation): Promise<{
   if ((await resolveChannelClassificationTag(channelArn)) !== STATIC_CLASSIFICATION) return refuse('not this classification');
   const assistant = await assistantOfBot(botArn, STATIC_CLASSIFICATION, await getBotArn());
   if (assistant.decision === 'decline') return refuse(assistant.reason);
-  const served = await servedWelcomeVersion(assistant.profile.name, channelArn).catch(() => undefined);
+  // THE RUN GOES ON WHERE IT STARTED (ADR-067 stage 2, WT17): the version it recorded, read by its parameter version when
+  // the one served now is another, so an activation since never strands a run on a step its new version lacks.
+  const served = await runOriginVersion(assistant.profile.name, channelArn, req.origin);
   const wf = workflowFor(served?.version.eventWorkflows, str(req.workflow));
   // AN AGENT STEP THE PROCESSOR COMPLETED, OR A TASK STEP WHOSE TASK SETTLED (ADR-063 decision 3).
-  if (!wf || wf.on !== req.event || !(wf.states[str(req.step)]?.agent || wf.states[str(req.step)]?.task)) return refuse('no such agent or task step');
+  // AN AGENT STEP THE PROCESSOR COMPLETED, A TASK STEP WHOSE TASK SETTLED, OR A WAIT THAT CAME DUE (WT20).
+  if (!wf || wf.on !== req.event || !continuableStep(wf, str(req.step))) return refuse('no such agent, task, wait, open or held end step');
   const person = (v: unknown) => (typeof v === 'string' && v.includes('/user/') ? v : undefined);
-  // AN ALARM'S RUN GOES ON ONLY WHILE THIS CONVERSATION STILL WATCHES THE ALARM, read again from its watch and its row.
+  // A RUN ITS TRIGGER STARTED FINISHES (owner decision, 2026-11-15): whether the alarm, rule or watched key that started it is
+  // still attached is checked before a run starts, never on its continuation, so detaching a trigger stops new runs and an
+  // open incident still reaches its end and tells the conversation that opened it. The continuation is still claimed
+  // once on a run key recomputed here, so nothing continues a run that never started.
   const alarm = wf.on === 'alarm-state-changed' ? alarmChangeOf(req.alarm) : undefined;
-  if (wf.on === 'alarm-state-changed') {
-    if (!alarm) return refuse('the run names no alarm');
-    if (!(await conversationWatches(channelArn, alarm.name))) return refuse('the conversation no longer watches the alarm');
-  }
-  const naturalKey = eventNaturalKey(wf.on, channelArn, person(req.eventPerson), str(req.invitationId), alarm);
+  if (wf.on === 'alarm-state-changed' && !alarm) return refuse('the run names no alarm');
+  // A REOPEN'S RUN reads the task that reopened, from its row: its requester and its visibility (WT111).
+  const reopenedTask = wf.on === 'task-reopened' && req.reopened?.taskId ? await getTask(req.reopened.taskId, channelArn) : undefined;
+  if (wf.on === 'task-reopened' && !reopenedTask) return refuse('the reopened task is not readable');
+  // A RULE'S RUN GOES ON ONLY WHILE ITS ROOM STILL NAMES THE RULE, read again from the room's own tags.
+  const reqWatch = req.ruleEvent?.watch;
+  const watch = reqWatch && typeof reqWatch.kind === 'string' && refId(reqWatch.key) ? { kind: reqWatch.kind, key: refId(reqWatch.key) as string } : undefined;
+  const ruleEvent = wf.on === 'event-received' && req.ruleEvent && typeof req.ruleEvent.rule === 'string'
+    ? { rule: req.ruleEvent.rule, window: Number(req.ruleEvent.window), ...(watch ? { watch } : {}) } : undefined;
+  if (wf.on === 'event-received' && !ruleEvent) return refuse('the run names no rule');
+  // A MEETING'S RUN names its meeting, which its natural key is computed from again.
+  const meeting = isMeetingEvent(wf.on) && isMeetingId(req.meeting?.meetingId) ? { meetingId: req.meeting!.meetingId } : undefined;
+  const naturalKey = runNaturalKey(wf.on, channelArn, {
+    eventPerson: person(req.eventPerson), invitationId: str(req.invitationId), alarm, ruleEvent, subjectMessageId: str(req.values?.message), meetingId: meeting?.meetingId,
+    ...(reopenedTask ? { reopened: { taskId: reopenedTask.taskId, n: Number(req.reopened?.n) } } : {}),
+  });
   if (!naturalKey) return refuse('the run names no person');
   const runKey = eventRunKey(wf.on, naturalKey, assistant.profile.name);
   if (str(req.runKey) !== runKey) return refuse('the run key does not match the run');
@@ -3422,9 +4647,24 @@ export async function handleEventContinuation(req: EventContinuation): Promise<{
   const invitation = isInvitationEvent(wf.on) ? await verifyInvitationEvent(channelArn, str(req.invitationId)) : undefined;
   if (invitation && 'refused' in invitation) return refuse(`the invitation is ${invitation.refused}`);
   const values = Object.fromEntries(Object.entries(req.values ?? {}).filter(([, v]) => typeof v === 'string').map(([k, v]) => [k, String(v).slice(0, 500)]));
+  // AN OPENED CONVERSATION A JOIN WAITS ON IS KEPT BY ITS STEP (`openedLinkValue`): a later open step's hand-back replaces the
+  // run's one link, so the join finds each part's conversation by the step that opened it.
+  if (str(req.outcome) === OPEN_STEP_OPENED && values[CHILD_LINK_VALUE] && joinedSteps(wf).includes(str(req.step))) values[openedLinkValue(str(req.step))] = values[CHILD_LINK_VALUE];
   const base: EventRunContext = invitation
     ? { event: wf.on, channelArn, eventPerson: invitation.record.personArn, invitationId: invitation.record.invitationId, inviter: invitation.record.inviterArn, values }
-    : { event: wf.on, channelArn, eventPerson: person(req.eventPerson), subject: person(req.subject), values, ...(alarm ? { alarm } : {}) };
+    : reopenedTask
+      ? {
+        event: wf.on, channelArn, values, reopened: { taskId: reopenedTask.taskId, n: Number(req.reopened?.n) }, privateRun: isPrivateVisibility(reopenedTask.visibility),
+        ...(reopenedTask.userArn?.includes('/user/') ? { eventPerson: reopenedTask.userArn, requester: reopenedTask.userArn } : {}),
+      }
+      : {
+        event: wf.on, channelArn, eventPerson: person(req.eventPerson), subject: person(req.subject), values, ...(alarm ? { alarm } : {}), ...(ruleEvent ? { ruleEvent } : {}), ...(meeting ? { meeting } : {}),
+        // A PRIVATE MESSAGE'S SUBJECT CHANGE STAYS PRIVATE AFTER IT GOES ON, as it was when it started (decision 8).
+        ...(wf.on === 'subject-changed' && values.private === '1' && person(req.eventPerson) ? { privateRun: true, requester: person(req.eventPerson) } : {}),
+      };
+  // THE RUN'S PROCESS GOES ON WITH IT, as it started (P2): kept only where every part has its shape.
+  const runProc = runProcessOf(req.process);
+  if (runProc) base.process = runProc;
   const invitationReason = invitation?.record.reason;
   const invitationRole = invitation?.record.participantRole;
   // The participant shape is re-read at the join only when a condition names a fact about its subject.
@@ -3439,11 +4679,356 @@ export async function handleEventContinuation(req: EventContinuation): Promise<{
   const withRoles: EventRunContext = roles.roles ? { ...base, roles: roles.roles, roleSaidInRoom: roles.saidInRoom, ...(roles.deciding ? { decidingRoles: roles.deciding } : {}), ...(roles.conversationType ? { conversationType: roles.conversationType } : {}) } : base;
   const ctx: EventRunContext = { ...withRoles, gate: await routerGate(wf, withRoles, served?.version.variables, { ...held, ...(roles.members ? { members: roles.members } : {}), ...(roles.conversationType ? { conversationType: roles.conversationType } : {}) }) };
   const transitions: EventTransition[] = (Array.isArray(req.transitions) ? req.transitions : [])
-    .filter((t) => t && typeof t.step === 'string' && typeof t.outcome === 'string').slice(0, 16);
-  const out = await continueAfter(str(req.workflow), wf, ctx, { step: str(req.step), outcome: str(req.outcome), transitions },
-    eventRunDeps(str(req.workflow), ctx, { botArn, assistant: assistant.profile.name, variantProfile: served?.variantProfile, variables: served?.version.variables }, runKey, undefined, invitationReason, invitationRole, held.invitationPrompt),
-    taskStateMachines());
+    .filter((t) => t && typeof t.step === 'string' && typeof t.outcome === 'string').slice(-34); // A run's 32 steps and the marks a continuation adds (WT129).
+  const deps = eventRunDeps(str(req.workflow), ctx, runnerOf(botArn, assistant.profile.name, served), runKey, undefined, invitationReason, invitationRole, held.invitationPrompt);
+  // A RESOLVE THAT MOVES THE RUN ON (O15): only the step that declares it, to the step it names, and once.
+  const moving = opts.moveTo && wf.states[str(req.step)]?.task?.movesTo === opts.moveTo ? opts.moveTo : undefined;
+  const out = moving
+    ? (await deps.claimStep(`moved#${str(req.step)}`, str(req.outcome)).catch(() => false)
+      ? await runEventWorkflow(str(req.workflow), wf, ctx, deps, { from: moving, transitions: [...transitions, { step: str(req.step), outcome: str(req.outcome) }] })
+      : { ran: false, steps: [] })
+    : await continueAfter(str(req.workflow), wf, ctx, { step: str(req.step), outcome: str(req.outcome), transitions, ...(opts.settledMachine ? { machine: opts.settledMachine } : {}) },
+      deps,
+      // THE MACHINES ITS CONDITIONS READ ARE ITS VERSION'S (ADR-067 stage 2), so `task:state` names a state that version declares.
+      served?.version ? machinesForVersion(served.version) : taskStateMachines());
+  // WHETHER A MOVE IT TOOK STOOD, from its own steps, which the answer to an offer reports to the person (WT90). A run that
+  // waits before its move has failed nothing: the move is still to come.
+  const moves = out.steps.filter((st) => wf.states[st.step]?.open?.mode === 'move');
+  const moved = moves.some((st) => st.outcome === OPEN_STEP_OPENED);
+  return { ran: out.ran, ...(moved ? { moved: true } : {}), ...(moves.length && !moved ? { moveFailed: true } : {}) };
+}
+
+/**
+ * AN INTENT'S RUN GOES ON (ADR-067 decision 1, stage 3), after its task settled or one of its agent steps answered.
+ *
+ * EVERYTHING THAT SAYS WHOSE RUN THIS IS COMES FROM THE RUN'S OWN TASK ROW, never from the hand-back: the person who asked
+ * (`userArn`), the correlation id the run is keyed by, and whether the request is private. A hand-back whose run key is
+ * not the one that row computes continues nothing. The run goes on on the version it started on, under the step's
+ * continuation claim, so it goes on once.
+ */
+export async function handleIntentContinuation(req: EventContinuation, opts: { settledMachine?: TaskStateMachine } = {}): Promise<{ ran: boolean; reason?: string }> {
+  const refuse = (reason: string) => {
+    console.warn('[Router][intent-run] continuation refused', { reason, classification: STATIC_CLASSIFICATION });
+    return { ran: false, reason };
+  };
+  const str = (v: unknown) => (typeof v === 'string' ? v : '');
+  const channelArn = str(req?.channelArn);
+  const botArn = str(req?.botArn);
+  if (!channelArn || !botArn || !str(req?.workflow) || !str(req?.step) || !str(req?.runTaskId)) return refuse('malformed');
+  if ((await resolveChannelClassificationTag(channelArn)) !== STATIC_CLASSIFICATION) return refuse('not this classification');
+  const assistant = await assistantOfBot(botArn, STATIC_CLASSIFICATION, await getBotArn());
+  if (assistant.decision === 'decline') return refuse(assistant.reason);
+  const own = await getTask(str(req.runTaskId), channelArn);
+  // A RUN ANOTHER ASSISTANT'S RUN ASKED FOR (WT118) is keyed by that asking run and its step, and has no person behind it.
+  const asked = own?.askedBy?.runKey && own.askedBy.step ? askedRunCorrelation(own.askedBy) : undefined;
+  if (!own || (!asked && (!own.correlationId || !own.userArn))) return refuse('the run\'s own task is not readable');
+  // THE RUN'S KEY, AS ITS OWN ROW COMPUTES IT: the turn's correlation id where the router's turn opened the request's task,
+  // the request's own message where no turn did (an accepted queued request, a request opened mid-task, WT115, WT106), or
+  // the asking run's step where another assistant asked.
+  const ids = [...(own.correlationId ? [own.correlationId] : []), ...(own.userMessageId ? [own.userMessageId] : []), ...(asked ? [asked] : [])];
+  const runKey = str(req.runKey);
+  const keyedBy = ids.find((id) => intentRunKey(id, assistant.profile.name) === runKey);
+  if (!keyedBy || own.workflowRun?.runKey !== runKey) return refuse('the run key does not match the run\'s own task');
+  const served = await runOriginVersion(assistant.profile.name, channelArn, req.origin);
+  const declared = served?.version.intentWorkflows?.[str(req.workflow)] ?? (asked && served ? canonicalIntentWorkflow(str(req.workflow)) : undefined);
+  if (!declared) return refuse('the version declares no workflow for the intent');
+  const wf = asRun(declared);
+  if (!continuableStep(wf, str(req.step))) return refuse('no such agent, task, wait, open or held end step');
+  const values = Object.fromEntries(Object.entries(req.values ?? {}).filter(([, v]) => typeof v === 'string').map(([k, v]) => [k, String(v).slice(0, 500)]));
+  // THE RUN'S PROCESS GOES ON WITH IT (P2), read from the run's own task row, never from the hand-back, so its end records it.
+  const ownProcess = runProcessOf(own.workflowRun?.process);
+  // The run goes on under the id it was keyed by, so one run's records carry one correlation id.
+  const base: EventRunContext = {
+    event: INTENT_TRIGGER, channelArn, ...(own.userArn?.includes('/user/') ? { requester: own.userArn } : {}), values, correlationId: keyedBy,
+    runTaskId: own.taskId, privateRun: isPrivateVisibility(own.visibility), trigger: own.workflowRun?.trigger ?? (asked ? 'assistant' : 'person'),
+    // THE CHAIN OF REQUESTS rides the run's own task, so a request made after the task settles is bounded as one made before.
+    ...(own.workflowRun?.askChain?.length ? { askChain: own.workflowRun.askChain } : {}),
+    ...(ownProcess ? { process: ownProcess } : {}),
+  };
+  const who = runnerOf(botArn, assistant.profile.name, served);
+  const roles = await participantRolesForRun(str(req.workflow), wf, base, who, {});
+  const withRoles: EventRunContext = roles.roles ? { ...base, roles: roles.roles, roleSaidInRoom: roles.saidInRoom, ...(roles.deciding ? { decidingRoles: roles.deciding } : {}), ...(roles.conversationType ? { conversationType: roles.conversationType } : {}) } : base;
+  const ctx: EventRunContext = { ...withRoles, gate: await routerGate(wf, withRoles, served?.version.variables, { ...(roles.members ? { members: roles.members } : {}), ...(roles.conversationType ? { conversationType: roles.conversationType } : {}) }) };
+  const transitions: EventTransition[] = (Array.isArray(req.transitions) ? req.transitions : [])
+    .filter((t) => t && typeof t.step === 'string' && typeof t.outcome === 'string').slice(-34); // A run's 32 steps and the marks a continuation adds (WT129).
+  const out = await continueAfter(str(req.workflow), wf, ctx, { step: str(req.step), outcome: str(req.outcome), transitions, ...(opts.settledMachine ? { machine: opts.settledMachine } : {}) },
+    eventRunDeps(str(req.workflow), ctx, who, runKey, roles.members),
+    served?.version ? machinesForVersion(served.version) : taskStateMachines());
   return { ran: out.ran };
+}
+
+/**
+ * THE RUNS A PERSON'S STOP ENDS (ADR-067 WT28): each stopped task that a run waits on, read back from its row. Its step's
+ * continuation is claimed `stopped` before the cancel's settlement can take it, and the run's end recorded as a failure.
+ * Never throws: a stop that ended its work and could not end a run still stopped the work.
+ */
+async function endStoppedRuns(channelArn: string, taskIds: readonly string[]): Promise<void> {
+  for (const taskId of taskIds) {
+    try {
+      const task = await getTask(taskId, channelArn);
+      const run = task?.workflowRun;
+      if (!run?.runKey || !run.step) continue;
+      if (!(await claimEventStep({ runKey: run.runKey, channelArn, step: continuationClaim(run.step), outcome: 'stopped' }).catch(() => false))) continue;
+      if (await claimEventStep({ runKey: run.runKey, channelArn, step: 'end', outcome: 'failure' }).catch(() => false)) {
+        await recordRunEnded({
+          channelArn, runKey: run.runKey, workflow: run.workflow, trigger: run.event, disposition: 'failure',
+          steps: [{ step: run.step, outcome: 'stopped' }], ...(run.origin ? { originConfigId: run.origin.configId } : {}),
+          ...(task?.userArn?.includes('/user/') ? { personId: personIdFromArn(task.userArn) } : {}),
+          ...processFactFields(run.process),
+        });
+      }
+    } catch (err) {
+      console.warn('[Router] /stop could not end a run its work belonged to', { errName: (err as Error)?.name });
+    }
+  }
+}
+
+/**
+ * A TASK ENTERED A STATE THAT SAYS A NOTICE (ADR-067 WT23): read back from the row, the state's notice is said once per
+ * entry (claimed by the task, the state and which entry), privately, to the task's requester or to the person who works
+ * it, as the task's own assistant, from the message template the state names.
+ */
+/**
+ * WHO A STATE'S UPDATE REACHES: the room (no one listed), or the people it names. A private task's update to the room or
+ * a role is withheld (WT72).
+ */
+async function stateNoticeAudience(task: Task, notice: NonNullable<TaskStateDef['notice']>, app: string, botArn: string): Promise<{ to: string[]; reason?: string }> {
+  const nobody = (reason: string) => ({ to: [], reason });
+  const person = notice.to === 'requester' ? (task.userArn?.includes('/user/') ? task.userArn : undefined)
+    : notice.to === 'worker' ? (task.workerType === 'user' && task.workerId ? userArnFor(app, task.workerId) : undefined)
+      : undefined;
+  if (notice.to === 'requester' || notice.to === 'worker') return person ? { to: [person] } : nobody('nobody to tell');
+  if (isPrivateVisibility(task.visibility)) return nobody('withheld');
+  if (notice.to === 'room') return { to: [] };
+  const size = await resolveChannelSize(chimeClient, task.channelArn, botArn).catch(() => null);
+  const humans = size && !size.refused && !size.unknown ? (size.members ?? []).filter((m) => !m.isBot).map((m) => m.arn) : [];
+  const row = await getChannelContext(task.channelArn, {}).catch(() => null);
+  const holders = holdersByRole(row?.participantRoles, row?.conversationType, humans)[notice.to.participantRole] ?? [];
+  if (!holders.length) return nobody('nobody to tell');
+  if (holders.length > PARTICIPANT_ROLE_AUDIENCE_CAP) return nobody('more holders than one message can address');
+  return { to: holders };
+}
+
+async function handleStateNotice(task: Task): Promise<{ ran: boolean; reason?: string }> {
+  const state = task.taskState;
+  const notice = task.taskType && state ? machinesForTask(task)[task.taskType]?.states[state]?.notice : undefined;
+  if (!notice || !state || !task.assistantId) return { ran: false, reason: 'no notice on the state' };
+  const app = appInstanceArnOf(task.channelArn) || '';
+  const botArn = botArnFor(app, task.assistantId);
+  const audience = await stateNoticeAudience(task, notice, app, botArn);
+  if (audience.reason) return { ran: false, reason: audience.reason };
+  // A TASK'S FIRST STATE IS TOLD BY ITS ASSIGNMENT: its notice is said when the task returns there, never when it opens.
+  const entries = entrySequenceOf(task.stateHistory, state);
+  if (entries === 0 && machinesForTask(task)[task.taskType ?? '']?.initial === state) return { ran: false, reason: 'the task opened here, and its assignment told it' };
+  const entry = actionRunKey(state, entries);
+  // SAID UNDER THE TASK'S OWN RUN and claimed on a key of its own (`stateNoticeRun`), so a process's runs are runs that end.
+  const at = stateNoticeRun(task, state);
+  // THE ASSISTANT IS RESOLVED BEFORE THE CLAIM, so one that may not say it here spends no entry's notice.
+  const assistant = await assistantOfBot(botArn, STATIC_CLASSIFICATION, await getBotArn());
+  if (assistant.decision === 'decline') return { ran: false, reason: assistant.reason };
+  if (!(await claimEventStep({ runKey: at.claimKey, channelArn: task.channelArn, step: entry, outcome: 'posted' }).catch(() => false))) {
+    return { ran: false, reason: 'already said' };
+  }
+  // In the version the task's run started on, where it has one, as every step of that run is said.
+  const served = await runOriginVersion(assistant.profile.name, task.channelArn, task.workflowRun?.origin);
+  // A TASK THE RUN'S END WAITS ON NAMES THE RUN'S STEPS STILL OPEN (`steps`), by their labels, read from the run's own claims.
+  const run = task.workflowRun;
+  const runWf = run?.holdsEnd && run.event !== INTENT_TRIGGER ? workflowFor(served?.version.eventWorkflows, run.workflow) : undefined;
+  const standing = runWf && run ? await standingOf(runWf, run.runKey, task.channelArn) : null;
+  const steps = standing ? [...standing.current, ...standing.next].join(', ') : '';
+  // THE PERSON THE STATE AWAITS IS HANDED ITS CHOICES with its notice, on the card only they may press.
+  const card = notice.to === 'worker' ? taskCardOf(task, machinesForTask(task)) : undefined;
+  const said = await sayWorkflowSend({
+    channelArn: task.channelArn, botArn, assistant: assistant.profile.name, workflow: at.workflow,
+    event: (run?.event as WorkflowEvent | undefined) ?? INTENT_TRIGGER, step: at.step,
+    template: notice.template, values: { ...(run?.values ?? {}), ...(steps ? { steps } : {}) }, to: audience.to, runKey: at.runKey, transitions: [], variables: served?.version.variables,
+    ...(at.process ? { process: at.process } : {}), ...(at.edition ? { edition: at.edition } : {}),
+    ...(card ? { taskCard: card } : {}),
+    // AN EMAILED UPDATE IS THE WRITTEN TEXT, so the message that carries the directive is the one the router posts.
+    ...(notice.email ? { emailKind: 'conversation' as const, emailRoom: notice.to === 'room', fallback: true } : {}),
+  });
+  return { ran: said };
+}
+
+/**
+ * A FINISHED TASK WAS REOPENED (ADR-067 decision 2, WT104): the task's own assistant runs the workflow its version declares
+ * on `task-reopened`, once per reopen. Read back from the row: the task is open again, and the nth reopen is the number
+ * of times its history leaves an ending. The run's person is the task's requester, and it takes the task's visibility
+ * (WT111), so a private task's run reaches no one but them.
+ */
+async function handleTaskReopened(task: Task): Promise<{ ran: boolean; reason?: string }> {
+  if (!task.assistantId) return { ran: false, reason: 'the task names no assistant' };
+  const machine = machinesForTask(task)[task.taskType ?? ''];
+  const ending = (state: unknown) => typeof state === 'string' && machine?.states[state]?.transitions.length === 0;
+  const n = (task.stateHistory ?? []).filter((e) => e && ending(e.from) && !ending(e.to)).length;
+  if (!n || ending(task.taskState)) return { ran: false, reason: 'the task is not reopened' };
+  const botArn = botArnFor(appInstanceArnOf(task.channelArn) || '', task.assistantId);
+  const assistant = await assistantOfBot(botArn, STATIC_CLASSIFICATION, await getBotArn());
+  if (assistant.decision === 'decline') return { ran: false, reason: assistant.reason };
+  const served = await servedWelcomeVersion(assistant.profile.name, task.channelArn).catch(() => undefined);
+  const declared = declaredWorkflowOn(served?.version.eventWorkflows, 'task-reopened');
+  if (!declared) return { ran: false, reason: 'no workflow' };
+  const requester = task.userArn?.includes('/user/') ? task.userArn : undefined;
+  const ctx: EventRunContext = {
+    event: 'task-reopened', channelArn: task.channelArn, values: {},
+    ...(requester ? { eventPerson: requester, requester } : {}),
+    privateRun: isPrivateVisibility(task.visibility),
+    reopened: { taskId: task.taskId, n },
+  };
+  return runWorkflowFor(declared.name, declared.workflow, ctx, runnerOf(botArn, assistant.profile.name, served));
+}
+
+/**
+ * A REQUEST WHOSE TASK NO ROUTER TURN OPENED STARTS ITS INTENT'S WORKFLOW (ADR-067 Appendix A, G9 and G15; WT115, WT106):
+ * a queued request its sender accepted, or a request a task's turn opened mid-task. As if the message had arrived alone:
+ * on the version the request's assistant serves now, keyed by the request's own message id, so a redelivered naming finds
+ * the run claimed and starts nothing twice. The request's task already exists, so the run's own task step takes it
+ * (`attachRequestRun`) rather than opening another, and the run waits on its ending like any request's.
+ * A version that declares no workflow for the intent starts nothing: the queued request goes on as it always has. A task
+ * that settled before its run was recorded continues that run on its ending here, since its settlement named no run.
+ */
+async function handleRequestAwaitingRun(task: Task): Promise<{ ran: boolean; reason?: string }> {
+  if (!requestAwaitingRun(task) || !task.openingIntent || !task.userMessageId) return { ran: false, reason: 'not a request awaiting its run' };
+  if (!task.assistantId) return { ran: false, reason: 'the task names no assistant' };
+  const botArn = botArnFor(appInstanceArnOf(task.channelArn) || '', task.assistantId);
+  const assistant = await assistantOfBot(botArn, STATIC_CLASSIFICATION, await getBotArn());
+  if (assistant.decision === 'decline') return { ran: false, reason: assistant.reason };
+  const served = await servedWelcomeVersion(assistant.profile.name, task.channelArn).catch(() => undefined);
+  if (!served?.version.intentWorkflows?.[task.openingIntent]) return { ran: false, reason: 'no workflow' };
+  const taken = await startIntentRun({
+    intent: task.openingIntent, channelArn: task.channelArn, botArn, assistant: assistant.profile.name, version: served.version,
+    requesterArn: task.userArn, correlationId: task.userMessageId, privateRun: isPrivateVisibility(task.visibility),
+    open: async (run, extra) => {
+      // THE WRITE IS CONDITIONAL (only while the request awaits its run, and has none), so a fault is tried again and never
+      // records a second run; a refusal (the request stopped awaiting one) is an answer, and the run stops where it is.
+      const attached = await retryOnFault(() => attachRequestRun({ taskId: task.taskId, channelArn: task.channelArn, workflowRun: run as unknown as Record<string, unknown>, ...extra }));
+      if (attached) return attached;
+      // A REFUSAL MAY BE AN EARLIER ATTEMPT'S OWN WRITE, which landed while its answer was lost: the row that names this run
+      // is this run's.
+      const row = await getTask(task.taskId, task.channelArn).catch(() => null);
+      if (row?.workflowRun?.runKey === run.runKey) return row;
+      throw new Error('the request did not take its run');
+    },
+  });
+  if (!taken) return { ran: false, reason: 'the run did not start' };
+  if (settlementOutcome(taken, machinesForTask(taken))) {
+    return handleTaskNaming({ kind: 'settled', channelArn: taken.channelArn, taskId: taken.taskId });
+  }
+  return { ran: true };
+}
+
+/**
+ * A REQUEST'S WORKFLOW STARTS ON THE TURN THAT CLASSIFIED IT (ADR-067 decision 1, stage 3).
+ *
+ * Only where the turn's version declares a workflow for the intent: the canonical workflow is today's rule, which the
+ * caller runs as it always has, so a version that declares none writes no run. The run is keyed by the turn's correlation
+ * id and starts on this turn: any sends before its own task step, then that step, which opens the request's task through
+ * `open` (the router's own door, so this turn works its first step and no pickup races it) with the run recorded on it.
+ * The run then waits on the task's ending, and the steps after it run once when it settles.
+ *
+ * TENET D5: a run that cannot be claimed or started opens nothing here, and the caller opens the task as today, so a
+ * failed run write never costs the person their answer. Returns the task the run opened, or undefined.
+ */
+async function startIntentRun(args: {
+  intent: string; channelArn: string; botArn: string; assistant: string;
+  version: ServedWelcomeVersion['version'] | undefined;
+  requesterArn: string | undefined; correlationId: string | undefined;
+  open: (run: WorkflowRunRef, extra: { dueBy?: string; ttlSeconds?: number }) => Promise<Task>;
+  /** Whether the request was private (its message targeted): its run then reaches no one but the requester (WT72). */
+  privateRun: boolean;
+  /** Another assistant's run that asked for this work (WT118): the request's task carries it, and it is continued on the ending. */
+  askedBy?: WorkflowRunRef;
+  /** What started the run (WT118): a person's request, unless another assistant's run asked. */
+  trigger?: RunTrigger;
+  /** The served version with its experiment arm, where the caller read it; else the version alone. */
+  served?: ServedWelcomeVersion;
+  /** The requests that led to this run (WT118), carried on it so a request it makes is bounded. */
+  askChain?: string[];
+}): Promise<Task | undefined> {
+  // AN ASK RUNS THE OWNER'S WORKFLOW FOR THE INTENT, or the standard one where its version declares none: the owner's run
+  // does the work in every case. A person's request with no declared workflow is opened by the caller as it always was.
+  const declared = args.version?.intentWorkflows?.[args.intent] ?? (args.askedBy ? canonicalIntentWorkflow(args.intent) : undefined);
+  if (!declared || !args.correlationId || (!args.askedBy && !args.requesterArn?.includes('/user/'))) return undefined;
+  try {
+    const wf = asRun(declared);
+    const who = runnerOf(args.botArn, args.assistant, args.served ?? (args.version ? { version: args.version } : undefined));
+    const runKey = intentRunKey(args.correlationId, args.assistant);
+    // A REQUEST IS PRIVATE WHERE ITS MESSAGE WAS (WT72): a targeted request's run reaches no one but the requester, and an
+    // open one's reaches the room as its own task would.
+    const base: EventRunContext = {
+      event: INTENT_TRIGGER, channelArn: args.channelArn, ...(args.requesterArn ? { requester: args.requesterArn } : {}), values: {},
+      correlationId: args.correlationId, privateRun: args.privateRun, trigger: args.trigger ?? 'person',
+      ...(args.askChain?.length ? { askChain: args.askChain } : {}),
+    };
+    const roles = await participantRolesForRun(args.intent, wf, base, who, {});
+    // AN INTENT'S WORKFLOW RUNS IN THE TYPES IT DECLARES (G20); in any other, the canonical workflow does.
+    if (wf.types?.length) {
+      const type = roles.conversationType ?? (await getChannelContext(args.channelArn).catch(() => null))?.conversationType;
+      if (!type || !wf.types.includes(type)) return undefined;
+    }
+    // THE RUN'S PROCESS (SPEC-PROCESSES P2): it starts or joins one only where its version links the intent's workflow, and the id
+    // rides the run as an event run's does: on the request's task, each message the run says, its end, and any `open` step.
+    const proc = await intentRunProcessFor(base, who, args.intent, runKey, args.askedBy);
+    const inProcess: EventRunContext = proc ? { ...base, process: proc } : base;
+    const withRoles: EventRunContext = roles.roles ? { ...inProcess, roles: roles.roles, roleSaidInRoom: roles.saidInRoom, ...(roles.deciding ? { decidingRoles: roles.deciding } : {}), ...(roles.conversationType ? { conversationType: roles.conversationType } : {}) } : inProcess;
+    const gated: EventRunContext = { ...withRoles, gate: await routerGate(wf, withRoles, who.variables, { ...(roles.members ? { members: roles.members } : {}), ...(roles.conversationType ? { conversationType: roles.conversationType } : {}) }) };
+    const deps = eventRunDeps(args.intent, gated, who, runKey, roles.members);
+    const ownStep = intentTaskStep(declared, args.intent);
+    let opened: Task | undefined;
+    await runEventWorkflow(args.intent, wf, gated, {
+      ...deps,
+      openTask: async (step, def, transitions) => {
+        if (step !== ownStep) return deps.openTask ? deps.openTask(step, def, transitions) : 'failed';
+        const origin = runOriginOf(args.version);
+        // HOW QUICKLY THE REQUEST IS DONE, as its author declared (WT21), read as every task step's deadline is: a timeout ends
+        // it and takes `onDeadline` on this classification's one-shot scheduler, a due time is shown on it, and its row is kept
+        // until the deadline has passed. The request's task step declares no recorded time and no reminder (`intentWorkflowErrors`).
+        const deadline = taskStepDeadline(def, {});
+        if (deadline === 'unreadable') return 'failed';
+        // AN OPEN THAT FAILS ABANDONS THE RUN, taking no edge: the request was never refused, so nothing says it failed, and the
+        // caller opens its task as it would without a workflow, under the same id, so one request keeps one task (or, for a
+        // request that is no longer awaiting its run, leaves it as it is). The run's claim stays on the step, so a redelivery
+        // starts nothing twice.
+        // THE DEADLINE COUNTS FROM HERE, where the run takes the request up: an accepted queued request is worked from acceptance.
+        const ownRun = runKey;
+        opened = await args.open({
+          runKey, workflow: args.intent, step, event: INTENT_TRIGGER, botArn: args.botArn, values: {}, ...(origin ? { origin } : {}),
+          workflowHash: contentHash12(declared), trigger: args.trigger ?? 'person', ...(args.askChain?.length ? { askChain: args.askChain } : {}),
+          ...(deadline.deadlineAt !== undefined ? { deadlineAt: deadline.deadlineAt } : {}),
+          // THE RUN'S PROCESS, carried to the task's settlement and onto each turn that works it (SPEC-PROCESSES P2, P8).
+          ...(gated.process ? { process: gated.process } : {}),
+          // A RUN WAITS ON IT, so a task no timeout ends is kept for the run's lifetime (WT26).
+        }, { ...(deadline.dueBy ? { dueBy: deadline.dueBy } : {}), ttlSeconds: deadline.ttlSeconds ?? 45 * 24 * 3600 })
+          .catch((err) => { throw new RunAbandoned((err as Error)?.message ?? 'the request\'s task was not written'); });
+        // THE ROW HOLDS THIS RUN, or it is some other open's: a run never waits on a row that does not name it.
+        if (opened.workflowRun?.runKey !== ownRun) throw new RunAbandoned('the request\'s task holds no run of this request');
+        if (deadline.deadlineAt !== undefined) await scheduleTaskDeadline(args.channelArn, opened.taskId, deadline.deadlineAt);
+        return 'opened';
+      },
+    });
+    return opened;
+  } catch (err) {
+    console.warn('[Router][intent-run] the request\'s workflow could not start; its task opens as today', { intent: args.intent, errName: (err as Error)?.name });
+    return undefined;
+  }
+}
+
+/**
+ * THE VERSION A RUN CONTINUES ON (ADR-067 stage 2): the one served now when it is the run's origin, or when the run
+ * records none (a run started before origins were recorded); else the origin, read by its parameter version. An origin
+ * that cannot be read is said and the served version continues the run, as it did before, rather than stopping it.
+ */
+async function runOriginVersion(profileName: string, channelArn: string, origin: RunOrigin | undefined): Promise<ServedWelcomeVersion | undefined> {
+  const served = await servedWelcomeVersion(profileName, channelArn).catch(() => undefined);
+  if (!origin?.configId || served?.version.configId === origin.configId || origin.version === undefined) return served;
+  try {
+    const version = await resolveProfileVersion(profileName, origin.version, { ssm: ssmClient, ssmRoot: SSM_ROOT });
+    if (version?.configId === origin.configId) return { version };
+    console.warn('[Router][event] the run\'s origin version names another configId; the served version continues it', { profileName });
+  } catch (err) {
+    console.warn('[Router][event] the run\'s origin version could not be read; the served version continues it', { profileName, errName: (err as Error)?.name });
+  }
+  return served;
 }
 
 /**
@@ -3451,7 +5036,156 @@ export async function handleEventContinuation(req: EventContinuation): Promise<{
  * rendered with no model call, posted as that assistant on a speak session, to the room or targeted at each person.
  * Declared a `notification` turn and carrying its workflow, step and event, never the rendered values.
  */
-async function sayWorkflowSend(args: {
+/**
+ * Each person as the composer writes a mention, `@<Name|id>`: how a message the room reads addresses several people.
+ * Undefined when the classification boundary refused the roster read, and then nothing is said.
+ */
+async function mentionsOf(channelArn: string, botArn: string, people: readonly string[]): Promise<string | undefined> {
+  const size = await resolveChannelSize(chimeClient, channelArn, botArn).catch(() => null);
+  if (size?.refused) return undefined;
+  const names = new Map((size?.members ?? []).map((m) => [m.arn, m.name]));
+  return people.map((arn) => `@<${(names.get(arn) || personIdFromArn(arn) || '').replace(/[<>|\n]/g, ' ').trim()}|${personIdFromArn(arn)}>`).join(' ');
+}
+
+/**
+ * SPEAK AS AN ASSISTANT FOR ONE PIECE OF WORK, outside a turn: a run's send, a meeting card, a notice, a placeholder. The
+ * router records which bot speaks and holds the speak session the vend gives (`speakAsRoutedAssistant`) for `work` alone,
+ * then acts as it did before (`keepingTheTurnsSession`): its own role outside a turn, the turn's session inside one. So a
+ * read the router makes after it has spoken, a room's tags, another assistant's roster, is made on the identity that holds
+ * it, never on the speak edge of whichever assistant spoke last.
+ */
+async function speakingAs<T>(
+  speaker: { botArn: string; channelArn?: string; purpose: string }, work: () => Promise<T>,
+): Promise<T> {
+  return keepingTheTurnsSession(async () => {
+    await speakAsRoutedAssistant(
+      {
+        routeId: `${SPEAK_ROUTE_PREFIX}${speaker.purpose}-${randomUUID()}`, botArn: speaker.botArn, classification: STATIC_CLASSIFICATION,
+        tableName: TURN_ROUTING_TABLE, ...(speaker.channelArn ? { channelArn: speaker.channelArn } : {}),
+      },
+      { ddb: routingDdb },
+    );
+    return work();
+  });
+}
+
+/**
+ * A conversation's own row, as a send beyond the run's own conversation reads its link: up to three times while it fails
+ * (`tryThrice`, as the tell to an opener reads the same link).
+ */
+const readLinkRow = (channelArn: string): ReturnType<typeof readChannelContext> =>
+  tryThrice(() => readChannelContext(channelArn, { consistent: true }));
+
+/**
+ * A ROW OR A CONVERSATION'S TAGS THAT COULD NOT BE READ, even tried again: an operational failure, never a refusal and never a
+ * SecurityEvent, since it says nothing about the link. The step is already claimed, so the send is not lost silently: it is
+ * logged as an error and answered `false`, so the step records `failed` and the run goes on by the step's failure edge.
+ */
+function linkUnreadable(step: string, what: string, err: string): false {
+  console.error('[Router][event-workflow] a send beyond this conversation could not read its link; nothing is said and the step takes its failure edge', { step, what, err });
+  return false;
+}
+
+/** A conversation's tags, read up to three times while the read fails (`tryThrice`); the failure's name where it still fails. */
+async function readTagsForSend(channelArn: string): Promise<{ tags: Record<string, string | undefined> } | { unreadable: string }> {
+  try {
+    return { tags: await tryThrice(() => readChannelTags(chimeClient, channelArn)) };
+  } catch (err) {
+    return { unreadable: (err as Error)?.name || 'read failed' };
+  }
+}
+
+/**
+ * A SEND IN THE CONVERSATION THAT OPENED THIS ONE (DESIGN-PROCESSES O24): the parent the opened conversation's server-side row
+ * records (`parentRef`, the link `tellOpener` reads), never a value from an event or a message, and only where it is this
+ * classification's, by its immutable tag, and not archived. The assistant says it there as itself, to the room, written, with
+ * this conversation's link; Amazon Chime SDK membership decides, so an assistant that is not a member there is refused
+ * (`refused`). No parent recorded, or one of another classification, is refused the same way, and nothing is said. A row or
+ * tags that could not be read, even tried again, is a failure (`linkUnreadable`), never a refusal.
+ */
+async function sayInOpener(args: Parameters<typeof sayWorkflowSend>[0]): Promise<boolean | 'refused'> {
+  const found = await openerConversation(args.channelArn, readLinkRow);
+  if ('unreadable' in found) return linkUnreadable(args.step, 'this conversation', found.unreadable);
+  if ('refused' in found) {
+    console.warn('[Router][event-workflow] the send names the conversation that opened this one, and none is recorded; nothing is said', { step: args.step });
+    return 'refused';
+  }
+  const parent = found.arn;
+  const read = await readTagsForSend(parent);
+  if ('unreadable' in read) return linkUnreadable(args.step, 'the conversation that opened this one', read.unreadable);
+  const closed = roomRefusal(read.tags);
+  if (closed) {
+    console.warn('[Router][event-workflow] the conversation that opened this one is not posted to; nothing is said', { step: args.step, reason: closed });
+    return 'refused';
+  }
+  const out = await sayWorkflowSendOutcome({
+    ...args, channelArn: parent, to: [], mentions: [], fallback: true,
+    values: { ...args.values, [CHILD_LINK_VALUE]: `?${conversationRef(args.channelArn.split('/').pop() || args.channelArn)}` },
+  });
+  if (out === 'refused') console.warn('[Router][event-workflow] the assistant is not a member of the conversation that opened this one; nothing is said', { step: args.step });
+  return out === 'posted' ? true : out === 'refused' ? 'refused' : false;
+}
+
+/**
+ * SAY A RUN'S TEMPLATE IN THE CONVERSATION ITS OWN `open` STEP OPENED (DESIGN-PROCESSES O33): read from the link the open step
+ * handed back (`conversation_link`), and said only where that conversation's own row names this one as the conversation that
+ * opened it, at the same classification. The assistant posts as itself and Amazon Chime SDK membership decides, so where it is
+ * not a member the post is refused, as is a run that opened nothing. A row or tags that could not be read, even tried again,
+ * is a failure (`linkUnreadable`), never a refusal and never a SecurityEvent.
+ */
+async function sayInOpened({ openTypes, ...args }: Parameters<typeof sayWorkflowSend>[0] & { openTypes: string[] }): Promise<boolean | 'refused'> {
+  // A RUN THAT WENT ON FROM A TASK OPENED BEFORE ITS OPEN STEP (a resolve, O15) holds values from before the link was handed
+  // back; the conversation's own row lists the children it opened, so the newest one of a type this run's open steps declare
+  // is the one it opened. Either way the child's own row must name this conversation as its parent, below.
+  let link: string | undefined = args.values[CHILD_LINK_VALUE];
+  if (link === undefined) {
+    try {
+      link = await newestOpenedLink(args.channelArn, openTypes);
+    } catch (err) {
+      return linkUnreadable(args.step, 'this conversation', (err as Error)?.name || 'read failed');
+    }
+  }
+  const found = await openedConversation(args.channelArn, link, readLinkRow);
+  if ('unreadable' in found) return linkUnreadable(args.step, 'the conversation this run opened', found.unreadable);
+  if ('refused' in found) {
+    if (found.refused === 'opened-none') console.warn('[Router][event-workflow] the send names the conversation this run opened, and it opened none; nothing is said', { step: args.step });
+    else console.warn('[Router][event-workflow][SecurityEvent] the conversation the run names was not opened from this one; nothing is said', { step: args.step });
+    return 'refused';
+  }
+  const child = found.arn;
+  const read = await readTagsForSend(child);
+  if ('unreadable' in read) return linkUnreadable(args.step, 'the conversation this run opened', read.unreadable);
+  const closed = roomRefusal(read.tags);
+  if (closed) {
+    console.warn('[Router][event-workflow] the conversation this run opened is not posted to; nothing is said', { step: args.step, reason: closed });
+    return 'refused';
+  }
+  const out = await sayWorkflowSendOutcome({
+    ...args, channelArn: child, to: [], mentions: [], fallback: true,
+    values: { ...args.values, [CHILD_LINK_VALUE]: `?${conversationRef(args.channelArn.split('/').pop() || args.channelArn)}` },
+  });
+  if (out === 'refused') console.warn('[Router][event-workflow] the assistant is not a member of the conversation this run opened; nothing is said', { step: args.step });
+  return out === 'posted' ? true : out === 'refused' ? 'refused' : false;
+}
+
+/** The link to the newest child this conversation's row lists of one of the given types, or undefined; throws where unreadable. */
+async function newestOpenedLink(channelArn: string, types: string[]): Promise<string | undefined> {
+  if (!types.length) return undefined;
+  const children = (await readLinkRow(channelArn))?.children ?? [];
+  const newest = children.filter((c) => types.includes(c.typeKey)).sort((a, b) => b.openedAt.localeCompare(a.openedAt))[0];
+  return newest ? `?${conversationRef(newest.channelId)}` : undefined;
+}
+
+/** Say a run's message template (`sayWorkflowSendOutcome`): true when it was posted. */
+async function sayWorkflowSend(args: Parameters<typeof sayWorkflowSendOutcome>[0]): Promise<boolean> {
+  return (await sayWorkflowSendOutcome(args)) === 'posted';
+}
+
+/**
+ * SAY A RUN'S MESSAGE TEMPLATE: `posted`, `refused` where the Amazon Chime SDK refused the assistant the conversation (it is
+ * not a member there), or `failed` where it could not be said.
+ */
+async function sayWorkflowSendOutcome(args: {
   channelArn: string; botArn: string; assistant: string; workflow: string; event: WorkflowEvent; step: string;
   template: string; values: Record<string, string>; to: string[]; runKey: string; transitions: EventTransition[];
   mentions?: string[]; variables?: Readonly<Record<string, VersionVariable>>; fallback?: boolean;
@@ -3460,84 +5194,98 @@ async function sayWorkflowSend(args: {
   /** A task step's card (ADR-063 decision 2), on the message only its addressee receives. */
   taskCard?: TaskCard;
   /** The email this send carries, where the event's own rule does not decide it: a task step's `task` notice. */
-  emailKind?: 'task';
-}): Promise<boolean> {
+  emailKind?: 'task' | 'conversation';
+  /** The email goes to the room: the message addresses `@humans`, and the bridge reads its members. */
+  emailRoom?: boolean;
+  /** Where the email's button leads: the conversation's meeting window (`meeting`), else the conversation. */
+  emailLink?: 'meeting';
+  /** What the message declares it is (a drift offer, and the message it answers), read by the archive. */
+  declare?: TurnDeclaration;
+  /** The run's edition (WT60): the version it started on and its workflow's hash, which the archive projects. */
+  edition?: { originConfigId?: string; workflowHash?: string; trigger?: RunTrigger };
+  /** Platform Metadata the message carries as well: a meeting step's notice is the meeting's started card. */
+  cardMetadata?: Record<string, unknown>;
+  /** The run's process, which the message's out-of-band record carries (SPEC-PROCESSES P8). */
+  process?: RunProcess;
+}): Promise<'posted' | 'refused' | 'failed'> {
   try {
     // THE TEMPLATE LEARNS ITS AUDIENCE (ADR-060 decision 3): a stored one this send's readers may not read is passed
     // over; a field it binds to the version's variables or a source is resolved here, and the run's own values stand.
     const held = routerVariables(args.variables);
     const resolver = { ...held, values: { ...held.values, ...(args.eventValues ?? {}) } };
-    const audience = args.to.length ? 'addressed' as const : 'room' as const;
+    // A TARGET IS ONE PERSON (the Amazon Chime SDK fixes it at one member). Several people are addressed by mention, in a
+    // message the room reads, so the template is held to what the room may read.
+    const onePerson = args.to.length === 1 ? args.to : [];
+    const audience = onePerson.length ? 'addressed' as const : 'room' as const;
     const template = await loadNamedTemplate({ classification: STATIC_CLASSIFICATION, assistant: args.assistant, name: args.template }, 'message', undefined,
       { lookup: resolver.lookup, audience, mentions: args.mentions ?? [], holds: routerHolds(resolver, args.channelArn, audience) });
     if (!template) {
       console.warn('[Router][event-workflow] the send names no message template this assistant can say', { template: args.template, step: args.step });
-      return false;
+      return 'failed';
     }
     // THE READER'S LANGUAGE (ADR-062 decision 4), read only when the template has a choice to make: a written variant,
     // or a `voice` fill. One person reads a targeted send, so their preferred language comes first; the room reads the
     // conversation's. Each is a declared tag from a record, never a judgement on text.
-    const languages = (template.variants || template.fill === 'voice') ? await sendLanguages(args.channelArn, args.to) : {};
+    const languages = (template.variants || template.fill === 'voice') ? await sendLanguages(args.channelArn, onePerson) : {};
     const choice = chooseLanguage(template, { audience, ...languages });
-    if (template.fill === 'voice' && !choice.targetWritten && !args.fallback) {
+    // A SEND THAT DECLARES WHAT IT IS (a drift offer) IS ALWAYS WRITTEN: its declaration rides the written text, so it is said here.
+    // SO IS ONE THAT CARRIES A TASK'S CARD: the card rides the written message, and a voiced one would arrive without it.
+    if (template.fill === 'voice' && !choice.targetWritten && !args.fallback && !args.declare && !args.taskCard && args.to.length <= 1) {
       // NO VARIANT IS WRITTEN FOR THE READER: the assistant says it in its own voice, which is a model call on its own
       // session, so the processor renders it and posts the written text if the render does not hold. THE EVENT'S OWN
       // VALUES TRAVEL RESOLVED (an invitation's reason, for one): the resolver says each only where its trust and this
       // send's readers allow, here where the router holds them, and the processor renders them as data.
       const eventResolved = resolveTemplateFields(choice.written.fields ?? {}, { ...resolver, site: { callSite: turnCallSite(undefined, args.channelArn), audience, section: 'chat' } });
       const handed = await dispatchVoiceSend({ ...args, values: { ...eventResolved, ...args.values }, target: choice.target, writtenLanguage: choice.writtenLanguage });
-      if (handed) return true;
+      if (handed) return 'posted';
       console.warn('[Router][event-workflow] a voice send could not be handed to the processor; its written text is said', { step: args.step });
     }
-    const written = choice.written;
-    // THE ROLE A CREATING APPLICATION ASSERTED FOR THE ONE PERSON A SEND IS ADDRESSED TO (`host:role`), read from the row
-    // only when the template binds it: member trust, so it is inserted for that person and never decides.
-    const hostRole = args.to.length === 1 && Object.values(written.fields ?? {}).includes('host:role')
-      ? await hostRoleOf(args.channelArn, args.to[0]) : undefined;
-    const withHost = hostRole ? { ...resolver, values: { ...resolver.values, 'host:role': hostRole } } : resolver;
-    const resolved = resolveTemplateFields(written.fields ?? {}, { ...withHost, site: { callSite: turnCallSite(undefined, args.channelArn), audience, section: 'chat' } });
-    const rendered = renderMessageTemplate(written, { ...resolved, ...args.values }, { refusedValue: 'empty' });
-    const content = rendered.ok ? (rendered.sections.chat ?? '').trim() : '';
-    if (!content) return false;
-    await speakAsRoutedAssistant(
-      { routeId: `${SPEAK_ROUTE_PREFIX}event-${randomUUID()}`, botArn: args.botArn, classification: STATIC_CLASSIFICATION, tableName: TURN_ROUTING_TABLE, channelArn: args.channelArn },
-      { ddb: routingDdb },
-    );
+    const { rendered, content: said } = await renderRunWritten({ written: choice.written, resolver, audience, channelArn: args.channelArn, to: onePerson, values: args.values });
+    if (!said) return 'failed';
+    const mentions = !args.emailRoom && args.to.length > 1 ? await mentionsOf(args.channelArn, args.botArn, args.to) : '';
+    if (mentions === undefined) return 'failed';
+    const addressed = args.emailRoom ? `@humans ${said}` : mentions ? `${mentions} ${said}` : said;
+    const content = args.declare ? withTurnDeclaration(addressed, args.declare) : addressed;
     const metadata = {
       ...JSON.parse(botMessageMetadata(
         { agentType: args.assistant, classification: STATIC_CLASSIFICATION, turnKind: 'notification' },
-        args.to.length ? { targetedSender: args.to[0] } : undefined,
+        onePerson.length ? { targetedSender: onePerson[0] } : undefined,
       )),
+      ...(args.cardMetadata ?? {}),
       eventStep: { workflow: args.workflow, step: args.step, event: args.event, outcome: 'posted' },
       // THE RUN'S MOVES REACH THE ARCHIVE ON ITS MESSAGES (ADR-061 rule 11), as a task's transitions do.
-      eventRun: { runKey: args.runKey, transitions: args.transitions },
+      eventRun: { runKey: args.runKey, transitions: args.transitions, ...(args.edition ?? {}) },
       // A PERSON ADDED TO A CONVERSATION THEY DID NOT OPEN IS EMAILED THE SEND ADDRESSED TO THEM (ADR-061 decision 3),
       // as the `memberWelcome` notice the run replaces emailed them: a `conversation-shared` notice they can mute, its
       // subject the template's own `email.subject`, sent by the notification bridge off the message stream.
       // A TASK STEP'S CARD, which only its addressee receives (ADR-063 decision 2): ids and declared names, never words.
       ...(args.taskCard && args.to.length === 1 ? { task: args.taskCard } : {}),
       ...(() => {
-        const kind = args.emailKind && args.to.length ? args.emailKind : workflowSendEmailKind(args.event, args.to);
+        const kind = args.emailKind && (args.to.length || args.emailRoom) ? args.emailKind : workflowSendEmailKind(args.event, args.to);
         if (!kind) return {};
         const subject = rendered.ok ? (rendered.sections['email.subject'] ?? '').trim() : '';
-        return notifyDirective({ ...(subject ? { subject } : {}), targets: args.to, kind, conversationId: conversationKey(args.channelArn) });
+        return notifyDirective({ ...(subject ? { subject } : {}), ...(args.emailRoom || args.to.length > 1 ? {} : { targets: args.to, kind }), conversationId: conversationKey(args.channelArn),
+          // A MEETING'S EMAIL IS ITS OWN WORDS AND BUTTON: the chat line's link is relative to the app, so the email says its `email.body`.
+          ...(args.emailLink ? { link: args.emailLink, ...(rendered.ok && rendered.sections['email.body']?.trim() ? { body: rendered.sections['email.body'].trim() } : {}) } : {}) });
       })(),
     };
     // ONE RESPONSE, IN AS MANY PARTS AS IT NEEDS (`sendInParts`), every part to the send's audience. The first part
-    // carries the directive, so a person is emailed once.
-    await sendInParts(chimeClient, {
+    // carries the directive, so a person is emailed once. The Metadata stays within the service's cap: an email's own
+    // words give way first (`withinMetadataCap`), and the email is still sent.
+    const sent = await speakingAs({ botArn: args.botArn, channelArn: args.channelArn, purpose: 'event' }, () => sendInParts(chimeClient, {
       ChannelArn: args.channelArn,
       text: content,
       Type: ChannelMessageType.STANDARD,
       Persistence: ChannelMessagePersistenceType.PERSISTENT,
       ChimeBearer: args.botArn,
-      Metadata: JSON.stringify(metadata),
-      ...(args.to.length && { Target: args.to.map((MemberArn) => ({ MemberArn })) }),
-    });
-    return true;
+      Metadata: JSON.stringify(withinMetadataCap(metadata, CHIME_METADATA_MAX)),
+      ...(onePerson.length && { Target: onePerson.map((MemberArn) => ({ MemberArn })) }),
+    }));
+    await recordRunMessageProcess(sent, args.channelArn, args.process);
+    return 'posted';
   } catch (err) {
     console.error('[Router][event-workflow] a send could not be posted', { step: args.step, errName: (err as Error)?.name });
-    return false;
+    return (err as Error)?.name === 'ForbiddenException' ? 'refused' : 'failed';
   }
 }
 
@@ -3567,6 +5315,10 @@ async function dispatchVoiceSend(args: {
   channelArn: string; botArn: string; assistant: string; workflow: string; event: WorkflowEvent; step: string;
   template: string; values: Record<string, string>; to: string[]; runKey: string; transitions: EventTransition[];
   mentions?: string[]; target: string; writtenLanguage: string;
+  /** The run's edition (WT60) and what started it (WT118), carried to the message the processor posts. */
+  edition?: { originConfigId?: string; workflowHash?: string; trigger?: RunTrigger };
+  /** The run's process, which the message's out-of-band record carries (SPEC-PROCESSES P8). */
+  process?: RunProcess;
 }): Promise<boolean> {
   const processorArn = await resolveAsyncProcessorArn(STATIC_CLASSIFICATION);
   if (!processorArn) return false;
@@ -3586,24 +5338,28 @@ async function dispatchVoiceSend(args: {
       runKey: args.runKey, workflow: args.workflow, step: args.step, event: args.event, template: args.template,
       values: args.values, to: args.to, ...(args.mentions ? { mentions: args.mentions } : {}),
       target: args.target, writtenLanguage: args.writtenLanguage, transitions: args.transitions,
+      ...(args.edition?.originConfigId ? { origin: { configId: args.edition.originConfigId } } : {}),
+      ...(args.edition?.workflowHash ? { workflowHash: args.edition.workflowHash } : {}),
+      ...(args.edition?.trigger ? { runTrigger: args.edition.trigger } : {}),
+      ...(args.process ? { process: args.process } : {}),
     },
   });
 }
 
 /**
- * THE ASSISTANT THAT TAKES A STEP NAMING `as` (ADR-061 decision 1, "Whose workflow runs"): read from this classification's
- * live assignment records and the room's members as the run's assistant reads them (`assistantForStep`). Undefined when
- * no assistant holding the role is in the room, or the room cannot be read, so nothing is dispatched to anyone.
+ * THE ASSISTANT A REQUEST TO A ROLE ASKS (WT118): read from this classification's live assignment records and the room's
+ * members as the run's assistant reads them (`holderOfRole`). Undefined when no assistant holding the role is in the room,
+ * or the room cannot be read, so nobody is asked; `ambiguous` where more than one holds it.
  */
-async function stepTaker(def: AgentStep, channelArn: string, selfBotArn: string): Promise<{ botArn: string; assistant?: string } | undefined> {
+async function roleHolder(role: string, channelArn: string, selfBotArn: string): Promise<{ botArn: string; assistant?: string } | 'ambiguous' | undefined> {
   await loadAssistantIndex();
   const self = { botArn: selfBotArn, role: roleByBotArn.get(selfBotArn) || ASSISTANT_ROLE || undefined };
-  if (self.role === def.as?.role) return { botArn: selfBotArn };
+  if (self.role === role) return { botArn: selfBotArn };
   const live = await liveAssistantsForClassification(STATIC_CLASSIFICATION);
-  if (!live.some((a) => a.role === def.as?.role)) return undefined;
+  if (!live.some((a) => a.role === role)) return undefined;
   const size = await resolveChannelSize(chimeClient, channelArn, selfBotArn).catch(() => undefined);
   if (!size || size.unknown || size.refused) return undefined;
-  return assistantForStep(def, { self, live, botsInRoom: (size.members ?? []).filter((m) => m.isBot).map((m) => m.arn) });
+  return holderOfRole(role, { self, live, botsInRoom: (size.members ?? []).filter((m) => m.isBot).map((m) => m.arn) });
 }
 
 /**
@@ -3618,10 +5374,26 @@ async function dispatchEventAgentStep(args: {
   roles?: Record<string, string[]>; conversationType?: string;
   invitationId?: string; inviter?: string;
   alarm?: AlarmChange;
+  /** `event-received` only: the rule that matched, and its window. */
+  ruleEvent?: RuleEventRef;
+  /** A meeting's events only: the meeting, which the run's natural key names. */
+  meeting?: { meetingId: string };
+  /** The run's process (SPEC-PROCESSES P2), handed back as it came. */
+  process?: RunProcess;
   variantProfile?: import('./lib/active-profile.js').ProfileDefinition;
   promptValues?: Record<string, string>; proposalNotAfter?: number;
-  /** A step another assistant takes (`as`): the run's assistant, whose version declares it, and its bot, handed back to. */
-  workflowOwner?: string; ownerBotArn?: string;
+  /** The version the run started on, handed back with the outcome (ADR-067 stage 2). */
+  origin?: RunOrigin;
+  /** An intent's run only: the task its own step opened. */
+  runTaskId?: string;
+  /** `task-reopened` only: the task that reopened, and which reopen. */
+  reopened?: { taskId: string; n: number };
+  /** The run's workflow's hash (WT60), stamped on the step's message. */
+  workflowHash?: string;
+  /** What started the run (WT118), stamped on the step's message. */
+  runTrigger?: RunTrigger;
+  /** A turn another assistant's run asked this assistant for (WT118); see `AskedTurn`. */
+  asked?: AskedTurn;
 }): Promise<boolean> {
   const processorArn = await resolveAsyncProcessorArn(STATIC_CLASSIFICATION);
   if (!processorArn) return false;
@@ -3630,9 +5402,10 @@ async function dispatchEventAgentStep(args: {
   const { channelArn, botArn, variantProfile, ...eventStep } = args;
   return invokeAsync(processorArn, {
     channelArn,
+    ...await roomGroundingFields(channelArn),
     // Keyed by the event and its natural key, so two people's `person-joined` runs, two invitations' runs, and two events
     // sharing a natural key (`invitation-sent` and `invitation-unredeemed`) are two turns, never collapsed into one.
-    correlationId: eventDispatchId('event', [args.event, eventNaturalKey(args.event, channelArn, args.eventPerson, args.invitationId, args.alarm) ?? conversationKey(channelArn), args.step, botIdFromArn(botArn)]),
+    correlationId: eventDispatchId('event', [args.event, runNaturalKey(args.event, channelArn, { ...args, subjectMessageId: args.values?.message, meetingId: args.meeting?.meetingId }) ?? conversationKey(channelArn), args.step, botIdFromArn(botArn)]),
     userMessage: '',
     userContent: '',
     classification: STATIC_CLASSIFICATION,
@@ -3642,6 +5415,26 @@ async function dispatchEventAgentStep(args: {
     eventStep,
     ...(variantProfile ? { variantProfile } : {}),
   });
+}
+
+/**
+ * WHAT THE ROOM'S SERVER-SIDE ROW GROUNDS A TURN IN that the router hands the processor outside a person's turn (an agent step, a
+ * task the assistant takes up), as host grounding carries it on a person's turn: the alarm the room watches, which an
+ * incident's or an incident watch's first look starts from (SPEC-WORKFLOWS-AND-TASKS WT120), and the conversations it
+ * threads with, unchecked, which the processor checks before reading (DESIGN-WORKFLOWS-AND-TASKS section 6). One read; a row
+ * that cannot be read gives neither.
+ */
+async function roomGroundingFields(channelArn: string): Promise<{ watchedAlarm?: string; threadRelatives?: RelatedConversation[]; userLanguage?: string }> {
+  const row = await getChannelContext(channelArn).catch(() => null);
+  const name = row?.watchedAlarm;
+  // AND, FROM THE SAME READ, THE CONVERSATIONS THIS ONE THREADS WITH, unchecked; the processor checks them (section 6).
+  const relatives = threadRelatives(channelArn, row);
+  return {
+    ...(typeof name === 'string' && name ? { watchedAlarm: name } : {}),
+    ...(relatives.length ? { threadRelatives: relatives } : {}),
+    // THE ROOM'S LANGUAGE, so a turn no person asked for reads and renders as a person's turn in this room does.
+    ...(typeof row?.userLanguage === 'string' && row.userLanguage ? { userLanguage: row.userLanguage } : {}),
+  };
 }
 
 /**
@@ -3812,9 +5605,10 @@ export async function handleInvitationSent(req: InvitationSentNaming): Promise<{
     });
     return { ran: false, reason: `the invitation is ${invitation.refused}` };
   }
-  const primary = await primaryAssistantOf(channelArn, chimeClient, '[Router][event]');
-  if (primary.classification !== STATIC_CLASSIFICATION) return refuse('primary is another classification');
-  const assistant = await assistantOfBot(primary.botArn, STATIC_CLASSIFICATION, await getBotArn());
+  // THE ASSISTANT THAT OWNS THE EVENT'S WORKFLOW (ADR-061 decision 2): its version runs, and the run speaks as it.
+  const owner = await eventWorkflowOwner(channelArn, '[Router][event]', { conversationType: invitation.record.conversationType });
+  if ('refused' in owner) return refuse(owner.refused);
+  const assistant = await assistantOfBot(owner.botArn, STATIC_CLASSIFICATION, await getBotArn());
   if (assistant.decision === 'decline') return refuse(assistant.reason);
   const served = await servedWelcomeVersion(assistant.profile.name, channelArn).catch(() => undefined);
   const { record } = invitation;
@@ -3825,7 +5619,7 @@ export async function handleInvitationSent(req: InvitationSentNaming): Promise<{
   if (wf.types?.length && !wf.types.includes(record.conversationType)) return { ran: false, reason: 'no workflow for this type', deadline };
   const out = await runWorkflowFor(name, wf, {
     event: 'invitation-sent', channelArn, eventPerson: record.personArn, invitationId: record.invitationId, inviter: record.inviterArn, values: {},
-  }, { botArn: primary.botArn, assistant: assistant.profile.name, variantProfile: served?.variantProfile, variables: served?.version.variables },
+  }, runnerOf(owner.botArn, assistant.profile.name, served),
   invitationHeld(record));
   return { ...out, deadline };
 }
@@ -3864,6 +5658,54 @@ async function scheduleTaskDeadline(channelArn: string, taskId: string, deadline
   return 'failed';
 }
 
+/** SCHEDULE A TASK'S nth REMINDER (WT21). A schedule that cannot be made is logged; the task keeps its row and its holder. */
+async function scheduleTaskReminder(channelArn: string, taskId: string, n: number, atSeconds: number): Promise<void> {
+  const wiring = deadlineWiringFor(channelArn);
+  if (!wiring) return;
+  await createTaskDeadlineSchedule(wiring, { kind: 'remind', channelArn, taskId, n }, new Date(atSeconds * 1000)).catch((err) => {
+    console.warn('[Router][deadline] a task reminder could not be scheduled', { n, errName: (err as Error)?.name });
+  });
+}
+
+/**
+ * A TASK'S REMINDER CAME DUE (ADR-067 WT21). Nothing is said unless the records say it still matters: the conversation is
+ * this classification's and not archived, the task is open and still names its run and its reminders, and a person holds
+ * it. Then they are told, privately, and emailed as a `task` notice, once per reminder (claimed), and the next reminder is
+ * scheduled while the step's cap allows. It moves nothing.
+ */
+async function handleTaskReminderFired(firing: TaskReminderFiring): Promise<{ ran: boolean; reason?: string }> {
+  const closed = roomRefusal(await readChannelTags(chimeClient, firing.channelArn).catch(() => null));
+  if (closed) return { ran: false, reason: closed };
+  const task = await getTask(firing.taskId, firing.channelArn);
+  const remind = task?.workflowRun?.remind;
+  if (!task || !remind || settlementOutcome(task, machinesForTask(task))) return { ran: false, reason: 'the task is settled or names no reminders' };
+  if (firing.n > remind.times) return { ran: false, reason: 'past the cap' };
+  if (task.assigneeType !== 'user' || !task.assigneeId) return { ran: false, reason: 'no person holds it' };
+  const app = appInstanceArnOf(task.channelArn) || '';
+  const holder = userArnFor(app, task.assigneeId);
+  const botArn = task.workflowRun!.botArn;
+  // THE NEXT REMINDER IS KEPT whatever this one does, so one that cannot be said never ends the chain.
+  const scheduleNext = async () => {
+    if (firing.n < remind.times) await scheduleTaskReminder(task.channelArn, task.taskId, firing.n + 1, Math.floor(Date.now() / 1000) + remind.everyMinutes * 60);
+  };
+  // THE ASSISTANT IS RESOLVED BEFORE THE CLAIM, so one that may not say it here spends no reminder.
+  const assistant = await assistantOfBot(botArn, STATIC_CLASSIFICATION, await getBotArn());
+  if (assistant.decision === 'decline') { await scheduleNext(); return { ran: false, reason: assistant.reason }; }
+  if (!(await claimEventStep({ runKey: `remind#${task.taskId}`, channelArn: task.channelArn, step: String(firing.n), outcome: 'posted' }).catch(() => false))) {
+    return { ran: false, reason: 'already said' };
+  }
+  const served = await servedWelcomeVersion(assistant.profile.name, task.channelArn).catch(() => undefined);
+  const name = await resolveUserName(holder).then((x) => (x === 'there' ? '' : x)).catch(() => '');
+  const said = await sayWorkflowSend({
+    channelArn: task.channelArn, botArn, assistant: assistant.profile.name, workflow: task.workflowRun!.workflow,
+    event: task.workflowRun!.event as WorkflowEvent, step: `${task.workflowRun!.step}:remind`, template: 'workflow-task-reminder',
+    values: name ? { name: workflowMention(name) } : {}, to: [holder], runKey: task.workflowRun!.runKey, transitions: [],
+    mentions: ['name'], variables: served?.version.variables, emailKind: 'task', process: task.workflowRun!.process,
+  });
+  await scheduleNext();
+  return { ran: said };
+}
+
 /** DELETE A TASK'S DEADLINE SCHEDULE once the task settled (decision 4). A failure leaves its check on fire. Never throws. */
 async function deleteTaskDeadline(channelArn: string, taskId: string): Promise<void> {
   const wiring = deadlineWiringFor(channelArn);
@@ -3874,21 +5716,45 @@ async function deleteTaskDeadline(channelArn: string, taskId: string): Promise<v
 }
 
 /**
+ * A RUN'S WAIT CAME DUE (ADR-067 WT20). Nothing runs until the records say it still matters: the conversation is this
+ * classification's and not archived, and the wait's record, read through the task service, holds a continuation. The run
+ * then goes on as `waited` through the continuation path every run takes, which checks its run key and claims the step's
+ * continuation, so a redelivered firing continues nothing twice.
+ */
+async function handleRunWaitFired(firing: RunWaitFiring): Promise<{ ran: boolean; reason?: string }> {
+  const closed = roomRefusal(await readChannelTags(chimeClient, firing.channelArn).catch(() => null));
+  if (closed) return { ran: false, reason: closed };
+  const held = await readRunWait({ waitId: firing.taskId, channelArn: firing.channelArn });
+  if (!held || held.channelArn !== firing.channelArn) return { ran: false, reason: 'the wait holds nothing' };
+  // A WAIT ON THE OPENED CONVERSATION'S END THAT IS STILL HELD at its backstop was never told how that run ended: the opened
+  // conversation has expired, so it goes on as timed out. One that was told continued under the step's claim already.
+  const backstop = firing.taskId.startsWith(CHILD_WAIT_PREFIX);
+  // AN OPEN STEP'S BACKSTOP (DESIGN-PROCESSES section 10) goes on as `timed-out`, its failure edge, where the creator never handed it back.
+  // A JOIN'S DEADLINE goes on as `waited` naming no part, which the join reads as its deadline (`continueAfter`).
+  if (firing.taskId.startsWith(OPEN_WAIT_PREFIX)) return handleEventContinuation({ ...(held as unknown as EventContinuation), outcome: 'timed-out' });
+  return handleEventContinuation({ ...(held as unknown as EventContinuation), outcome: backstop ? childEndedOutcome('timed-out') : WAIT_CAME });
+}
+
+/**
  * A TASK STEP'S DEADLINE FIRED (ADR-063 decision 4). Nothing runs until the records say it still matters: the conversation
  * is this classification's and not archived, and the task, read through the task service, is still open and still names
  * a run. Then the task service cancels it with the deadline's ending and names the settlement, and the run continues on
  * `onDeadline`, else `onFailure`, when that naming arrives.
  */
 export async function handleTaskDeadlineFired(firing: TaskDeadlineFiring): Promise<{ ran: boolean; reason?: string }> {
-  const tags = await readChannelTags(chimeClient, firing.channelArn).catch(() => null);
-  if (!tags) return { ran: false, reason: 'the conversation could not be read' };
-  if (tags[CLASSIFICATION_TAG] !== STATIC_CLASSIFICATION) return { ran: false, reason: 'not this classification' };
-  if (tags.archived === 'true') return { ran: false, reason: 'the conversation is archived' };
+  const closed = roomRefusal(await readChannelTags(chimeClient, firing.channelArn).catch(() => null));
+  if (closed) return { ran: false, reason: closed };
   const task = await getTask(firing.taskId, firing.channelArn);
   if (!task?.workflowRun) return { ran: false, reason: 'the task names no run' };
-  if (settlementOutcome(task, taskStateMachines())) {
-    console.info('[Router][deadline] the task settled before its deadline; nothing runs', { classification: STATIC_CLASSIFICATION });
-    return { ran: false, reason: 'the task is settled' };
+  // A TASK THAT SETTLED AND STILL HAS ITS DEADLINE LOST ITS NAMING (ADR-067 OPEN 10, WT15): the naming deletes the schedule
+  // when it continues the run, so a schedule that fires on a settled task is the one record of a run that never went on.
+  // It goes on now, as the naming would have taken it; the step's continuation claim takes it once, so a naming that did
+  // arrive (and whose schedule delete failed) continues nothing twice. No sweep reads the table: the step's own one-shot
+  // deadline is the reconciliation (tenet D6).
+  if (settlementOutcome(task, machinesForTask(task))) {
+    console.info('[Router][deadline] the task settled before its deadline; its run goes on if its naming was lost', { classification: STATIC_CLASSIFICATION });
+    const reconciled = await handleTaskNaming({ kind: 'settled', channelArn: firing.channelArn, taskId: firing.taskId });
+    return { ran: reconciled.ran, reason: reconciled.ran ? 'a lost naming was reconciled' : 'the task is settled' };
   }
   const { cancelled } = await cancelForDeadline({ taskId: firing.taskId, channelArn: firing.channelArn });
   return { ran: cancelled, ...(cancelled ? {} : { reason: 'the task service did not cancel it' }) };
@@ -3898,6 +5764,18 @@ export async function handleDeadlineFired(raw: unknown): Promise<{ ran: boolean;
   // A TASK STEP'S DEADLINE (ADR-063 decision 4) shares the router entry and the schedule group, by its own firing shape.
   const taskFiring = taskDeadlineFiringOf(raw);
   if (taskFiring) return handleTaskDeadlineFired(taskFiring);
+  // A RUN'S WAIT CAME DUE (WT20): the run goes on from the continuation its wait holds, once under the step's claim.
+  const waitFiring = runWaitFiringOf(raw);
+  if (waitFiring) return handleRunWaitFired(waitFiring);
+  // A TASK'S REMINDER (WT21), which moves nothing.
+  const reminder = taskReminderFiringOf(raw);
+  if (reminder) return handleTaskReminderFired(reminder);
+  // A MEETING'S SUMMARY CAME DUE: its ended card is rewritten with its figures.
+  const summary = meetingSummaryFiringOf(raw);
+  if (summary) return handleMeetingSummaryFired(summary);
+  // A RUNNING MEETING'S WATCH: it ends an unattended meeting, or one past its limit, and otherwise checks again.
+  const watch = meetingWatchFiringOf(raw);
+  if (watch) return handleMeetingWatchFired(watch);
   const refuse = (reason: string, expected = false) => {
     // AN INVITATION REDEEMED, REVOKED, EXPIRED OR GONE IS THE EXPECTED END OF A SCHEDULE: redemption and offboarding never
     // delete one, so it fires, finds nothing pending and deletes itself. That is logged at info; anything else at warn.
@@ -3907,16 +5785,15 @@ export async function handleDeadlineFired(raw: unknown): Promise<{ ran: boolean;
   const firing: DeadlineFiring | null = deadlineFiringOf(raw);
   if (!firing) return refuse('malformed');
   const { channelArn, invitationId } = firing;
-  const tags = await readChannelTags(chimeClient, channelArn).catch(() => null);
-  if (!tags) return refuse('the conversation could not be read');
-  if (tags[CLASSIFICATION_TAG] !== STATIC_CLASSIFICATION) return refuse('not this classification');
-  if (tags.archived === 'true') return refuse('the conversation is archived');
+  const closed = roomRefusal(await readChannelTags(chimeClient, channelArn).catch(() => null));
+  if (closed) return refuse(closed);
   const invitation = await verifyInvitationEvent(channelArn, invitationId);
   if ('refused' in invitation) return refuse(`the invitation is ${invitation.refused}`, !invitation.refused.startsWith('unreadable'));
   const { record } = invitation;
-  const primary = await primaryAssistantOf(channelArn, chimeClient, '[Router][deadline]');
-  if (primary.classification !== STATIC_CLASSIFICATION) return refuse('primary is another classification');
-  const assistant = await assistantOfBot(primary.botArn, STATIC_CLASSIFICATION, await getBotArn());
+  // THE ASSISTANT THAT OWNS THE EVENT'S WORKFLOW (ADR-061 decision 2): its version runs, and the run speaks as it.
+  const owner = await eventWorkflowOwner(channelArn, '[Router][deadline]', { conversationType: record.conversationType });
+  if ('refused' in owner) return refuse(owner.refused);
+  const assistant = await assistantOfBot(owner.botArn, STATIC_CLASSIFICATION, await getBotArn());
   if (assistant.decision === 'decline') return refuse(assistant.reason);
   const served = await servedWelcomeVersion(assistant.profile.name, channelArn).catch(() => undefined);
   const declared = declaredWorkflowOn(served?.version.eventWorkflows, firing.event);
@@ -3924,13 +5801,13 @@ export async function handleDeadlineFired(raw: unknown): Promise<{ ran: boolean;
   const { name, workflow: wf } = declared;
   if (wf.types?.length && !wf.types.includes(record.conversationType)) return refuse('no workflow for this type');
   // THE PEOPLE IT NAMES ARE STILL MEMBERS, read live as the room's primary: an inviter who left is chased for nobody.
-  const size = await resolveChannelSize(chimeClient, channelArn, primary.botArn);
+  const size = await resolveChannelSize(chimeClient, channelArn, owner.botArn);
   if (size.refused || size.unknown) return refuse('the conversation\'s members could not be read');
   const roster = (size.members ?? []).map((m) => ({ arn: m.arn, name: m.name, isBot: m.isBot }));
   if (verifiedJoiners([record.inviterArn, record.personArn], roster).length < 2) return refuse('a person it names is no longer a member');
   return runWorkflowFor(name, wf, {
     event: firing.event, channelArn, eventPerson: record.personArn, invitationId: record.invitationId, inviter: record.inviterArn, values: {},
-  }, { botArn: primary.botArn, assistant: assistant.profile.name, variantProfile: served?.variantProfile, variables: served?.version.variables },
+  }, runnerOf(owner.botArn, assistant.profile.name, served),
   { ...invitationHeld(record), members: roster });
 }
 
@@ -3946,23 +5823,47 @@ function alarmChangeOf(raw: unknown): AlarmChange | undefined {
 /**
  * WHETHER THIS CONVERSATION WATCHES THE ALARM: the alarm's watch record names it at this classification, and its own row
  * names the alarm. Both are server-only records the canonical creator wrote (`recordAlarmWatch`, `watchedAlarm`); a room
- * a newer incident's room superseded watches it no longer.
+ * a newer incident's room superseded watches it no longer. Null only where a record answers so; a record that cannot be
+ * read throws, so the change is delivered again rather than taken as unwatched.
  */
 async function conversationWatches(channelArn: string, alarmName: string): Promise<{ conversationType?: string } | null> {
-  const watch = await alarmWatchOf(alarmWatchKey(alarmName));
+  const watch = await alarmWatchOf(alarmWatchKey(alarmName), { strict: true });
   if (!watch || watch.room !== channelArn || watch.classification !== STATIC_CLASSIFICATION) return null;
-  const row = await getChannelContext(channelArn, { consistent: true }).catch(() => null);
+  const row = await readChannelContext(channelArn, { consistent: true });
   if (!row || row.watchedAlarm !== alarmName) return null;
   return { ...(row.conversationType ? { conversationType: row.conversationType } : {}) };
 }
 
 let cloudwatch: CloudWatchClient | null = null;
 
+/** What an alarm watches, as CloudWatch reports it: its metric, its threshold and the latest value it evaluated. */
+interface AlarmFacts { alarmMetric?: string; alarmThreshold?: string; alarmLatest?: string }
+
+/**
+ * THE ALARM'S FACTS, from the structured fields of its own record, never from its reason's prose: the metric's name, the
+ * threshold, and the most recent datapoint the alarm evaluated (`StateReasonData.evaluatedDatapoints`, by timestamp).
+ */
+function alarmFactsOf(alarm: { MetricName?: string; Threshold?: number; StateReasonData?: string }): AlarmFacts {
+  const num = (n: unknown) => (typeof n === 'number' && Number.isFinite(n) ? String(Math.round(n * 100) / 100) : undefined);
+  let latest: string | undefined;
+  try {
+    const points = (JSON.parse(alarm.StateReasonData || '{}') as { evaluatedDatapoints?: Array<{ timestamp?: string; value?: number }> }).evaluatedDatapoints ?? [];
+    const newest = points.filter((p) => typeof p.value === 'number').sort((a, b) => Date.parse(b.timestamp ?? '') - Date.parse(a.timestamp ?? ''))[0];
+    latest = num(newest?.value);
+  } catch { /* an unreadable reason record leaves the latest value out */ }
+  return {
+    ...(alarm.MetricName ? { alarmMetric: alarm.MetricName.slice(0, 100) } : {}),
+    ...(num(alarm.Threshold) ? { alarmThreshold: num(alarm.Threshold) } : {}),
+    ...(latest ? { alarmLatest: latest } : {}),
+  };
+}
+
 /**
  * THE ALARM'S STATE AS CLOUDWATCH REPORTS IT NOW, read by name under the router's one alarm read, which reaches this
- * deployment's alarms alone. Null when it cannot be read or names no alarm.
+ * deployment's alarms alone. Null when it names no alarm, or, unless `strict`, when it cannot be read; with `strict`, a
+ * read that fails throws, so a caller deciding from the state never takes a throttled read for an alarm that is gone.
  */
-async function alarmStateNow(alarmName: string): Promise<{ state: string; changedAt: number } | null> {
+async function alarmStateNow(alarmName: string, opts: { strict?: boolean } = {}): Promise<{ state: string; changedAt: number; reason?: string; facts?: AlarmFacts } | null> {
   try {
     cloudwatch = cloudwatch ?? new CloudWatchClient({});
     // METRIC ALARMS ONLY: asking for composite alarms is authorized against `*`, which the scoped read refuses. The
@@ -3970,9 +5871,12 @@ async function alarmStateNow(alarmName: string): Promise<{ state: string; change
     const res = await cloudwatch.send(new DescribeAlarmsCommand({ AlarmNames: [alarmName], AlarmTypes: ['MetricAlarm'] }));
     const alarm = res.MetricAlarms?.[0];
     const at = alarm?.StateUpdatedTimestamp ? new Date(alarm.StateUpdatedTimestamp).getTime() : NaN;
-    return alarm?.StateValue && Number.isFinite(at) ? { state: alarm.StateValue, changedAt: at } : null;
+    return alarm?.StateValue && Number.isFinite(at)
+      ? { state: alarm.StateValue, changedAt: at, ...(alarm.StateReason ? { reason: alarm.StateReason } : {}), facts: alarmFactsOf(alarm) }
+      : null;
   } catch (err) {
     console.warn('[Router][alarm] the alarm could not be read', { err: (err as Error)?.name });
+    if (opts.strict) throw err;
     return null;
   }
 }
@@ -4002,23 +5906,25 @@ export async function handleAlarmStateChanged(
   const r = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
   const alarmName = typeof r.alarmName === 'string' ? r.alarmName : '';
   if (!ALARM_NAME.test(alarmName) || !isAlarmState(r.state)) return refuse('malformed');
-  const watch = await (deps.watch ?? alarmWatchOf)(alarmWatchKey(alarmName));
+  // EVERY READ BELOW IS STRICT: a record, a tag, the alarm or the version that cannot be read throws, so the change is
+  // delivered again (its natural key, the time the alarm entered the state, keeps a redelivery to one run). A refusal is
+  // only ever what a record answered.
+  const watch = await (deps.watch ?? alarmWatchOf)(alarmWatchKey(alarmName), { strict: true });
   if (!watch) return refuse('no conversation watches the alarm');
   const channelArn = watch.room;
   const watching = await (deps.watches ?? conversationWatches)(channelArn, alarmName);
   if (!watching) return refuse('the conversation does not watch the alarm at this classification');
-  const tags = await readChannelTags(chimeClient, channelArn).catch(() => null);
-  if (!tags) return refuse('the conversation could not be read');
-  if (tags[CLASSIFICATION_TAG] !== STATIC_CLASSIFICATION) return refuse('not this classification');
-  if (tags.archived === 'true') return refuse('the conversation is archived');
-  const now = await (deps.stateNow ?? alarmStateNow)(alarmName);
-  if (!now) return refuse('the alarm could not be read');
+  const closed = roomRefusal(await readChannelTags(chimeClient, channelArn));
+  if (closed) return refuse(closed);
+  const now = await (deps.stateNow ?? alarmStateNow)(alarmName, { strict: true });
+  if (!now) return refuse('the alarm names no alarm');
   if (now.state !== r.state || !isAlarmState(now.state)) return refuse('the alarm has left the state the change reported');
-  const primary = await primaryAssistantOf(channelArn, chimeClient, '[Router][alarm]');
-  if (primary.classification !== STATIC_CLASSIFICATION) return refuse('primary is another classification');
-  const assistant = await assistantOfBot(primary.botArn, STATIC_CLASSIFICATION, await getBotArn());
+  // THE ASSISTANT THAT OWNS THE EVENT'S WORKFLOW (ADR-061 decision 2): its version runs, and the run speaks as it.
+  const owner = await eventWorkflowOwner(channelArn, '[Router][alarm]', { ...(watching.conversationType ? { conversationType: watching.conversationType } : {}) });
+  if ('refused' in owner) return refuse(owner.refused);
+  const assistant = await assistantOfBot(owner.botArn, STATIC_CLASSIFICATION, await getBotArn());
   if (assistant.decision === 'decline') return refuse(assistant.reason);
-  const served = await servedWelcomeVersion(assistant.profile.name, channelArn).catch(() => undefined);
+  const served = await servedWelcomeVersion(assistant.profile.name, channelArn);
   const declared = declaredWorkflowOn(served?.version.eventWorkflows, 'alarm-state-changed');
   if (!declared) return refuse('no workflow');
   const { name, workflow: wf } = declared;
@@ -4026,8 +5932,1324 @@ export async function handleAlarmStateChanged(
   const alarm: AlarmChange = { name: alarmName, state: now.state, changedAt: now.changedAt };
   return runWorkflowFor(name, wf, {
     event: 'alarm-state-changed', channelArn, alarm, values: { alarm: alarmName, alarmState: now.state },
-  }, { botArn: primary.botArn, assistant: assistant.profile.name, variantProfile: served?.variantProfile, variables: served?.version.variables },
+  }, runnerOf(owner.botArn, assistant.profile.name, served),
   { ...(watching.conversationType ? { conversationType: watching.conversationType } : {}) });
+}
+
+/**
+ * WHAT A ROOM IS TOLD WHEN ITS MEETING STARTS, by a person or by a workflow's `start_meeting` step alike. A room that
+ * watches an alarm is about that incident (its server-only `watchedAlarm`, which the canonical creator wrote, never the
+ * event or a message), so its call is announced by the alarm's name and, where CloudWatch answers, the reason the alarm
+ * reports now. Every other room is told the meeting is running and where to join. `meetingArn` is the meeting's own
+ * conversation, which the link opens; `record` is the room's, the conversation the meeting was started from.
+ */
+async function meetingStartedCard(meetingArn: string, record: { watchedAlarm?: unknown } | null | undefined): Promise<{ template: string; values: Record<string, string> }> {
+  const incident = typeof record?.watchedAlarm === 'string' && record.watchedAlarm ? record.watchedAlarm : '';
+  const alarmNow = incident ? await alarmStateNow(incident) : null;
+  return {
+    template: (incident ? MEETING_INCIDENT_TEMPLATE : MEETING_NOTICE_TEMPLATE),
+    values: {
+      [MEETING_LINK_VALUE]: `?${meetingRef(conversationKey(meetingArn))}`,
+      ...(incident ? { alarm: incident, ...(alarmNow?.reason ? { alarm_reason: alarmNow.reason } : {}) } : {}),
+    },
+  };
+}
+
+/** The template a meeting's own conversation is told it started in, naming the conversation it was started from. */
+export const MEETING_STARTED_FROM_TEMPLATE = 'meeting-started-from';
+
+/**
+ * THE STARTED CARD IN A MEETING'S OWN CONVERSATION (`meeting-started-from`): the conversation the meeting was started from, by
+ * its name in Amazon Chime SDK channel state and a link to it; and where that conversation's opening run stands, read from
+ * the run's own records (`meetingRoomStanding`). Every value is the server's, never a message's or channel Metadata's.
+ */
+async function meetingStartedFromCard(room: string, roomRecord: import('./lib/channel-context-client.js').ChannelContext | null | undefined, botArn: string): Promise<{ template: string; values: Record<string, string> }> {
+  const name = await chimeClient.send(new DescribeChannelCommand({ ChannelArn: room, ChimeBearer: botArn }))
+    .then((r) => (typeof r.Channel?.Name === 'string' ? r.Channel.Name.trim() : ''), () => '');
+  const room_link = `?${conversationRef(conversationKey(room))}`;
+  const standing = await meetingRoomStanding(room, roomRecord).catch(() => ({}));
+  return { template: MEETING_STARTED_FROM_TEMPLATE, values: { room_name: name, room_link, ...standing } };
+}
+
+/**
+ * WHERE THE RUN THAT OPENED A MEETING'S ROOM STANDS (an incident's runbook, `ops-room`), for the meeting's own card: its
+ * current steps (`status`) and the steps still to come in order (`next_steps`), by their labels, from the run's own claims;
+ * the person holding the task its end waits on (`lead`), what the run is about (`about`), and, where it is about a resource
+ * or the room watches an alarm, the room as where its dashboard is (`dashboard_link`). Nothing where the room was opened by
+ * no workflow, or its run has ended. Each item is the platform's own read: an item it cannot read is left out.
+ */
+async function meetingRoomStanding(room: string, roomRecord: import('./lib/channel-context-client.js').ChannelContext | null | undefined): Promise<Record<string, string>> {
+  const type = roomRecord?.conversationType;
+  if (!type) return {};
+  const owner = await eventWorkflowOwner(room, '[Router][meeting]', { conversationType: type });
+  if ('refused' in owner) return {};
+  const assistant = await assistantOfBot(owner.botArn, STATIC_CLASSIFICATION, await getBotArn());
+  if (assistant.decision === 'decline') return {};
+  const served = await servedWelcomeVersion(assistant.profile.name, room).catch(() => undefined);
+  const opened = openedWorkflowOf(served?.version.eventWorkflows, type);
+  const naturalKey = opened ? runNaturalKey('conversation-opened', room, {}) : undefined;
+  if (!opened || !naturalKey) return {};
+  const runKey = eventRunKey('conversation-opened', naturalKey, assistant.profile.name);
+  const standing = await standingOf(opened.workflow, runKey, room);
+  if (!standing || standing.ended || (!standing.current.length && !standing.next.length)) return {};
+  // THE TASK THE RUN'S END WAITS ON: its worker leads it, and its run's values say what it is about.
+  const held = alongsideSteps(opened.workflow)[0];
+  const task = held ? await getTask(eventTaskId(runKey, held), room).catch(() => null) : null;
+  const app = appInstanceArnOf(room);
+  const lead = task?.workerType === 'user' && task.workerId && app
+    ? await resolveUserName(userArnFor(app, task.workerId)).then((n) => (n === 'there' ? '' : n)).catch(() => '') : '';
+  const values = task?.workflowRun?.values ?? {};
+  const alarm = typeof roomRecord?.watchedAlarm === 'string' ? roomRecord.watchedAlarm : '';
+  const about = values.label || values.resource || alarm;
+  return {
+    status: standing.current.join(', '), next_steps: standing.next.join(', '),
+    ...(lead ? { lead } : {}), ...(about ? { about } : {}),
+    ...(values.resource || alarm ? { dashboard_link: `?${conversationRef(conversationKey(room))}` } : {}),
+  };
+}
+
+/**
+ * WHY THE ROUTER ACTS IN NO CONVERSATION BUT THIS CLASSIFICATION'S OPEN ONES (`conversationClosedTo`, the one rule), in the
+ * words a refusal logs: tags that could not be read, another classification, or archived. Undefined where it may act.
+ */
+function roomRefusal(tags: Record<string, string | undefined> | null | undefined, noun: 'conversation' | 'room' = 'conversation'): string | undefined {
+  return closedRefusal(conversationClosedTo(tags, STATIC_CLASSIFICATION), noun);
+}
+
+/** The refusal a conversation's closed reason (`conversationClosedTo`) is logged as; undefined where it is open. */
+function closedRefusal(closed: ReturnType<typeof conversationClosedTo>, noun: 'conversation' | 'room' = 'conversation'): string | undefined {
+  if (closed === 'unreadable') return `the ${noun} could not be read`;
+  if (closed === 'classification') return 'not this classification';
+  if (closed === 'archived') return `the ${noun} is archived`;
+  return undefined;
+}
+
+/**
+ * THE ROOM A MEETING'S CARDS ARE POSTED IN: the conversation the meeting's own conversation was started from, from that
+ * conversation's server-side row (`meetingOf`), never from the event or a message; but only where it is this
+ * classification's, by its immutable tag, and not archived. Otherwise the meeting's own conversation. Tags that cannot be
+ * read throw, so the handoff is retried rather than carded where the room's members never see it.
+ */
+async function meetingRoomOf(meetingArn: string, record: { meetingOf?: string } | null | undefined): Promise<string> {
+  const parent = record?.meetingOf;
+  if (!parent || parent === meetingArn) return meetingArn;
+  const closed = roomRefusal(await readChannelTags(chimeClient, parent));
+  if (closed) {
+    console.warn('[Router][meeting] the room a meeting was started from is not posted to; its own conversation is', { reason: closed });
+    return meetingArn;
+  }
+  return parent;
+}
+
+/**
+ * A MEETING CARD IS SAID IN THE TEAM'S WORDING (ADR-062), as any message is: the template the served version names for the
+ * card, else the assistant's stored template of the card's name, else the classification's, else the one the platform
+ * ships; and in the room's language where the template is written in it (ADR-062 decision 4), as a workflow's send to the
+ * room is. The card is rendered from the values the platform gives it alone, so a field a stored template adds beyond
+ * them renders empty and its line is dropped. A store that cannot be read says the shipped wording.
+ */
+async function meetingCardTemplate(
+  name: string, assistant: string | undefined, version: { messages?: import('./lib/message-template.js').VersionMessages } | undefined, room: string,
+  opts: { shipped?: boolean } = {},
+): Promise<ParsedTemplate> {
+  let chosen: ParsedTemplate;
+  try {
+    chosen = opts.shipped ? shippedMessageTemplate(name)
+      : (await selectMessageTemplate({ classification: STATIC_CLASSIFICATION, ...(assistant ? { assistant } : {}), name, messages: version?.messages })).template;
+  } catch (err) {
+    console.warn('[Router][meeting] the card template could not be read; the shipped wording is said', { name, errName: (err as Error)?.name });
+    chosen = shippedMessageTemplate(name);
+  }
+  return chosen.variants ? chooseLanguage(chosen, { audience: 'room', ...(await sendLanguages(room, [])) }).written : chosen;
+}
+
+/**
+ * THE ASSISTANT A MEETING CARD IS SAID BY, and its wording: the assistant `botArn` serves at this classification, and the
+ * version it serves in `room`. A read that fails throws, so the caller's asynchronous invoke is retried.
+ */
+interface CardSpeaker {
+  botArn: string;
+  decision: Awaited<ReturnType<typeof assistantOfBot>>;
+  served?: ServedWelcomeVersion;
+}
+async function cardSpeaker(botArn: string, room: string): Promise<CardSpeaker> {
+  const decision = await assistantOfBot(botArn, STATIC_CLASSIFICATION, await getBotArn());
+  const served = decision.decision === 'decline' ? undefined : await servedWelcomeVersion(decision.profile.name, room);
+  return { botArn, decision, ...(served ? { served } : {}) };
+}
+
+/** What a card's template is chosen by: the speaker's assistant, where it serves one, and its served version. */
+function cardWording(speaker: CardSpeaker): { assistant?: string; version?: { messages?: import('./lib/message-template.js').VersionMessages } } {
+  return { ...(speaker.decision.decision === 'decline' ? {} : { assistant: speaker.decision.profile.name }), version: speaker.served?.version };
+}
+
+/**
+ * THE ENDED CARD'S FACTS beside its kind, every post and rewrite the same: its length where it is known, and its hosts by
+ * person id (`recordedHostIds`), which decide who is offered the transcript and the recording.
+ */
+function endedCardFacts(duration: number | undefined | null, last: Parameters<typeof recordedHostIds>[0]): { durationMinutes?: number; hosts: string[] } {
+  return { ...(typeof duration === 'number' && duration ? { durationMinutes: duration } : {}), hosts: recordedHostIds(last) };
+}
+
+/**
+ * POST A MEETING CARD in `target` as its speaker: rendered by `sayMeetingCard`, sent once per `token` (a redelivery is the
+ * same message), its Metadata held within the service's cap (`withinMetadataCap`). Undefined where the card renders
+ * nothing to say; a send that fails throws.
+ */
+async function postMeetingCard(args: {
+  target: string; token: string; name: string; speaker: CardSpeaker; values: Record<string, string>; email?: boolean;
+  content?: (chat: string) => string;
+  metadata: (said: { subject: string; body: string }) => Record<string, unknown>;
+}): Promise<{ MessageId?: string } | undefined> {
+  return sayMeetingCard({
+    name: args.name, room: args.target, botArn: args.speaker.botArn, ...cardWording(args.speaker), values: args.values, ...(args.email ? { email: true } : {}),
+  }, (said) => sendChannelMessage(chimeClient, {
+    ChannelArn: args.target,
+    Content: args.content ? args.content(said.chat) : said.chat,
+    Type: ChannelMessageType.STANDARD,
+    Persistence: ChannelMessagePersistenceType.PERSISTENT,
+    ChimeBearer: args.speaker.botArn,
+    ClientRequestToken: args.token.slice(0, 64),
+    Metadata: JSON.stringify(withinMetadataCap(args.metadata(said), CHIME_METADATA_MAX)),
+  }));
+}
+
+/** The Metadata that makes a message the platform's meeting card, which the chat app reads for the meeting's state. */
+/**
+ * The card's metadata: ids only. An ended card names its meeting's hosts by person id (`hosts`), so the chat app offers the
+ * transcript and the recording to them alone, as the download path signs them for them alone.
+ */
+/**
+ * A started card carries when its meeting's ring stops (`ringUntil`, server time), so a person of the room the ring did not
+ * reach hears it from their app for what is left of it.
+ */
+function meetingCardMetadata(event: 'meeting-started' | 'meeting-ended', meetingId: string, meetingArn: string, extra: { summarized?: true; transcriptKey?: string; durationMinutes?: number; hosts?: string[]; roomConversationId?: string; ringUntil?: string } = {}): Record<string, unknown> {
+  return { meetingCard: { event, meetingId, conversationId: conversationKey(meetingArn), ...extra } };
+}
+
+/**
+ * THE NAMES THE ROOM SHOWS THE MEETING'S PEOPLE UNDER: the human members of the meeting's own conversation, who are the
+ * people who joined it or were added to it to join, read live as its primary assistant, in name order. Empty where the
+ * conversation's members cannot be read.
+ */
+async function meetingPeopleNames(meetingArn: string): Promise<string> {
+  try {
+    const primary = await primaryAssistantOf(meetingArn, chimeClient, '[Router][meeting]');
+    const names: string[] = [];
+    let nextToken: string | undefined;
+    do {
+      const page = await chimeClient.send(new ListChannelMembershipsCommand({ ChannelArn: meetingArn, ChimeBearer: primary.botArn, MaxResults: 50, NextToken: nextToken }));
+      for (const m of page.ChannelMemberships ?? []) if (m.Member?.Arn && isPersonArn(m.Member.Arn) && m.Member.Name?.trim()) names.push(m.Member.Name.trim());
+      nextToken = page.NextToken;
+    } while (nextToken && names.length < 50);
+    return [...new Set(names)].sort((a, b) => a.localeCompare(b)).join(', ');
+  } catch (err) {
+    console.warn('[Router][meeting] the meeting\'s people could not be read; the card leaves them out', { errName: (err as Error)?.name });
+    return '';
+  }
+}
+
+/** The template that says how a meeting ended: a host ended it, its watch did (`meeting-watch.ts`), or everyone left. */
+function endedHowTemplate(reason: string | undefined): string {
+  if (reason === 'host') return 'meeting-ended-by-host';
+  if (reason === 'nobody-joined' || reason === 'left-alone' || reason === 'time-limit') return MEETING_TIMEOUT_TEMPLATES[reason];
+  return 'meeting-ended-everyone-left';
+}
+
+/**
+ * THE ENDED CARD'S ITEMS beyond its length, from the meeting's own record: how it ended (in the card speaker's wording),
+ * the names of its people, the link to the meeting's conversation where the card is posted in another conversation, and
+ * its audio and video recording: the link to each part written, or that one is processing or failed (`recordingCardValues`).
+ */
+async function endedCardValues(
+  meetingArn: string, room: string, last: { endReason?: string; recordings?: unknown },
+  speaker: { assistant?: string; version?: { messages?: import('./lib/message-template.js').VersionMessages } },
+): Promise<Record<string, string>> {
+  const how = renderMessageTemplate(await meetingCardTemplate(endedHowTemplate(last.endReason), speaker.assistant, speaker.version, room),
+    { max_minutes: String(meetingMaxMinutes()) }, { sections: ['chat'], refusedValue: 'empty' });
+  return {
+    ended_how: how.ok ? (how.sections.chat ?? '').replace(/\s+/g, ' ').trim() : '',
+    people_names: await meetingPeopleNames(meetingArn),
+    conversation_link: room !== meetingArn ? `?${conversationRef(conversationKey(meetingArn))}` : '',
+    ...await recordingCardValues(last.recordings, async (name) => {
+      const said = renderMessageTemplate(await meetingCardTemplate(name, speaker.assistant, speaker.version, room), {}, { sections: ['chat'], refusedValue: 'empty' });
+      return said.ok ? said.sections.chat ?? '' : '';
+    }),
+  };
+}
+
+/**
+ * TELL THE PEOPLE IN A MEETING ITS TRANSCRIPTION STARTED OR STOPPED (SPEC-ASSISTANT-MEETINGS FR28), in its own chat, as
+ * its primary assistant, on the service's own event: the chat the meeting window shows beside the meeting. Once per
+ * change, by the event's time. Answers whether it was posted.
+ */
+/**
+ * THE NOTICE A CHANGE OF TRANSCRIPTION IS SAID IN, by the two modes: captions started in recording mode is said as
+ * recording started (the meeting's record says the mode, as the service's own event does not).
+ */
+function transcriptionNoticeOf(event: 'transcription-started' | 'transcription-stopped' | 'recording-started' | 'recording-stopped', recording: boolean): string {
+  // Where the deployment records media, recording keeps the meeting's audio and video too, and the notice says so.
+  if (event === 'recording-started' || (event === 'transcription-started' && recording)) return meetingMediaRecordingEnabled() ? 'meeting-recording-started-media' : 'meeting-recording-started';
+  if (event === 'recording-stopped') return 'meeting-recording-stopped';
+  return event === 'transcription-started' ? 'meeting-transcription-started' : 'meeting-transcription-stopped';
+}
+
+async function sayTranscriptionNotice(meetingArn: string, meetingId: string, notice: string, at: string): Promise<boolean> {
+  try {
+    const primary = await primaryAssistantOf(meetingArn, chimeClient, '[Router][meeting]');
+    if (primary.classification !== STATIC_CLASSIFICATION) return false;
+    const sent = await postMeetingCard({
+      target: meetingArn, token: `${notice.replace('meeting-', '').slice(0, 14)}-${meetingId}-${Date.parse(at) || 0}`,
+      name: notice, speaker: await cardSpeaker(primary.botArn, meetingArn), values: {}, metadata: () => ({}),
+    });
+    return !!sent;
+  } catch (err) {
+    console.warn('[Router][meeting] the transcription notice could not be posted', { notice, errName: (err as Error)?.name });
+    return false;
+  }
+}
+
+/**
+ * AN ENDED MEETING'S CONVERSATION IS ARCHIVED (ADR-017) through the platform's one archive sequence, the conversation
+ * management function's (`conversation-management.ts`), which checks the conversation's own record again and archives it
+ * read-only. Asynchronous; a failed invoke is logged and the conversation stays open.
+ */
+async function archiveEndedMeeting(meetingArn: string, meetingId: string): Promise<boolean> {
+  const fn = process.env.CONVERSATION_MANAGEMENT_FUNCTION;
+  if (!fn) return false;
+  try {
+    await lambdaClient.send(new InvokeCommand({
+      FunctionName: fn, InvocationType: InvocationType.Event,
+      Payload: Buffer.from(JSON.stringify({ aeMeetingArchive: { channelArn: meetingArn, meetingId } })),
+    }));
+    return true;
+  } catch (err) {
+    console.warn('[Router][meeting] the ended meeting\'s conversation could not be archived', { errName: (err as Error)?.name });
+    return false;
+  }
+}
+
+/**
+ * SAY A MEETING CARD, every card the one way: its template (`meetingCardTemplate`), rendered from the platform's values in
+ * the sections asked for, then spoken in `room` as `botArn`, which the router records before it posts. `post` sends or
+ * edits the message with what was rendered. Undefined, and nothing posted, when the card renders nothing to say.
+ */
+async function sayMeetingCard<T>(
+  args: {
+    name: string; room: string; botArn: string; assistant?: string;
+    version?: { messages?: import('./lib/message-template.js').VersionMessages };
+    values: Record<string, string>; email?: boolean;
+  },
+  post: (said: { chat: string; subject: string; body: string }) => Promise<T>,
+): Promise<T | undefined> {
+  const sections: string[] = args.email ? ['chat', 'email.subject', 'email.body'] : ['chat'];
+  const render = async (shipped: boolean) => renderMessageTemplate(
+    await meetingCardTemplate(args.name, args.assistant, args.version, args.room, { shipped }), args.values, { sections, refusedValue: 'empty' });
+  // A CARD IS ALWAYS SAID: a team's wording that renders nothing for these values gives way to the shipped one, because the
+  // card is what tells each app the meeting's state and what its summary is recorded against.
+  let rendered = await render(false);
+  if (!rendered.ok || !rendered.sections.chat) rendered = await render(true);
+  if (!rendered.ok || !rendered.sections.chat) return undefined;
+  return speakingAs({ botArn: args.botArn, channelArn: args.room, purpose: 'call-card' }, () => post({
+    chat: rendered.sections.chat,
+    subject: args.email ? (rendered.sections['email.subject'] ?? '').trim() : '',
+    body: args.email ? (rendered.sections['email.body'] ?? '').trim() : '',
+  }));
+}
+
+/**
+ * Ring a meeting's conversation, or stop its ring, as `botArn`: one CONTROL message, never stored, to everyone in it, or
+ * to one person (`to`, an AppInstanceUser ARN) alone. Best effort: a ring ends on its own.
+ */
+async function ringTheRoom(room: string, botArn: string, ring: string, to?: string): Promise<boolean> {
+  try {
+    await speakingAs({ botArn, channelArn: room, purpose: 'call-card' }, () => sendChannelMessage(chimeClient, {
+      ChannelArn: room,
+      Content: ring,
+      Type: ChannelMessageType.CONTROL,
+      Persistence: ChannelMessagePersistenceType.NON_PERSISTENT,
+      ChimeBearer: botArn,
+      ClientRequestToken: randomUUID(),
+      ...(to ? { Target: [{ MemberArn: to }] } : {}),
+    }));
+    return true;
+  } catch (err) {
+    console.warn('[Router][meeting] the room\'s ring could not be sent', { ring, errName: (err as Error)?.name });
+    return false;
+  }
+}
+
+/**
+ * A CONVERSATION'S MEETING STARTED OR ENDED (`meeting-started`, `meeting-ended`, the `meetings` capability), handed here by
+ * this classification's rule on the Meetings stack's lifecycle event (`meeting-lifecycle.ts`). The handoff says where to
+ * look and decides nothing. Before anything runs:
+ *  - the conversation is this classification's, by its immutable tag, and not archived;
+ *  - the meeting is the conversation's own, by its record: the running one for a start, the last one for an end, so an
+ *    event naming any other meeting starts nothing;
+ *  - an end is one Amazon Chime SDK confirms: the service no longer holds the meeting (`meetingRunsNow`), and the length
+ *    the card words is held between the meeting's recorded start and now (`endedAt`).
+ * A READ THAT FAILS IS NEVER AN ANSWER: it throws, so the asynchronous invoke is retried, and only what the records say refuses.
+ * Then, once per meeting per event (the card's request token, and the run's natural key):
+ *  - the platform's card: for a start a person made, the room is told it is running and where to join, and its members
+ *    other than the person who started it are emailed (a workflow's start told the room itself); for every end, how long
+ *    it ran, recorded so a summary updates that card in place;
+ *  - the workflow the room's primary assistant's served version declares on the event, where it runs in the room's type,
+ *    with the run values the shipped meeting templates read (`MEETING_EVENT_VALUES`).
+ * THE ROOM IS THE CONVERSATION THE MEETING WAS STARTED FROM. The meeting is held in its own conversation (FR27), whose
+ * row names that room (`meetingOf`); the cards are posted there and link to the meeting's conversation, and the room's
+ * workflows run. A room at another classification, or archived, is not posted to: the meeting's own conversation is.
+ * A refusal is logged by reason.
+ */
+export async function handleMeetingLifecycle(raw: unknown): Promise<{ ran: boolean; carded: boolean; reason?: string }> {
+  const refuse = (reason: string) => {
+    console.warn('[Router][meeting] the meeting event starts nothing here', { reason, classification: STATIC_CLASSIFICATION });
+    return { ran: false, carded: false, reason };
+  };
+  const h = readLifecycleHandoff(raw);
+  if (!h) return refuse('malformed');
+  // A RECORDING'S PART SETTLES AFTER ITS MEETING ENDED, and often after the meeting's conversation was archived: the card it
+  // completes is in the room, which `rewriteEndedCard` checks itself, so an archived meeting conversation still has its
+  // card finished. The archive does not wait on the media pipeline, whose parts settle in their own time.
+  const settlesARecording = h.event === 'recording-ready' || h.event === 'recording-failed';
+  const closed = conversationClosedTo(await readChannelTags(chimeClient, h.channelArn), STATIC_CLASSIFICATION);
+  if (closed && !(settlesARecording && closed === 'archived')) return refuse(closedRefusal(closed) ?? 'closed');
+  const record = await readChannelContext(h.channelArn, { consistent: true });
+  const last = record?.lastMeeting;
+  if (!last || last.meetingId !== h.meetingId) return refuse('not a meeting of this conversation');
+  // A PART OF ITS AUDIO AND VIDEO RECORDING IS READY OR FAILED: the ended card is rewritten in place with what the record
+  // holds now (`meeting-recording-events.ts`), and no workflow runs.
+  if (h.event === 'recording-ready' || h.event === 'recording-failed') {
+    return { ran: false, carded: await rewriteEndedCard(h.channelArn, h.meetingId) };
+  }
+  // ITS TRANSCRIPTION STARTED OR STOPPED: the people in it are told in its own chat, and no workflow runs.
+  if (h.event === 'transcription-started' || h.event === 'transcription-stopped' || h.event === 'recording-started' || h.event === 'recording-stopped') {
+    return { ran: false, carded: await sayTranscriptionNotice(h.channelArn, h.meetingId, transcriptionNoticeOf(h.event, last.transcription?.recording === true), h.at) };
+  }
+  // A PERSON LEFT THE RUNNING MEETING: it is checked once the watch's window has passed since, the moment one left alone in
+  // it may be due to end (`meeting-watch.ts`). Nothing is said and no workflow runs.
+  if (h.event === 'person-left') {
+    if (record?.activeMeeting?.meetingId !== h.meetingId) return refuse('the meeting is no longer running');
+    const leftAt = Math.min(Date.parse(h.at) || Date.now(), Date.now());
+    const scheduled = await scheduleMeetingWatch(h.channelArn, h.meetingId, leftAt + MEETING_WATCH_MINUTES * 60_000);
+    if (scheduled === 'failed') throw new Error('the meeting\'s check after a leave could not be scheduled');
+    return { ran: false, carded: false, reason: `checked after the leave: ${scheduled}` };
+  }
+  if (h.event === 'meeting-started' && record?.activeMeeting?.meetingId !== h.meetingId) return refuse('the meeting is no longer running');
+  if (h.event === 'meeting-ended') {
+    if (await meetingRunsNow(h.meetingId)) return refuse('the meeting is still running');
+    // THE CONVERSATION IS FREE FOR ITS NEXT MEETING: its record of this one is released, only while it still names this one,
+    // and when the SERVICE ended it is recorded in the same write, which the ended card's length, the transcript's last
+    // lines and an app's last report batch are held to. Where a reader already released it on finding it gone, the time
+    // that reader recorded is replaced by the service's own (only while the record's last meeting is still this one).
+    const serviceEnd = endedAt(h.at, last.createdAt);
+    if (await releaseActiveMeeting(h.channelArn, h.meetingId, serviceEnd) === 'superseded') {
+      await recordMeetingFact(h.channelArn, h.meetingId, { endedAt: serviceEnd });
+    }
+  }
+  // A PERSON TOOK THE RUNNING MEETING (`person-attended`): a ring-off addressed to them alone, in the meeting's own
+  // conversation, so their other tabs and devices stop ringing for it. Nothing else is said and no workflow runs.
+  if (h.event === 'person-attended') {
+    if (record?.activeMeeting?.meetingId !== h.meetingId || !h.personId) return refuse('the meeting is no longer running');
+    const speaker = await primaryAssistantOf(h.channelArn, chimeClient, '[Router][meeting]');
+    if (speaker.classification !== STATIC_CLASSIFICATION) return refuse('primary is another classification');
+    const app = appInstanceArnOf(h.channelArn);
+    if (!app) return refuse('malformed');
+    return { ran: false, carded: await ringTheRoom(h.channelArn, speaker.botArn, RING_OFF, userArnFor(app, h.personId)) };
+  }
+  // A MEETING THAT STARTED IS WATCHED from its start, so it ends in bounded time whoever is or is not in it (`meeting-watch.ts`).
+  if (h.event === 'meeting-started') {
+    const startedAt = Date.parse(record?.activeMeeting?.createdAt ?? '') || Date.now();
+    await scheduleMeetingWatch(h.channelArn, h.meetingId, startedAt + MEETING_WATCH_MINUTES * 60_000);
+  }
+  // THE ROOM: the conversation the meeting was started from, from the meeting conversation's own server-side row.
+  const room = await meetingRoomOf(h.channelArn, record);
+  const roomRecord = room === h.channelArn ? record : await readChannelContext(room, { consistent: true });
+  const primary = await primaryAssistantOf(room, chimeClient, '[Router][meeting]');
+  if (primary.classification !== STATIC_CLASSIFICATION) return refuse('primary is another classification');
+
+  // The primary assistant and its served version, whose wording the card is said in.
+  const speaker = await cardSpeaker(primary.botArn, room);
+
+  // THE PLATFORM'S CARD, once per meeting per event: the request token makes a redelivery the same message.
+  let carded = false;
+  const started = h.event === 'meeting-started';
+  const startCard = started ? await meetingStartedCard(h.channelArn, roomRecord) : null;
+  const values: Record<string, string> = startCard
+    ? startCard.values
+    : { [MEETING_DURATION_VALUE]: String(durationMinutes(last.createdAt, endedAt(h.at, last.createdAt)) ?? '') };
+  // THE ENDED CARD'S ITEMS beyond its length: how it ended, its people, and its conversation (`endedCardValues`).
+  const cardValues = started ? values : { ...values, ...await endedCardValues(h.channelArn, room, last, cardWording(speaker)) };
+  // THE ENDED CARD CARRIES ITS LENGTH AND HOSTS, so a later rewrite says the same length (`rewriteEndedCard`); a person's started
+  // card carries when the ring it sends stops (`ringUntil`), so a person of the room the ring did not reach hears it from that card.
+  const ringUntil = started && last.startedVia !== 'workflow' && record?.activeMeeting?.meetingId === h.meetingId ? ringUntilOf(record.activeMeeting) : undefined;
+  const ended = started ? (ringUntil ? { ringUntil } : {}) : endedCardFacts(Number(values[MEETING_DURATION_VALUE]), last);
+  const cardName = startCard ? startCard.template : 'meeting-ended';
+  const cardEvent = started ? 'meeting-started' : 'meeting-ended';
+  // THE PERSON WHO STARTED IT IS IN IT, so the started card's email reaches the room's other members.
+  const starter = started && last.startedVia !== 'workflow' && last.createdBy ? [last.createdBy] : [];
+  // EVERY CARD IS SENT ONCE PER MEETING PER EVENT (its request token), so a send that fails throws and the redelivered event
+  // posts the same message. The ended card is what the summary, the transcript and the archive hang on.
+  if (!started || last.startedVia !== 'workflow') {
+    // A PERSON'S START EMAILS THE ROOM, as a workflow's start does with `email`: the card addresses `@humans`, and the
+    // notification bridge emails the members, its button opening the meeting window.
+    const sent = await postMeetingCard({
+      target: room, token: `${h.event}-${h.meetingId}`, name: cardName, speaker, values: cardValues, email: started,
+      content: (chat) => (started ? `@humans ${chat}` : chat),
+      metadata: (said) => ({
+        ...meetingCardMetadata(cardEvent, h.meetingId, h.channelArn, ended),
+        ...(started ? notifyDirective({
+          ...(said.subject ? { subject: said.subject } : {}), ...(said.body ? { body: said.body } : {}),
+          conversationId: conversationKey(h.channelArn), link: 'meeting', exclude: starter,
+        }) : {}),
+      }),
+    });
+    carded = !!sent;
+    if (h.event === 'meeting-ended') {
+      if (!sent?.MessageId) throw new Error('the ended card was not posted');
+      if (await endedCardRecorded(h.channelArn, h.meetingId, sent.MessageId, primary.botArn, room)) {
+        if (await scheduleMeetingSummary(h.channelArn, h.meetingId) === 'failed') throw new Error('the meeting\'s summary could not be scheduled');
+      }
+    }
+  }
+  // THE MEETING'S OWN CONVERSATION HEARS IT TOO, where everyone in the parent conversation is a member from the moment it opens and a
+  // person added to the meeting alone is one: the platform's started and ended cards are what tell each app the meeting
+  // runs or ended, over the messaging connection. No `@humans` address and no email: the parent conversation's card carries those.
+  if (room !== h.channelArn) {
+    // THE MEETING'S OWN CONVERSATION IS NOT THE CONVERSATION IT WAS STARTED FROM: its started card names that one and links to it,
+    // with where that conversation's run stands, so the meeting stands on its own for a person in it alone; its ended card
+    // carries no link to itself.
+    const own = started ? await meetingStartedFromCard(room, roomRecord, primary.botArn) : null;
+    const said = await postMeetingCard({
+      target: h.channelArn, token: `${h.event}-m-${h.meetingId}`, name: own ? own.template : cardName, speaker,
+      values: own ? own.values : { ...cardValues, conversation_link: '' },
+      metadata: () => meetingCardMetadata(cardEvent, h.meetingId, h.channelArn, { roomConversationId: conversationKey(room), ...ended }),
+    });
+    carded = carded || !!said;
+  }
+  // ITS CONVERSATION RINGS FOR A PERSON'S START, for what is left of the meeting's ring (a workflow's start rang in its
+  // step), and every end stops a ring still sounding: one ring key, the meeting, whose conversation the parent conversation's people are
+  // members of. Each is said by the parent conversation's primary, the one sender an app takes a ring from.
+  const ring = started
+    ? (last.startedVia !== 'workflow' && record?.activeMeeting?.meetingId === h.meetingId ? ringLeft(record.activeMeeting) : null)
+    : RING_OFF;
+  if (ring) await ringTheRoom(h.channelArn, primary.botArn, ring);
+
+  // THE ROOM'S WORKFLOW ON THE EVENT IS ITS OWNER'S (ADR-061 decision 2): the card above is the primary's notice, and the run
+  // is the owning assistant's, from its version and in its voice.
+  const roomType = roomRecord?.conversationType;
+  const owner = await eventWorkflowOwner(room, '[Router][meeting]', roomType ? { conversationType: roomType } : {});
+  if ('refused' in owner) return { ran: false, carded, reason: owner.refused };
+  // The owning assistant and the version it serves here, read as a card's speaker is (`cardSpeaker`).
+  const runnerSpeaker = owner.botArn === primary.botArn ? speaker : await cardSpeaker(owner.botArn, room);
+  const runner = runnerSpeaker.decision;
+  if (runner.decision === 'decline') return { ran: false, carded, reason: runner.reason };
+  const runnerServed = runnerSpeaker.served;
+  const declared = declaredWorkflowOn(runnerServed?.version.eventWorkflows, h.event);
+  if (!declared) return { ran: false, carded, reason: 'no workflow' };
+  // A WORKFLOW THAT NAMES ITS TYPES RUNS IN THOSE ROOMS ONLY, as every event's does.
+  if (declared.workflow.types?.length && !(roomType && declared.workflow.types.includes(roomType))) return { ran: false, carded, reason: 'no workflow for this type' };
+  const run = await runWorkflowFor(declared.name, declared.workflow, {
+    event: h.event, channelArn: room, meeting: { meetingId: h.meetingId }, values,
+  }, runnerOf(owner.botArn, runner.profile.name, runnerServed), { ...(roomType ? { conversationType: roomType } : {}) });
+  return { ran: run.ran, carded };
+}
+
+/**
+ * THE ENDED CARD, RECORDED ON THE MEETING'S ROW (`recordEndedMeetingCard`) with its poster and the room it is in. True once
+ * the row names this card; false where the row's last meeting is another one now, so nothing is scheduled for it. A write
+ * that fails while the row still names this meeting throws, so the event is delivered again.
+ */
+async function endedCardRecorded(channelArn: string, meetingId: string, messageId: string, by: string, room: string): Promise<boolean> {
+  if (await recordEndedMeetingCard(channelArn, meetingId, messageId, by, room)) return true;
+  const last = (await readChannelContext(channelArn, { consistent: true }))?.lastMeeting;
+  if (last?.meetingId !== meetingId) return false;
+  if (last.endedCardMessageId === messageId) return true;
+  throw new Error('the ended card could not be recorded');
+}
+
+/**
+ * SCHEDULE A RUNNING MEETING'S NEXT CHECK, once, on this classification's group, for the moment `at` (epoch ms), carrying
+ * since when an earlier check found it unattended. Only where the Meetings stack's run and summary entries are wired. Never
+ * throws: the service still ends a meeting nobody is connected to after five minutes.
+ */
+async function scheduleMeetingWatch(channelArn: string, meetingId: string, at: number, aloneSince?: number): Promise<'scheduled' | 'exists' | 'not wired' | 'failed'> {
+  const wiring = deadlineWiringFor(channelArn);
+  if (!wiring || !process.env.MEETING_RUN_FUNCTION || !process.env.MEETING_SUMMARY_FUNCTION) return 'not wired';
+  // A schedule is set at least a minute ahead, as the scheduler takes one, and on a whole second, which names it.
+  const when = Math.ceil(Math.max(at, Date.now() + 60_000) / 1000);
+  try {
+    const out = await createTaskDeadlineSchedule(wiring, {
+      kind: 'meeting-watch', channelArn, meetingId, at: when, ...(aloneSince !== undefined ? { aloneSince } : {}),
+    }, new Date(when * 1000));
+    return out === 'created' ? 'scheduled' : 'exists';
+  } catch (err) {
+    console.warn('[Router][meeting] the meeting watch could not be scheduled', { errName: (err as Error)?.name });
+    deadlineScheduleFailed(STATIC_CLASSIFICATION);
+    return 'failed';
+  }
+}
+
+/**
+ * A RUNNING MEETING'S WATCH CAME DUE (`meeting-watch.ts`). A meeting that has ended (its conversation no longer holds it,
+ * or the service no longer runs it) is left alone, and nothing is scheduled. Otherwise its people are read from its events
+ * (the summary entry's `present` and `people`), and the check decides:
+ *  - unattended, or past the deployment's limit: the meeting is ended, with its reason recorded for the ended card,
+ *    for everyone through the meetings function's one end (`endConversationMeeting`, `endMeeting`); the service's own end
+ *    event then posts the ended card and releases the record;
+ *  - otherwise: the next check is scheduled.
+ * People that cannot be read leave the meeting running and check again.
+ */
+export async function handleMeetingWatchFired(firing: MeetingWatchFiring): Promise<{ ran: boolean; reason?: string }> {
+  const refuse = (reason: string) => {
+    console.info('[Router][meeting] the meeting watch ends nothing', { reason, classification: STATIC_CLASSIFICATION });
+    return { ran: false, reason };
+  };
+  const runFn = process.env.MEETING_RUN_FUNCTION;
+  const summaryFn = process.env.MEETING_SUMMARY_FUNCTION;
+  if (!runFn || !summaryFn) return refuse('not wired');
+  // A READ THAT FAILS IS NEVER AN ANSWER: the meeting is checked again, so a passing fault never ends its watch.
+  const again = async (what: string) => {
+    await scheduleMeetingWatch(firing.channelArn, firing.meetingId, Date.now() + 60_000, firing.aloneSince);
+    return refuse(`${what} could not be read; it is checked again`);
+  };
+  const tags = await readChannelTags(chimeClient, firing.channelArn).catch(() => undefined);
+  if (tags === undefined) return again('the conversation');
+  const closed = roomRefusal(tags);
+  if (closed) return refuse(closed);
+  let record: Awaited<ReturnType<typeof readChannelContext>>;
+  try {
+    record = await readChannelContext(firing.channelArn, { consistent: true });
+  } catch {
+    return again('the meeting\'s record');
+  }
+  const active = record?.activeMeeting;
+  if (!active || active.meetingId !== firing.meetingId) return refuse('the meeting has ended');
+  if (!(await meetingRunsNow(firing.meetingId).catch(() => true))) return refuse('the meeting has ended');
+
+  // THE CHECK IS DECIDED AT THE MOMENT IT WAS DUE, not the moment it ran, so a firing delivered twice decides the same and
+  // schedules the same next check, whose name (its moment) the second one finds already there: one chain per meeting.
+  const now = Number.isFinite(firing.at) && firing.at > 0 ? firing.at * 1000 : Date.now();
+  const startedAt = Date.parse(active.createdAt) || now;
+  const maxMinutes = meetingMaxMinutes();
+  let present = 0;
+  let people = 0;
+  if (now < startedAt + maxMinutes * 60_000) {
+    const s = await summarizeConversationMeeting(summaryFn, firing.channelArn, firing.meetingId).catch(() => null);
+    if (!s?.ok || typeof s.present !== 'number' || typeof s.people !== 'number') {
+      await scheduleMeetingWatch(firing.channelArn, firing.meetingId, now + MEETING_WATCH_MINUTES * 60_000, firing.aloneSince);
+      return refuse('its people could not be read; it is checked again');
+    }
+    present = s.present;
+    people = s.people;
+  }
+  const decision = meetingWatchDecision({
+    now, startedAt, maxMinutes, present, people, ...(firing.aloneSince !== undefined ? { aloneSince: firing.aloneSince } : {}),
+    ...(Number.isFinite(Date.parse(active.lastJoinAt ?? '')) ? { lastJoinAt: Date.parse(active.lastJoinAt!) } : {}),
+  });
+  if ('next' in decision) {
+    await scheduleMeetingWatch(firing.channelArn, firing.meetingId, decision.next, decision.aloneSince);
+    return refuse('the meeting is not due to end; it is checked again');
+  }
+
+  // WHY IT ENDS is recorded with the end (`endConversationMeeting`), and the ended card the service's end raises says it.
+  let ended: Awaited<ReturnType<typeof endConversationMeeting>>;
+  try {
+    ended = await endConversationMeeting(runFn, firing.channelArn, firing.meetingId, decision.end);
+  } catch (err) {
+    console.warn('[Router][meeting] the meeting could not be ended; it is checked again', { errName: (err as Error)?.name });
+    await scheduleMeetingWatch(firing.channelArn, firing.meetingId, now + 60_000, firing.aloneSince);
+    return refuse('the end could not be reached');
+  }
+  if (!ended.ok) {
+    if (ended.code !== 'NOT_RUNNING') await scheduleMeetingWatch(firing.channelArn, firing.meetingId, now + 60_000, firing.aloneSince);
+    return refuse(`the end was refused: ${ended.code ?? 'unknown'}`);
+  }
+  console.log('[Router][meeting] a meeting ended on its own', { reason: decision.end, classification: STATIC_CLASSIFICATION });
+  return { ran: true, reason: decision.end };
+}
+
+/**
+ * SCHEDULE A MEETING'S SUMMARY, once, on this classification's group, for when its last events are filed in both stores.
+ * Only where the Meetings stack's summary entry is wired. Never throws: the ended card already says how long it ran.
+ */
+async function scheduleMeetingSummary(channelArn: string, meetingId: string): Promise<'scheduled' | 'exists' | 'not wired' | 'failed'> {
+  const wiring = deadlineWiringFor(channelArn);
+  if (!wiring || !process.env.MEETING_SUMMARY_FUNCTION) return 'not wired';
+  try {
+    const out = await createTaskDeadlineSchedule(wiring, { kind: 'meeting', channelArn, meetingId }, new Date(Date.now() + MEETING_SUMMARY_DELAY_SECONDS * 1000));
+    return out === 'created' ? 'scheduled' : 'exists';
+  } catch (err) {
+    console.warn('[Router][meeting] the meeting summary could not be scheduled; the ended card keeps its length', { errName: (err as Error)?.name });
+    return 'failed';
+  }
+}
+
+/**
+ * A MEETING'S SUMMARY CAME DUE, once its last events are filed. Before anything is read:
+ *  - the meeting's conversation, and the room its ended card is in, are this classification's, by their immutable tags,
+ *    and not archived;
+ *  - the meeting is the conversation's last one, and its ended card is recorded with the assistant that posted it.
+ * Then, in order:
+ *  1. Its transcript is written where it was transcribed (the run entry's `transcript`, `meeting-api.ts`).
+ *  2. The Meetings stack's summary entry reads the meeting's figures from its events.
+ *  3. The ended card is rewritten in place by the assistant that posted it (`sayMeetingCard`): with its figures where the
+ *     meeting has ended in its events and someone joined, so a figure always has its people, and with the transcript's
+ *     link where one was written.
+ *  4. The meeting's conversation is archived read-only (`archiveEndedMeeting`), whatever the card did, once the service no
+ *     longer runs the meeting.
+ */
+/** A conversation the platform can no longer reach: deleted, or this assistant is no longer a member. */
+export const CONVERSATION_GONE = Symbol('conversation-gone');
+/** Errors Amazon Chime SDK answers for a conversation that is gone; any other failure is retried. */
+const GONE_ERRORS = new Set(['ForbiddenException', 'NotFoundException']);
+
+/**
+ * A CONVERSATION'S TAGS, OR THAT IT IS GONE. Amazon Chime SDK answers Forbidden or NotFound for a deleted conversation, and
+ * that answer does not change on a retry; every other failure (throttling, a service error) throws so the caller's invoke
+ * is retried.
+ */
+export async function tagsUnlessGone(channelArn: string): Promise<Record<string, string | undefined> | typeof CONVERSATION_GONE> {
+  try {
+    return await readChannelTags(chimeClient, channelArn);
+  } catch (err) {
+    if (!GONE_ERRORS.has((err as { name?: string })?.name ?? '')) throw err;
+    console.warn('[Router][meeting-summary] the conversation is gone; nothing is summarized into it', { errName: (err as { name?: string }).name, classification: STATIC_CLASSIFICATION });
+    return CONVERSATION_GONE;
+  }
+}
+
+export async function handleMeetingSummaryFired(firing: MeetingSummaryFiring): Promise<{ ran: boolean; reason?: string }> {
+  const refuse = (reason: string) => {
+    console.info('[Router][meeting] the meeting summary changes nothing', { reason, classification: STATIC_CLASSIFICATION });
+    return { ran: false, reason };
+  };
+  const fn = process.env.MEETING_SUMMARY_FUNCTION;
+  if (!fn) return refuse('not wired');
+  // A READ THAT FAILS IS NEVER AN ANSWER: it throws, so the schedule's asynchronous invoke is retried. A conversation that is
+  // gone (deleted, or no longer reachable by this assistant) is an answer: there is nothing to summarize into, so the
+  // summary ends here rather than retrying for as long as the schedule lives.
+  const meetingTags = await tagsUnlessGone(firing.channelArn);
+  if (meetingTags === CONVERSATION_GONE) return refuse('the meeting conversation is gone');
+  const closed = roomRefusal(meetingTags);
+  if (closed) return refuse(closed);
+  const record = await readChannelContext(firing.channelArn, { consistent: true });
+  const last = record?.lastMeeting;
+  if (!last || last.meetingId !== firing.meetingId) return refuse('not the last meeting of this conversation');
+  // AN ENDED MEETING'S CONVERSATION IS ARCHIVED whatever its card does, once nothing runs in it any more.
+  const archive = async (outcome: { ran: boolean; reason?: string }) => {
+    if (record?.activeMeeting?.meetingId !== firing.meetingId && !(await meetingRunsNow(firing.meetingId).catch(() => true))) {
+      await archiveEndedMeeting(firing.channelArn, firing.meetingId);
+    }
+    return outcome;
+  };
+  if (!last.endedCardMessageId || !last.endedCardBy) return archive(refuse('no ended card'));
+  // THE CARD IS IN THE ROOM the meeting was started from, as recorded when it was posted.
+  const cardIn = last.endedCardIn || firing.channelArn;
+  if (cardIn !== firing.channelArn) {
+    const roomTags = await tagsUnlessGone(cardIn);
+    if (roomTags === CONVERSATION_GONE) return archive(refuse('the conversation the meeting was started from is gone'));
+    const roomClosed = roomRefusal(roomTags, 'room');
+    if (roomClosed) return archive(refuse(roomClosed));
+  }
+  // 1 AND 2, AT ONCE, so both fit the router's own time: THE TRANSCRIPT, where the meeting was transcribed, and THE
+  // FIGURES, where the events can be read whole. A call that fails throws, so the whole summary is retried; a transcript
+  // the run entry refuses is no transcript.
+  let transcriptKey = '';
+  const runFn = process.env.MEETING_RUN_FUNCTION;
+  const [t, s] = await Promise.all([
+    runFn && last.transcription?.everOn ? transcribeEndedMeeting(runFn, firing.channelArn, firing.meetingId) : Promise.resolve(null),
+    summarizeConversationMeeting(fn, firing.channelArn, firing.meetingId),
+  ]);
+  // AN ENTRY THAT COULD NOT ANSWER IS NO ANSWER: a transient code throws, so the transcript and the figures are tried again.
+  if (t && !t.ok && isTransientEntryCode(t.code)) throw new Error(`the transcript could not be written: ${t.code}`);
+  if (s && !s.ok && isTransientEntryCode(s.code)) throw new Error(`the meeting's figures could not be read: ${s.code}`);
+  if (t?.ok && typeof t.key === 'string') transcriptKey = t.key;
+  else if (t && !t.ok) console.warn('[Router][meeting] the transcript was not written', { code: t.code });
+  const figures: EndedCardFigures | null = s?.ok && s.ended && s.people
+    ? { people: s.people, connectedMinutes: s.connectedMinutes, drops: s.drops, durationMinutes: s.durationMinutes } : null;
+  if (!figures && !transcriptKey) {
+    return archive(refuse(!s ? 'the summary could not be read' : !s.ok ? `the summary was not read: ${s.code ?? 'unknown'}` : !s.ended ? 'the meeting has not ended in its events' : 'nobody joined'));
+  }
+  // 3. THE CARD, rewritten in place by the one rewrite, with what this run established. A rewrite that fails throws before
+  // the summary is dispatched or the conversation archived, so the firing is retried whole: the card is where later rewrites
+  // read the transcript's key from.
+  if (!(await rewriteEndedCard(firing.channelArn, firing.meetingId, { transcriptKey, figures }))) return archive(refuse('the summary could not be rendered'));
+  // 4. THE MEETING'S SUMMARY, where its transcript was written: the room's owning assistant's turn, which hands it back to
+  // `handleMeetingSummaryWritten`. The segments it reads are kept, so the archive below does not wait on it.
+  const duration = figures?.durationMinutes ?? (last.endedAt ? durationMinutes(last.createdAt, last.endedAt) : null);
+  if (transcriptKey) await dispatchMeetingSummaryTurn(firing.channelArn, firing.meetingId, last, cardIn, last.endedCardMessageId, duration ?? undefined);
+  // 5. THE MEETING'S CONVERSATION, archived.
+  return archive({ ran: true });
+}
+
+/**
+ * A RUN OR SUMMARY ENTRY'S CODE FOR A READ OR A WRITE THAT FAILED, never a fact about the meeting: the entry failed outright,
+ * a store or a tag could not be read, or the call faulted. The caller throws on one, so its asynchronous invoke is retried.
+ */
+const TRANSIENT_ENTRY_CODES: ReadonlySet<string> = new Set(['ENTRY_FAILED', 'UNAVAILABLE', 'INTERNAL', 'CLASSIFICATION_UNREADABLE']);
+export const isTransientEntryCode = (code: unknown): boolean => typeof code === 'string' && TRANSIENT_ENTRY_CODES.has(code);
+
+/** The line no summary is said in: the meeting kept no transcript. */
+const MEETING_NO_SUMMARY_TEMPLATE = 'meeting-summary-none';
+
+/** A meeting card's one-line part, rendered from its own template in the card speaker's wording; empty where it cannot be. */
+async function meetingCardLine(
+  name: string, values: Record<string, string>,
+  speaker: { assistant?: string; version?: { messages?: import('./lib/message-template.js').VersionMessages } }, room: string,
+): Promise<string> {
+  const r = renderMessageTemplate(await meetingCardTemplate(name, speaker.assistant, speaker.version, room), values, { sections: ['chat'], refusedValue: 'empty' });
+  return r.ok ? (r.sections.chat ?? '').trim() : '';
+}
+
+/** A conversation's people, each AppInstanceUser id and the name the room shows them under, read live as `bearer`; null where unread. */
+async function conversationPeople(channelArn: string, bearer: string): Promise<Map<string, string> | null> {
+  const size = await resolveChannelSize(chimeClient, channelArn, bearer).catch(() => null);
+  if (!size || size.unknown || size.refused) return null;
+  const out = new Map<string, string>();
+  for (const m of size.members ?? []) {
+    const id = m.isBot ? null : personIdFromArn(m.arn);
+    if (id) out.set(id, m.name ?? '');
+  }
+  return out;
+}
+
+/**
+ * DISPATCH A RECORDED MEETING'S SUMMARY TURN (FR66) to the room's owning assistant (`eventWorkflowOwner`: the role the room's
+ * type names, else its primary), as one of its turns on its own vended session: ids, the meeting's people as its
+ * conversation lists them, and the card the turn is recorded against. Never throws: the card keeps its figures and links.
+ */
+async function dispatchMeetingSummaryTurn(
+  meetingArn: string, meetingId: string, last: { createdAt: string }, cardIn: string, cardMessageId: string, minutes: number | undefined,
+): Promise<boolean> {
+  try {
+    const roomRecord = await getChannelContext(cardIn).catch(() => null);
+    const owner = await eventWorkflowOwner(cardIn, '[Router][meeting]', roomRecord?.conversationType ? { conversationType: roomRecord.conversationType } : {});
+    if ('refused' in owner) {
+      console.info('[Router][meeting] the meeting summary has no assistant to write it', { reason: owner.refused });
+      return false;
+    }
+    const processorArn = await resolveAsyncProcessorArn(STATIC_CLASSIFICATION);
+    if (!processorArn) return false;
+    const primary = await primaryAssistantOf(meetingArn, chimeClient, '[Router][meeting]');
+    const people = await conversationPeople(meetingArn, primary.botArn);
+    return await invokeAsync(processorArn, {
+      channelArn: cardIn,
+      ...await roomGroundingFields(cardIn),
+      correlationId: meetingSummaryCorrelationId(meetingId),
+      userMessage: '',
+      userContent: '',
+      classification: STATIC_CLASSIFICATION,
+      botArn: owner.botArn,
+      trigger: 'meeting_summary',
+      triggerAtMs: Date.now(),
+      meetingSummary: {
+        meetingArn, meetingId, startedAt: last.createdAt, ...(minutes !== undefined ? { durationMinutes: minutes } : {}),
+        attendees: [...(people ?? new Map<string, string>())].map(([personId, name]) => ({ personId, name })),
+        card: { messageId: cardMessageId, room: cardIn },
+      },
+    });
+  } catch (err) {
+    console.warn('[Router][meeting] the meeting summary turn could not be dispatched', { errName: (err as Error)?.name });
+    return false;
+  }
+}
+
+/**
+ * A RECORDED MEETING'S SUMMARY, HANDED BACK BY ITS TURN (FR66, FR67). Before anything is written, from this router's own reads:
+ *  - the meeting conversation and the room are this classification's, by their immutable tags, and the room is not archived;
+ *  - the meeting is the conversation's last, its ended card is recorded, and no summary is stored for it yet;
+ *  - the assistant whose turn wrote it is the room's owning assistant now.
+ * Then each action item opens its task in the room through the workflow-task seam (`openWorkflowTaskStep`): assigned to
+ * the person the model's reference stands for only where they are a member of both the meeting's conversation and the
+ * room (`planActionItems`), else held by a host; the summary is stored on the meeting conversation's row; and the ended
+ * card is rewritten with it (`rewriteEndedCard`).
+ */
+/**
+ * A TURN'S MEETING PLACE, ASKED BY THIS CLASSIFICATION'S PROCESSOR for `propose_meeting_invites` (SPEC-ASSISTANT-MEETINGS
+ * FR42): whether the conversation's meeting runs and takes people from outside, and the meeting and room rows that say so,
+ * their meeting attributes alone (`meetingPlaceFields`).
+ *
+ * The router reads them because the conversation is its own: every row it reads must belong to a conversation whose
+ * immutable classification tag is this router's (`STATIC_CLASSIFICATION`), and a conversation of another classification,
+ * or one whose tag cannot be read, answers no place. The assistant's session holds no read of the context table, so a
+ * turn cannot read another classification's meeting (tenets D1, D12).
+ */
+export async function handleMeetingPlaceRead(raw: unknown): Promise<{ place?: MeetingPlace; reason?: string }> {
+  const channelArn = raw && typeof raw === 'object' ? (raw as { channelArn?: unknown }).channelArn : undefined;
+  if (typeof channelArn !== 'string' || !/^arn:aws[a-z-]*:chime:[a-z0-9-]+:\d{12}:app-instance\/[^/]+\/channel\/[^/]+$/.test(channelArn)) return { reason: 'malformed' };
+  if (!STATIC_CLASSIFICATION) return { reason: 'no classification' };
+  const appInstance = channelArn.split('/channel/')[0];
+  let crossed = false;
+  const readRow = async (arn: string) => {
+    if (!arn.startsWith(`${appInstance}/channel/`) || (await resolveChannelClassificationTag(arn)) !== STATIC_CLASSIFICATION) {
+      crossed = true;
+      return null;
+    }
+    return meetingPlaceFields(await readChannelContext(arn, { consistent: true }));
+  };
+  const place = await meetingPlaceOfTurn(channelArn, readRow);
+  if (crossed) {
+    console.warn('[Router][meeting][SecurityEvent] a meeting place names a conversation of another classification; answering none', { channelArn, classification: STATIC_CLASSIFICATION });
+    return { reason: 'not this classification' };
+  }
+  return place ? { place } : { reason: 'no meeting runs here' };
+}
+
+export async function handleMeetingSummaryWritten(raw: unknown): Promise<{ ran: boolean; reason?: string; tasks?: number }> {
+  const refuse = (reason: string) => {
+    console.info('[Router][meeting] the meeting summary is not written', { reason, classification: STATIC_CLASSIFICATION });
+    return { ran: false, reason };
+  };
+  const w = readMeetingSummaryWritten(raw);
+  if (!w) return refuse('malformed');
+  // A READ THAT FAILS IS NEVER AN ANSWER: it throws, so the hand-back's asynchronous invoke is retried.
+  if ((await classificationTagOf(w.meetingArn)) !== STATIC_CLASSIFICATION) return refuse('not this classification');
+  const record = await readChannelContext(w.meetingArn, { consistent: true });
+  const last = record?.lastMeeting;
+  if (!last || last.meetingId !== w.meetingId) return refuse('not the last meeting of this conversation');
+  // ALREADY WRITTEN: a hand-back delivered again (the retry of one whose card edit failed) only rewrites the card.
+  if (last.summary) {
+    await rewriteEndedCard(w.meetingArn, w.meetingId);
+    return refuse('already written');
+  }
+  if (!last.endedCardMessageId || !last.endedCardBy) return refuse('no ended card');
+  const room = last.endedCardIn || w.meetingArn;
+  if (room !== w.meetingArn) {
+    const closed = roomRefusal(await readChannelTags(chimeClient, room), 'room');
+    if (closed) return refuse(closed);
+  }
+  if ((await classificationTagOf(room)) !== STATIC_CLASSIFICATION) return refuse('the room is another classification');
+  const roomRecord = room === w.meetingArn ? record : await readChannelContext(room);
+  const owner = await eventWorkflowOwner(room, '[Router][meeting]', roomRecord?.conversationType ? { conversationType: roomRecord.conversationType } : {});
+  if ('refused' in owner) return refuse(owner.refused);
+  if (owner.botArn !== w.botArn) return refuse('not the room\'s owning assistant');
+  // The owning assistant and the version it serves in the room, read as the card it rewrites is (`cardSpeaker`).
+  const runnerSpeaker = await cardSpeaker(owner.botArn, room);
+  const runner = runnerSpeaker.decision;
+  if (runner.decision === 'decline') return refuse(runner.reason);
+  const served = runnerSpeaker.served;
+  // WHO MAY BE GIVEN AN ITEM: the people of the meeting's conversation and of the room, each read live.
+  const primary = await primaryAssistantOf(w.meetingArn, chimeClient, '[Router][meeting]');
+  const [meetingPeople, roomPeople] = await Promise.all([conversationPeople(w.meetingArn, primary.botArn), conversationPeople(room, owner.botArn)]);
+  if (!meetingPeople || !roomPeople) throw new Error('the people of the meeting or the room could not be read');
+  const members = { meeting: new Set(meetingPeople.keys()), room: new Set(roomPeople.keys()) };
+  const plan = planActionItems(w.content.actionItems, members, actionItemHolder(last, members.room));
+  const app = appInstanceArnOf(room);
+  const who = runnerOf(owner.botArn, runner.profile.name, served);
+  const runKey = meetingSummaryRunKey(w.meetingId);
+  const items: StoredMeetingSummary['actionItems'] = [];
+  // One run, one edition: every action item's task steps belong to the summary run, so its edition is computed once.
+  const edition = runEdition(who, { event: 'meeting-ended', channelArn: room, meeting: { meetingId: w.meetingId }, values: {} } as EventRunContext, MEETING_SUMMARY_RUN);
+  for (const p of plan) {
+    const base = { text: p.item.text, ...(p.item.due ? { due: p.item.due } : {}) };
+    if (!p.worker || !app) { items.push(base); continue; }
+    const step = actionItemStep(p.index);
+    const ctx: EventRunContext = {
+      event: 'meeting-ended', channelArn: room, eventPerson: userArnFor(app, p.worker), meeting: { meetingId: w.meetingId },
+      values: { item: p.item.text, ...(p.item.due ? { due: dueAtOf(p.item.due) } : {}) },
+    };
+    const opened = await openWorkflowTaskStep({
+      name: MEETING_SUMMARY_RUN, step, ctx, who, runKey, transitions: [], edition,
+      def: {
+        machine: MEETING_ACTION_ITEM_MACHINE, by: { people: 'event:person' }, visibility: 'conversation',
+        ...(p.item.due ? { deadline: { kind: 'due' as const, at: 'due' } } : {}),
+      },
+    });
+    items.push({
+      ...base,
+      ...(opened === 'opened' ? { taskId: eventTaskId(runKey, step) } : {}),
+      ...(p.assignee ? { assignee: p.assignee } : {}), ...(p.heldBy ? { heldBy: p.heldBy } : {}),
+    });
+  }
+  const stored: StoredMeetingSummary = {
+    summary: w.content.summary, keyPoints: w.content.keyPoints, nextSteps: w.content.nextSteps, topics: w.content.topics,
+    actionItems: items, writtenBy: botIdFromArn(owner.botArn) ?? '', writtenAt: new Date().toISOString(), ...(w.turn.model ? { model: w.turn.model } : {}),
+  };
+  // THE SUMMARY IS STORED OR THE HAND-BACK IS RETRIED: its tasks open again as the same tasks (`eventTaskId`), so a retry
+  // names them once more and the summary that names them is kept. Refused only where the meeting is no longer the last.
+  if (!(await recordMeetingFact(w.meetingArn, w.meetingId, { summary: stored }))) {
+    const now = (await readChannelContext(w.meetingArn, { consistent: true }))?.lastMeeting;
+    if (now?.meetingId === w.meetingId && !now.summary) throw new Error('the meeting summary could not be stored');
+    return refuse('the summary could not be stored');
+  }
+  await rewriteEndedCard(w.meetingArn, w.meetingId);
+  return { ran: true, tasks: items.filter((i) => i.taskId).length };
+}
+
+/**
+ * THE SUMMARY'S PART OF THE ENDED CARD (FR66, FR67): the summary, the key points and each action item with the person it is
+ * assigned to or held by, by the name the room shows them under, each in its own template, fitted with the rest of the card
+ * into one message (`fitSummaryCard`). Empty where there is no summary.
+ */
+async function summaryCardValues(
+  summary: StoredMeetingSummary | undefined, card: { name: string; room: string; bearer: string; base: Record<string, string> },
+  speaker: { assistant?: string; version?: { messages?: import('./lib/message-template.js').VersionMessages } },
+): Promise<Record<string, string>> {
+  if (!summary) return {};
+  const line = (name: string, values: Record<string, string>) => meetingCardLine(name, values, speaker, card.room);
+  const names = (await conversationPeople(card.room, card.bearer)) ?? new Map<string, string>();
+  const itemLines = (await Promise.all(summary.actionItems.map((i) => (i.assignee
+    ? line('meeting-action-item', { item: i.text, assignee: names.get(i.assignee) ?? '', due: i.due ?? '' })
+    : line('meeting-action-item-held', { item: i.text, holder: i.heldBy ? names.get(i.heldBy) ?? '' : '', due: i.due ?? '' }))))).filter(Boolean);
+  const valuesOf = async (p: SummaryCardParts): Promise<Record<string, string>> => ({
+    summary: await line('meeting-summary-text', { summary: p.summary }),
+    key_points: p.keyPoints.length ? await line('meeting-summary-key-points', { points: p.keyPoints.map((k) => `- ${k}`).join('\n') }) : '',
+    action_items: p.itemLines.length ? await line('meeting-summary-action-items', { items: p.itemLines.join('\n') }) : '',
+  });
+  const template = await meetingCardTemplate(card.name, speaker.assistant, speaker.version, card.room);
+  const fitted = await fitSummaryCard(async (p) => {
+    const r = renderMessageTemplate(template, { ...card.base, ...await valuesOf(p) }, { sections: ['chat'], refusedValue: 'empty' });
+    return r.ok ? r.sections.chat : undefined;
+  }, { summary: summary.summary, keyPoints: summary.keyPoints, itemLines }, CHIME_CONTENT_SAFE, MESSAGE_VALUE_CAPS.longText);
+  return fitted ? valuesOf(fitted) : {};
+}
+
+/** The figures a meeting's ended card carries, from the summary entry's read of its events. */
+type EndedCardFigures = { people: number; connectedMinutes?: number; drops?: number; durationMinutes?: number | null };
+
+/**
+ * REWRITE A MEETING'S ENDED CARD IN PLACE WITH WHAT ITS RECORD HOLDS NOW, as the assistant that posted it: the one edit of the
+ * card, for its summary's first rewrite (`handleMeetingSummaryFired`, which passes what it just established: the transcript
+ * and the figures), a recording's finish and a stored summary. What `known` does not give is what the card already carries:
+ * its transcript link, and its figures where it was summarized. Every item `endedCardValues` reads is read from the record
+ * (its recording among them). Its length is the card's own, else the figures', else the record's start to its recorded
+ * end, and never the moment of a rewrite.
+ *
+ * False, and nothing changed, where the meeting is not the conversation's last, no card is recorded, the card renders
+ * nothing, or the conversation the card is in is closed (the room; or the meeting's own conversation where the card is in
+ * it). A read or an edit that fails throws, so the caller's asynchronous invoke is retried.
+ */
+export async function rewriteEndedCard(
+  meetingArn: string, meetingId: string, known?: { transcriptKey: string; figures: EndedCardFigures | null },
+): Promise<boolean> {
+  const record = await readChannelContext(meetingArn, { consistent: true });
+  const last = record?.lastMeeting;
+  if (!last || last.meetingId !== meetingId || !last.endedCardMessageId || !last.endedCardBy) return false;
+  const cardIn = last.endedCardIn || meetingArn;
+  if (roomRefusal(await readChannelTags(chimeClient, cardIn), cardIn === meetingArn ? 'conversation' : 'room')) return false;
+  const messageId = last.endedCardMessageId;
+  const bearer = last.endedCardBy;
+  // What the card already says that the record does not hold: its length, its transcript, whether it was summarized.
+  const current = await chimeClient.send(new GetChannelMessageCommand({ ChannelArn: cardIn, MessageId: messageId, ChimeBearer: bearer }));
+  let card: { summarized?: boolean; transcriptKey?: string; durationMinutes?: number } = {};
+  try { card = (JSON.parse(current.ChannelMessage?.Metadata || '{}') as { meetingCard?: typeof card }).meetingCard ?? {}; } catch { card = {}; }
+  const carried = typeof card.transcriptKey === 'string' && parseTranscriptKey(card.transcriptKey) ? card.transcriptKey : '';
+  const transcriptKey = known ? known.transcriptKey : carried;
+  const summaryFn = process.env.MEETING_SUMMARY_FUNCTION;
+  const s = !known && card.summarized && summaryFn ? await summarizeConversationMeeting(summaryFn, meetingArn, meetingId) : null;
+  const figures: EndedCardFigures | null = known ? known.figures
+    : s?.ok && s.ended && s.people ? { people: s.people, connectedMinutes: s.connectedMinutes, drops: s.drops, durationMinutes: s.durationMinutes } : null;
+  // SUMMARIZED: the summary's run found its figures, and a later rewrite keeps saying so whether or not it reads them again.
+  const summarized = known ? !!known.figures : !!card.summarized;
+  const recordedEnd = last.endedAt && Number.isFinite(Date.parse(last.endedAt)) ? durationMinutes(last.createdAt, last.endedAt) : null;
+  const duration = typeof card.durationMinutes === 'number' ? card.durationMinutes : figures?.durationMinutes ?? recordedEnd ?? undefined;
+  const speaker = cardWording(await cardSpeaker(bearer, cardIn));
+  // THE MEETING'S SUMMARY, where one is stored (FR66): the card is the summary card, with or without figures.
+  const name = figures || last.summary ? 'meeting-summary' : 'meeting-ended';
+  const base: Record<string, string> = {
+    [MEETING_DURATION_VALUE]: String(duration ?? ''),
+    ...await endedCardValues(meetingArn, cardIn, last, speaker),
+    ...(figures ? { people: String(figures.people), connected_minutes: String(figures.connectedMinutes ?? 0), drops: String(figures.drops ?? 0) } : {}),
+    ...(transcriptKey ? { transcript_link: transcriptLink(transcriptKey) } : {}),
+    // NO TRANSCRIPT, NO SUMMARY (FR66), and the card says so.
+    ...(summarized && !transcriptKey ? { summary_note: await meetingCardLine(MEETING_NO_SUMMARY_TEMPLATE, {}, speaker, cardIn) } : {}),
+  };
+  const edited = await sayMeetingCard({
+    name, room: cardIn, botArn: bearer, ...speaker,
+    values: { ...base, ...await summaryCardValues(last.summary, { name, room: cardIn, bearer, base }, speaker) },
+  }, async (said) => {
+    await chimeClient.send(new UpdateChannelMessageCommand({
+      ChannelArn: cardIn,
+      MessageId: messageId,
+      Content: said.chat,
+      Metadata: JSON.stringify(withinMetadataCap({
+        ...meetingCardMetadata('meeting-ended', meetingId, meetingArn, {
+          ...(summarized ? { summarized: true as const } : {}), ...(transcriptKey ? { transcriptKey } : {}),
+          ...endedCardFacts(duration, last),
+        }),
+        // THE SUMMARY'S TURN IS RECORDED ON THIS CARD (`meeting-summary-turn.ts`), so its update is that turn, named.
+        ...(last.summary ? { turnKind: 'meeting_summary', trigger: 'meeting_summary' } : {}),
+      }, CHIME_METADATA_MAX)),
+      ChimeBearer: bearer,
+    }));
+    return true;
+  });
+  return !!edited;
+}
+
+/** One incident the team conversation holds open: the conversation it opened, the resource it is for, and its task. */
+interface OpenIncident { conversation: string; resource?: string; task?: Task }
+
+/**
+ * WHETHER A CHILD CONVERSATION IS ONE ITS TEAM ROOM STILL WAITS ON: a wait the team's run holds with no end recorded and has
+ * not gone on from, or a wait that cannot be read (so the room's cap holds on a failure). A child no run waits on is not open
+ * for the room, and neither is one whose wait its run went on from (the child told it at the resolve, `moveRunOn`); a wait
+ * whose going on cannot be read counts as held.
+ */
+export function waitHoldsChildOpen(read: { ended?: unknown } | 'none' | 'unread', wentOn: boolean | 'unread' = false): boolean {
+  if (read === 'unread') return true;
+  if (read === 'none') return false;
+  if (typeof read.ended === 'string') return false;
+  return wentOn !== true;
+}
+
+/**
+ * THE TEAM CONVERSATION'S OPEN INCIDENTS, read from two records: the conversations of `type` its workflow opened within an
+ * incident's lifetime (`MAX_WAIT_MINUTES`), from its own row, each open until its end is recorded under the team's wait for
+ * it (`childEndWaitId`) or the team's run has gone on from that wait, as it does at a resolve, whether or not its run opened
+ * an incident task; and the open `incident_ownership` tasks those conversations hold, read in one query by the conversation that
+ * opened them (`openedFrom`), which name the resource. A conversation whose end record cannot be read counts as open. Null
+ * when the row or the tasks cannot be read, so a limit is never passed on a short count.
+ */
+export async function openIncidents(channelArn: string, type: string | undefined): Promise<OpenIncident[] | null> {
+  const [row, tasks] = await Promise.all([readChannelContext(channelArn, { consistent: true }).catch(() => undefined), openTasksOpenedFrom(channelArn, 'incident_ownership')]);
+  if (row === undefined || !tasks) return null;
+  const out = new Map<string, OpenIncident>();
+  for (const t of tasks) out.set(t.channelArn, { conversation: t.channelArn, ...(typeof t.workflowRun?.values?.resource === 'string' ? { resource: t.workflowRun.values.resource } : {}), task: t });
+  const app = appInstanceArnOf(channelArn);
+  const since = Date.now() - MAX_WAIT_MINUTES * 60_000;
+  const children = (row?.children ?? []).filter((c) => c?.channelId && c.typeKey === type && Date.parse(c.openedAt) >= since);
+  await Promise.all(children.map(async (c) => {
+    const child = `${app}/channel/${c.channelId}`;
+    if (!app || out.has(child)) return;
+    // OPEN WHILE THE TEAM'S RUN HOLDS A WAIT ON IT with no end recorded. A child no run waits on is not one this room is
+    // waiting on, whatever its own run did; a wait that cannot be read counts as held, so the cap never opens on a failure.
+    const record = await readRunWait({ waitId: childEndWaitId(child), channelArn }).then((r) => r ?? 'none' as const, () => 'unread' as const);
+    // THE TEAM'S RUN HAS GONE ON FROM THE WAIT where its continuation claim on that step is recorded (`continueAfter`).
+    const held = typeof record === 'object' && typeof record.runKey === 'string' && typeof record.step === 'string' ? { runKey: record.runKey, step: record.step } : undefined;
+    const wentOn = held
+      ? await readEventSteps({ runKey: held.runKey, channelArn, steps: [continuationClaim(held.step)] })
+        .then((c) => (c ? c[continuationClaim(held.step)] !== undefined : 'unread' as const), () => 'unread' as const)
+      : false;
+    if (!waitHoldsChildOpen(record, wentOn)) return;
+    const values = (record === 'unread' || record === 'none' ? undefined : record.values) as Record<string, unknown> | undefined;
+    out.set(child, { conversation: child, ...(typeof values?.resource === 'string' ? { resource: values.resource } : {}) });
+  }));
+  return [...out.values()];
+}
+
+/** Tell an open incident's conversation that its event happened again, as the team's workflow owner. Never fails the event. */
+async function tellIncident(task: Task, botArn: string, assistant: string, label: string): Promise<void> {
+  const run = task.workflowRun;
+  if (!run) return;
+  await sayWorkflowSend({
+    channelArn: task.channelArn, botArn, assistant, workflow: run.workflow, event: run.event as WorkflowEvent, step: 'repeated', template: 'incident-event-repeated',
+    values: { label }, to: [], runKey: run.runKey, transitions: [], process: run.process,
+  }).catch(() => false);
+}
+
+/** The refusal an owning assistant that is not a member of the room is answered with (`workflowOwnerOf`). */
+const OWNER_NOT_IN_ROOM = 'the assistant that owns the workflow is not a member of the room';
+
+/**
+ * ASK THE CREATOR TO COMPLETE A TEAM CONVERSATION with the members its type names (the attach's own request, `ensureTeamRoom`
+ * in `event-triggers-api.ts`): its id is fixed, so the creator adds who is missing and doubles nothing. Asynchronous; a request
+ * that could not be made throws.
+ */
+async function completeTeamRoom(typeKey: string): Promise<void> {
+  const creator = process.env.TYPED_CREATOR_NAME;
+  if (!creator) throw new Error('no conversation creator is named');
+  const forRole = groupSourcedRoles((k) => k === typeKey).find((r) => r.decl.holders === 'one')?.role;
+  await lambdaClient.send(new InvokeCommand({
+    FunctionName: creator, InvocationType: InvocationType.Event,
+    Payload: Buffer.from(JSON.stringify({ detail: { conversationType: typeKey, ...(forRole ? { forRole } : {}), teamRoom: true } })),
+  }));
+}
+
+/** How far an event's own time may run ahead of this router's clock: a producer's clock skew, never a later window. */
+const EVENT_CLOCK_SKEW_MS = 60_000;
+
+/**
+ * WHY AN EVENT'S TIME STARTS NOTHING, or undefined: older than the policy allows, or dated ahead of now by more than clock
+ * skew. Its window (`eventTriggerWindow`) is taken no later than now, so a time the producer chose opens no window of its own.
+ */
+export function eventAgeRefusal(at: string, maxEventAgeSeconds: number, now = Date.now()): string | undefined {
+  const age = now - Date.parse(at);
+  if (!Number.isFinite(age)) return 'malformed';
+  if (age > maxEventAgeSeconds * 1000) return 'the event is older than the policy allows';
+  if (age < -EVENT_CLOCK_SKEW_MS) return 'the event is dated in the future';
+  return undefined;
+}
+
+/**
+ * AN AWS EVENT A RULE MATCHED (WT121), VERIFIED BEFORE ANYTHING RUNS. Only a rule under this classification's trigger prefix may
+ * invoke this router with it, and the rule's input is fixed at creation, so the room and the workflow are the rule's. Before any
+ * model call: the room is this classification's team room of the type the workflow declares, it is not archived, and its own
+ * tags still name this rule for this workflow, so a rule whose room detached it starts nothing. One run per rule per window.
+ */
+export async function handleRuleEvent(raw: unknown): Promise<{ ran: boolean; reason?: string }> {
+  const refuse = (reason: string) => {
+    console.warn('[Router][rule-event] the event starts nothing here', { reason, classification: STATIC_CLASSIFICATION });
+    return { ran: false, reason };
+  };
+  const r = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+  const str = (v: unknown, max = 256) => (typeof v === 'string' ? v.slice(0, max) : '');
+  const rule = str(r.rule);
+  const channelArn = str(r.channelArn);
+  const workflow = str(r.workflow);
+  const window = eventTriggerWindow(r.at);
+  // THE ASSISTANT THE TRIGGER WAS ATTACHED FOR, fixed in the rule's input by the attach as the workflow is. A rule attached
+  // before the attach recorded one names none, and the room's type or primary owns its run.
+  const attachedBy = r.assistant === undefined ? undefined : str(r.assistant, 64);
+  if (!/^[a-f0-9]{12}$/.test(rule) || !channelArn || !workflow || window === undefined) return refuse('malformed');
+  // A READ THAT FAILS THROWS, so the event is delivered again; a refusal is only what a record answered.
+  const tags = await readChannelTags(chimeClient, channelArn);
+  const closed = roomRefusal(tags, 'room');
+  if (closed) return refuse(closed);
+  if (tags[`${EVENT_RULE_TAG_PREFIX}${rule}`] !== workflow) return refuse('the room does not name this rule');
+  const roomType = tags[TEAM_ROOM_TAG];
+  if (!roomType) return refuse('not a team room');
+  // THE ASSISTANT THAT OWNS THE EVENT'S WORKFLOW (ADR-061 decision 2): its version runs, and the run speaks as it.
+  const owner = await eventWorkflowOwner(channelArn, '[Router][rule-event]', { conversationType: roomType, ...(attachedBy !== undefined ? { attachedBy } : {}) });
+  if ('refused' in owner && owner.refused === OWNER_NOT_IN_ROOM) {
+    // A TEAM CONVERSATION OPENED BEFORE ITS TYPE NAMED THIS ASSISTANT is completed with the members its type names now, as an
+    // attach completes it, and the event throws so it is delivered again once the assistant is a member.
+    await completeTeamRoom(roomType);
+    throw new Error('the team conversation is completed with the assistant that owns the workflow; the event is delivered again');
+  }
+  if ('refused' in owner) return refuse(owner.refused);
+  const assistant = await assistantOfBot(owner.botArn, STATIC_CLASSIFICATION, await getBotArn());
+  if (assistant.decision === 'decline') return refuse(assistant.reason);
+  const served = await servedWelcomeVersion(assistant.profile.name, channelArn);
+  const wf = workflowFor(served?.version.eventWorkflows, workflow);
+  if (!wf || wf.on !== 'event-received') return refuse('no such workflow');
+  const named = str(r.resource).split(/[:/]/).pop();
+  if (!wf.types?.includes(roomType)) return refuse('the workflow runs in another type of room');
+  const source = str(r.source, 128);
+  const detailType = str(r.detailType, 128);
+  const resource = str(r.resource);
+  // THE DEPLOYMENT'S POLICY, read again on every event: switched off, or this event type no longer allowed, runs nothing.
+  const policy = await readEventPolicy();
+  if (!policy.enabled) return refuse('event triggers are switched off');
+  if (!eventTypeAllowed(policy, source, detailType)) return refuse('the event type is not allowed');
+  // AN EVENT THAT WAITED LONGER THAN THE POLICY ALLOWS, at the rule or in the relay's queue, is stale and starts nothing,
+  // and one dated ahead of now starts nothing either.
+  const age = eventAgeRefusal(str(r.at), policy.maxEventAgeSeconds);
+  if (age) return refuse(age);
+  // THE ROOM'S OPEN INCIDENTS, read from their tasks, the one record of what is open: one for this resource takes the event
+  // and opens nothing; as many as the policy allows open nothing until one is resolved.
+  const opens = Object.values(wf.states).find((s) => s.open)?.open?.type;
+  const open = await openIncidents(channelArn, opens);
+  if (!open) throw new Error('the room\'s open incidents could not be read');
+  const same = resource ? open.find((e) => e.resource === resource) : undefined;
+  if (same) {
+    if (same.task) await tellIncident(same.task, owner.botArn, assistant.profile.name, named || detailType);
+    return refuse('an incident for this resource is open');
+  }
+  if (open.length >= policy.maxOpenIncidentsPerRoom) return refuse('the room holds as many open incidents as its policy allows');
+  // WHAT THE ALARM WATCHES, read back from CloudWatch under the router's own alarm read, never taken from the event: a message
+  // may say it, and nothing decides from it. Unread, the message says the rest.
+  const isAlarm = !!named && resource.includes(':alarm:');
+  const facts = isAlarm ? (await alarmStateNow(named))?.facts ?? {} : {};
+  return runWorkflowFor(workflow, wf, {
+    event: 'event-received', channelArn, ruleEvent: { rule, window },
+    // An alarm names the room in words (`identifierWords`); `resource` keeps the alarm's own name for every match.
+    values: { source, detailType, resource, label: (isAlarm ? identifierWords(named) : named) || detailType, ...facts, ...incidentFactsOfEvent(str(r.at), resource) },
+  }, runnerOf(owner.botArn, assistant.profile.name, served), { conversationType: roomType });
+}
+
+/**
+ * A WATCH RULE'S BINDING (DESIGN-EVENT-TARGETS section 4), read from the tags of the rule whose ARN this router builds from the
+ * rule id and its own classification (`WATCH_RULE_ARN_PREFIX`). IAM lets it read only its own classification's watch rules, and
+ * the `classification` tag is compared too, so a rule another classification attached is never this router's to run.
+ *
+ * Remembered per rule for the container's life: a rule's id is a content hash of its binding (`watchRuleId`), so the tags
+ * under one ARN never change. A rule that is gone answers null and is not remembered; any other failed read throws, so the
+ * event is delivered again rather than taken as no rule's.
+ */
+type WatchBinding = { workflow: string; type: string; kind: string; source: string; detailType: string; assistant?: string };
+let eventbridge: EventBridgeClient | null = null;
+const watchBindings = new Map<string, WatchBinding | null>();
+export async function watchBindingOf(rule: string): Promise<WatchBinding | null> {
+  const prefix = process.env.WATCH_RULE_ARN_PREFIX ?? '';
+  if (!prefix || !TRIGGER_RULE_ID.test(rule)) return null;
+  const arn = `${prefix}${rule}`;
+  if (watchBindings.has(arn)) return watchBindings.get(arn) ?? null;
+  eventbridge = eventbridge ?? new EventBridgeClient({});
+  let res: { Tags?: Array<{ Key?: string; Value?: string }> };
+  try {
+    res = await eventbridge.send(new ListRuleTagsCommand({ ResourceARN: arn }));
+  } catch (err) {
+    if ((err as Error)?.name === 'ResourceNotFoundException') return null;
+    console.warn('[Router][watch-event] the rule\'s binding could not be read', { err: (err as Error)?.name });
+    throw err;
+  }
+  const tags = Object.fromEntries((res.Tags ?? []).map((t) => [t.Key ?? '', t.Value ?? '']));
+  const binding = { workflow: tags[WATCH_TAG.workflow], type: tags[WATCH_TAG.type], kind: tags[WATCH_TAG.kind], source: tags[WATCH_TAG.source], detailType: tags[WATCH_TAG.detailType] };
+  // THE ASSISTANT IT WAS ATTACHED FOR, where the attach recorded one: its version's workflow runs (`workflowOwnerOf`).
+  const assistant = tags[WATCH_TAG.assistant];
+  const out = tags[WATCH_TAG.classification] !== STATIC_CLASSIFICATION || !Object.values(binding).every((v) => typeof v === 'string' && v)
+    ? null : assistant === undefined ? binding : { ...binding, assistant };
+  watchBindings.set(arn, out);
+  return out;
+}
+
+/**
+ * WHETHER A CONVERSATION WATCHES A KEY, read from both records (DESIGN-EVENT-TARGETS section 3): the key's item at this
+ * classification names the conversation, and the conversation's row lists the key and is of the type the rule names. False
+ * only where a record answers so; a record that cannot be read throws.
+ */
+export async function conversationWatchesRef(
+  channelArn: string, kind: string, key: string, type: string,
+  read: { room: string; classification: string } | null | undefined = undefined,
+): Promise<boolean> {
+  const watch = read === undefined ? await refWatchOf(refWatchKey(STATIC_CLASSIFICATION, kind, key), { strict: true }) : read;
+  if (!watch || watch.room !== channelArn || watch.classification !== STATIC_CLASSIFICATION) return false;
+  const row = await readChannelContext(channelArn, { consistent: true });
+  return !!row && !!row.watchedRefs?.includes(refKey(kind, key)) && row.conversationType === type;
+}
+
+/**
+ * AN EVENT REACHES THE CONVERSATION THAT WATCHES ITS KEY (DESIGN-EVENT-TARGETS section 4), every check before any model call:
+ * the rule's binding from its own tags, the event's type against the rule's, the key's two records, the room's tags, the
+ * version's workflow on `event-received` for the type, the deployment's policy and the event's age. The payload names the rule
+ * and the key, and nothing else is read from it to decide.
+ */
+export async function handleWatchEvent(
+  raw: unknown,
+  deps: { binding?: typeof watchBindingOf; watches?: typeof conversationWatchesRef; watchOf?: typeof refWatchOf } = {},
+): Promise<{ ran: boolean; reason?: string }> {
+  const refuse = (reason: string) => {
+    console.warn('[Router][watch-event] the event starts nothing here', { reason, classification: STATIC_CLASSIFICATION });
+    return { ran: false, reason };
+  };
+  const r = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+  const str = (v: unknown, max = 256) => (typeof v === 'string' ? v.slice(0, max) : '');
+  const rule = str(r.rule);
+  const window = eventTriggerWindow(r.at);
+  if (!TRIGGER_RULE_ID.test(rule) || window === undefined) return refuse('malformed');
+  const key = refId(r.key);
+  if (!key) return refuse('the event names no key');
+  const binding = await (deps.binding ?? watchBindingOf)(rule);
+  if (!binding) return refuse('not a watch rule of this classification');
+  const source = str(r.source, 128);
+  const detailType = str(r.detailType, 128);
+  if (source !== binding.source || detailType !== binding.detailType) return refuse('the event is not the rule\'s event type');
+  const watch = await (deps.watchOf ?? refWatchOf)(refWatchKey(STATIC_CLASSIFICATION, binding.kind, key), { strict: true });
+  if (!watch || watch.classification !== STATIC_CLASSIFICATION) return refuse('no conversation watches the key');
+  const channelArn = watch.room;
+  if (!(await (deps.watches ?? conversationWatchesRef)(channelArn, binding.kind, key, binding.type, watch))) return refuse('the conversation does not watch the key');
+  const closed = roomRefusal(await readChannelTags(chimeClient, channelArn), 'room');
+  if (closed) return refuse(closed);
+  // THE ASSISTANT THAT OWNS THE EVENT'S WORKFLOW (ADR-061 decision 2): its version runs, and the run speaks as it.
+  const owner = await eventWorkflowOwner(channelArn, '[Router][watch-event]', { conversationType: binding.type, ...(binding.assistant !== undefined ? { attachedBy: binding.assistant } : {}) });
+  if ('refused' in owner) return refuse(owner.refused);
+  const assistant = await assistantOfBot(owner.botArn, STATIC_CLASSIFICATION, await getBotArn());
+  if (assistant.decision === 'decline') return refuse(assistant.reason);
+  const served = await servedWelcomeVersion(assistant.profile.name, channelArn);
+  const wf = workflowFor(served?.version.eventWorkflows, binding.workflow);
+  if (!wf || wf.on !== 'event-received') return refuse('no such workflow');
+  if (!wf.types?.includes(binding.type)) return refuse('the workflow runs in another type of conversation');
+  const policy = await readEventPolicy();
+  if (!policy.enabled) return refuse('event triggers are switched off');
+  if (!eventTypeAllowed(policy, source, detailType)) return refuse('the event type is not allowed');
+  const age = eventAgeRefusal(str(r.at), policy.maxEventAgeSeconds);
+  if (age) return refuse(age);
+  const resource = str(r.resource);
+  return runWorkflowFor(binding.workflow, wf, {
+    event: 'event-received', channelArn, ruleEvent: { rule, window, watch: { kind: binding.kind, key } },
+    values: { source, detailType, resource, key, label: key },
+  }, runnerOf(owner.botArn, assistant.profile.name, served), { conversationType: binding.type });
 }
 
 /**
@@ -4037,17 +7259,25 @@ export async function handleAlarmStateChanged(
  * deletes itself (`handleDeadlineFired`).
  * Each is deleted by the name its ids derive, in this classification's own group, which is all its grant reaches. For a
  * whole conversation the invitations are read from the token store's sparse index, the one read this router holds
- * there, and only those at this classification are named. A schedule already gone is not an error. Never throws.
+ * there, and only those at this classification are named. A schedule already gone is not an error.
+ *
+ * AN ARCHIVE IS SETTLED WHATEVER ELSE FAILS, and anything of it that failed throws once the rest is done, so the asynchronous
+ * invoke is tried again: settling and deleting are each safe to repeat, and an open task is never left for its deadline.
+ * One invitation's cancel never throws.
  */
 export async function handleDeadlineCancel(
   raw: unknown,
-  deps: { wiring?: DeadlineWiring | null; del?: typeof deleteDeadlineSchedule; list?: (channelArn: string) => Promise<InvitationRecord[]> } = {},
+  deps: {
+    wiring?: DeadlineWiring | null; del?: typeof deleteDeadlineSchedule; list?: (channelArn: string) => Promise<InvitationRecord[]>;
+    settle?: (channelArn: string) => Promise<string[] | null>;
+  } = {},
 ): Promise<{ deleted: number; reason?: string }> {
   const cancel: DeadlineCancel | null = deadlineCancelOf(raw);
   if (!cancel) return { deleted: 0, reason: 'malformed' };
   const wiring = deps.wiring === undefined ? deadlineWiringFor(cancel.channelArn) : deps.wiring;
   if (!wiring) return { deleted: 0, reason: 'not wired' };
   let ids: string[];
+  const unsettled: string[] = [];
   if (cancel.invitationId) ids = [cancel.invitationId];
   else {
     const list = deps.list ?? (async (channelArn: string) => {
@@ -4056,8 +7286,8 @@ export async function handleDeadlineCancel(
       return everyInvitation(invitationsDoc, INVITATIONS_TABLE, channelArn);
     });
     const listed = await list(cancel.channelArn).catch(() => null);
-    if (!listed) return { deleted: 0, reason: 'the conversation\'s invitations could not be read' };
-    ids = listed.filter((r) => r.classification === STATIC_CLASSIFICATION).map((r) => r.invitationId);
+    if (!listed) unsettled.push('the conversation\'s invitations could not be read');
+    ids = (listed ?? []).filter((r) => r.classification === STATIC_CLASSIFICATION).map((r) => r.invitationId);
   }
   let deleted = 0;
   for (const id of ids) {
@@ -4067,15 +7297,24 @@ export async function handleDeadlineCancel(
     });
     if (out === 'deleted') deleted++;
   }
-  // AN ARCHIVED CONVERSATION'S OPEN WORKFLOW TASKS LOSE THEIR DEADLINES TOO (ADR-063 decision 4), by name.
-  if (!cancel.invitationId && !deps.list) {
-    const open = await workflowTasksOf(cancel.channelArn).catch(() => []);
-    for (const taskId of open) {
-      const out = await deleteTaskDeadlineSchedule(wiring, cancel.channelArn, taskId).catch(() => 'failed' as const);
-      if (out === 'deleted') deleted++;
+  // AN ARCHIVED CONVERSATION'S OPEN WORKFLOW TASKS ARE SETTLED (ADR-017): the task service cancels each, its ending the
+  // archive's, and names the settlement, so the run waiting on it goes on as its failure would take it and deletes its
+  // deadline as it does (`handleTaskNaming`). An incident's run ends, and the conversation that opened it is told. The service
+  // reads the archive tag again before it settles anything; one it could not settle loses its deadline here, by name.
+  if (!cancel.invitationId && (!deps.list || deps.settle)) {
+    const settled = await (deps.settle ?? settleArchivedTasks)(cancel.channelArn).catch(() => null);
+    if (!settled) {
+      console.warn('[Router][deadline] the open workflow tasks of an archived conversation could not be settled; their deadlines are deleted, and the archive is tried again');
+      unsettled.push('the archived conversation\'s open workflow tasks could not be settled');
+      const open = await workflowTasksOf(cancel.channelArn).catch(() => []);
+      for (const taskId of open) {
+        const out = await deleteTaskDeadlineSchedule(wiring, cancel.channelArn, taskId).catch(() => 'failed' as const);
+        if (out === 'deleted') deleted++;
+      }
     }
   }
   console.log('[Router][deadline] cancelled', { deleted, named: ids.length, channelArn: cancel.channelArn });
+  if (unsettled.length) throw new Error(unsettled.join('; '));
   return { deleted };
 }
 
@@ -4107,21 +7346,24 @@ export async function handlePersonJoined(req: PersonJoinedNaming): Promise<{ ran
     : [];
   if (req?.event !== 'person-joined' || !channelArn || !named.length) return refuse('malformed');
   if ((await resolveChannelClassificationTag(channelArn)) !== STATIC_CLASSIFICATION) return refuse('not this classification');
-  const primary = await primaryAssistantOf(channelArn, chimeClient, '[Router][event]');
-  if (primary.classification !== STATIC_CLASSIFICATION) return refuse('primary is another classification');
-  const assistant = await assistantOfBot(primary.botArn, STATIC_CLASSIFICATION, await getBotArn());
+  // THE ROOM'S TYPE, from its server-side row: it names the assistant that owns the room's workflows, and selects among them.
+  const roomType = (await getChannelContext(channelArn).catch(() => null))?.conversationType;
+  // THE ASSISTANT THAT OWNS THE EVENT'S WORKFLOW (ADR-061 decision 2): its version runs, and the run speaks as it.
+  const owner = await eventWorkflowOwner(channelArn, '[Router][event]', { ...(roomType ? { conversationType: roomType } : {}) });
+  if ('refused' in owner) return refuse(owner.refused);
+  const assistant = await assistantOfBot(owner.botArn, STATIC_CLASSIFICATION, await getBotArn());
   if (assistant.decision === 'decline') return refuse(assistant.reason);
   const served = await servedWelcomeVersion(assistant.profile.name, channelArn).catch(() => undefined);
   // THE VERSION'S OWN, FOR A TYPE IT DECLARES, ELSE THE PLATFORM'S RECAP: a workflow written for another type leaves the
   // joiner caught up all the same.
   let chosen = personJoinedWorkflowOf(served?.version.eventWorkflows);
-  const conversationType = chosen.workflow.types?.length ? (await getChannelContext(channelArn).catch(() => null))?.conversationType : undefined;
+  const conversationType = chosen.workflow.types?.length ? roomType : undefined;
   if (chosen.workflow.types?.length && !(conversationType && chosen.workflow.types.includes(conversationType))) {
     chosen = { name: 'join-recap', workflow: workflowFor(undefined, 'join-recap')!, declared: false };
   }
   const { name, workflow: wf, declared } = chosen;
   // THE PERSON IS A MEMBER, read live as the room's primary: the read the join recap's refusal makes.
-  const size = await resolveChannelSize(chimeClient, channelArn, primary.botArn);
+  const size = await resolveChannelSize(chimeClient, channelArn, owner.botArn);
   if (size.refused || size.unknown) return refuse('the conversation\'s members could not be read');
   const roster = (size.members ?? []).map((m) => ({ arn: m.arn, name: m.name, isBot: m.isBot }));
   const members = verifiedJoiners(named, roster);
@@ -4130,7 +7372,7 @@ export async function handlePersonJoined(req: PersonJoinedNaming): Promise<{ ran
       refused: named.length - members.length, channelArn, classification: STATIC_CLASSIFICATION,
     });
   }
-  const who = { botArn: primary.botArn, assistant: assistant.profile.name, variantProfile: served?.variantProfile, variables: served?.version.variables };
+  const who = runnerOf(owner.botArn, assistant.profile.name, served);
   let ran = false;
   for (let i = 0; i < members.length; i += PERSON_JOINED_CONCURRENCY) {
     const results = await Promise.all(members.slice(i, i + PERSON_JOINED_CONCURRENCY).map((personArn) => runWorkflowFor(name, wf, {
@@ -4161,10 +7403,11 @@ export async function handleConversationOpened(req: ConversationOpenedNaming): P
   if (req?.event !== 'conversation-opened' || !channelArn || !personArn) return refuse('malformed');
   if ((await resolveChannelClassificationTag(channelArn)) !== STATIC_CLASSIFICATION) return refuse('not this classification');
   const type = (await getChannelContext(channelArn, { consistent: true }).catch(() => null))?.conversationType;
-  if (!type || !(getConversationTypeConfig(type).openedBy ?? []).length) return refuse('no type an event opens');
-  const primary = await primaryAssistantOf(channelArn, chimeClient, '[Router][event]');
-  if (primary.classification !== STATIC_CLASSIFICATION) return refuse('primary is another classification');
-  const assistant = await assistantOfBot(primary.botArn, STATIC_CLASSIFICATION, await getBotArn());
+  if (!type || !opensWithARun(type)) return refuse('no type an event or a workflow opens');
+  // THE ASSISTANT THAT OWNS THE EVENT'S WORKFLOW (ADR-061 decision 2): its version runs, and the run speaks as it.
+  const owner = await eventWorkflowOwner(channelArn, '[Router][event]', { conversationType: type });
+  if ('refused' in owner) return refuse(owner.refused);
+  const assistant = await assistantOfBot(owner.botArn, STATIC_CLASSIFICATION, await getBotArn());
   if (assistant.decision === 'decline') return refuse(assistant.reason);
   const served = await servedWelcomeVersion(assistant.profile.name, channelArn).catch(() => undefined);
   // THE WORKFLOW THE ROOM'S TYPE SELECTS (W1): the primary's `conversation-opened` workflow whose `types` name it.
@@ -4172,9 +7415,22 @@ export async function handleConversationOpened(req: ConversationOpenedNaming): P
   if (!opened) return { ran: false, reason: 'no workflow' };
   const wf = opened.workflow;
   const label = typeof req.label === 'string' ? req.label.slice(0, 200) : '';
+  // WHAT OPENED THE ROOM, as its creator names it: a closed set, so anything else names neither.
+  const openedBy = (OPENED_BY_VALUES as readonly unknown[]).includes(req.openedBy) ? req.openedBy as string : '';
+  // THE RESOURCE THE OPENING RUN WAS FOR (an incident's alarm), carried on this conversation's run so the opener can tell a
+  // repeat of the same event from a new one (`handleRuleEvent`). Only where a workflow opened the conversation.
+  const resource = openedBy === 'workflow' && typeof req.resource === 'string' ? req.resource.slice(0, 500) : '';
+  // THE OPENING RUN'S PROCESS (P3): the run here inherits it, read only where a workflow opened the conversation.
+  const inherited = openedBy === 'workflow' ? runProcessOf(req.process) : undefined;
+  // THE CUSTOMER IMPACT THE OPENING RUN'S TRIAGE RECORDED ON ITS CARD (O27): a closed set, only where a workflow opened it.
+  const customerImpact = openedBy === 'workflow' && isCustomerImpact(req.customerImpact) ? req.customerImpact : '';
+  // THE INCIDENT'S FACTS (O28): when it started and its Region, each kept only in its own shape, where a workflow opened it.
+  const facts = openedBy === 'workflow' ? incidentFactsOf(req.facts) : {};
+  if (inherited) await recordConversationProcess(channelArn, inherited);
   const out = await runWorkflowFor(opened.name, wf, {
-    event: 'conversation-opened', channelArn, eventPerson: personArn, values: { ...(label ? { label } : {}) },
-  }, { botArn: primary.botArn, assistant: assistant.profile.name, variantProfile: served?.variantProfile, variables: served?.version.variables }, { conversationType: type });
+    event: 'conversation-opened', channelArn, eventPerson: personArn, ...(inherited ? { process: inherited } : {}),
+    values: { ...(label ? { label } : {}), ...(openedBy ? { openedBy } : {}), ...(resource ? { resource } : {}), ...(customerImpact ? { customerImpact } : {}), ...facts },
+  }, runnerOf(owner.botArn, assistant.profile.name, served), { conversationType: type });
   // THE PERSON THE OPENING NAMES ARRIVES WITH IT (decision 5, one welcome per arrival): a run that started owns their
   // welcome, so the creator names them in no `person-joined` and they are welcomed once, by this run.
   return { ran: out.ran, ...(out.ran ? { people: [personArn] } : {}) };
@@ -4265,10 +7521,6 @@ export async function sayNotice(req: NoticeRequest): Promise<NoticeOutcome> {
   const role = (assistant.source === 'assigned' && roleByBotArn.get(botArn)) || ASSISTANT_ROLE;
 
   try {
-    await speakAsRoutedAssistant(
-      { routeId: `${SPEAK_ROUTE_PREFIX}notice-${randomUUID()}`, botArn, classification: STATIC_CLASSIFICATION, tableName: TURN_ROUTING_TABLE, channelArn },
-      { ddb: routingDdb },
-    );
     const metadata = {
       ...JSON.parse(botMessageMetadata(
         {
@@ -4285,7 +7537,7 @@ export async function sayNotice(req: NoticeRequest): Promise<NoticeOutcome> {
       ...noticeMetadata(req.kind, vars, { channelArn, template: selected }),
     };
     // ONE RESPONSE, IN AS MANY PARTS AS IT NEEDS (`sendInParts`), every part to the notice's audience.
-    await sendInParts(chimeClient, {
+    await speakingAs({ botArn, channelArn, purpose: 'notice' }, () => sendInParts(chimeClient, {
       ChannelArn: channelArn,
       text: content,
       Type: ChannelMessageType.STANDARD,
@@ -4293,7 +7545,7 @@ export async function sayNotice(req: NoticeRequest): Promise<NoticeOutcome> {
       ChimeBearer: botArn,
       Metadata: JSON.stringify(metadata),
       ...(to.length && { Target: to.map((MemberArn) => ({ MemberArn })) }),
-    });
+    }));
     return { posted: true };
   } catch (err) {
     console.error('[Router][notice] the notice could not be posted', {
@@ -4316,6 +7568,12 @@ export interface RebuttalDispatch {
 export async function dispatchRebuttalRound(p: Record<string, unknown>): Promise<RebuttalDispatch> {
   const refuse = (reason: string): RebuttalDispatch => {
     console.error('[Router][SecurityEvent] refused a rebuttal round', { reason, correlationId: p?.correlationId, classification: STATIC_CLASSIFICATION });
+    return { dispatched: false, reason };
+  };
+  // A DUEL THAT ENDED IS NOT AN ATTACK: its rounds still in flight stand down quietly, as round 1's sides do
+  // (`duelWasAbandoned` before the claim). Only a round the duel's own record does not support is a SecurityEvent.
+  const standDown = (reason: string): RebuttalDispatch => {
+    console.log('[Router][battle] the duel was ended before this rebuttal round ran; standing down', { reason, correlationId: p?.correlationId });
     return { dispatched: false, reason };
   };
   const str = (v: unknown) => (typeof v === 'string' ? v : '');
@@ -4342,6 +7600,7 @@ export async function dispatchRebuttalRound(p: Record<string, unknown>): Promise
   if (!rows.some((r) => r.botArn === ORCHESTRATOR_CLAIM)) return refuse('the duel has no claimed round 2');
   const recordedChannel = battleChannelFrom(rows);
   if (recordedChannel && recordedChannel !== channelArn) return refuse('the duel ran in another conversation');
+  if (duelWasAbandoned(rows)) return standDown('the duel was ended');
   if (botRowsOnly(rows).find((r) => r.botArn === botArn)?.state !== 'COMPLETED') return refuse('the side did not finish round 1');
   if (rivalBotArn && !botRowsOnly(rows).some((r) => r.botArn === rivalBotArn)) return refuse('the rival is not a side of the duel');
   const processorArn = await resolveAsyncProcessorArn(STATIC_CLASSIFICATION);
@@ -4359,7 +7618,7 @@ export async function dispatchRebuttalRound(p: Record<string, unknown>): Promise
   // may judge any more. Ending is idempotent, so the other side's round finding the same answers nothing new.
   if (sides.ended) {
     await endDuelHere({ channelArn, battleId, reason: 'abandoned:experiment-ended' });
-    return refuse('the experiment of the duel is no longer active; the duel is ended');
+    return standDown('the experiment of the duel is no longer active; the duel is ended');
   }
   const self = sides.self;
   const {
@@ -4395,12 +7654,8 @@ export async function dispatchRebuttalRound(p: Record<string, unknown>): Promise
   // that cannot be posted dispatches nothing, so no rebuttal is generated with nowhere to land.
   let placeholderMessageId: string | undefined;
   try {
-    await speakAsRoutedAssistant(
-      { routeId: `${SPEAK_ROUTE_PREFIX}duel-${randomUUID()}`, botArn, classification: STATIC_CLASSIFICATION, tableName: TURN_ROUTING_TABLE, channelArn },
-      { ddb: routingDdb },
-    );
     // ONE MESSAGE BY CONSTRUCTION: a duel side's placeholder, which its round-2 answer replaces in place.
-    const sent = await sendChannelMessage(chimeClient, {
+    const sent = await speakingAs({ botArn, channelArn, purpose: 'duel' }, () => sendChannelMessage(chimeClient, {
       ChannelArn: channelArn,
       Content: battlePlaceholderContent({
         correlationId: str(p.correlationId),
@@ -4415,16 +7670,13 @@ export async function dispatchRebuttalRound(p: Record<string, unknown>): Promise
       Type: ChannelMessageType.STANDARD,
       Persistence: ChannelMessagePersistenceType.PERSISTENT,
       ChimeBearer: botArn,
-    });
+    }));
     placeholderMessageId = sent?.MessageId;
   } catch (err) {
     console.error('[Router][rebuttal] the round placeholder could not be posted; the round is not dispatched', {
       correlationId: p.correlationId, errName: (err as Error)?.name, err: (err as Error)?.message,
     });
     return { dispatched: false, reason: 'placeholder-failed' };
-  } finally {
-    // The speak session ends with the placeholder: recording and dispatching the round acts as this router.
-    releaseAssistantSession();
   }
   // invokeAsync records the turn (with the side's routed variant and the conversation) before dispatching.
   return (await invokeAsync(processorArn, round))
@@ -4487,6 +7739,18 @@ export async function clearDuelMarkers(req: ClearMarkersEvent['aeClearMarkers'])
   if (recordedChannel && recordedChannel !== channelArn) return refuse('the duel ran in another conversation');
   const classificationBotArn = await getBotArn();
 
+  // ── THE WORK THE DUEL'S SIDES OPENED ENDS WITH IT (`endDuelTasks`) ──
+  //
+  // After the checks above, so only a duel proven ended, in this conversation, closes anything. Every end reaches this
+  // handler (`endBattle` asks it whether or not a side is waiting), so no side's task is left open for its TTL. A
+  // failure closes nothing and the TTL still bounds the task.
+  let closedTaskIds = new Set<string>();
+  try {
+    closedTaskIds = new Set((await endDuelTasks(channelArn, battleId)).map((t) => t.taskId));
+  } catch (err) {
+    console.warn('[Router][duel] the tasks of the ended duel could not be closed', { battleId, message: (err as Error)?.message });
+  }
+
   let cleared = 0;
   for (const marker of req.markers) {
     const botArn = str(marker?.botArn);
@@ -4501,15 +7765,12 @@ export async function clearDuelMarkers(req: ClearMarkersEvent['aeClearMarkers'])
       continue;
     }
     try {
-      await speakAsRoutedAssistant(
-        { routeId: `${SPEAK_ROUTE_PREFIX}duel-${randomUUID()}`, botArn, classification: STATIC_CLASSIFICATION, tableName: TURN_ROUTING_TABLE, channelArn },
-        { ddb: routingDdb },
-      );
-      if (await clearBattleWaitingMarker(channelArn, messageId, botArn, chimeClient)) cleared += 1;
+      // THE SAME EDIT DECLARES THE SIDE'S TASK ENDED WITH THE DUEL, so the archive records the ending once, from the
+      // message that carried the task, and reports read it as abandoned work (`declareDuelEnded`).
+      if (await speakingAs({ botArn, channelArn, purpose: 'duel' },
+        () => clearBattleWaitingMarker(channelArn, messageId, botArn, chimeClient, (m) => declareDuelEnded(m, closedTaskIds)))) cleared += 1;
     } catch (err) {
       console.warn('[Router][markers] could not clear a waiting marker', { battleId, message: (err as Error)?.message });
-    } finally {
-      releaseAssistantSession();
     }
   }
   return { cleared };
@@ -4550,6 +7811,14 @@ export const handler = async (rawEvent: LexEvent | BypassTurnEvent | RebuttalRou
       await releaseAfterHeldWork();
     }
   }
+  // A recorded meeting's summary its turn handed back (FR66), verified before its tasks open and its card is rewritten.
+  if ((rawEvent as unknown as { aeMeetingSummary?: unknown }).aeMeetingSummary) {
+    try {
+      return (await handleMeetingSummaryWritten((rawEvent as unknown as { aeMeetingSummary: unknown }).aeMeetingSummary)) as unknown as LexResponse;
+    } finally {
+      await releaseAfterHeldWork();
+    }
+  }
   // A run the processor hands back after its agent step (ADR-061 decision 5), verified before it continues.
   if ((rawEvent as unknown as { aeEventContinue?: EventContinuation }).aeEventContinue) {
     try {
@@ -4583,6 +7852,29 @@ export const handler = async (rawEvent: LexEvent | BypassTurnEvent | RebuttalRou
     }
   }
   // An alarm the incident watch follows changed state (ADR-061 slice 5), checked against CloudWatch before anything runs.
+  if ((rawEvent as unknown as { aeRuleEvent?: unknown }).aeRuleEvent) {
+    try {
+      return (await handleRuleEvent((rawEvent as unknown as { aeRuleEvent: unknown }).aeRuleEvent)) as unknown as LexResponse;
+    } finally {
+      await releaseAfterHeldWork();
+    }
+  }
+  // An event a watch rule delivers for the conversation that watches its key (DESIGN-EVENT-TARGETS), checked before anything runs.
+  if ((rawEvent as unknown as { aeWatchEvent?: unknown }).aeWatchEvent) {
+    try {
+      return (await handleWatchEvent((rawEvent as unknown as { aeWatchEvent: unknown }).aeWatchEvent)) as unknown as LexResponse;
+    } finally {
+      await releaseAfterHeldWork();
+    }
+  }
+  // A conversation's meeting started or ended (the `meetings` capability), checked against its record before anything runs.
+  if ((rawEvent as unknown as { aeMeeting?: unknown }).aeMeeting) {
+    try {
+      return (await handleMeetingLifecycle((rawEvent as unknown as { aeMeeting: unknown }).aeMeeting)) as unknown as LexResponse;
+    } finally {
+      await releaseAfterHeldWork();
+    }
+  }
   if ((rawEvent as unknown as { aeAlarm?: unknown }).aeAlarm) {
     try {
       return (await handleAlarmStateChanged((rawEvent as unknown as { aeAlarm: unknown }).aeAlarm)) as unknown as LexResponse;
@@ -4598,6 +7890,14 @@ export const handler = async (rawEvent: LexEvent | BypassTurnEvent | RebuttalRou
   if ((rawEvent as unknown as EventNaming).aeEvent) {
     try {
       return (await handleEventNaming((rawEvent as unknown as EventNaming).aeEvent)) as unknown as LexResponse;
+    } finally {
+      await releaseAfterHeldWork();
+    }
+  }
+  // A turn's meeting place, asked by this classification's processor (`handleMeetingPlaceRead`): a read on this router's role.
+  if ((rawEvent as unknown as { aeMeetingPlace?: unknown }).aeMeetingPlace) {
+    try {
+      return (await handleMeetingPlaceRead((rawEvent as unknown as { aeMeetingPlace: unknown }).aeMeetingPlace)) as unknown as LexResponse;
     } finally {
       await releaseAfterHeldWork();
     }
@@ -4627,7 +7927,7 @@ const handleTurn = async (rawEvent: LexEvent | BypassTurnEvent): Promise<LexResp
   refusedChannelReads.clear();
   const event: LexEvent = (rawEvent as BypassTurnEvent).aeTurn
     ? bypassToLexEvent((rawEvent as BypassTurnEvent).aeTurn)
-    : (rawEvent as LexEvent);
+    : withoutDeclaredTurnAttributes(rawEvent as LexEvent);
 
   // The identity this turn answered as, filled in by `runTurn` once it has resolved and VALIDATED it.
   // Carried out here rather than re-resolved, so the send can never post as a bot the turn itself
@@ -4986,8 +8286,8 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
   //
   // `bypassToken` IS IN THE GATE, AND DROPPING IT WAS A DEFECT. This guard used to fire on that alone;
   // widening it to the prefilter without keeping it NARROWED the guard, because the two have different
-  // match surfaces - `matchesAtAll` has no leading boundary and the prefilter requires one, so
-  // "hey@all" is an `@all` that the prefilter calls no mention. Every such form skipped the guard
+  // match surfaces - `matchesAtAll` takes punctuation before the token and the prefilter requires a space, so
+  // "(@all)" is an `@all` that the prefilter calls no mention. Every such form skipped the guard
   // entirely and this entry ran a full turn for a message the flow was claiming at the same moment.
   // A guard that grows must be a superset of the guard it replaces, or the widening is a narrowing
   // somewhere nobody looked.
@@ -5390,7 +8690,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     // first time a line of this turn needs them, and every later line of the turn reads the same set. A read that fails is
     // not kept, so the next line asks again.
     let turnWordsRead: ReturnType<typeof wordsOf> | undefined;
-    const turnWords = (): ReturnType<typeof wordsOf> => (turnWordsRead ??= wordsOf(turnProfile.name).catch((err) => { turnWordsRead = undefined; throw err; }));
+    const turnWords = (): ReturnType<typeof wordsOf> => (turnWordsRead ??= wordsOf(turnProfile.name, { channelArn }).catch((err) => { turnWordsRead = undefined; throw err; }));
     const turnRole = (turnAssignment.source === 'assigned' && roleByBotArn.get(botArn)) || ASSISTANT_ROLE;
     /** The turn's assistant, for the welcome: the same resolution the answer uses. */
     const turnAssistant = turnProfile.name;
@@ -5467,6 +8767,10 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       // THE ADDRESSED ASSISTANT'S OWN WELCOME, falling back to the classification's configured copy.
       // Two assistants in one classification introduced themselves identically before this.
       const welcomeTypeKey = driftCtx?.conversationType;
+      // A MEETING'S OWN CONVERSATION IS THE MEETING'S CHAT (FR27): its room is told by the meeting's cards, and nobody is
+      // welcomed here, so no welcome, intake or meeting step runs in it. Its type, not its `meetingOf`, says so, because the
+      // creator writes the type before the conversation exists.
+      if (channelArn && meetingSettingsOf(welcomeTypeKey)) return formatLexNothingToPost(event);
       const loaded = await loadWelcomeFor(
         turnAssistant,
         channelClassification,
@@ -5544,7 +8848,12 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       // produces them and only `content` is overridden. `composeOpening` is also what the console's
       // preview renders, so the preview and this post are one function.
       // A TEMPLATE NAMES ITS VERSION'S VARIABLES TOO (ADR-060, slice 1c), read through the served version.
-      const opening = composeOpening(roleTemplate, welcomeOrientation, { role: welcomeRole },
+      // THE ASSISTANT'S OWN NAME, as the room shows it, for an opening that says it (`{{assistantName}}`): the serving
+      // version's name, else the name the assistant was provisioned with (`displayNameFor`, the one precedence).
+      const welcomeAssistantName = loaded.served?.version.displayName?.trim()
+        || turnProfile.displayName?.trim()
+        || profiles.displayNameFor(turnProfile.name);
+      const opening = composeOpening(roleTemplate, welcomeOrientation, { role: welcomeRole, ...(welcomeAssistantName ? { name: welcomeAssistantName } : {}) },
         routerVariables(loaded.served?.version.variables, { conversationType: welcomeTypeKey }));
       const assembledWelcome = opening.composition;
       const renderedTemplate = opening.rendered;
@@ -5799,7 +9108,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
             ...(welcomeRole ? { role: welcomeRole } : {}),
           },
         }, {
-          botArn, assistant: turnAssistant, variantProfile: loaded.served?.variantProfile, variables: loaded.served?.version.variables,
+          ...runnerOf(botArn, turnAssistant, loaded.served),
           welcome: { opening: welcome.content, promptValues },
         }, { ...(welcomeTypeKey ? { conversationType: welcomeTypeKey } : {}), participants: participants as ParticipantContext });
         return formatLexNothingToPost(event);
@@ -5883,6 +9192,14 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         senderReach,
         effectiveClassification,
       });
+      // A KNOWN CLEARANCE THAT DOES NOT REACH THIS ROOM ENDS THE TURN. A session vended before a downgrade
+      // can still post for its remaining life, so the turn reads the clearance the person holds now. A
+      // clearance that could not be read is an outage rather than a decision, and the turn goes on.
+      if (userClearance !== undefined) {
+        recordClassificationBoundaryRefusal({ channelArn, assistant: STATIC_CLASSIFICATION, refusedAt: 'sender-reach' });
+        await reportTurnNotStarted({ event, channelArn, botArn: '', why: 'the sender\'s clearance does not reach this conversation', notice: false });
+        return formatLexSilentResponse(event);
+      }
     }
     // A SENDER WHOSE ISSUER DECIDES ONLY FROM A TOKEN is read through what the exchange recorded it decided at
     // their last sign-in (C3). EVIDENCE, FLAGGED AND NEVER APPLIED: the turn is still answered at the channel's
@@ -5897,9 +9214,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
 
     const asyncProcessorArn = await resolveAsyncProcessorArn(effectiveClassification);
     // Does the ADDRESSED assistant's profile use the LLM intent classifier? A deployment-time field,
-    // read from the turn's assistant profile: `ops-premium` is keyword-classified while `advisor`, in the same
-    // classification, is not. True for every shipped primary (basic included, a deliberate change from
-    // the legacy keyword path); a deployment can set classifierMode:'keyword' on a cheap profile.
+    // read from the turn's assistant profile. True for every shipped assistant, `ops-premium` included.
     const usesLlmClassifier = turnProfile.classifierMode === 'llm';
 
     console.log('[Router] Resolved', {
@@ -6179,6 +9494,10 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       // from their side. This is the half that must not fail: it is the only part of a stop the person
       // can see working, so it is written before the cancel can cost it anything.
       await recordStop(channelArn, personId, stopTarget.responderId);
+      // /stop ENDS THE PERSON'S OWN RUN (ADR-067 WT28): the platform's exit, which no team's workflow removes. A run waiting
+      // on the work being stopped does not go on down its failure edge: its continuation is taken as `stopped` BEFORE the
+      // cancel, so the cancel's settlement naming finds it taken and continues nothing, and the run's end is recorded once.
+      if (held.length) await endStoppedRuns(channelArn, held.map(({ summary }) => summary.taskId));
       // THROUGH THE SEAM, BY THE IDS JUST SELECTED. `cancelStoppedTasks` skips anything already
       // finished and takes the per-user mirror with the row, without which `getActiveTask` resurrects
       // the task on the next turn. A turn still running cannot advance it back out of `cancelled`:
@@ -6249,7 +9568,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         }
       }
       if (held.length && !cancelFailed) {
-        asked = await dispatchStopEvaluationTurn({
+        const evaluation: StopEvaluationDispatch = {
           channelArn,
           botArn,
           classification: effectiveClassification,
@@ -6287,7 +9606,15 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
           ...(event.requestAttributes?.[BYPASS_MESSAGE_ID_ATTR]
             ? { userMessageId: String(event.requestAttributes[BYPASS_MESSAGE_ID_ATTR]) }
             : {}),
-        }).catch((err) => {
+        };
+        // THE QUESTION IS SENT WHEN THE ACKNOWLEDGEMENT IS RELEASED, not when it was sent (`deferStopEvaluation`): the
+        // channel flow stamps each message as it releases it, so dispatching here let a slower acknowledgement land
+        // after the question it promised. Dispatched here only when there is no posted acknowledgement to wait on, or
+        // the deferral could not be recorded, so a failure costs the order and never the question.
+        const deferred = postedAckId
+          ? await deferStopEvaluation({ channelArn, responderId: thisResponderId, acknowledgementId: postedAckId, dispatch: evaluation })
+          : false;
+        asked = deferred || await dispatchStopEvaluationTurn(evaluation).catch((err) => {
           console.warn('[Router] stop evaluation dispatch failed', err);
           return false;
         });
@@ -6355,10 +9682,20 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       );
     }
 
-    // Attachment-in, present only on a bypass (the flow reads it from message Metadata; Lex never
-    // sees it). Resolved here because it changes what the turn IS, not just what the processor gets:
-    // see the greeting short-circuit below.
-    const turnAttachment = bypassAttachment(event);
+    // A TURN AMAZON LEX ENTERED READS ITS MESSAGE BACK (ADR-036): Lex carries neither the message's Metadata nor its attachment,
+    // so a private item answered by id and a file sent with it are read from the message itself, in the read that finds it for
+    // the rest of the turn (`inboundMessage`). The item is honored only where the task service says its sender may answer it.
+    const lexEnteredRead = !isFlowEntry(event) && channelArn
+      ? resolveOriginatingMessage({
+        event, channelArn, senderArn: event.requestAttributes?.['CHIME.sender.arn'] || '', botArn, userMessage: inboundText,
+      }).catch((): { messageId: string; metadata?: string } => ({ messageId: '' }))
+      : undefined;
+    // STARTED HERE AND AWAITED AT ITS FIRST READER (the attachment check after classification), so the read overlaps the
+    // intake, version and classification work rather than standing before it. A failure surfaces where it is awaited.
+    const lexEnteredPending: Promise<Awaited<ReturnType<typeof lexEnteredFacts>> | Record<string, never>> = lexEnteredRead
+      ? lexEnteredRead.then((m) => lexEnteredFacts(m, { channelArn, senderArn: event.requestAttributes?.['CHIME.sender.arn'] || '' }, answerableTaskById))
+      : Promise.resolve({});
+    lexEnteredPending.catch(() => undefined);
 
     // Onboarding intake interception (opt-in). While an intake is in progress,
     // every message from the person being onboarded is an answer to the current
@@ -6493,6 +9830,16 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       await endDuelHere({ channelArn, battleId: duelEntry.battleId, reason: 'abandoned:experiment-ended' });
       return formatLexSilentResponse(event as LexEvent);
     }
+    // A SIDE OF A DUEL SOMEBODY ALREADY ENDED DOES NOT RUN. `/battle end` can land between the flow's fan-out and this
+    // side's arrival, and a side that ran anyway would answer a duel that is over, post after "Battle ended", and hold
+    // this assistant's turn so the next `/battle`'s side queued behind it. The end is the recorded `__abandoned__`
+    // marker (`duelWasAbandoned`). Rows that cannot be read come back empty, so the side runs as it would have.
+    if (duelEntry && duelWasAbandoned(await readBattleRows(duelEntry.battleId))) {
+      console.log('[Router][battle] the duel was ended before this side ran; standing down', {
+        battleId: duelEntry.battleId, round: duelEntry.round,
+      });
+      return formatLexSilentResponse(event as LexEvent);
+    }
     let duelVersion: Awaited<ReturnType<typeof resolveActiveProfile>> | undefined;
     if (duelSides?.self) {
       try {
@@ -6582,14 +9929,33 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     //
     // Same 30s-cached read as the classifier model above; a second call inside the TTL is free.
     let profileIntentPack: IntentPack | undefined;
-    // THE MACHINES THIS TURN RUNS UNDER, resolved once (ADR-047): the FULL resolved set, platform
-    // graphs plus whatever this classification pack adds.
+    // THE MACHINES THIS TURN RUNS UNDER, resolved once (ADR-047): the FULL set the serving version runs
+    // (`machinesForVersion`, ADR-066), its own machines over the platform and classification graphs. A
+    // task already open follows the version it started on instead (`taskMachinesOf`, below).
     //
     // The workflow SELECTION is deliberately NOT applied to this value. A selection decides what an
     // assistant may OPEN; applying it here would also hide tasks already in flight, and a task whose
     // graph disappeared from under it cannot be advanced or finished by anyone. It is applied at the
     // one place a task TYPE is chosen, below.
-    const turnMachines: Record<string, TaskStateMachine> = taskStateMachines();
+    let turnMachines: Record<string, TaskStateMachine> = taskStateMachines();
+    /** The version this turn serves, by what a task it opens records (`originConfigId`) and the machines it declares. */
+    let turnVersionForTasks: Awaited<ReturnType<typeof resolveActiveProfile>> | undefined;
+    /** THE MACHINES AN OPEN TASK FOLLOWS: its origin version's (ADR-066 decision 5), else this turn's. */
+    const taskMachinesOf = (t: { originConfigId?: string; taskId?: string } | null | undefined): Promise<Record<string, TaskStateMachine>> =>
+      resolveTaskMachines(t, { profileName: turnProfile.name, fallback: turnMachines });
+    /**
+     * WHAT A TASK THIS TURN OPENS RECORDS OF ITS VERSION (ADR-066 decision 5): the served version's `configId`, the content
+     * hash of the machine it starts on (`machineHashOf`), and the machine that version declares for the type, so the task
+     * service starts the task in that machine's initial state.
+     */
+    const originTaskFields = (taskType: string | undefined): { originConfigId?: string; originMachineHash?: string; originMachine?: TaskStateMachine; machines?: Record<string, TaskStateMachine> } => {
+      const originConfigId = originConfigIdOf(turnVersionForTasks);
+      const originMachineHash = taskType ? machineHashOf(turnMachines[taskType]) : undefined;
+      const machines = declaredMachineFor(turnVersionForTasks, taskType);
+      // THE VERSION'S OWN MACHINE RIDES THE TASK (ADR-067 stage 2), so the task service and `/tasks/mine` read its steps.
+      const originMachine = taskType ? machines?.[taskType] : undefined;
+      return { ...(originConfigId ? { originConfigId } : {}), ...(originMachineHash ? { originMachineHash } : {}), ...(originMachine ? { originMachine } : {}), ...(machines ? { machines } : {}) };
+    };
     // WHAT A PLACEHOLDER SAYS: the workflow state's declared `placeholder`, else this assistant's
     // `task-placeholder` template (ADR-062 decision 6).
     const placeholderWords = async (taskType?: string, taskState?: string) => ({
@@ -6624,10 +9990,15 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       const activeForPack = servedVersion ?? await resolveActiveProfile(turnProfile.name, { ssm: ssmClient, ssmRoot: SSM_ROOT });
       profileIntentPack = activeForPack.intentPack;
       turnWorkflowSelection = activeForPack.workflows;
+      turnVersionForTasks = activeForPack;
+      turnMachines = machinesForVersion(activeForPack);
     } catch (error) {
       // Fail to the deployment pack, never to no taxonomy: an unreadable version must not collapse
       // every domain intent to `general`, which is the failure this whole change exists to end.
       console.error('[Router] profile intent-pack resolution failed (using the deployment pack):', error);
+      // The version's workflow selection is unknown, so the turn may open only the platform's own machines:
+      // an unset selection means every workflow, which is wider than any version may have chosen.
+      turnWorkflowSelection = [...PLATFORM_TASK_MACHINE_KEYS];
     }
 
     // The assistant that will answer is settled: intent pack hydrated, classifier experiment
@@ -6731,7 +10102,22 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       ...(prefetchedPersonTasks?.live ?? []),
       ...(prefetchedOwnTasks?.live ?? []).filter((t) => t.ownerPersonId === personId),
     ];
-    const classification = isStopQuestionTurn
+    // THE MESSAGE IS READ WITH THE CONVERSATION'S TASK STATE (ADR-064, amended 2026-11-12): each open task is offered
+    // to the classifier as a place the message may belong, with its step, how that step is named, whether it waits on
+    // this person, and (for their own work) the words that asked for it. The classifier decides once: the message
+    // continues one of them, or it is a request of its own intent.
+    const waitingWork: WaitingWork[] = openWorkForThisPerson.map((t) => {
+      const stepLabel = t.taskState ? machinesForTask(t, turnMachines)[t.taskType]?.states?.[t.taskState]?.label : undefined;
+      return {
+        taskId: t.taskId,
+        taskType: t.taskType,
+        step: t.taskState,
+        ...(stepLabel ? { stepLabel } : {}),
+        waitsOnPerson: (prefetchedPersonTasks?.live ?? []).some((h) => h.taskId === t.taskId),
+        ...(t.ownerPersonId === personId && t.requestExcerpt ? { request: t.requestExcerpt } : {}),
+      };
+    });
+    const classification: IntentClassification = isStopQuestionTurn
       ? { intent: IntentType.GENERAL as string, confidence: 'high' as const }
       : joinRecapTurn
       ? { intent: IntentType.CONVERSATION_SUMMARY as string, confidence: 'high' as const }
@@ -6742,7 +10128,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
             modelId: classifierModelId,
             pack: packForClassification,
             refused: refusedIntents,
-            waitingWork: openWorkForThisPerson.map((t) => ({ taskType: t.taskType, step: t.taskState })),
+            waitingWork,
           })
           : classifyIntentByKeyword(userMessage, packForClassification);
     // WHAT THE LABEL COST, as an instant rather than only as `classifierMs`. Marked on BOTH the model
@@ -6773,16 +10159,17 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
      * A step this assistant holds, of work this person owns, and the message is that work
      * (`isStalledStepCandidate`, task-continuity.ts). Asked wherever the turn finds the task.
      */
-    const stalledStepCandidateHere = (t: Pick<UserTask, 'taskType' | 'taskState' | 'ownerPersonId' | 'assistantId'>): boolean =>
+    const stalledStepCandidateHere = (t: Pick<UserTask, 'taskType' | 'taskState' | 'ownerPersonId' | 'assistantId' | 'originConfigId'>): boolean =>
       isStalledStepCandidate({
         task: t,
-        awaitsAParty: !!awaitedPartyOf(taskStateMachines()[t.taskType]?.states?.[t.taskState ?? '']),
+        awaitsAParty: !!awaitedPartyOf(machinesForTask(t, turnMachines)[t.taskType]?.states?.[t.taskState ?? '']),
         selfAssistantId: principalIdFromArn(botArn),
         speakerPersonId: personId,
         // The same turn value every caller of the rule reads, a roommate's key included: that key names no task
         // type, and what it reads back to here is `keptHereAs`.
         turnOpensTaskType: turnOpensOtherWorkKey(),
         keptHereAs: turnKeptHereAs(),
+        turnIsAcknowledgment: classification.intent === IntentType.ACKNOWLEDGMENT,
       });
     /** Whether this conversation holds a live duel, read once and only when a decision needs it. */
     let duelHereRead: Promise<boolean> | undefined;
@@ -6792,19 +10179,32 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       ? resolveActiveBattle(channelArn).then((d) => !!d).catch(() => true)
       : Promise.resolve(false));
     /**
-     * WHETHER THIS MESSAGE IS OTHER WORK THAN `task`, A TASK WAITING ON IT (`opensOtherWorkThan`,
-     * task-continuity.ts). The duel is read through `inADuel` only when the rule would otherwise set the
-     * task aside, so a turn the rule already settles costs no battle read. Both waiting lookups ask this.
+     * WHETHER THIS MESSAGE IS OTHER WORK THAN `task`, A TASK WAITING ON IT. The classifier's decision where it was
+     * offered the task (`classifierPlacement`, task-continuity.ts: the message read with the task state, ADR-064
+     * amended 2026-11-12), else the structural rule (`opensOtherWorkThan`). The duel is read through `inADuel` only
+     * when the task would otherwise be set aside, so a turn already settled costs no battle read. Both waiting
+     * lookups ask this.
      */
-    const otherWorkThan = async (task: { taskType?: string }, inADuel: () => Promise<boolean>): Promise<boolean> =>
-      opensOtherWorkThan({
-        task,
-        turnOpensTaskType: turnOpensOtherWorkKey(),
-        keptHereAs: turnKeptHereAs(),
-        namedByThePerson: false,
-        platformTaskTypes: PLATFORM_TASK_MACHINE_KEYS,
-        inADuel: false,
-      }) && !(await inADuel());
+    const otherWorkThan = async (task: { taskId?: string; taskType?: string }, inADuel: () => Promise<boolean>): Promise<boolean> => {
+      const placed = placementSetsAside(classification, task, { opens: turnOpensOtherWorkKey(), keptHere: turnKeptHereAs() });
+      const other = placed !== undefined
+        ? placed
+        : opensOtherWorkThan({
+          task,
+          turnOpensTaskType: turnOpensOtherWorkKey(),
+          keptHereAs: turnKeptHereAs(),
+          namedByThePerson: false,
+          platformTaskTypes: PLATFORM_TASK_MACHINE_KEYS,
+          inADuel: false,
+        });
+      return other && !(await inADuel());
+    };
+
+    // THE MESSAGE A TURN AMAZON LEX ENTERED, read back above (`lexEnteredPending`), first needed here.
+    const lexEntered: { attachment?: Awaited<ReturnType<typeof lexEnteredFacts>>['attachment']; answersTaskId?: string } = await lexEnteredPending;
+    // Attachment-in: a bypass carries it (the flow reads it from message Metadata), and a turn Lex entered reads it back from
+    // its message. It changes what the turn IS, not just what the processor gets: see the greeting check below.
+    const turnAttachment = bypassAttachment(event) ?? lexEntered.attachment;
 
     // A TURN CARRYING A FILE IS NOT A GREETING, whatever its caption says.
     //
@@ -6885,6 +10285,10 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     const meteredUpstream = Boolean(battleCtx);
 
     let activeTask: UserTask | null = null;
+    /** The moves a requester may ask for on the task another person holds that this turn binds to (WT114). */
+    let requesterMoves: string[] | undefined;
+    /** A single-turn intent's workflow run, started beside its one-turn answer and joined with its dispatch. */
+    let sideRun: Promise<unknown> = Promise.resolve();
     /**
      * THIS CHANNEL HAS LIVE WORK IN IT, whoever currently holds it.
      *
@@ -6914,6 +10318,8 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     // How many open items this person may answer here, and which (ADR-035): a question about one of
     // several gets a line saying which reference to type.
     let answerableTaskIds: string[] = [];
+    /** The message names the person's own request that another person holds, so the requester's path takes it. */
+    let requestedElsewhere = false;
     let liveTaskInChannel = false;
     /**
      * WORK THAT FINISHED HERE A MOMENT AGO, which the conversation is probably still about.
@@ -7050,7 +10456,13 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         const personTasks = channelArn
           ? prefetchedPersonTasks ?? await getAssigneeChannelTasks(personId, channelArn, { endedWithinMs: RECENTLY_ENDED_WINDOW_MS })
           : { live: [], recentlyEnded: [] };
-        const heldByPerson = personTasks.live;
+        // A DRIFT OFFER IS ANSWERED BY DRIFT (WT89), which reads the reply against it, never as input to the task.
+        // AN OFFER OF A SUBJECT CHANGE IS ANSWERED BY DRIFT, read in full to say so; another workflow's move-or-keep is still held work.
+        const subjectOffers = new Set((await Promise.all(personTasks.live
+          .filter((t) => t.taskId.startsWith('evt-') && offersMoveOrKeep(t))
+          .map((t) => getTask(t.taskId, t.channelArn))))
+          .filter((t): t is Task => !!t && isSubjectOffer(t)).map((t) => t.taskId));
+        const heldByPerson = personTasks.live.filter((t) => !subjectOffers.has(t.taskId));
         // Live work this person holds here. Recorded for drift the moment it is read, not when a
         // continuation decides to use it: the two branches below can legitimately decline to continue
         // one (it belongs to another assistant, or another person is the one being waited on), and the
@@ -7102,7 +10514,8 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         // person holds or owns here - so an id naming anything else finds nothing, precisely as a
         // reference to anything else does. The flow already checked it; this does not trust that.
         const declaredTaskId = !isAmendmentFold(event)
-          ? event.requestAttributes?.[BYPASS_ANSWERS_TASK_ATTR] || null
+          // A turn Amazon Lex entered names its item from its message, read back above (`lexEntered`).
+          ? event.requestAttributes?.[BYPASS_ANSWERS_TASK_ATTR] || lexEntered.answersTaskId || null
           : null;
         const ownedHere = (heldByPerson.length || reference || declaredTaskId) && channelArn && personId
           ? await referentCandidatesFor({
@@ -7129,9 +10542,15 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         // A row with no `assistantId` predates the field and is kept: it belongs to whichever assistant
         // is answering, which on this turn is this one.
         const self = principalIdFromArn(botArn);
+        // ── A REDIRECT REACHES WORK THE PERSON HOLDS, OR WORK AN ASSISTANT HOLDS FOR THEM ──────────────
+        //
+        // A request of theirs that another person now holds is reached through the requester's path below
+        // (`requesterMovableTask`), which carries the moves its step declares for the requester (WT114). It is
+        // not a redirect candidate. The processor holds a redirect to the same rule from the task's own row.
+        const heldForThem = (o: UserTask): boolean => o.principalId === personId || o.principalId === self || o.assigneeType === 'assistant';
         const candidateRows = [
           ...heldByPerson,
-          ...ownedHere.filter((o) => !heldByPerson.some((h) => h.taskId === o.taskId)),
+          ...ownedHere.filter((o) => !heldByPerson.some((h) => h.taskId === o.taskId) && heldForThem(o)),
         ].filter((t) => !t.assistantId || t.assistantId === self);
         const referents = rankReferentCandidates(
           candidateRows.map((t) => ({
@@ -7144,7 +10563,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
             ...(t.assistantId ? { assistantId: t.assistantId } : {}),
             updatedAt: t.updatedAt,
           })),
-          { assistantId: principalIdFromArn(botArn), machines: taskStateMachines() },
+          { assistantId: principalIdFromArn(botArn), machines: turnMachines },
         );
         // NAMEABLE ONLY WHEN THERE IS A CHOICE. One open item is not ambiguous, and offering a
         // redirect with one destination teaches the model to redirect for no reason.
@@ -7164,10 +10583,12 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         // own with this assistant: a reference to anything else - closed, someone else's, another
         // conversation's - finds nothing, so it narrows what was already allowed and never widens it.
         // Another assistant's item held by this person stays in the set, and the handover below sends it
-        // to its owner exactly as a ranked pick would be.
+        // to its owner exactly as a ranked pick would be. A request of theirs that another person holds is answered
+        // through the requester's path below, with the moves its step declares for the requester (WT114), the same
+        // rule a redirect follows: answering it here would hand the step back from the person who holds it.
         const answerable = [
           ...heldByPerson,
-          ...ownedHere.filter((o) => !heldByPerson.some((h) => h.taskId === o.taskId)),
+          ...ownedHere.filter((o) => !heldByPerson.some((h) => h.taskId === o.taskId) && heldForThem(o)),
         ];
         answerableTaskIds = answerable.map((t) => t.taskId);
         // The declared id first: a client that named the item is not guessing, and a `#<n>` cannot
@@ -7175,7 +10596,12 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         const referenced = declaredTaskId
           ? answerable.find((t) => t.taskId === declaredTaskId) ?? null
           : reference ? findReferencedTask(answerable, reference.taskRef) : null;
-        if (reference && !referenced && answerable.length && channelArn) {
+        // The person's own request, held by another person: the requester's path takes the message.
+        const heldElsewhere = ownedHere.filter((o) => !heldForThem(o));
+        requestedElsewhere = !referenced && (declaredTaskId
+          ? heldElsewhere.some((t) => t.taskId === declaredTaskId)
+          : reference ? !!findReferencedTask(heldElsewhere, reference.taskRef) : false);
+        if (reference && !referenced && !requestedElsewhere && answerable.length && channelArn) {
           // ANSWERED, NOT IGNORED, AND ONLY TO THE SENDER. Falling through would let the ranked path
           // attach the reply to whatever ranks first, which is the silent wrong pick a reference exists
           // to prevent. Nothing else was open for them at all ⇒ the message is not a reply to anything
@@ -7257,7 +10683,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         // The first candidate the message is not other work for. In a live duel the first is never set
         // aside; the duel is read once (`duelHere` is memoized), so later candidates are the rule alone.
         let answered = referenced ?? null;
-        if (!referenced) {
+        if (!referenced && !requestedElsewhere) {
           for (const t of waitingCandidates) {
             if (!(await otherWorkThan(t, duelHere))) { answered = t; break; }
           }
@@ -7325,12 +10751,8 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
             taskId: answered.taskId,
             channelArn,
             assistantId: principalIdFromArn(botArn),
-            // The DEPLOYMENT pack, not the profile's overrides: the active profile version is resolved
-            // later in this turn, after this point. The cost is bounded and degrades safely - a state
-            // that only a profile's custom machine declares `awaits` on is not advanced here, and the
-            // model's `advance_task_state` on the worker, which does have the merged machines, moves it
-            // instead. Nothing is advanced WRONGLY; at worst it is advanced one hop later.
-            machines: taskStateMachines(),
+            // The machines the task follows: those of the version it started on (ADR-066 decision 5).
+            machines: await taskMachinesOf(answered),
             messageId: inboundMessageId(event),
           });
           // A REDELIVERY OF THE REQUEST THAT OPENED THE TASK is not its answer (`applyUserResponseToTask`
@@ -7450,7 +10872,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
           // answers is unchanged; WHO is being waited on is settled just below.
           const blockedOnAPerson = Boolean(
             mine?.taskState
-            && awaitedPartyOf(taskStateMachines()[mine.taskType]?.states?.[mine.taskState]),
+            && awaitedPartyOf((await taskMachinesOf(mine))[mine.taskType]?.states?.[mine.taskState]),
           );
           if (mine && blockedOnAPerson && !(await otherWorkThan(mine, duelHere))) {
             // WHO IS THIS WAITING ON. A duel's answer belongs to the person who started it,
@@ -7477,7 +10899,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
                 taskId: mine.taskId,
                 channelArn,
                 assistantId: principalIdFromArn(botArn),
-                machines: taskStateMachines(),
+                machines: await taskMachinesOf(mine),
                 messageId: inboundMessageId(event),
               });
               // The same refusal as the person's branch, for a chain found only in this assistant's
@@ -7614,7 +11036,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
           // so a continuation that missed the owner lookups found nothing here and the multi-step
           // branch opened a fresh task beside the live chain; the next machine anyone adds drifted
           // the same way with no error.
-          for (const candidateType of Object.keys(taskStateMachines())) {
+          for (const candidateType of Object.keys(turnMachines)) {
             activeTask = await getActiveTask(personId, candidateType);
             if (activeTask) break;
           }
@@ -7662,8 +11084,9 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     if (!liveTaskInChannel && recentlyEndedTaskHere && channelArn) {
       const ended = await getTask(recentlyEndedTaskHere.taskId, channelArn);
       const endedAt = taskEndedAt(ended);
+      // AN ANSWERED OFFER IS NOT WORK THE NEXT MESSAGE CONTINUES: it was a question about the subject, and detection goes on.
       recentlyEndedWithinWindow = Boolean(
-        endedAt && Date.now() - Date.parse(endedAt) <= RECENTLY_ENDED_WINDOW_MS,
+        endedAt && Date.now() - Date.parse(endedAt) <= RECENTLY_ENDED_WINDOW_MS && ended?.workflowRun?.event !== 'subject-changed',
       );
       if (recentlyEndedWithinWindow) {
         console.log('[Router] work finished here a moment ago; this turn is read as being about it', {
@@ -7680,6 +11103,8 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       //
       // NOT FOR A SHORT ACKNOWLEDGMENT. "thanks" after a delivery keeps its quick reply and its unspent
       // model call; a bare token is never a change request.
+      // ITS REOPEN IS THE ONE ITS OWN VERSION DECLARES (ADR-066 decision 5).
+      const endedMachines = ended && !activeTask ? await taskMachinesOf(ended) : turnMachines;
       if (
         !activeTask && !battleCtx && !shortAcknowledgment && ended
         && reopenableFollowUpSubject({
@@ -7687,7 +11112,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
           endedWithinWindow: recentlyEndedWithinWindow,
           assistantId: principalIdFromArn(botArn),
           senderSub: personId,
-          reopenTargets: (type, state) => reopenTargetsFrom(type, state, taskStateMachines()),
+          reopenTargets: (type, state) => reopenTargetsFrom(type, state, endedMachines),
           // NOT FOR NEW WORK OF ANOTHER KIND. The same opening rule the TASK_MULTI_STEP branch below
           // applies: an intent owns the machine of its own name when one exists and may be opened.
           // A turn that would open a different workflow opens it, rather than continuing the report.
@@ -7720,6 +11145,27 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     // carries the target, the cost this interim accepts (while a task is open, a genuinely new
     // subject is never offered its own conversation), and the signal the two-axis version needs and
     // does not have.
+    // A REQUESTER'S MOVE ON A TASK ANOTHER PERSON HOLDS (ADR-067 G8, WT114). A task a workflow gave to someone else is filed
+    // under them, so the person who asked for it reaches it nowhere above. Where nothing else took this message, the
+    // person's own request held by another, in a step that declares the moves its requester may ask for (a reschedule, a
+    // cancel), is this turn's task, and the turn may take only those moves. Looked up only where this turn's machines
+    // declare any, so a deployment that offers none pays no read for it.
+    if (!activeTask && channelArn && personId && !isMachineWrittenTurn(event) && anyRequesterMoves(turnMachines)) {
+      const movable = await requesterMovableTask({ channelArn, personId, machines: turnMachines }).catch(() => null);
+      if (movable) {
+        requesterMoves = movable.moves;
+        liveTaskInChannel = true;
+        activeTask = {
+          principalId: movable.task.assigneeId ?? '', taskId: movable.task.taskId, channelArn,
+          taskType: movable.task.taskType ?? '', taskState: movable.task.taskState, status: movable.task.status,
+          ...(movable.task.assistantId ? { assistantId: movable.task.assistantId } : {}),
+        } as UserTask;
+        console.log('[Router] the requester asks about their task another person holds; the turn may take only its declared moves', {
+          taskId: movable.task.taskId, moves: movable.moves,
+        });
+      }
+    }
+
     const continuity = resolveTaskContinuity({
       liveTaskInChannel,
       recentlyEndedTaskInChannel: recentlyEndedWithinWindow,
@@ -7805,7 +11251,8 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       : '';
     const declaredAnswerId = (): string => handoverMessageIdForTurn || knownInboundMessageId;
     const inboundMessage = (): Promise<{ messageId: string; targeted?: boolean; createdAt?: string }> => {
-      inboundLookup ??= resolveOriginatingMessage({
+      // A TURN AMAZON LEX ENTERED HAS ALREADY READ ITS MESSAGE BACK (`lexEnteredRead`), and that one read answers here too.
+      inboundLookup ??= (lexEnteredRead ?? resolveOriginatingMessage({
         event,
         channelArn,
         senderArn: event.requestAttributes?.['CHIME.sender.arn'] || '',
@@ -7813,7 +11260,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         // The text AS SENT, not the text handed to the model: this lookup compares against stored
         // content, so a stripped private address makes it miss every time.
         userMessage: inboundText,
-      }).then((r) => {
+      })).then((r) => {
         knownInboundMessageId ||= r.messageId;
         return r;
       }).catch(() => ({ messageId: '' }));
@@ -7982,6 +11429,12 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       ?? { key: classification.intent };
     const imageUnavailable = needsOf(servedIntentDef) === 'image' && !classificationAllows(effectiveClassification, 'image');
     const willRefuse = !!channelArn && ((!battleCtx && (classification as { refused?: boolean }).refused) || imageUnavailable);
+    let subjectOfferRead: Promise<OpenSubjectOffer | undefined> | undefined;
+    const subjectOffer = () => (subjectOfferRead ??= (async () => {
+      if (!channelArn || !personId) return undefined;
+      const live = prefetchedPersonTasks?.live ?? (await getAssigneeChannelTasks(personId, channelArn).catch(() => null))?.live;
+      return openSubjectOfferOf(live, personId, channelArn);
+    })());
     const driftResponse = isMachineWrittenTurn(event) || isAmendmentFold(event) || battleCtx || willRefuse ? null : await runLiveDriftFlow({
       event,
       words: await turnWords(),
@@ -7991,6 +11444,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       classification: effectiveClassification,
       botArn,
       intent: classification.intent,
+      classifierModelId,
       // The field name is the WIRE contract: `detectDrift` runs in the data-plane Lambda and this
       // value crosses that boundary as JSON, so it is deliberately not renamed to match the widened
       // meaning. Renaming it would mean a router and a data plane deployed minutes apart disagree
@@ -8004,11 +11458,35 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       resolveInbound: inboundMessage,
       onDecision: (d) => { turnSubjectDecision = d; },
       onHeldQuestion: (q) => { turnHeldQuestion = q; },
+      raiseSubjectChanged: async (change) => raiseSubjectChanged({
+        channelArn, botArn, assistant: turnProfile.name, senderArn: event.requestAttributes?.['CHIME.sender.arn'] || '', change,
+        // A PRIVATE MESSAGE'S CHANGE STAYS WITH ITS SENDER (DESIGN-TASK-ACCESS 2.4): a declaration short of targeted is checked
+        // against the stored message, and one that cannot be read back is treated as private.
+        privateMessage: event.requestAttributes?.[BYPASS_TARGETED_ATTR] === '1'
+          || await inboundTarget(chimeClient, channelArn, change.messageId, await getBotArn()) !== 'public',
+        ...(change.conversationType ? { conversationType: change.conversationType } : {}),
+      }),
+      // THE PERSON'S OPEN OFFER, from the work the turn read for them before classifying, else read once now.
+      openOffer: subjectOffer,
+      answerOffer: async (answer, messageId) => {
+        const offer = await subjectOffer();
+        return offer && personId ? answerSubjectOffer(offer, personId, answer, messageId) : 'gone';
+      },
     });
     // Drift has run, or declined to. Marked BEFORE the early return below, so a turn that drift
     // answered records how long the check took even though it never reaches a placeholder - which is
     // the turn where knowing matters most, since the person waits the whole span for a drift offer.
     markRouterStep('drift_checked');
+    // A DECLINE THAT HOLDS A QUESTION IS ANSWERED BY A TURN. "no" to a drift offer is under three characters, so the
+    // classifier's fast path calls it a greeting and the quick reply below would answer it ("Hey, what can I help you
+    // with?") in place of the question the offer held. The same correction every resume gets.
+    if (!driftResponse && turnHeldQuestion
+        && (classification.intent === IntentType.GREETING || classification.intent === IntentType.ACKNOWLEDGMENT)) {
+      console.log('[Router] a declined drift offer holds a question; not treating the reply as a greeting', {
+        classifiedAs: classification.intent, heldMessageId: turnHeldQuestion.messageId,
+      });
+      classification.intent = IntentType.GENERAL;
+    }
     if (driftResponse) {
       // ── AN OFFER ON A TARGETED REQUEST IS TARGETED (DESIGN-TASK-ACCESS 2.4) ─────────────────────
       //
@@ -8018,7 +11496,8 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       // text", which is not "sent without a `Target`", so a declaration short of `1` is checked against
       // the stored message, the same read the task's visibility takes below. Measured: an offer to a
       // targeted request posted to the whole room.
-      if (isFlowEntry(event) && channelArn && event.requestAttributes?.[BYPASS_TARGETED_ATTR] !== '1') {
+      // NOTHING TO TARGET WHERE NOTHING IS POSTED: a subject change the run answered posts no reply from this turn.
+      if (isFlowEntry(event) && channelArn && driftResponse.messages.length && event.requestAttributes?.[BYPASS_TARGETED_ATTR] !== '1') {
         const offeredFor = (await inboundMessage()).messageId;
         // An offer whose request cannot be read back fails toward PRIVATE: a public offer to a private
         // request discloses it, and a private offer to a public one costs only a courtesy.
@@ -8064,7 +11543,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     // assistant's, or a mirror lagging at an `awaits` state would wave a second turn through. One read,
     // and only on a turn that carries an active task. The platform machines are decided on the state
     // this turn holds: their rule does not depend on the row (`assistantOwesTheStep`).
-    const declineMachines = taskStateMachines();
+    const declineMachines = await taskMachinesOf(activeTask);
     const declinePlatform = !!activeTask?.taskType
       && (PLATFORM_TASK_MACHINE_KEYS as readonly string[]).includes(activeTask.taskType);
     // A MACHINE WITH NO STATE THE ASSISTANT MOVES IS NEVER OWED, at whatever state the row holds, so its
@@ -8096,6 +11575,9 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         console.log('[Router] resuming a stalled step of this person\'s work', {
           taskId: activeTask!.taskId, taskType: activeTask!.taskType, taskState: declineState,
         });
+        // The same correction every other resume gets above: a short message that resumes work is a
+        // continuation, so the quick reply below does not answer it in place of the step's turn.
+        if (shortAcknowledgment) classification.intent = IntentType.GENERAL;
       }
     }
     if (!resumedWaitingWork && activeTask?.taskType && declineState) {
@@ -8604,6 +12086,9 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
      * A DECLARED ID WINS. A bypass caller hands over the exact inbound `MessageId`; the lookup matches
      * on content, which is identifying but not exact, so the declared one is preferred where it exists.
      *
+     * READ WHERE IT IS NEEDED: where a task is opened, and where a single-turn intent's workflow runs beside its answer
+     * (to know whether its run is private), the latter started alongside the answer's dispatch, off its path.
+     *
      * VISIBILITY IS OMITTED WHEN NOTHING ESTABLISHED IT, and that is the important half. An absent
      * visibility reads as private (`task-visibility.ts`), so a lookup that FAILED leaves the task
      * private rather than converting "we did not find out" into "we checked, it is public". A lookup
@@ -8648,23 +12133,29 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
        * `LATENCY-TARGETS.md` is trying to shorten. Putting it in the flow instead would cost every turn
        * a `GetChannelMessage` to serve the few that open work.
        *
-       * AN UNREADABLE MESSAGE KEEPS THE DECLARATION. `inboundWasTargeted` already answers `false` when it
-       * cannot read, and overriding a declaration on a failed read would convert "we could not check"
-       * into "it is private" for every ordinary turn - reinstating the receipts by another route.
+       * AN UNREADABLE MESSAGE IS PRIVATE. When the stored message cannot be read, whether it carried a
+       * `Target` is unknown, and the task row records the request's own text: recording it as the
+       * room's would disclose a private request, which cannot be taken back (ADR-033). So an unreadable
+       * read, or a failed one, leaves the visibility unset, which reads as private. An ordinary turn whose
+       * read fails then opens a private task and its receipt; that is the recoverable direction.
        */
       const verifyId = id;
       if (declared === false && channelArn && verifyId) {
         try {
-          if (await inboundWasTargeted(chimeClient, channelArn, verifyId, await getBotArn())) {
+          const stored = await inboundTarget(chimeClient, channelArn, verifyId, await getBotArn());
+          if (stored === 'targeted') {
             targeted = true;
             console.log('[Router] the flow declared this untargeted; the stored message says otherwise', {
               channelArn, messageId: verifyId,
             });
+          } else if (stored === 'unreadable') {
+            targeted = undefined;
+            console.warn('[Router] could not read the stored message; opening the task as private', { channelArn, messageId: verifyId });
           }
         } catch (err) {
-          // Never fail opening the task over this check: the declaration stands, which is the same
-          // outcome as before the check existed.
-          console.warn('[Router] could not verify the declared targeting; keeping the declaration', {
+          // Never fail opening the task over this check, and never open it to the room: unset reads as private.
+          targeted = undefined;
+          console.warn('[Router] could not verify the declared targeting; opening the task as private', {
             channelArn, messageId: verifyId, err: (err as { name?: string })?.name,
           });
         }
@@ -8787,8 +12278,8 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     // rules, so a turn that gets here is one this assistant is committed to answering.
     //
     // KEYED ON THE RESPONDER, not the conversation: two people mentioning two different assistants
-    // should both get answers. `/battle` is the deliberate exception and does not come through here -
-    // a duel occupies the whole conversation, and its own channel-scoped guard already says so.
+    // should both get answers. A duel is the deliberate exception: it occupies the whole conversation,
+    // its own channel-scoped guard says so, and its sides pass this point without claiming.
     //
     // INERT UNTIL SWITCHED ON. `claimTurn` returns `claimed: true` when the feature is off or its
     // table is unset, so this whole block is a no-op on a deployment that has not enabled it.
@@ -8812,7 +12303,12 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     // and queueing it behind a running turn would put its request in the queue as if the new member had
     // typed it.
     const isJoinRecapTurn = isJoinRecap(event);
-    const turnClaim = isTriageTurn || isStopEvaluationTurn || isJoinRecapTurn
+    // NOR A SIDE OF A DUEL (ADR-033: `/battle` locks the conversation, through the battle pointer). The
+    // flow has already decided this duel may run, and the side's answer is the comparison: it runs now,
+    // whatever this assistant's previous turn is still finishing, and it never waits in the queue a
+    // person's message waits in.
+    const isDuelSideTurn = !!bypassBattleContext(event);
+    const turnClaim = isTriageTurn || isStopEvaluationTurn || isJoinRecapTurn || isDuelSideTurn
       ? { claimed: true }
       : await claimTurn({
         channelArn,
@@ -8853,7 +12349,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     // above precisely so they do NOT queue behind the turn they are describing. Their write would fail
     // the holder condition anyway, after the processor had already paid a channel read for it.
     const owesHolderRecord = turnQueueEnabled() && turnClaim.claimed
-      && !isTriageTurn && !isStopEvaluationTurn && !isJoinRecapTurn
+      && !isTriageTurn && !isStopEvaluationTurn && !isJoinRecapTurn && !isDuelSideTurn
       && !!channelArn && !!responderId;
     /** The hand-off fields for that record. Empty on a turn that owes nothing. */
     const holderRecordFields = (): Record<string, unknown> => (owesHolderRecord
@@ -8880,7 +12376,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     // Concretely, without this release: one rate-limited message and every later message in that
     // conversation queues behind a holder that will never drain, until one arrives after the
     // staleness bound and takes the lock over. The record has no TTL.
-    if (!isTriageTurn && !isStopEvaluationTurn && turnClaim.claimed) {
+    if (!isTriageTurn && !isStopEvaluationTurn && !isDuelSideTurn && turnClaim.claimed) {
       lockToRelease = { channelArn, responderId, correlationId };
     }
     // ADR-033 ADMISSION IS OVER: the claim was attempted, and a turn that took it knows whether it
@@ -8918,6 +12414,14 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         // Last resort. Queued under an id nothing can resolve still beats losing the message, and
         // the notice still tells the person something is waiting.
         || correlationId;
+      // THE TURN HOLDING THE CONVERSATION IS THIS SAME MESSAGE'S, entered through the channel flow: the message is already
+      // being answered, so this entry says nothing and queues nothing. The holder's id is the one the platform derives from
+      // the message id (`mentionCorrelationId`), so the comparison is exact. One message has one entry, so reaching this
+      // is a second entry for it: logged at warn under `[duplicate-entry]`, which is what makes it visible and countable.
+      if (queuedMessageId && turnClaim.heldBy === mentionCorrelationId(queuedMessageId)) {
+        console.warn('[Router] [duplicate-entry] a second entry for the turn in progress stands down', { correlationId, heldBy: turnClaim.heldBy });
+        return formatLexSilentResponse(event);
+      }
       // WITH THE INTENT IT WAS CLASSIFIED AS, which is what the message is attributed to wherever it is completed: the
       // task a reading opens for it, or the answer it is folded into (ADR-064 decision B).
       const queued = await enqueueMessage({ channelArn, responderId, messageId: queuedMessageId, intent: classification.intent });
@@ -9326,7 +12830,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         channelArn, answeringBotArn: botArn, classification: STATIC_CLASSIFICATION,
         knownName: channelNameCache.get(channelArn), ...(battleCtx ? { battle: battleCtx } : {}),
       }, roomNamingMemory, {
-        primaryOf: (arn) => primaryAssistantOf(arn, chimeClient, '[Router][naming]'),
+        primaryOf: (arn) => primaryAssistantOf(arn, routerRoleChimeClient, '[Router][naming]'),
         isNamed: async (arn) => (await roomNamingOf(arn)).named,
         markNamed: (arn) => markRoomNamed(arn),
       })
@@ -9479,6 +12983,22 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         ? battleSide.deliveryOption
         : selectDeliveryOption(classification.intent, hasActiveTask, profileIntentPack);
 
+      // A SINGLE-TURN INTENT'S WORKFLOW RUNS BESIDE ITS ONE-TURN ANSWER: its author decided the request
+      // opens no task of its own, so the run says its sends and ends in this turn, keyed by it as a multi-step request's run
+      // is, and the turn answers as it always does. A run that cannot start costs the answer nothing.
+
+      if (deliveryOption !== DeliveryOption.TASK_MULTI_STEP && !battleSide && !hasActiveTask && channelArn
+        && turnVersionForTasks?.intentWorkflows?.[classification.intent]) {
+        // Started now and joined with the answer's dispatch below, so the run adds nothing in front of the answer.
+        const sideVersion = turnVersionForTasks;
+        sideRun = inboundTaskFields().then((fields) => startIntentRun({
+          intent: classification.intent, channelArn, botArn, assistant: turnProfile.name, version: sideVersion,
+          requesterArn: event.requestAttributes?.['CHIME.sender.arn'], correlationId,
+          open: async () => { throw new Error('a single-turn intent opens no task of its own'); },
+          privateRun: isPrivateVisibility(fields.visibility),
+        })).catch(() => undefined);
+      }
+
       // TASK_MULTI_STEP: Create or continue task
       if (deliveryOption === DeliveryOption.TASK_MULTI_STEP) {
         let isNewTaskForBattle = false;
@@ -9548,6 +13068,8 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
             ...(await inboundTaskFields()),
             // THE INTENT THAT OPENED IT (ADR-064 decision B), which the side's steps route and are attributed under.
             openingIntent: classification.intent,
+            // THE VERSION IT STARTED ON (ADR-066 decision 5), the side's own, and the machine that version declares for it.
+            ...originTaskFields(battleSide.taskType),
           });
           taskId = battleTask.taskId;
           taskCreated = true;
@@ -9605,8 +13127,18 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
           // the user's message id is carried separately, and stays absent on this path rather than
           // being filled with the correlation key. The duplicate-task guard is getActiveTask's
           // strongly-consistent recheck.
-          const task = await createTask(event, deliveryOption, taskType, correlationId, {
+          // ONE TASK PER REQUEST: its id comes from the turn's correlation id, so the run's open and the open without a run
+          // write the same row once, and an open that finds it reads it back (`createOnly`).
+          const requestTaskId = correlationId && !taskOpts?.taskId ? `req-${contentHash12({ correlationId, intent: classification.intent, assistant: principalIdFromArn(botArn) })}` : undefined;
+          const openRequestTask = async (run?: WorkflowRunRef, extra?: { dueBy?: string; ttlSeconds?: number }) => createTask(event, deliveryOption, taskType, correlationId, {
             ...(taskOpts ?? {}),
+            // WRITTEN ONCE UNDER THE REQUEST'S ID, whoever opens it: a second open reads back the row that exists.
+            ...(requestTaskId ? { taskId: requestTaskId, createOnly: true } : {}),
+            // A RUN WAITS ON THIS ROW, so a row that did not land is raised rather than handed back as if it had.
+            ...(run ? { throwOnTaskWriteFailure: true } : {}),
+            ...(extra?.dueBy ? { dueBy: extra.dueBy } : {}),
+            // THE LONGER LIFETIME WINS: a plan task's row lives to the plan's end, whatever its step's deadline.
+            ...(extra?.ttlSeconds ? { ttlSeconds: Math.max(extra.ttlSeconds, taskOpts?.ttlSeconds ?? 0) } : {}),
             // Whose work this is: the assistant running this turn (the validated identity from
             // ADR-025, same value the battle branch derives its owner from). Without it the mirror
             // row has no assistantId, and the composer's "Answering..." affordance - which resolves
@@ -9630,7 +13162,23 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
               experimentId: enrolledResolution.experimentId, variantId: enrolledResolution.variantId,
               ...(enrolledResolution.configId ? { configId: enrolledResolution.configId } : {}),
             } } : {}),
+            // THE VERSION IT STARTED ON (ADR-066 decision 5): the one this turn serves, the arm's where the turn is on
+            // one, so the task finishes on the machine it started on whatever is activated meanwhile.
+            ...originTaskFields(taskType),
+            // THE RUN OF THE REQUEST'S WORKFLOW (ADR-067 stage 3), where one started: the task is its own step's.
+            ...(run ? { workflowRun: run } : {}),
           });
+          // A REQUEST'S WORKFLOW (ADR-067 decision 1): where the version declares one for the intent, it starts here and its
+          // own task step opens this task; else, and wherever it cannot start, the task opens as it always has.
+          const task = (taskType === classification.intent
+            ? await startIntentRun({
+              intent: taskType, channelArn: channelArn ?? '', botArn, assistant: turnProfile.name, version: turnVersionForTasks,
+              requesterArn: event.requestAttributes?.['CHIME.sender.arn'], correlationId, open: openRequestTask,
+              privateRun: isPrivateVisibility((await inboundTaskFields()).visibility),
+            })
+            : undefined)
+            // THE REQUEST'S TASK WITHOUT A RUN, written once under its id (or read back where it was).
+            ?? await openRequestTask();
           taskId = task.taskId;
           taskState = task.taskState;
           taskCreated = true;
@@ -9674,6 +13222,8 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
             // old comment worried about (an unrelated open task in the channel making a battle look like
             // a resumption) cannot arise from this lookup.
             isTaskContinuation: !isNewTaskForBattle && !!activeTask,
+            // THE MOVES THIS TURN MAY TAKE ON A TASK ANOTHER PERSON HOLDS (WT114): only where the requester's message bound to it.
+            ...(requesterMoves && activeTask && taskId === activeTask.taskId ? { requesterMoves } : {}),
             ...holderRecordFields(),
             ...(handoverMessageIdForTurn ? { answersMessageId: handoverMessageIdForTurn } : {}),
             senderArn: event.requestAttributes?.['CHIME.sender.arn'],
@@ -9683,6 +13233,14 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
             // here - the router cannot see the inbound message's Target.
             intent: classification.intent,
             intentConfidence: classification.confidence,
+            // HOW THE CLASSIFIER PLACED THE MESSAGE AGAINST THE OPEN WORK (`routedAsOf`): continuing a task, or a
+            // request of its own intent. Absent when no open work was offered. A turn that continues an offered task is
+            // that, whether the classifier named the task's place or its work's label.
+            ...(() => {
+              const routed = routedAsOf(classification);
+              const continued = !isNewTaskForBattle && activeTask && classification.waitingWorkDecided?.includes(activeTask.taskId);
+              return routed ? { routedAs: routed === 'own_intent' && continued ? 'continues_task' as const : routed } : {};
+            })(),
             // WHAT THE LABEL COST, carried because it is the largest controllable step in TTFF and the
             // router is the only component that can see it. Absent on the no-LLM fast paths, which
             // is itself the fact worth recording: those turns did not pay for a model.
@@ -9782,6 +13340,8 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         // the async processor (see the task-continuation invoke above).
         intent: classification.intent,
         intentConfidence: classification.confidence,
+        // The classifier's placement against the open work; see the task-continuation invoke above.
+        ...(routedAsOf(classification) ? { routedAs: routedAsOf(classification) } : {}),
         ...(classification.classifierLatencyMs !== undefined
           && { classifierMs: classification.classifierLatencyMs }),
         // The same spend fields as the other dispatch site; see the comment there.
@@ -9803,11 +13363,13 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         ...roomNamingFields,
         intentPackVersion,
         ...domainGrounding,
-      }, turnRoster), askRoomToBeNamed(asyncProcessorArn)]);
+      }, turnRoster), askRoomToBeNamed(asyncProcessorArn), sideRun]);
       if (dispatched) lockToRelease = null;
       // Same rule as the task-shaped branch above: the flag reports what the Invoke did.
       spoke.dispatched = dispatched;
     }
+    // A single-turn intent's run finishes before the turn returns, whether or not the answer was dispatched.
+    await sideRun;
 
     // A duel side's placeholder carries the battle marker as well as the correlation marker, and the
     // `name=` part is this side's resolved display name - which is why composing it belongs to the
@@ -9930,9 +13492,14 @@ async function invokeAsync(
   try {
     const channelArn = typeof payload.channelArn === 'string' ? payload.channelArn : '';
     const variant = payload.routedVariant && typeof payload.routedVariant === 'object' ? payload.routedVariant as GrantVariant : undefined;
+    // THE TURN'S THREAD RELATIVES, as this router read them from the server-side row, so the data plane serves their summaries.
+    const relatives = (Array.isArray(payload.threadRelatives) ? payload.threadRelatives as Array<{ channelArn?: unknown }> : [])
+      .map((r) => (typeof r?.channelArn === 'string' && r.channelArn.startsWith(`${appInstanceArnOf(channelArn)}/channel/`) ? r.channelArn : ''))
+      .filter(Boolean).slice(0, MAX_RELATIVES_NAMED);
     await recordTurnRouting(routingDdb, TURN_ROUTING_TABLE, {
       correlationId, botArn, classification,
       ...(channelArn ? { channelArn } : {}),
+      ...(relatives.length ? { threadRelatives: relatives } : {}),
       ...(variant ? { variant } : {}),
     });
   } catch (err) {

@@ -149,8 +149,9 @@ describe('the gate at Activate', () => {
     const activate = handler.slice(handler.indexOf("if (path.endsWith('/activate'))"));
     expect(activate.indexOf('goldenGateOutcome(')).toBeGreaterThan(-1);
     expect(activate.indexOf('goldenGateOutcome(')).toBeLessThan(activate.indexOf('await activateDraft('));
-    // Activation is held to the configId the gate checked, so a draft saved in between is refused, not activated unrun.
-    expect(activate).toContain('guardrailCatalogFor, pendingDraft?.configId);');
+    // Activation is held to the configId the activator reviewed and the gate checked, so a draft saved in between is
+    // refused, not activated unrun.
+    expect(activate).toContain('guardrailCatalogFor, reviewed);');
     const rollback = handler.slice(handler.indexOf("if (path.endsWith('/rollback'))"), handler.indexOf("if (path.endsWith('/rollback'))") + 800);
     expect(rollback).not.toContain('goldenGateOutcome(');
   });

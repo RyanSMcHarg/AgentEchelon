@@ -15,6 +15,7 @@ import {
   adminListMessages,
   adminListEvents,
   adminMembershipHistory,
+  moderationStateOf,
 } from '../../lambda/src/analytics-aurora/admin-conversations-aurora';
 
 const mockedQuery = query as jest.MockedFunction<typeof query>;
@@ -63,6 +64,48 @@ describe('admin-conversations-aurora', () => {
     [sql, params] = mockedQuery.mock.calls[0] as [string, unknown[]];
     expect(params[4]).toEqual([]);
     mockedQuery.mockReset();
+  });
+
+  it('an EMPTY classification scope answers nothing, and reads nothing: never "unscoped"', async () => {
+    // A scope that reaches no classification must not become the unscoped (null) query, and a lookup by
+    // id under it must not say whether the conversation exists: the same empty page, total 0, either way.
+    mockedQuery.mockResolvedValue({
+      rows: [{ channel_arn: 'arn:secret', classification: 'premium', name: 'Board', message_count: '3', last_message_at: null, total_count: '1' }],
+      rowCount: 1,
+    } as any);
+    expect(await adminListConversations(50, 0, [])).toEqual({ conversations: [], total: 0 });
+    expect(await adminListConversations(50, 0, [], 'arn:secret')).toEqual({ conversations: [], total: 0 });
+    expect(mockedQuery).not.toHaveBeenCalled();
+    mockedQuery.mockReset();
+  });
+
+  it('a non-empty scope is pushed into the SQL; only null is unscoped', async () => {
+    mockedQuery.mockResolvedValue({ rows: [], rowCount: 0 } as any);
+    await adminListConversations(50, 0, ['basic'], 'arn:c');
+    let [, params] = mockedQuery.mock.calls[0] as [string, unknown[]];
+    expect(params[2]).toEqual(['basic']);
+    expect(params[3]).toBe('arn:c');
+    mockedQuery.mockClear();
+    await adminListConversations(50, 0, null);
+    [, params] = mockedQuery.mock.calls[0] as [string, unknown[]];
+    expect(params[2]).toBeNull();
+    mockedQuery.mockReset();
+  });
+
+  it('moderationStateOf reads the message and the sibling event the action names', async () => {
+    mockedQuery.mockResolvedValueOnce({ rows: [{ archived: true, moderated: false }], rowCount: 1 } as any);
+    expect(await moderationStateOf('arn:c', 'm1', 'redact')).toEqual({ archived: true, moderated: false });
+    let [sql, params] = mockedQuery.mock.calls[0] as [string, unknown[]];
+    expect(sql).toMatch(/event_type = 'CREATE_CHANNEL_MESSAGE'/);
+    expect(params).toEqual(['arn:c', 'm1', 'm1-RED', 'REDACT_CHANNEL_MESSAGE']);
+    mockedQuery.mockClear();
+    mockedQuery.mockResolvedValueOnce({ rows: [{ archived: true, moderated: true }], rowCount: 1 } as any);
+    expect(await moderationStateOf('arn:c', 'm1', 'delete')).toEqual({ archived: true, moderated: true });
+    [sql, params] = mockedQuery.mock.calls[0] as [string, unknown[]];
+    expect(params).toEqual(['arn:c', 'm1', 'm1-DEL', 'DELETE_CHANNEL_MESSAGE']);
+    // No row (or an unexpected shape) is neither archived nor moderated.
+    mockedQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 } as any);
+    expect(await moderationStateOf('arn:c', 'm1', 'redact')).toEqual({ archived: false, moderated: false });
   });
 
   it('derives lifecycle state: deleted wins over archived, else archived, else live', async () => {

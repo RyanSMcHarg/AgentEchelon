@@ -29,7 +29,10 @@ export interface InvitePanelProps {
 const KNOWN_REFUSALS = new Set([
   'NOT_A_MEMBER', 'CONVERSATION_ARCHIVED', 'INVITATIONS_NOT_DECLARED', 'MODE_NOT_DECLARED', 'LINK_NOT_AVAILABLE',
   'NOT_CLEARED', 'INVITATIONS_UNAVAILABLE', 'INVITATION_INVALID', 'NOT_YOURS',
+  'CLASSIFICATION_UNREADABLE', 'NOT_A_PERSON_SESSION',
 ]);
+/** A refusal said in the words of another: an access check that could not be answered is invitations being unavailable. */
+const SAID_AS: Record<string, string> = { UNAVAILABLE: 'INVITATIONS_UNAVAILABLE' };
 
 export default function InvitePanel({ channelArn, deps = {} }: InvitePanelProps) {
   const { t, i18n } = useTranslation();
@@ -43,7 +46,8 @@ export default function InvitePanel({ channelArn, deps = {} }: InvitePanelProps)
   const [invitations, setInvitations] = useState<InvitationView[]>([]);
 
   const reasonOf = useCallback((err: unknown): string => {
-    const code = err instanceof InvitationRequestError ? err.code : '';
+    const raw = err instanceof InvitationRequestError ? err.code : '';
+    const code = SAID_AS[raw] ?? raw;
     return KNOWN_REFUSALS.has(code) ? t(`invite.refused.${code}`) : t('invite.failed');
   }, [t]);
 

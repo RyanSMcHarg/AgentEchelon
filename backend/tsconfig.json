@@ -25,6 +25,10 @@
       "./node_modules/@types"
     ]
   },
+  "include": [
+    "**/*",
+    "../demo/**/*"
+  ],
   "exclude": [
     "node_modules",
     "cdk.out",

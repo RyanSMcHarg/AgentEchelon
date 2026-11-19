@@ -41,7 +41,7 @@ tracking: |
 
 ## Status
 
-**Accepted (2026-10-28). All three slices built (2026-10-27 and 2026-10-28) and deployed to dev; the language e2e passed on dev on 2026-10-29 ("What proves it").** What each slice builds is in "What is built", and what remains, with its reason, in "What is not built".
+**Accepted (2026-10-28). All three slices built (2026-10-27 and 2026-10-28) and deployed to dev; the language e2e passed on dev on 2026-11-05 ("What proves it").** What each slice builds is in "What is built", and what remains, with its reason, in "What is not built".
 
 Two systems put words in front of a person, and only one of them is built to be owned, versioned and localized:
 
@@ -228,7 +228,7 @@ The share lines (`sharedSubject`, `sharedHeading`, `sharedBody`) are retired rat
 Each keyed line and each literal becomes a shipped template, so the console shows the shipped text beside every line an assistant can reword. Two need a seam rather than a template only:
 
 - **Drift** is composed in the data plane, which holds no assistant's templates, so drift detection returns a template name and its values and the router renders it.
-- **A workflow step's placeholder** is the step's declared `placeholder` (parsed from the intent pack and never read today, as SPEC-TASK-STATE-TRANSITIONS section 4 specifies), then the assistant's message template, then the shipped one.
+- **A workflow step's placeholder** is the step's declared `placeholder` (parsed from the intent pack and never read today, as DESIGN-TASK-STATE-TRANSITIONS section 4 specifies), then the assistant's message template, then the shipped one.
 
 ## Decision 7: a reply is chosen by intent, never by matching what a person typed
 
@@ -380,9 +380,9 @@ Built in slice 1 (each test is named in "What is built"):
 - the notice-variable strip tests run against message templates;
 - `backend/test/tenets-are-enforced.test.ts`'s D11 block refuses a string literal as the content of a channel post or `formatLexResponse` in the router and processor, and a phrase list in `delivery-options.ts`;
 - **deny tests:** a person's language setting reads and writes only a profile row's preferences (`a-person-sets-their-own-language`); the admin alert poster reads only the admin assistant's notice family (`the-operator-notices-are-the-admin-agents-templates`); a classification's turn role reads only its own classification's templates; the console's writer holds no write on the classification and `_shipped` families, a team route cannot write another assistant's, and `manage-profiles` is refused every template pointer; the deploy writer reaches only the names it writes, never an assistant's family.
-- an e2e in which a person who chose a language receives a targeted workflow welcome in it, from a written variant (`tests/e2e/a-person-who-joins-is-welcomed-once-in-their-language.spec.ts`, 3/3) and from the assistant's voice, where a render that holds carries `voiceFill` with `outcome: voice` in the reader's language and adds no link or handle, and a render past its deadline posts the written text with `outcome: fallback:deadline` (`tests/e2e/a-welcome-is-said-in-the-assistants-voice.spec.ts`, 2/2); verified on dev 2026-10-29 with `cd backend && node scripts/validate.mjs --only=welcome-workflows`.
+- an e2e in which a person who chose a language receives a targeted workflow welcome in it, from a written variant (`tests/e2e/a-person-who-joins-is-welcomed-once-in-their-language.spec.ts`, 3/3) and from the assistant's voice, where a render that holds carries `voiceFill` with `outcome: voice` in the reader's language and adds no link or handle, and a render past its deadline posts the written text with `outcome: fallback:deadline` (`tests/e2e/a-welcome-is-said-in-the-assistants-voice.spec.ts`, 2/2); verified on dev 2026-11-05 with `cd backend && node scripts/validate.mjs --only=welcome-workflows`.
 
-Not yet proven:
+**Unproven** (no run recorded):
 
-- an e2e in which an assistant's reworded `member-welcome` template reaches the person in chat and by email (it needs a deploy);
-- an e2e in which an operator notice is said from the admin assistant's own template (written, not yet run: `tests/e2e/an-operator-notice-is-worded-by-the-admin-agent.spec.ts`, phase `notifications`).
+- an assistant's reworded `member-welcome` template reaching the person in chat and by email: no e2e exists;
+- an operator notice said from the admin assistant's own template: `tests/e2e/an-operator-notice-is-worded-by-the-admin-agent.spec.ts`, phase `notifications`.

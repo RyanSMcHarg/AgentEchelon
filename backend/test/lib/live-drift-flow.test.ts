@@ -39,8 +39,11 @@ function duelRunning(initiatorUserSub: string) {
 const mockCreateConversationFromDrift = jest.fn();
 
 const mockSavePending = jest.fn();
+/** The person's open offer, as the router reads it from their own work and hands it over. */
 const mockReadPending = jest.fn();
 const mockResolvePending = jest.fn();
+/** The answer relayed to the offer's task: a keep is kept, a move moved, unless a test says otherwise. */
+const mockAnswerOffer = jest.fn();
 const mockSeedDriftTopic = jest.fn().mockResolvedValue(undefined);
 const mockAdoptTopic = jest.fn();
 const mockClassifyReply = jest.fn();
@@ -56,11 +59,6 @@ jest.mock('../../lambda/src/lib/data-plane-client', () => ({
   resolveDriftRival: (...a: unknown[]) => mockResolveDriftRival(...a),
   recordDriftFire: (...a: unknown[]) => mockRecordDriftFire(...a),
   recordDriftOutcome: (...a: unknown[]) => mockRecordDriftOutcome(...a),
-  // The pending-suggestion task ops now run through the data plane (ADR-018),
-  // not via a direct routing-state query() from the non-VPC handler.
-  savePendingSuggestion: (...a: unknown[]) => mockSavePending(...a),
-  readPendingSuggestion: (...a: unknown[]) => mockReadPending(...a),
-  resolvePendingSuggestion: (...a: unknown[]) => mockResolvePending(...a),
   adoptOfferedTopic: (...a: unknown[]) => mockAdoptTopic(...a),
   // An accepted offer records the new conversation topic as its first summary, so drift there has a
   // real anchor from message one rather than the turn-one seed it refuses to compare against.
@@ -95,8 +93,14 @@ jest.mock('../../lambda/src/lib/battle-state', () => ({
 jest.mock('../../lambda/src/lib/channel-creation', () => ({
   createConversationFromDrift: (...a: unknown[]) => mockCreateConversationFromDrift(...a),
 }));
-jest.mock('../../lambda/src/lib/routing-state', () => ({
-  classifyConfirmDeclineReply: (...a: unknown[]) => mockClassifyReply(...a),
+// The reply to an open offer is the classifier model's reading (`readDriftOfferAnswer`), stood in for
+// here: `affirmative` reads as `move`, `negative` and `ambiguous` as `keep`, and `unread` as no reading.
+jest.mock('../../lambda/src/lib/drift-offer-answer', () => ({
+  readDriftOfferAnswer: async (args: { message: string }) => {
+    const verdict = mockClassifyReply(args.message);
+    if (verdict === 'unread') return undefined;
+    return verdict === 'affirmative' ? 'move' : 'keep';
+  },
 }));
 /** Which type key the gate actually looked its policy up by - the whole question for a stamped type. */
 const typeKeysAsked: string[] = [];
@@ -127,7 +131,19 @@ function loadFlow(env: Record<string, string | undefined>): FlowModule {
     else process.env[k] = v;
   }
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  return require('../../lambda/src/lib/live-drift-flow');
+  const mod = require('../../lambda/src/lib/live-drift-flow') as FlowModule;
+  return {
+    ...mod,
+    // THE ROUTER'S PART: it hands the person's open offer over, and relays their answer to it.
+    runLiveDriftFlow: async (input: Parameters<FlowModule['runLiveDriftFlow']>[0]) => {
+      const offer = await mockReadPending({ personId: input.personId, channelArn: input.channelArn });
+      return mod.runLiveDriftFlow({
+        ...(offer ? { openOffer: async () => offer } : {}),
+        answerOffer: (...a: unknown[]) => mockAnswerOffer(...a),
+        ...input,
+      });
+    },
+  } as FlowModule;
 }
 
 const CHANNEL = 'arn:aws:chime:us-east-1:111:app-instance/i/channel/c1';
@@ -160,6 +176,7 @@ beforeEach(() => {
   // These are awaited with `.catch(...)` in the flow, so they must be promises.
   mockRecordDriftOutcome.mockResolvedValue(undefined);
   mockResolvePending.mockResolvedValue(undefined);
+  mockAnswerOffer.mockImplementation(async (answer: string) => (answer === 'keep' ? 'kept' : 'moved'));
   mockAdoptTopic.mockResolvedValue({ adopted: true });
   // Default: no offer open.
   mockReadPending.mockResolvedValue(null);
@@ -351,7 +368,7 @@ describe('drift during a battle', () => {
 });
 
 describe('basic-classification drift path (basic had no drift before the re-home)', () => {
-  it('runs detectDrift and emits the suggestion template when drift fires', async () => {
+  it('runs detectDrift and raises the subject change when drift fires; the run makes the offer', async () => {
     mockDetectDrift.mockResolvedValue({
       isDrift: true,
       driftScore: 0.42,
@@ -362,8 +379,9 @@ describe('basic-classification drift path (basic had no drift before the re-home
     mockRecordDriftFire.mockResolvedValue('drift-evt-1');
     mockSavePending.mockResolvedValue({ taskId: 'task-1' });
 
+    const raise = jest.fn().mockResolvedValue('offered');
     const flow = loadFlow(ENABLED);
-    const result = await flow.runLiveDriftFlow({ ...baseInput, classification: 'basic' });
+    const result = await flow.runLiveDriftFlow({ ...baseInput, classification: 'basic', raiseSubjectChanged: raise });
 
     expect(mockDetectDrift).toHaveBeenCalledTimes(1);
     // detectDrift gets the classification as its EMF dimension and the uppercased intent.
@@ -372,19 +390,44 @@ describe('basic-classification drift path (basic had no drift before the re-home
     );
     expect(mockRecordDriftFire).toHaveBeenCalledTimes(1);
 
-    // The drift row must carry a RESOLVED originating message id, and the SAME one the pending
-    // suggestion records. It previously took `CHIME.message.id` straight off the event, which Chime
-    // does not send, so every live row stored '' - and the evaluation pass selects offers by
-    // `JOIN messages m ON m.message_id = d.originating_message_id`, which '' can never satisfy. No
-    // live offer was ever judged and the Accuracy tile read "Not measured" for good.
+    // The drift row must carry a RESOLVED originating message id, and the SAME one the subject change
+    // is raised for. Chime does not send `CHIME.message.id` on the event, so the id is resolved rather
+    // than read from it: the evaluation pass selects offers by
+    // `JOIN messages m ON m.message_id = d.originating_message_id`, which an empty id can never satisfy,
+    // and an offer that is never judged leaves the Accuracy tile reading "Not measured".
     const firedWith = mockRecordDriftFire.mock.calls[0][0] as { messageId?: string };
     expect(firedWith.messageId).toBeTruthy();
-    const savedWith = mockSavePending.mock.calls[0][0] as { originatingMessageId?: string };
-    expect(firedWith.messageId).toBe(savedWith.originatingMessageId);
+    // NO SECOND RECORD OF THE OFFER: the run's task is the only one.
+    expect(mockSavePending).not.toHaveBeenCalled();
+    // THE CHANGE IS RAISED FOR THE SAME MESSAGE, with what detection found, and this turn posts nothing.
+    expect(raise).toHaveBeenCalledWith(expect.objectContaining({ messageId: firedWith.messageId, kind: 'confirm', driftEventId: 'drift-evt-1', correlationId: 'corr-1' }));
+    expect(result).toEqual({ messages: [] });
+  });
 
-    expect(mockSavePending).toHaveBeenCalledTimes(1);
-    expect(result).not.toBeNull();
-    expect(result!.messages[0].content).toContain('separate conversation');
+  it('a redirect carries the conversation detection found, so the run can link the person there', async () => {
+    mockDetectDrift.mockResolvedValue({
+      isDrift: true, driftScore: 0.5, suggestedAction: 'redirect', suggestionTemplate: 'drift-redirect-offer',
+      rivalConversationArn: 'arn:aws:chime:us-east-1:111:app-instance/i/channel/rival', correlationId: 'corr-r',
+    });
+    mockRecordDriftFire.mockResolvedValue('drift-evt-r');
+    mockSavePending.mockResolvedValue({ taskId: 'task-r' });
+    const raise = jest.fn().mockResolvedValue('offered');
+    const flow = loadFlow(ENABLED);
+    await flow.runLiveDriftFlow({ ...baseInput, raiseSubjectChanged: raise });
+    expect(raise).toHaveBeenCalledWith(expect.objectContaining({ kind: 'redirect', rivalConversationArn: 'arn:aws:chime:us-east-1:111:app-instance/i/channel/rival' }));
+  });
+
+  it('a change no run took makes no offer: it is recorded so and the turn is answered', async () => {
+    mockDetectDrift.mockResolvedValue({
+      isDrift: true, driftScore: 0.42, suggestedAction: 'confirm', suggestionTemplate: 'drift-offer', correlationId: 'corr-n',
+    });
+    mockRecordDriftFire.mockResolvedValue('drift-evt-n');
+    mockSavePending.mockResolvedValue({ taskId: 'task-n' });
+    const flow = loadFlow(ENABLED);
+    const result = await flow.runLiveDriftFlow({ ...baseInput, raiseSubjectChanged: jest.fn().mockResolvedValue('none') });
+    expect(result).toBeNull();
+    // Nobody was shown an offer, so the record says so and no acceptance rate counts it.
+    expect(mockRecordDriftOutcome).toHaveBeenCalledWith({ eventId: 'drift-evt-n', outcome: 'not_offered' });
   });
 
   it('claims BEFORE posting, so a duplicate turn does not suggest twice', async () => {
@@ -460,26 +503,59 @@ describe('confirm path creates a channel at the type classification', () => {
     ...over,
   });
 
-  it('on an affirmative reply to an open confirm, creates a new channel and returns a NAVIGATE response', async () => {
+  /** The move the run's move step makes (WT90), with what the open offer recorded. */
+  const move = (flow: FlowModule, offer: ReturnType<typeof openOffer> & { rivalConversationArn?: string }, over: Record<string, unknown> = {}) => flow.moveSubject({
+    kind: offer.kind as 'confirm' | 'redirect', channelArn: CHANNEL, classification: 'basic', botArn: baseInput.botArn,
+    senderArn: baseInput.event.requestAttributes['CHIME.sender.arn'], originatingMessageId: offer.originatingMessageId, answeringMessageId: 'msg-yes',
+    ...(offer.driftEventId ? { driftEventId: offer.driftEventId } : {}),
+    ...(offer.rivalConversationArn ? { rivalConversationArn: offer.rivalConversationArn } : {}),
+    ...over,
+  });
+
+  it('a yes moves the sender\'s offer to move, carrying the reply, and posts nothing from the turn', async () => {
     mockReadPending.mockResolvedValue(openOffer());
     mockClassifyReply.mockReturnValue('affirmative');
+    const answerOffer = jest.fn().mockResolvedValue('moved');
+    const flow = loadFlow(ENABLED);
+    const result = await flow.runLiveDriftFlow({ ...baseInput, event: { ...baseInput.event, requestAttributes: { ...baseInput.event.requestAttributes, 'AE.message.id': 'msg-yes' } }, answerOffer });
+    expect(answerOffer).toHaveBeenCalledWith('move', 'msg-yes');
+    expect(result).toEqual({ messages: [] });
+    expect(mockCreateConversationFromDrift).not.toHaveBeenCalled();
+    expect(mockDetectDrift).not.toHaveBeenCalled();
+  });
+
+  it('a yes to an offer that is no longer open answers the message', async () => {
+    mockReadPending.mockResolvedValue(openOffer());
+    mockClassifyReply.mockReturnValue('affirmative');
+    const flow = loadFlow(ENABLED);
+    const result = await flow.runLiveDriftFlow({ ...baseInput, answerOffer: jest.fn().mockResolvedValue('gone') });
+    expect(result).toBeNull();
+  });
+
+  it('a yes whose move did not happen is told so, never met with silence', async () => {
+    mockReadPending.mockResolvedValue(openOffer());
+    mockClassifyReply.mockReturnValue('affirmative');
+    const flow = loadFlow(ENABLED);
+    const result = await flow.runLiveDriftFlow({ ...baseInput, answerOffer: jest.fn().mockResolvedValue('not-moved') });
+    expect(result?.messages).toHaveLength(1);
+    expect(result!.messages[0].content).toMatch(/move/i);
+  });
+
+  it('the move creates a new conversation at the room\'s classification, of the step\'s type, with the audience', async () => {
     mockCreateConversationFromDrift.mockResolvedValue({ channelArn: 'arn:new:channel', channelId: 'cid' });
 
     const flow = loadFlow(ENABLED);
-    const result = await flow.runLiveDriftFlow({ ...baseInput, classification: 'premium' });
+    const result = await move(flow, openOffer(), { classification: 'premium', typeKey: 'support', memberArns: ['arn:p2'] });
 
     expect(mockCreateConversationFromDrift).toHaveBeenCalledTimes(1);
     // The spawned channel carries the PARENT conversation's classification, never one read off a type.
     expect(mockCreateConversationFromDrift).toHaveBeenCalledWith(
-      expect.objectContaining({ modelTier: 'premium' }),
+      expect.objectContaining({ modelTier: 'premium', typeKey: 'support', additionalMemberArns: ['arn:p2'] }),
     );
-    expect(mockResolvePending).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'confirmed' }));
     // The drift event id rides the durable offer, so the acceptance is recorded on it.
     expect(mockRecordDriftOutcome).toHaveBeenCalledWith(expect.objectContaining({ eventId: 'evt-1', outcome: 'accepted' }));
-    expect(result).not.toBeNull();
-    expect(result!.messages[0].content).toContain('NAVIGATE_CHANNEL:arn:new:channel');
-    // detectDrift is NOT re-run on a confirmed offer.
-    expect(mockDetectDrift).not.toHaveBeenCalled();
+    expect(result?.channelArn).toBe('arn:new:channel');
+    expect(result!.reply).toContain('NAVIGATE_CHANNEL:arn:new:channel');
   });
 
   /**
@@ -505,20 +581,36 @@ describe('confirm path creates a channel at the type classification', () => {
     ...over,
   });
 
-  it('on an affirmative reply to an open REDIRECT, navigates to the rival and creates NOTHING', async () => {
-    mockReadPending.mockResolvedValue(openRedirect());
-    mockClassifyReply.mockReturnValue('affirmative');
-
+  it('a move nobody was asked about is recorded so, never as an acceptance', async () => {
+    mockCreateConversationFromDrift.mockResolvedValue({ channelArn: 'arn:new:unasked', channelId: 'cid' });
     const flow = loadFlow(ENABLED);
-    const result = await flow.runLiveDriftFlow({ ...baseInput, classification: 'premium' });
+    await move(flow, openOffer(), { unasked: true });
+    expect(mockRecordDriftOutcome).toHaveBeenCalledWith(expect.objectContaining({ eventId: 'evt-1', outcome: 'moved_unasked' }));
+    // The outcome the record may hold (migration 101).
+    const sql = require('fs').readFileSync(require('path').resolve(__dirname, '../../lambda/src/analytics-aurora/schema/101-a-move-nobody-was-asked-about.sql'), 'utf8');
+    expect(sql).toMatch(/'moved_unasked'/);
+  });
+
+  it('the stats count a yes whatever became of the new conversation, and tell a move nobody used from an offer nobody answered', () => {
+    const query = require('fs').readFileSync(require('path').resolve(__dirname, '../../lambda/src/analytics-aurora/analytics-query.ts'), 'utf8');
+    expect(query).toMatch(/outcome IN \('accepted', 'abandoned', 'rejected_in_new_channel'\) AND new_channel_arn IS NOT NULL\)\)\) AS moved_count/);
+    expect(query).toMatch(/outcome = 'accepted' AND engagement_settled\) AS carried_on_count/);
+    expect(query).toMatch(/outcome = 'abandoned' AND new_channel_arn IS NOT NULL\) AS moved_unused_count/);
+    expect(query).toMatch(/outcome = 'abandoned' AND new_channel_arn IS NULL\) AS unanswered_count/);
+    expect(query).not.toMatch(/AS unresolved_count/);
+  });
+
+  it('a move on a REDIRECT links the person to the existing conversation and creates NOTHING', async () => {
+    const flow = loadFlow(ENABLED);
+    const result = await move(flow, openRedirect() as unknown as ReturnType<typeof openOffer>);
 
     // THE ASSERTION FR7 IS ABOUT. A redirect that created a channel would satisfy any test looking
     // only at the reply, and would be the duplicate thread the requirement forbids.
     expect(mockCreateConversationFromDrift).not.toHaveBeenCalled();
 
     expect(result).not.toBeNull();
-    expect(result!.messages[0].content).toContain('NAVIGATE_CHANNEL:arn:aws:chime:us-east-1:111111111111:app-instance/test/channel/rival');
-    expect(result!.messages[0].content).toContain('Existing conversation');
+    expect(result!.reply).toContain('NAVIGATE_CHANNEL:arn:aws:chime:us-east-1:111111111111:app-instance/test/channel/rival');
+    expect(result!.reply).toContain('Existing conversation');
 
     // The acceptance is recorded against the rival, so the analytics say where the person went
     // rather than that a conversation was born.
@@ -527,27 +619,20 @@ describe('confirm path creates a channel at the type classification', () => {
       outcome: 'accepted',
       newChannelArn: 'arn:aws:chime:us-east-1:111111111111:app-instance/test/channel/rival',
     }));
-    expect(mockResolvePending).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'confirmed' }));
-    expect(mockDetectDrift).not.toHaveBeenCalled();
   });
 
-  it('leaves a redirect offer that names no rival unacted, rather than creating a conversation', async () => {
+  it('moves nothing for a redirect that names no rival, rather than creating a conversation', async () => {
     // An offer written by an older deploy, or one whose rival went away. The branch is gated on the
     // ARN being present; without this, falling through to the create path would turn a redirect into
     // exactly the duplicate FR7 prevents - and the person would get a plausible answer either way.
-    mockReadPending.mockResolvedValue(openRedirect({ rivalConversationArn: undefined }));
-    mockClassifyReply.mockReturnValue('affirmative');
-
     const flow = loadFlow(ENABLED);
-    const result = await flow.runLiveDriftFlow({ ...baseInput });
+    const result = await move(flow, openRedirect({ rivalConversationArn: undefined }) as unknown as ReturnType<typeof openOffer>);
 
     expect(mockCreateConversationFromDrift).not.toHaveBeenCalled();
-    // The offer stays open and the turn is answered normally rather than acted on wrongly.
-    expect(mockResolvePending).not.toHaveBeenCalled();
     expect(result).toBeNull();
   });
 
-  it('reads the open offer from the durable store on EVERY drift turn, whatever the message looks like', async () => {
+  it('takes the open offer the router hands over on EVERY drift turn, whatever the message looks like', async () => {
     // THE DEFECT THIS PINS. The offer was read from the Amazon Lex session first, and from Aurora only
     // when the reply looked like a yes or a no. A turn the channel flow answers has no Lex session, so
     // there an ordinary message could not see the open offer and ran detection again beside it.
@@ -555,31 +640,32 @@ describe('confirm path creates a channel at the type classification', () => {
     mockDetectDrift.mockResolvedValue({ isDrift: false, driftScore: 0.1, suggestedAction: 'continue', correlationId: 'c' });
 
     const flow = loadFlow(ENABLED);
-    await flow.runLiveDriftFlow({ ...baseInput });
+    const offer = jest.fn(async () => undefined);
+    await flow.runLiveDriftFlow({ ...baseInput, openOffer: offer });
 
-    expect(mockReadPending).toHaveBeenCalledWith({ personId: 'u1', channelArn: CHANNEL });
+    expect(offer).toHaveBeenCalledTimes(1);
+    const router = require('fs').readFileSync(require('path').resolve(__dirname, '../../lambda/src/router-agent-handler.ts'), 'utf8');
+    expect(router).toMatch(/openOffer: subjectOffer,/);
   });
 
   it('keeps no state in an event session, so a turn with no Lex session behaves identically', async () => {
     mockReadPending.mockResolvedValue(openOffer());
     mockClassifyReply.mockReturnValue('affirmative');
-    mockCreateConversationFromDrift.mockResolvedValue({ channelArn: 'arn:new:channel', channelId: 'cid' });
+    const answerOffer = jest.fn().mockResolvedValue('moved');
     const flow = loadFlow(ENABLED);
 
     // The event carries no sessionState at all: the shape a channel-flow entry produces.
-    const result = await flow.runLiveDriftFlow({ ...baseInput });
+    const result = await flow.runLiveDriftFlow({ ...baseInput, answerOffer });
 
     expect(result).not.toBeNull();
     expect(result).not.toHaveProperty('sessionAttributes');
-    expect(mockCreateConversationFromDrift).toHaveBeenCalledTimes(1);
+    expect(answerOffer).toHaveBeenCalledTimes(1);
   });
 
   it('passes the ORIGINATING message by reference — the ack text never becomes the new channel content', async () => {
     // SPEC-DRIFT-CONVERGENCE.md "by-reference principle": the new channel references the original user
     // message by id; the confirmation reply ("yes please") is a control token, not conversation content,
     // and must NOT be copied into the spawned channel.
-    mockReadPending.mockResolvedValue(openOffer({ taskId: 'task-9', originatingMessageId: 'msg-original-42' }));
-    mockClassifyReply.mockReturnValue('affirmative');
     mockCreateConversationFromDrift.mockResolvedValue({ channelArn: 'arn:new:channel2', channelId: 'cid2' });
     // The person's words, read back from Amazon Chime SDK by the id the offer stored.
     mockChimeSend.mockImplementation(async (cmd: { __type?: string; input?: { MessageId?: string } }) => (
@@ -590,7 +676,7 @@ describe('confirm path creates a channel at the type classification', () => {
 
     const flow = loadFlow(ENABLED);
     const ackText = 'yes please';
-    await flow.runLiveDriftFlow({ ...baseInput, classification: 'premium', userMessage: ackText });
+    await move(flow, openOffer({ taskId: 'task-9', originatingMessageId: 'msg-original-42' }));
 
     expect(mockCreateConversationFromDrift).toHaveBeenCalledTimes(1);
     const createArgs = mockCreateConversationFromDrift.mock.calls[0][0] as Record<string, unknown>;
@@ -603,13 +689,11 @@ describe('confirm path creates a channel at the type classification', () => {
   });
 
   it('still creates the conversation under the generic label when the message cannot be read back', async () => {
-    mockReadPending.mockResolvedValue(openOffer());
-    mockClassifyReply.mockReturnValue('affirmative');
     mockCreateConversationFromDrift.mockResolvedValue({ channelArn: 'arn:new:channel3', channelId: 'cid3' });
     mockChimeSend.mockRejectedValue(Object.assign(new Error('gone'), { name: 'NotFoundException' }));
 
     const flow = loadFlow(ENABLED);
-    await flow.runLiveDriftFlow({ ...baseInput, userMessage: 'yes' });
+    await move(flow, openOffer());
 
     const createArgs = mockCreateConversationFromDrift.mock.calls[0][0] as Record<string, unknown>;
     expect(createArgs.topicLabel).toBe('Drift Follow-up');
@@ -621,12 +705,10 @@ describe('confirm path creates a channel at the type classification', () => {
   // compare against a turn-one seed, so without this the conversation created because of a topic would
   // be the one place drift stayed blind longest.
   it('records the topic as the new conversation first summary', async () => {
-    mockReadPending.mockResolvedValue(openOffer());
-    mockClassifyReply.mockReturnValue('affirmative');
     mockCreateConversationFromDrift.mockResolvedValue({ channelArn: 'arn:new:channel4', channelId: 'cid4' });
 
     const flow = loadFlow(ENABLED);
-    await flow.runLiveDriftFlow({ ...baseInput, userMessage: 'yes' });
+    await move(flow, openOffer());
 
     expect(mockSeedDriftTopic).toHaveBeenCalledTimes(1);
     const seedArgs = mockSeedDriftTopic.mock.calls[0][0] as Record<string, unknown>;
@@ -641,16 +723,14 @@ describe('confirm path creates a channel at the type classification', () => {
     // The conversation exists and the person is being sent to it. A failure to write its anchor must
     // be invisible to them. A REJECTION and a SYNCHRONOUS THROW are different failures and this pins
     // the throwing one, which is what escapes a bare .catch() and cost this path a whole turn.
-    mockReadPending.mockResolvedValue(openOffer());
-    mockClassifyReply.mockReturnValue('affirmative');
     mockCreateConversationFromDrift.mockResolvedValue({ channelArn: 'arn:new:channel5', channelId: 'cid5' });
     mockSeedDriftTopic.mockImplementationOnce(() => { throw new Error('data plane absent'); });
 
     const flow = loadFlow(ENABLED);
-    const result = await flow.runLiveDriftFlow({ ...baseInput, userMessage: 'yes' });
+    const result = await move(flow, openOffer());
 
     expect(result).not.toBeNull();
-    expect(result!.messages[0].content).toContain('NAVIGATE_CHANNEL:arn:new:channel5');
+    expect(result!.reply).toContain('NAVIGATE_CHANNEL:arn:new:channel5');
   });
 });
 
@@ -659,6 +739,31 @@ describe('confirm path creates a channel at the type classification', () => {
 // "Once drift is declined the topic determined as drift becomes a topic of the conversation, so
 // therefore should no longer be considered drift." And the offer says "anything else to keep going here",
 // so any reply but a yes is that decline.
+describe('the words read back are the person\'s, without their address to the assistant', () => {
+  const BOT = 'arn:aws:chime:us-east-1:1:app-instance/i/bot/advisor-id';
+  const read = async (content: string) => {
+    mockChimeSend.mockImplementation(async () => ({ ChannelMessage: { Content: encodeURIComponent(content) } }));
+    return loadFlow(ENABLED).readOriginatingMessageText({ channelArn: CHANNEL, messageId: 'm1', botArn: BOT });
+  };
+
+  it('a private address or a mention of this assistant is left out', async () => {
+    expect(await read('.<Advisor|advisor-id> quarterly revenue forecasting')).toBe('quarterly revenue forecasting');
+    expect(await read('@<Advisor|advisor-id> quarterly revenue forecasting')).toBe('quarterly revenue forecasting');
+  });
+
+  it('an address typed by hand goes too, by the name the room knows the assistant by, and so does @all', async () => {
+    mockChimeSend.mockImplementation(async (cmd: { __type?: string }) => (cmd.__type === 'ListMemberships'
+      ? { ChannelMemberships: [{ Member: { Arn: BOT, Name: 'Advisor' } }] }
+      : { ChannelMessage: { Content: encodeURIComponent('@Advisor quarterly revenue forecasting') } }));
+    expect(await loadFlow(ENABLED).readOriginatingMessageText({ channelArn: CHANNEL, messageId: 'm1', botArn: BOT })).toBe('quarterly revenue forecasting');
+    expect(await read('@all quarterly revenue forecasting')).toBe('quarterly revenue forecasting');
+  });
+
+  it('a colleague named in the message stays, as the person wrote it', async () => {
+    expect(await read('ask @<Dana|dana-id> about forecasting')).toBe('ask @<Dana|dana-id> about forecasting');
+  });
+});
+
 describe('declining an offer keeps the subject here, as a topic of the conversation', () => {
   const openOffer = {
     taskId: 'task-d', channelArn: CHANNEL, personId: 'u1', kind: 'confirm',
@@ -674,9 +779,49 @@ describe('declining an offer keeps the subject here, as a topic of the conversat
     const result = await flow.runLiveDriftFlow({ ...baseInput, userMessage: 'no' });
 
     expect(mockRecordDriftOutcome).toHaveBeenCalledWith({ eventId: 'evt-d', outcome: 'declined' });
-    expect(mockResolvePending).toHaveBeenCalledWith({ taskId: 'task-d', outcome: 'declined' });
+    expect(mockAnswerOffer).toHaveBeenCalledWith('keep', expect.any(String));
     expect(mockAdoptTopic).toHaveBeenCalledWith({ channelArn: CHANNEL, correlationId: 'corr-d' });
     // The turn is answered normally.
+    expect(result).toBeNull();
+  });
+
+  it('a public message cannot answer an offer made on a private one, so the private question is not answered in the room', async () => {
+    mockReadPending.mockResolvedValue({ ...openOffer, privateMessage: true });
+    mockClassifyReply.mockReturnValue('negative');
+    const flow = loadFlow(ENABLED);
+
+    const result = await flow.runLiveDriftFlow({ ...baseInput, userMessage: 'no' });
+
+    expect(result).toBeNull();
+    expect(mockRecordDriftOutcome).not.toHaveBeenCalled();
+    expect(mockAnswerOffer).not.toHaveBeenCalled();
+  });
+
+  it('a private reply answers an offer made on a private message', async () => {
+    mockReadPending.mockResolvedValue({ ...openOffer, privateMessage: true });
+    mockClassifyReply.mockReturnValue('negative');
+    mockDetectDrift.mockResolvedValue({ isDrift: false, driftScore: 0.1, suggestedAction: 'continue', correlationId: 'c' });
+    const flow = loadFlow(ENABLED);
+    const event = { ...baseInput.event, requestAttributes: { ...baseInput.event.requestAttributes, 'AE.message.id': 'msg-private-reply', 'AE.turn.targeted': '1' } };
+
+    await flow.runLiveDriftFlow({ ...baseInput, event, userMessage: 'no' });
+
+    expect(mockRecordDriftOutcome).toHaveBeenCalledWith({ eventId: 'evt-d', outcome: 'declined' });
+    expect(mockAnswerOffer).toHaveBeenCalledWith('keep', 'msg-private-reply');
+  });
+
+  it('a reply the model could not read leaves the offer open, declines nothing and answers the message', async () => {
+    mockReadPending.mockResolvedValue(openOffer);
+    mockClassifyReply.mockReturnValue('unread');
+    const flow = loadFlow(ENABLED);
+
+    const result = await flow.runLiveDriftFlow({ ...baseInput, userMessage: 'hmm' });
+
+    expect(mockRecordDriftOutcome).not.toHaveBeenCalled();
+    // NEITHER: nobody said no, so the offer stays open until its deadline and nothing is relayed to it.
+    expect(mockAnswerOffer).not.toHaveBeenCalled();
+    expect(mockAdoptTopic).not.toHaveBeenCalled();
+    expect(mockCreateConversationFromDrift).not.toHaveBeenCalled();
     expect(result).toBeNull();
   });
 
@@ -722,7 +867,7 @@ describe('declining an offer keeps the subject here, as a topic of the conversat
 
     await flow.runLiveDriftFlow({ ...baseInput, userMessage: 'actually, what about the second quarter?' });
 
-    expect(mockResolvePending).toHaveBeenCalledWith({ taskId: 'task-d', outcome: 'declined' });
+    expect(mockAnswerOffer).toHaveBeenCalledWith('keep', expect.any(String));
     expect(mockAdoptTopic).toHaveBeenCalledWith({ channelArn: CHANNEL, correlationId: 'corr-d' });
   });
 
@@ -755,7 +900,7 @@ describe('declining an offer keeps the subject here, as a topic of the conversat
     const result = await flow.runLiveDriftFlow({ ...baseInput });
 
     expect(result).toBeNull();
-    expect(mockResolvePending).not.toHaveBeenCalled();
+    expect(mockAnswerOffer).not.toHaveBeenCalled();
     expect(mockRecordDriftOutcome).not.toHaveBeenCalled();
     expect(mockAdoptTopic).not.toHaveBeenCalled();
     // And no second offer is attempted beside the open one.
@@ -775,7 +920,7 @@ describe('declining an offer keeps the subject here, as a topic of the conversat
     });
 
     expect(result).toBeNull();
-    expect(mockResolvePending).not.toHaveBeenCalled();
+    expect(mockAnswerOffer).not.toHaveBeenCalled();
     expect(mockAdoptTopic).not.toHaveBeenCalled();
   });
 
@@ -792,10 +937,10 @@ describe('declining an offer keeps the subject here, as a topic of the conversat
       resolveInbound: async () => ({ messageId: 'msg-late', createdAt: '2026-09-12T10:00:09.000Z' }),
     });
 
-    expect(mockResolvePending).toHaveBeenCalledWith({ taskId: 'task-d', outcome: 'declined' });
+    expect(mockAnswerOffer).toHaveBeenCalledWith('keep', expect.any(String));
   });
 
-  it('a fired offer keeps its embedding for adoption and carries its drift event on the durable record', async () => {
+  it('a fired offer keeps its embedding for adoption and carries its drift event into the run', async () => {
     mockDetectDrift.mockResolvedValue({
       isDrift: true, driftScore: 0.5, suggestedAction: 'confirm',
       suggestionTemplate: 'drift-offer', correlationId: 'corr-new',
@@ -803,11 +948,12 @@ describe('declining an offer keeps the subject here, as a topic of the conversat
     mockRecordDriftFire.mockResolvedValue('evt-new');
     mockSavePending.mockResolvedValue({ taskId: 'task-new' });
     const flow = loadFlow(ENABLED);
+    const raise = jest.fn().mockResolvedValue('offered');
 
-    await flow.runLiveDriftFlow({ ...baseInput });
+    await flow.runLiveDriftFlow({ ...baseInput, raiseSubjectChanged: raise });
 
     expect(mockDetectDrift.mock.calls[0][0].retainOfferEmbedding).toBe(true);
-    expect(mockSavePending).toHaveBeenCalledWith(expect.objectContaining({
+    expect(raise).toHaveBeenCalledWith(expect.objectContaining({
       correlationId: 'corr-new', driftEventId: 'evt-new',
     }));
   });

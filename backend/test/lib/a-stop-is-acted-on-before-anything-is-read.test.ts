@@ -35,7 +35,7 @@ describe('the stop branch runs before anything reads the message for meaning', (
 
   it('runs before the waiting-task step, so a stop is never applied as an answer', () => {
     expect(STOP).toBeLessThan(at('await applyUserResponseToTask({'));
-    expect(STOP).toBeLessThan(at('const heldByPerson = personTasks.live;'));
+    expect(STOP).toBeLessThan(at('const heldByPerson = personTasks.live'));
   });
 
   it('runs before the onboarding intake and the drift check', () => {
@@ -49,7 +49,7 @@ describe('the stop branch runs before anything reads the message for meaning', (
 });
 
 describe('the private-stop refusal moved with it', () => {
-  const end = SRC.indexOf('const turnAttachment = bypassAttachment(event);');
+  const end = SRC.indexOf('const lexEnteredRead = ');
   const block = SRC.slice(STOP, end);
 
   it('is inside the stop branch and ahead of the rest of the turn', () => {

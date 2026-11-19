@@ -216,7 +216,7 @@ const ExperimentBattles: React.FC<ExperimentBattlesProps> = ({ dateRange, experi
 
   return (
     <section className="admin-section" data-testid="experiment-battles" aria-labelledby="experiment-battles-title">
-      <h4 id="experiment-battles-title">{t('admin.battles.title')}</h4>
+      <h3 id="experiment-battles-title">{t('admin.battles.title')}</h3>
       <p className="admin-tab-description">{t('admin.battles.help')}</p>
 
       {error && <div className="admin-error" role="alert"><span>{error}</span></div>}
@@ -232,7 +232,7 @@ const ExperimentBattles: React.FC<ExperimentBattlesProps> = ({ dateRange, experi
         <>
           {summary && <p className="battle-summary" data-testid="battles-summary"><strong>{summary}</strong></p>}
 
-          <h5>{t('admin.battles.byVersion')}</h5>
+          <h4>{t('admin.battles.byVersion')}</h4>
           <p className="admin-tab-description">{t('admin.battles.byVersionHelp')}</p>
           <div className="data-table-wrapper">
             <table className="data-table" data-testid="battles-by-version">
@@ -264,7 +264,7 @@ const ExperimentBattles: React.FC<ExperimentBattlesProps> = ({ dateRange, experi
             </table>
           </div>
 
-          <h5>{t('admin.battles.eachBattle')}</h5>
+          <h4>{t('admin.battles.eachBattle')}</h4>
           <p className="admin-tab-description">{t('admin.battles.eachBattleHelp')}</p>
           {battles.length === 0 ? (
             <p className="admin-tab-description">{t('admin.battles.noneListed')}</p>

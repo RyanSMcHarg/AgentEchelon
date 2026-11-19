@@ -30,7 +30,7 @@ import { edgeIssuers, edgeVerificationErrors } from '../config/edge-verification
 import { defaultProfileRegistry as profiles } from '../profile-registry';
 import { publishRegistryRow, registryBucket, registryHealthAlarms } from '../constructs/registry-row';
 import { COGNITO_LIFECYCLE_EVENTS } from '../../lambda/src/lib/issuer-lifecycle';
-import { grantAccountStateRead } from '../constructs/directory-access';
+import { grantAccountStateRead, grantLiveClearance } from '../constructs/directory-access';
 import { issuersOf, trustedIssuersJson } from '../constructs/trusted-issuers';
 import { PROVISIONERS, SubjectProvisioner, type ProvisionerCaller } from '../constructs/subject-provisioner';
 import { contactCopiesDeclared, grantContactCopyParams } from '../constructs/contact-copy';
@@ -62,7 +62,7 @@ export interface IdentityStackProps extends cdk.StackProps {
   subjectProvisioners?: Partial<Record<ProvisionerCaller, string[]>>;
   /**
    * Whether the deployment receives email replies (M-8): `notifications` is declared with a `replyDomain`.
-   * The reply poster's role is created here, beside the one-conversation role it assumes.
+   * The reply poster's role is created here, beside the `restricted` role it assumes.
    */
   emailReplies?: boolean;
   /**
@@ -127,7 +127,7 @@ export class IdentityStack extends cdk.Stack implements RouteSource {
   public readonly subjectProvisioners: Partial<Record<ProvisionerCaller, lambda.IFunction>> = {};
   /**
    * The role the email reply poster runs on (M-8), when the deployment receives replies, and the
-   * one-conversation role it assumes to post as the person. The Notifications stack builds the function.
+   * `restricted` role it assumes to post as the person. The Notifications stack builds the function.
    */
   public readonly replyPoster?: { roleArn: string; restrictedRoleArn: string };
 
@@ -162,7 +162,7 @@ export class IdentityStack extends cdk.Stack implements RouteSource {
     const exchangeOrigins = sharedOrigins(this);
     const appUrlForExchange = exchangeOrigins.join(',');
     // A person's vend roles, their bearer-pinned statements and their boundaries are `ExchangeRole`
-    // (`lib/constructs/exchange-role.ts`), built here for the one-conversation role and the admin plane, and by
+    // (`lib/constructs/exchange-role.ts`), built here for the `restricted` role and the admin plane, and by
     // each `Assistants-<classification>` stack for its own classification.
 
     // ── THE TRUSTED-ISSUER REGISTRY (lib/config/issuers.ts) ─────────────────────────────────────────
@@ -204,7 +204,7 @@ export class IdentityStack extends cdk.Stack implements RouteSource {
       managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')],
     });
 
-    // THE ONE-CONVERSATION ROLE (`restricted`), which is not a classification: bounded by the session scope and
+    // THE `restricted` ROLE, which is not a classification: bounded by the session scope and
     // by membership rather than by a classification tag (SPEC-CONVERSATION-SECURITY section 4a, footnote 1). The
     // same construct as every vend role, on the same path, with the same pins on its trust policy.
     const exchangeRoleRestricted = new ExchangeRole(this, 'ExchangeRoleRestricted', {
@@ -213,8 +213,8 @@ export class IdentityStack extends cdk.Stack implements RouteSource {
 
     // ── THE EMAIL REPLY POSTER (M-8): A PERSON'S REPLY, ON THE PERSON'S OWN ROLE ──────────────────
     //
-    // A reply that passes its token, DMARC and From checks is posted as the person, on the session the
-    // exchange's one-conversation vend gives them: this role, with the same `person` and `classification`
+    // A reply that passes its token, DMARC and From checks is posted as the person, on
+    // this role, with the same `person` and `classification`
     // assertions on the assume and on the tagging, so the bearer is pinned exactly as it is for the exchange.
     // Its role holds the assume and nothing else here; the Notifications stack adds what the poster reads.
     if (props.emailReplies) {
@@ -283,10 +283,9 @@ export class IdentityStack extends cdk.Stack implements RouteSource {
         // EACH CLASSIFICATION'S VEND ROLE IS FOUND BY NAME AT CALL TIME, under the key its own stack publishes
         // (`exchangeRoleArnKey`), so the exchange's environment names no classification.
         EXCHANGE_ROLE_ARN_PARAM_ROOT,
-        EXCHANGE_ROLE_RESTRICTED: exchangeRoleRestricted.roleArn,
         ...(this.selfPoolId ? { USER_POOL_ID: this.selfPoolId } : {}),
         // ONE EXCHANGE FOR EVERY ISSUER: the registry decides the subject, the clearance and the
-        // classifications it may grant, admin, and whether a person is vended one conversation.
+        // classifications it may grant, and admin.
         TRUSTED_ISSUERS: trustedIssuersJsonValue,
       },
       bundling: { minify: false, forceDockerBundling: false, externalModules: ['@aws-sdk/*'] },
@@ -428,7 +427,7 @@ export class IdentityStack extends cdk.Stack implements RouteSource {
     });
 
     // THE EXCHANGE'S ROUTE, ON `PersonApi`, behind the edge authorizer's UNCACHED attachment: every issuer the
-    // registry declares reaches it, the one-conversation ones and a first sign-in included, since it is
+    // registry declares reaches it, a first sign-in included, since it is
     // what mints their person. What a person is vended follows from their issuer's entry
     // (`TRUSTED_ISSUERS`, above), never from a second route. Not throttled: a shared throttle here would
     // throttle sign-in for everyone at once.
@@ -487,6 +486,23 @@ export class IdentityStack extends cdk.Stack implements RouteSource {
       actions: ['chime:PutAppInstanceUserExpirationSettings'],
       resources: [`${props.appInstanceArn}/user/*`],
     }));
+    // A DASHBOARD READ IS VENDED AFTER THE CONVERSATION CHECK THE PRESIGNER MAKES (DESIGN-CONVERSATION-DASHBOARDS section 4): the
+    // caller's membership, looked up with the caller as bearer, the conversation's classification tag and the live clearance.
+    // Reads only; the bucket is found by name at call time, under the key the conversations stack publishes.
+    credentialExchangeRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'DashboardConversationCheck',
+      actions: ['chime:DescribeChannelMembership', 'chime:ListTagsForResource'],
+      resources: [`${props.appInstanceArn}/channel/*`, `${props.appInstanceArn}/user/*`],
+    }));
+    credentialExchangeRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'DashboardBucketName',
+      actions: ['ssm:GetParameter'],
+      resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SHARED_SSM.attachmentsBucketArn}`],
+    }));
+    credentialExchangeFn.addEnvironment('EXCHANGE_ATTACHMENTS_BUCKET_ARN_PARAM', SHARED_SSM.attachmentsBucketArn);
+    // THE TABLE ITSELF, as this stack's own grants pass it: resolved through SSM, a first deploy would read a parameter this stack
+    // has not created yet.
+    grantLiveClearance(credentialExchangeFn, { appInstanceArn: props.appInstanceArn, userPoolId: this.selfPoolId, identities: identitiesTable });
     credentialExchangeRole.addToPolicy(new iam.PolicyStatement({
       sid: 'InvitationTokensName',
       actions: ['ssm:GetParameter'],
@@ -558,17 +574,30 @@ export class IdentityStack extends cdk.Stack implements RouteSource {
             new iam.PolicyStatement({
               actions: [
                 'chime:DescribeAppInstanceUser',
-                // Delete on offboard: the person, and their admin-plane twin.
-                'chime:DeleteAppInstanceUser',
                 // The twin is found by its `owner` tag, which offboarding reads before removing it.
                 'chime:ListTagsForResource',
               ],
               resources: [`${props.appInstanceArn}/user/*`, props.appInstanceArn],
             }),
+            // Delete on offboard: the person, and their admin-plane twin. The delete authorizes against the
+            // AppInstanceUser alone.
+            new iam.PolicyStatement({
+              sid: 'DeletesAPersonOrTheirTwin',
+              actions: ['chime:DeleteAppInstanceUser'],
+              resources: [`${props.appInstanceArn}/user/*`],
+            }),
             // An offboarded twin's app-instance-admin elevation goes with it.
             new iam.PolicyStatement({
               actions: ['chime:DeleteAppInstanceAdmin'],
               resources: [props.appInstanceArn, `${props.appInstanceArn}/user/*`],
+            }),
+            // THE SERVICE ADMIN IS NO PERSON: offboarding never deletes it or drops its elevation, whatever id
+            // an erasure resolves to.
+            new iam.PolicyStatement({
+              sid: 'NeverTheServiceAdmin',
+              effect: iam.Effect.DENY,
+              actions: ['chime:DeleteAppInstanceUser', 'chime:DeleteAppInstanceAdmin'],
+              resources: [serviceAdminArnOf(props.appInstanceArn)],
             }),
           ],
         }),
@@ -907,9 +936,9 @@ export class IdentityStack extends cdk.Stack implements RouteSource {
     //
     // The app treats Cognito group membership — NOT the custom:tier
     // attribute — as the authoritative signal for what a user is
-    // allowed to do. custom:tier is set by the admin UI as a hint,
-    // and a sync step (post-confirmation + user-management) mirrors
-    // it into the matching group. Defense in depth: clearance checks in
+    // allowed to do. custom:tier is a request at sign-up and a hint after it;
+    // only an administrator (user-management) places a person in a
+    // group. Defense in depth: clearance checks in
     // create-conversation, share-conversation, and router-agent-
     // handler all look up groups, not the attribute.
     //
@@ -1187,9 +1216,7 @@ export class IdentityStack extends cdk.Stack implements RouteSource {
     // another member's name and have a private `.Name` message resolve to them. It also made
     // `custom:approved` self-settable, which is what the pre-authentication trigger gates sign-in on. So a
     // client writes only what sign-up sends: `email`, and `custom:tier` as a REQUESTED tier (authorization
-    // reads groups, which only admins and the post-confirmation trigger set, and the trigger only on a confirmed
-    // sign-up: it ran on a password reset too, which let a user write a tier and reset into it). Names are set by
-    // admins or the identity provider.
+    // reads groups, which only admins set). Names are set by admins or the identity provider.
     const selfWritableAttributes = new cognito.ClientAttributes()
       .withStandardAttributes({ email: true })
       .withCustomAttributes('tier');

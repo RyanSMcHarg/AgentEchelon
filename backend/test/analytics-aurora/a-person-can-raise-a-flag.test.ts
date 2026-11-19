@@ -25,7 +25,10 @@ jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
   InvokeModelCommand: jest.fn((input: unknown) => input),
 }));
 
-import { handler } from '../../lambda/src/analytics-aurora/analytics-query';
+import { handler, __setContentReadRecorder } from '../../lambda/src/analytics-aurora/analytics-query';
+
+// Every content read is recorded in the access log before it is served; the record itself is tested elsewhere.
+__setContentReadRecorder(async () => undefined);
 import { analyticsPathFor as pathFor } from '../helpers/analytics-path';
 import { edgeContext } from '../helpers/edge-context';
 
@@ -155,9 +158,12 @@ describe('a moderator withdraws a flag', () => {
   });
 });
 
+/** The flagged list carries each response and the message before it, so it is read with a stated reason. */
+const LIST_READ = { queryType: 'flagged_responses', dateRange: RANGE, accessReason: 'weekly quality review' };
+
 describe('the flagged list reads all three origins', () => {
   it('names the origin of every row, so a judge score and a colleague are not the same claim', async () => {
-    await handler(postEvent({ queryType: 'flagged_responses', dateRange: RANGE }));
+    await handler(postEvent(LIST_READ));
     const read = statements().find((s) => s.includes('raised_agg'));
     expect(read).toBeDefined();
     // All three origins, and the source carried out to the caller.
@@ -171,7 +177,7 @@ describe('the flagged list reads all three origins', () => {
     // Archival is asynchronous. Resolving the exchange when the flag is raised would pin a NULL for
     // any response flagged before its exchange row landed, and that flag would never appear in the
     // list it was raised for.
-    await handler(postEvent({ queryType: 'flagged_responses', dateRange: RANGE }));
+    await handler(postEvent(LIST_READ));
     const read = statements().find((s) => s.includes('raised_agg'))!;
     expect(read).toContain('JOIN messages m ON m.message_id = hf.message_id');
     expect(read).toContain('JOIN exchanges e ON e.agent_message_id = m.id');
@@ -186,7 +192,7 @@ describe('the flagged list reads all three origins', () => {
     // comparison is not a missing cast: Postgres raised `operator does not exist: uuid = character
     // varying` and the whole Flagged tab 502'd. Caught by the admin e2e, not by this file, because
     // every test here mocks the database and a mock has no types.
-    await handler(postEvent({ queryType: 'flagged_responses', dateRange: RANGE }));
+    await handler(postEvent(LIST_READ));
     const read = statements().find((s) => s.includes('raised_agg'))!;
     expect(read).not.toMatch(/agent_message_id\s*=\s*(hf|pf)\.message_id/);
   });
@@ -194,13 +200,13 @@ describe('the flagged list reads all three origins', () => {
   it('matches only the CREATE row, so one flag raises one row', async () => {
     // Archival writes a `<MessageId>-UPD` sibling for the answer, and exchanges link to the CREATE
     // row. Without this the join could match both and the response would appear twice.
-    await handler(postEvent({ queryType: 'flagged_responses', dateRange: RANGE }));
+    await handler(postEvent(LIST_READ));
     const read = statements().find((s) => s.includes('raised_agg'))!;
     expect(read.match(/m\.event_type = 'CREATE_CHANNEL_MESSAGE'/g) ?? []).toHaveLength(2);
   });
 
   it('LEFT joins the evaluation, because a human can flag what the judge never scored', async () => {
-    await handler(postEvent({ queryType: 'flagged_responses', dateRange: RANGE }));
+    await handler(postEvent(LIST_READ));
     const read = statements().find((s) => s.includes('raised_agg'))!;
     expect(read).toContain('LEFT JOIN evaluation_results er');
   });
@@ -208,13 +214,13 @@ describe('the flagged list reads all three origins', () => {
   it('orders human-raised rows first, so they are not buried under machine ones', async () => {
     // The old ordering was score-ascending with NULLS LAST. A human flag carries no score, so that
     // ordering would have put every one of them below every judge flag.
-    await handler(postEvent({ queryType: 'flagged_responses', dateRange: RANGE }));
+    await handler(postEvent(LIST_READ));
     const read = statements().find((s) => s.includes('raised_agg'))!;
     expect(read).toMatch(/ORDER BY \('moderator' = ANY\(ra\.flag_sources\) OR 'person' = ANY\(ra\.flag_sources\)\) DESC/);
   });
 
   it('shows one row per response however many origins raised it', async () => {
-    await handler(postEvent({ queryType: 'flagged_responses', dateRange: RANGE }));
+    await handler(postEvent(LIST_READ));
     const read = statements().find((s) => s.includes('raised_agg'))!;
     expect(read).toContain('GROUP BY exchange_id');
     expect(read).toContain('array_agg(DISTINCT flag_source)');

@@ -9,13 +9,16 @@
  *
  * ── AS THE PERSON, ON THE PERSON'S OWN PATH ──────────────────────────────────────────────────────
  *
- * An accepted reply is sent with `ChimeBearer` = the person's AppInstanceUser, on a session the
- * credential exchange's one-conversation role would vend them: the `restricted` classification role, assumed with
+ * An accepted reply is sent with `ChimeBearer` = the person's AppInstanceUser, on a session on the
+ * `restricted` classification role, assumed with
  * the `person` and `classification` session tags its trust policy requires, so the role pins the bearer
  * to that person (`…/user/${aws:PrincipalTag/person}`), and a session policy narrowed to the one
  * conversation the token names and to `SendChannelMessage`. It is never posted as a service identity or
- * as an assistant. Two layers decide where it can land:
- *  - IAM: the pinned bearer and the one-channel session policy;
+ * as an assistant. Three layers decide where it can land:
+ *  - this function: the person's current clearance reaches the conversation's classification, read from its
+ *    immutable tag (`lib/email-clearance.ts`), or nothing is posted and the refusal is counted by reason;
+ *  - IAM: the pinned bearer, and a session policy of the one channel while it carries the classification
+ *    that check read;
  *  - the Amazon Chime SDK: the person must still be a member of the conversation, or the send is refused.
  * The message then passes through the channel flow like any message the person types.
  *
@@ -35,6 +38,8 @@ import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { presentBoundedToken } from './lib/tokens.js';
 import { decideReply, replyTextOf, type ReceivedMail, type ReplyDecision } from './lib/reply-tokens.js';
 import { defaultDirectory, type Directory } from './lib/membership-source.js';
+import { personClearedForConversation } from './lib/email-clearance.js';
+import type { TagReader } from './lib/channel-classification.js';
 import { personIdFromArn, userArnFor, appInstanceArnOf } from './lib/person-arn.js';
 import { emitEmfMetric } from './lib/emf-metrics.js';
 import { loadProfileRegistry } from '../../lib/profile-registry';
@@ -69,8 +74,10 @@ export interface EmailReplyDeps {
   doc: Sender;
   s3: Sender;
   directory: Directory;
-  /** Post the reply as the person. Returns the message id. */
-  postAsPerson(args: { personArn: string; channelArn: string; text: string; idempotencyKey: string }): Promise<string | undefined>;
+  /** Reads the conversation's tags as this function's own role, for its classification. */
+  tags: TagReader;
+  /** Post the reply as the person, into a conversation of `classification`. Returns the message id. */
+  postAsPerson(args: { personArn: string; channelArn: string; classification: string; text: string; idempotencyKey: string }): Promise<string | undefined>;
   now(): number;
 }
 
@@ -125,6 +132,9 @@ export async function handleReceived(mail: ReceivedMail, deps: EmailReplyDeps): 
         return { ok: true, record: { channelArn: String(r.record.channelArn), personArn: String(r.record.personArn), expiresAt: r.record.expiresAt, ...(r.record.noticeId ? { noticeId: String(r.record.noticeId) } : {}) } };
       },
       contactOf: async (personArn) => (await deps.directory.contactFor(personArn, 'email'))?.address ?? null,
+      cleared: (personArn, channelArn) => personClearedForConversation({
+        tags: deps.tags, directory: deps.directory, channelArn, personArn, logPrefix: '[email-reply]',
+      }),
       text: async () => replyTextOf(await readStored(deps, mail.messageId)),
     });
   } catch (err) {
@@ -140,7 +150,9 @@ export async function handleReceived(mail: ReceivedMail, deps: EmailReplyDeps): 
     try {
       // One post per received message, whatever SES retries: the key is the message's own id.
       const idempotencyKey = createHash('sha256').update(mail.messageId).digest('hex').slice(0, 64);
-      await deps.postAsPerson({ personArn: decision.personArn, channelArn: decision.channelArn, text: decision.text, idempotencyKey });
+      await deps.postAsPerson({
+        personArn: decision.personArn, channelArn: decision.channelArn, classification: decision.classification, text: decision.text, idempotencyKey,
+      });
       console.log('[email-reply] posted as the person', { channelArn: decision.channelArn, personId: personIdFromArn(decision.personArn) });
       countReplyOutcome('Posted');
     } catch (err) {
@@ -160,20 +172,30 @@ export async function handleReceived(mail: ReceivedMail, deps: EmailReplyDeps): 
 
 /**
  * THE PERSON'S OWN SESSION, NARROWED TO ONE CONVERSATION: the restricted classification role, its `person` tag
- * pinning the bearer, and a session policy allowing `SendChannelMessage` on the channel and the person.
+ * pinning the bearer, and a session policy allowing `SendChannelMessage` on the person and on the channel
+ * while the channel carries the classification the clearance check decided on. Amazon Chime SDK authorizes a
+ * channel message against the channel and the bearer separately, so the tag condition sits on the channel's
+ * statement alone, the shape every classification role takes (`classificationChannelScopedAllow`).
  */
 export function pinnedPoster(restrictedRoleArn: string, sts: Sender = new STSClient({ region: REGION })) {
-  return async (args: { personArn: string; channelArn: string; text: string; idempotencyKey: string }): Promise<string | undefined> => {
+  return async (args: { personArn: string; channelArn: string; classification: string; text: string; idempotencyKey: string }): Promise<string | undefined> => {
     const personId = personIdFromArn(args.personArn);
     const app = appInstanceArnOf(args.personArn);
     if (!personId || !app || appInstanceArnOf(args.channelArn) !== app) throw new Error('the reply names no person and conversation of one app instance');
+    if (!args.classification) throw new Error('the reply names no classification for its conversation');
     const assumed = await sts.send(new AssumeRoleCommand({
       RoleArn: restrictedRoleArn,
       RoleSessionName: `reply-${personId}`.slice(0, 64),
       DurationSeconds: 900,
       Policy: JSON.stringify({
         Version: '2012-10-17',
-        Statement: [{ Sid: 'OneConversationReply', Effect: 'Allow', Action: ['chime:SendChannelMessage'], Resource: [args.channelArn, userArnFor(app, personId)] }],
+        Statement: [
+          {
+            Sid: 'OneConversationReply', Effect: 'Allow', Action: ['chime:SendChannelMessage'], Resource: [args.channelArn],
+            Condition: { StringEquals: { 'aws:ResourceTag/classification': args.classification } },
+          },
+          { Sid: 'AsThePerson', Effect: 'Allow', Action: ['chime:SendChannelMessage'], Resource: [userArnFor(app, personId)] },
+        ],
       }),
       Tags: [
         { Key: 'person', Value: personId },
@@ -209,6 +231,7 @@ function defaultDeps(): EmailReplyDeps {
     doc: DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION })),
     s3: new S3Client({ region: REGION }),
     directory: defaultDirectory(),
+    tags: chimeMessagingClient({ region: REGION }),
     postAsPerson: pinnedPoster(process.env.RESTRICTED_ROLE_ARN || ''),
     now: () => Date.now(),
   };

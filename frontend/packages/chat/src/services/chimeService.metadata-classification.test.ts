@@ -39,3 +39,12 @@ describe('metadataClassification', () => {
     }
   });
 });
+
+describe('channel Metadata that is not an object', () => {
+  it('is read as none, so the list and a lookup never break on it', async () => {
+    const { channelMetadataOf } = await import('./chimeService');
+    for (const raw of ['null', '42', '"text"', '[1,2]', '{not json']) expect(channelMetadataOf(raw)).toEqual({});
+    expect(channelMetadataOf('{"archived":true}')).toEqual({ archived: true });
+    expect(channelMetadataOf(undefined)).toEqual({});
+  });
+});

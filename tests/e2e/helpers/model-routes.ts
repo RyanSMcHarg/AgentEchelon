@@ -11,6 +11,7 @@ import { idTokenFor } from './person';
 import { adminUrl, ADMIN_API_URL, PERSON_API_URL } from './api-urls';
 import { signedAnalyticsPost } from './signed-analytics';
 import { PROFILE, sleep } from './workflow-task';
+import { replacingDraft, draftIdOf } from './profile-draft';
 import { noteProgress } from './watchdog/current';
 
 export const ANALYTICS_API = ADMIN_API_URL ? adminUrl('analytics', '/') : '';
@@ -37,9 +38,9 @@ export async function activeBody(admin: unknown): Promise<Record<string, any>> {
 
 /** Create a draft, patch its `models` (and anything else in `extra`), validate, and return the validation body. */
 export async function draftModels(admin: unknown, models: Record<string, unknown>, extra: Record<string, unknown> = {}, profileName = PROFILE): Promise<any> {
-  const created = await signedCall(adminUrl('assistant-admin', '/admin/profiles/version'), admin as never, 'POST', { profileName });
+  const created = await replacingDraft((b) => signedCall(adminUrl('assistant-admin', '/admin/profiles/version'), admin as never, 'POST', b), { profileName });
   expect(created.status, JSON.stringify(created.body).slice(0, 400)).toBe(200);
-  const edited = await signedCall(adminUrl('assistant-admin', '/admin/profiles/draft'), admin as never, 'POST', { profileName, patch: { models, ...extra } });
+  const edited = await signedCall(adminUrl('assistant-admin', '/admin/profiles/draft'), admin as never, 'POST', { profileName, patch: { models, ...extra }, configId: draftIdOf(created) });
   if (edited.status !== 200) return { status: edited.status, errors: [JSON.stringify(edited.body)], body: edited.body };
   const valid = await signedCall(adminUrl('assistant-admin', '/admin/profiles/validate'), admin as never, 'POST', { profileName });
   return valid.body ?? {};
@@ -47,7 +48,11 @@ export async function draftModels(admin: unknown, models: Record<string, unknown
 
 /** Discard the profile's draft, so a refused draft is not left for the next spec. */
 export async function discardDraft(admin: unknown, profileName = PROFILE): Promise<void> {
-  await signedCall(adminUrl('assistant-admin', '/admin/profiles/discard'), admin as never, 'POST', { profileName });
+  // A discard names the draft it throws away (SPEC-PORTABLE-PROFILES FR18): the one the listing shows now.
+  const listing = await signedCall(adminUrl('assistant-admin', '/admin/profiles'), admin as never);
+  const configId = (listing.body?.profiles ?? []).find((p: any) => p.profileName === profileName)?.draftConfigId;
+  if (!configId) return;
+  await signedCall(adminUrl('assistant-admin', '/admin/profiles/discard'), admin as never, 'POST', { profileName, configId });
 }
 
 /** The catalog key a Bedrock invoke id names (`us.anthropic.claude-haiku-...` is `haiku`), or the id itself. */

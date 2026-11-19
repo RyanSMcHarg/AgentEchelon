@@ -89,6 +89,11 @@ export const DEFAULT_NOTICE_COPY = {
   /** To the person who joined, privately. `{name}` is them; `{recap}` names what they joined. */
   memberWelcome: "Welcome, {name}. You've been added to {recap}.\n\n_Only you can see this message. Mention **@assistant** or **@all** to bring in the assistant; other messages are visible to everyone here, but I won't reply unless I'm mentioned._",
   /** A proactive briefing is ready, in this conversation. `{source}` is what produced it. */
+  /**
+   * To a person a confirmed proposal added to a meeting, privately, when they first join: the brief the assistant that
+   * proposed it drafted (`{brief}`) and the accounts they were asked in for (`{accounts}`).
+   */
+  meetingArrivalBrief: '{brief}\n\nYour accounts in this: {accounts}.\n\n_Only you can see this message._',
   briefingReady: 'I generated a proactive briefing for you (no request needed, triggered by {source}). Ask me anything about it here.',
   // A turn died and its retries are spent. Says the work did not finish and that sending it again is worth
   // doing, and names no internals (`AssistantCopy.turnFailed`).
@@ -183,6 +188,7 @@ export const NOTICE_VARIABLES: Partial<Record<NoticeCopyKey, Record<string, Noti
     notifySubject: { binding: 'value:text' },
   },
   briefingReady: { source: { binding: 'value:text' } },
+  meetingArrivalBrief: { brief: { binding: 'value:longText' }, accounts: { binding: 'value:text' } },
   assistantUnavailable: { name: { binding: 'assistant:displayName' } },
   battleSideDidNotFinish: { name: { binding: 'assistant:displayName' } },
 };
@@ -192,6 +198,7 @@ export const NOTICE_AUDIENCE: Partial<Record<NoticeCopyKey, 'room' | 'addressed'
   conversationArchived: 'room',
   memberJoined: 'room',
   memberWelcome: 'addressed',
+  meetingArrivalBrief: 'addressed',
 };
 
 /**

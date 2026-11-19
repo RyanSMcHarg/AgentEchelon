@@ -13,7 +13,7 @@
  *
  * Optional throughout: an intent without `answer` behaves exactly as before (tenet P3, additive schema).
  */
-import type { IntentDef, IntentPack } from './intent-pack.js';
+import type { IntentDef, IntentPack } from './intent-pack-taxonomy.js';
 
 export const ANSWER_FORMS = ['message', 'file', 'auto'] as const;
 export type AnswerForm = (typeof ANSWER_FORMS)[number];

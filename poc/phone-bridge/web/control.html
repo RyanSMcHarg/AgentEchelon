@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phone Bridge POC</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { max-width: 900px; margin: 24px auto; padding: 0 16px; line-height: 1.5; }
+    section { border: 1px solid #8884; border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
+    button { padding: 6px 14px; margin-right: 8px; }
+    input { padding: 6px; width: 16em; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #8883; }
+    #error { color: #d33; min-height: 1.5em; }
+    .muted { opacity: 0.7; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <h1>Phone Bridge POC</h1>
+  <p class="muted">Twilio phone legs into an Amazon Chime SDK WebRTC meeting, with no Amazon Chime SDK PSTN Audio. Local only.</p>
+  <p id="error" role="alert"></p>
+
+  <section aria-labelledby="h-meeting">
+    <h2 id="h-meeting">Meeting</h2>
+    <p>Status: <span id="status">No meeting</span></p>
+    <button id="start" type="button">Start meeting</button>
+    <button id="end" type="button" disabled>End meeting</button>
+    <audio id="meeting-audio" autoplay></audio>
+    <h3>In the meeting</h3>
+    <ul id="roster" aria-live="polite"></ul>
+  </section>
+
+  <section aria-labelledby="h-phone">
+    <h2 id="h-phone">Phone</h2>
+    <p>Dial in: <strong id="dial-in"></strong> <span class="muted">(joins the meeting running now)</span></p>
+    <label>Dial out to <input id="number" type="tel" placeholder="+15555550100" autocomplete="off"></label>
+    <button id="dial" type="button" disabled>Call</button>
+    <p class="muted">Webhook: <span id="public-url"></span></p>
+  </section>
+
+  <section aria-labelledby="h-legs">
+    <h2 id="h-legs">Phone legs</h2>
+    <table>
+      <thead><tr><th>Direction</th><th>Number</th><th>Status</th><th>Attendee joined</th><th>Twilio stream started</th><th>Late audio dropped</th><th></th></tr></thead>
+      <tbody id="legs" aria-live="polite"></tbody>
+    </table>
+    <p class="muted">Times are from when the call was received or placed.</p>
+  </section>
+
+  <script src="/control.js"></script>
+</body>
+</html>

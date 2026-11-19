@@ -533,7 +533,7 @@ describe('a deploy never removes a commit a live stack runs', () => {
     const v = rollbackVerdict({ ...base, deployed: { commit: LIVE }, isAncestor: false });
     expect(v.ok).toBe(false);
     expect(v.reason).toMatch(/not an ancestor/);
-    expect(v.reason).toMatch(/rebase onto private\/main/);
+    expect(v.reason).toMatch(/rebase onto the branch that was deployed/);
   });
 
   it('allows a forward deploy and a redeploy of what is live', () => {

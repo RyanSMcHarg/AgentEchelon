@@ -23,9 +23,8 @@
  *
  * This lived inside `membership-audit.ts`, which loads Amazon Chime SDK, Cognito, SSM, DynamoDB and
  * Lambda clients at module scope - so archival could not import it without dragging all of them into
- * an unrelated handler, and a second copy was the obvious shortcut. Two principal taxonomies that
- * disagree is exactly the class of drift the classification work spent this session removing, so it
- * moved here instead: pure, client-free, and imported by both.
+ * an unrelated handler. One taxonomy serves both, so the two cannot disagree about a principal: it is
+ * here, pure, client-free, and imported by both.
  */
 import { adminTwinOwnerId, personIdFromArn } from './person-arn.js';
 

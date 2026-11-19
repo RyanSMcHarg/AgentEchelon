@@ -32,7 +32,7 @@ interface Request { action: string; resource: string; prefix?: string }
 
 const OWN = 'premium';
 const OTHER = 'standard';
-const BUCKET = CLASSIFICATION_TEST_PROPS.attachmentsBucketArn;
+const BUCKET = CLASSIFICATION_TEST_PROPS.profileBucketArn;
 const HASH = 'a'.repeat(64);
 
 function synth(classification: string): Record<string, Resource> {

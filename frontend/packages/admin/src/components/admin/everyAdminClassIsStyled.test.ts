@@ -59,7 +59,6 @@ const DELIBERATELY_UNSTYLED = new Set<string>([
   'admin-filter-clear',
   'admin-flag-chip',
   'admin-help-text',
-  'admin-inline-label',
   'admin-mini-table',
   'admin-modal-overlay',
   'admin-review-compliance',
@@ -151,5 +150,36 @@ describe('every admin- class in the markup is styled somewhere', () => {
     // A baseline entry for a deleted class hides the fact that the list is shorter than it looks.
     const used = new Set(markupClasses().keys());
     expect([...DELIBERATELY_UNSTYLED].filter((cls) => !used.has(cls))).toEqual([]);
+  });
+});
+
+/**
+ * THE SAME RULE FOR THE MEETINGS TAB'S `meetings-` CLASSES AND THE SHARED `metric-` CARD CLASSES. A tile written as
+ * `metric-label` rather than `metric-card-title` renders as bare text in a stacked column, so each such class in the
+ * markup has a rule in one of the package's stylesheets.
+ */
+const PREFIXED = /^(?:meetings|metrics?)-[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+describe('every meetings- and metric- class in the markup is styled somewhere', () => {
+  it('has a CSS rule for each', () => {
+    const styled = new Set<string>();
+    for (const file of filesUnder(SRC, ['.css'])) {
+      for (const m of fs.readFileSync(file, 'utf-8').matchAll(/\.((?:meetings|metrics?)-[a-z0-9]+(?:-[a-z0-9]+)*)/g)) styled.add(m[1]);
+    }
+    const unstyled: string[] = [];
+    let seen = 0;
+    for (const file of filesUnder(SRC, ['.tsx'])) {
+      if (file.endsWith('.test.tsx')) continue;
+      const src = fs.readFileSync(file, 'utf-8');
+      for (const m of src.matchAll(/className\s*=\s*(?:"([^"]*)"|\{\s*`([^`]*)`|\{\s*'([^']*)')/g)) {
+        for (const token of (m[1] ?? m[2] ?? m[3] ?? '').split(/[\s${}()?:|&'"`,]+/)) {
+          if (!PREFIXED.test(token)) continue;
+          seen += 1;
+          if (!styled.has(token)) unstyled.push(`${token}  (used in ${path.relative(SRC, file).replace(/\\/g, '/')})`);
+        }
+      }
+    }
+    expect(seen).toBeGreaterThan(20);
+    expect(unstyled).toEqual([]);
   });
 });

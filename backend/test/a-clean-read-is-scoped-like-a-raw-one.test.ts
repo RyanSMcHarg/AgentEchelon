@@ -63,7 +63,7 @@ const read = (team: boolean, query: Record<string, string> | null = { reason: 'r
   headers: { origin: 'http://localhost:5173' },
   pathParameters: team ? { assistant: 'hr', channelId: 'conv-1' } : { channelId: 'conv-1' },
   queryStringParameters: query,
-  requestContext: { identity: { userArn: `arn:aws:sts::1:assumed-role/ae-${team ? 'team' : 'admin'}-console/console-sub${team ? '@standard' : ''}` } },
+  requestContext: { identity: { userArn: `arn:aws:sts::1:assumed-role/agent-echelon-${team ? 'team' : 'admin'}-console/console-sub${team ? '@standard' : ''}` } },
 } as unknown as APIGatewayProxyEvent);
 const body = (r: { body: string }) => JSON.parse(r.body);
 

@@ -53,7 +53,10 @@ describe('ready, blocked and waiting, from data alone (decision 5)', () => {
     expect(pickupReadiness(task({ assigneeId: 'p1', assigneeType: 'user' }), M, BOT)).toMatchObject({ hold: 'not-assigned' });
     expect(pickupReadiness(task({ status: 'abandoned' }), M, BOT)).toMatchObject({ hold: 'not-live' });
     const withAction = { ...M, flow: { initial: 'a', states: { a: { transitions: ['b'], action: { tool: 'x' }, onSuccess: 'b' }, b: { transitions: [], terminal: 'success' as const } } } };
-    expect(pickupReadiness(task({ taskType: 'flow', taskState: 'a' }), withAction as never, BOT)).toMatchObject({ hold: 'runs-an-action' });
+    // A STATE THE PLATFORM RUNS is taken up only to run it: ready while its action has not run this entry (a task opened in it,
+    // a workflow's required refresh), held once it has.
+    expect(pickupReadiness(task({ taskType: 'flow', taskState: 'a' }), withAction as never, BOT)).toEqual({ ready: true });
+    expect(pickupReadiness(task({ taskType: 'flow', taskState: 'a', actionRuns: ['a#0'] }), withAction as never, BOT)).toMatchObject({ hold: 'runs-an-action' });
     expect(pickupReadiness(task({ actionRuns: [`${pickupClaimState('accepted')}#0`] }), M, BOT)).toMatchObject({ hold: 'taken-up' });
     expect(pickupReadiness(task({ turnsInState: 1 }), M, BOT)).toMatchObject({ hold: 'worked-this-entry' });
   });

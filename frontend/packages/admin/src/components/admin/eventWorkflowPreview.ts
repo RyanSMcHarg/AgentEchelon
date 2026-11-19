@@ -26,6 +26,8 @@ export interface StepSummary {
   as?: string;
   /** How a terminal step ends. */
   disposition?: 'success' | 'failure';
+  /** True for a step no edge from the start reaches, which never runs. */
+  unreached?: true;
 }
 
 const targets = (edge: EventEdge | undefined): string[] => (edge === undefined ? [] : typeof edge === 'string' ? [edge] : edge.map((a) => a.to));
@@ -33,7 +35,7 @@ const targets = (edge: EventEdge | undefined): string[] => (edge === undefined ?
 /**
  * THE STEPS IN THE ORDER A RUN REACHES THEM: from the first step, breadth first along each step's success, failure and
  * deadline edges (each conditioned edge's alternatives in order), with the ends after every other reached step, and any
- * step nothing reaches last.
+ * step nothing reaches last, marked `unreached`: it never runs.
  */
 export function workflowSteps(wf: EventWorkflow): StepSummary[] {
   const states = wf.states ?? {};
@@ -45,13 +47,14 @@ export function workflowSteps(wf: EventWorkflow): StepSummary[] {
     const at = queue.shift()!;
     order.push(at);
     const def = states[at];
-    for (const to of [...targets(def.onSuccess), ...targets(def.onFailure), ...targets(def.onDeadline)]) {
+    // A resolve that moves the run on reaches the step it names (`movesTo`, O15).
+    for (const to of [...targets(def.onSuccess), ...targets(def.onFailure), ...targets(def.onDeadline), ...(def.task?.movesTo ? [def.task.movesTo] : [])]) {
       if (states[to] && !seen.has(to)) { seen.add(to); queue.push(to); }
     }
   }
   const reached = [...order.filter((k) => !states[k].disposition), ...order.filter((k) => states[k].disposition)];
   const unreached = Object.keys(states).filter((k) => !seen.has(k));
-  return [...reached, ...unreached].map((key) => summarizeStep(key, states[key]));
+  return [...reached.map((key) => summarizeStep(key, states[key])), ...unreached.map((key) => ({ ...summarizeStep(key, states[key]), unreached: true as const }))];
 }
 
 function summarizeStep(key: string, def: EventStepDef): StepSummary {
@@ -75,7 +78,7 @@ export function welcomeSays(wf: EventWorkflow): ReturnType<typeof welcomePlan> {
 }
 
 /** The conversation fields a welcome's text may name, which the room fills when the welcome is said. */
-const CONVERSATION_FIELD_NAMES = Object.keys(WELCOME_FIELDS).filter((f) => f !== 'role' && f !== 'examples');
+const CONVERSATION_FIELD_NAMES = Object.keys(WELCOME_FIELDS).filter((f) => f !== 'role' && f !== 'assistantName');
 /** `{{field}}` in a welcome's text: the grammar every template uses. */
 const FIELD = /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g;
 
@@ -118,7 +121,6 @@ export function previewOpening(
   // A field the room fills goes through the composer's own insertion; any other name (a version's variable, `room.*`)
   // is the value the router resolves when the welcome is said, so it is shown as its placeholder in place.
   const template = welcomeTemplateFields(own.template).replace(FIELD, (match, name: string) => {
-    if (name === 'examples') return match;
     if (name === 'role' && role) return match;
     if (!placeholders.includes(name)) placeholders.push(name);
     if (CONVERSATION_FIELD_NAMES.includes(name)) {

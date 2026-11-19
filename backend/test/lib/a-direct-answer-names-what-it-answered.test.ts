@@ -32,6 +32,7 @@ import {
   turnDeclarationOf,
   withTurnDeclaration,
   declaresFinalAnswer,
+  isPlaceholderMessage,
 } from '../../lambda/src/lib/turn-declaration.js';
 import { stripMessageMarkers } from '../../lambda/src/lib/message-markers.js';
 import { correlationMarkerOf } from '../../lambda/src/lib/correlation.js';
@@ -166,8 +167,10 @@ describe('a marked message is no longer necessarily a placeholder', () => {
     // `isPlaceholderMessage` drops placeholders from the conversation history. Its own header
     // records what that costs when it is wrong: an invisible, intermittent drop that reads as "the
     // assistant forgot the previous turn".
-    expect(src('lambda/src/lib/async-processor-core.ts'))
-      .toContain('if (declaresFinalAnswer(content)) return false;');
+    expect(isPlaceholderMessage('Hi <!--corr:abcd1234--><!--turn:delivery=DIRECT;phase=final-->')).toBe(false);
+    expect(isPlaceholderMessage('One moment... <!--corr:abcd1234-->')).toBe(true);
+    // The history the processor builds reads the same rule.
+    expect(src('lambda/src/lib/async-processor-core.ts')).toMatch(/import \{[^}]*isPlaceholderMessage[^}]*\} from '\.\/turn-declaration\.js'/);
   });
 
   it('lets the judge score the greeting rather than walking past it', () => {

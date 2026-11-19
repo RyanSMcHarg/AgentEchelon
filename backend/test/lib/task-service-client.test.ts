@@ -190,3 +190,38 @@ describe('a write that cannot be delivered', () => {
     expect(await client.createTask({ event: {}, deliveryOption: 'DIRECT' })).toBeNull();
   });
 });
+
+/**
+ * THE OPEN INCIDENTS A TEAM CONVERSATION OPENED ARE ONE QUERY (SPEC-WORKFLOWS-AND-TASKS WT122): the service answers the open
+ * tasks of the machine across every conversation the opener's workflow opened, each whole. A read that fails is null, never an
+ * empty list, so the policy's cap is never passed on a count that could not be taken.
+ */
+describe('the open tasks of the conversations an opener opened', () => {
+  const answer = (byOp: Record<string, (input: any) => unknown>) => mockSend.mockImplementation(async (cmd: { input: { Payload: Buffer } }) => {
+    const { op, input } = JSON.parse(Buffer.from(cmd.input.Payload).toString());
+    return { Payload: Buffer.from(JSON.stringify(byOp[op](input))) };
+  });
+
+  it('asks the service once, naming the opener and the machine, and answers its tasks whole', async () => {
+    const asked: unknown[] = [];
+    answer({ openTasksOpenedFrom: (input) => { asked.push(input); return [{ taskId: 'evt-1', channelArn: CHANNEL, taskType: 'incident_ownership', openedFrom: 'arn:team' }]; } });
+    const found = await client.openTasksOpenedFrom({ openedFrom: 'arn:team', taskType: 'incident_ownership' });
+    expect(found.map((t: { taskId: string }) => t.taskId)).toEqual(['evt-1']);
+    expect(asked).toEqual([{ openedFrom: 'arn:team', taskType: 'incident_ownership' }]);
+    expect(mockSend).toHaveBeenCalledTimes(1);
+  });
+
+  it('DENY: a refused or failed read is null, never an empty list', async () => {
+    answer({ openTasksOpenedFrom: () => null });
+    expect(await client.openTasksOpenedFrom({ openedFrom: 'arn:team', taskType: 'incident_ownership' })).toBeNull();
+    mockSend.mockRejectedValue(new Error('throttled'));
+    expect(await client.openTasksOpenedFrom({ openedFrom: 'arn:team', taskType: 'incident_ownership' })).toBeNull();
+  });
+
+  it('DENY: archiving settles nothing the service did not say it settled', async () => {
+    answer({ settleArchivedTasks: () => ({ failed: true }) });
+    expect(await client.settleArchivedTasks({ channelArn: CHANNEL })).toBeNull();
+    answer({ settleArchivedTasks: () => ({ settled: ['evt-1'] }) });
+    expect(await client.settleArchivedTasks({ channelArn: CHANNEL })).toEqual(['evt-1']);
+  });
+});

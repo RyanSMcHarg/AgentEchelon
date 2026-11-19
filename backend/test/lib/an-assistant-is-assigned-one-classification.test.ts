@@ -35,9 +35,9 @@
  *     their clearance the recorded value describes neither the agent nor anything stable.
  *
  *   - `kinesis-archival` fell back to matching substrings in the bot ARN ('admin' meant premium,
- *     'auth' meant standard). Bot ARNs here look like
- *     `.../bot/28532eca-4472-4f50-b33a-d9149a54e5ae`, so it returned null for every bot message this
- *     deployment has ever archived. It never once produced a value, and each miss became an
+ *     'auth' meant standard). A bot ARN ends in an opaque id
+ *     (`.../bot/00000000-0000-4000-8000-0000000000b1`), so it returned null for every bot message a
+ *     deployment archived. It never once produced a value, and each miss became an
  *     'unknown' row indistinguishable from a measurement. The answer was in the adjacent field:
  *     `Sender.Name` is "Assistant-basic".
  *
@@ -468,7 +468,7 @@ describe('every credential vend asserts both identity and classification', () =>
 
   it('finds every vending file (a scan that finds none passes vacuously)', () => {
     expect(vendFiles.length).toBeGreaterThanOrEqual(2);
-    // The one exchange every issuer shares, its one-conversation vend included, and the assistant vend.
+    // The one exchange every issuer shares, and the assistant vend.
     expect(vendFiles.map((x) => x.file)).toEqual(expect.arrayContaining(['credential-exchange.ts', 'admin-credential-exchange.ts', 'assistant-vend.ts']));
   });
 

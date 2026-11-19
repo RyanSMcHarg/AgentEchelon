@@ -14,18 +14,23 @@ import { personIdFromArn } from './person-arn.js';
  * message Metadata, so a caller MUST gate the S3 GetObject on this before reading — otherwise a
  * crafted key could read another user's uploaded file (the classification's `s3:GetObject` grant spans the
  * whole `attachments/*` prefix). Uploads are keyed `attachments/<conversationId>/<senderSub>/...`
- * (see presigned-url), so we require the key's 3rd segment to equal the sender's own sub. S3 keys
- * are not path-normalized, so a literal '..' cannot traverse out of the sender's segment. Mirrors
- * the ownership check the presigned-url download path enforces.
+ * (see presigned-url), so the key's 2nd segment must be the conversation being answered and its 3rd the
+ * sender's own sub. Both, because the grant carries no classification: a sender's own upload from a
+ * conversation at another classification, named in this one, would otherwise be read and described to
+ * members who are not cleared for it. S3 keys are not path-normalized, so a literal '..' cannot
+ * traverse out of either segment. Mirrors the presigned-url download path, which signs only under the
+ * conversation it checked.
  */
 export function senderOwnsAttachmentKey(
   fileKey: string | undefined,
+  channelArn: string | undefined,
   senderArn: string | undefined,
 ): boolean {
   const senderSub = personIdFromArn(senderArn) || '';
-  if (!senderSub) return false;
+  const conversationId = (channelArn || '').split('/channel/')[1] || '';
+  if (!senderSub || !conversationId || conversationId.includes('/')) return false;
   const parts = (fileKey || '').split('/');
-  return parts[0] === 'attachments' && parts.length >= 4 && parts[2] === senderSub;
+  return parts[0] === 'attachments' && parts.length >= 4 && parts[1] === conversationId && parts[2] === senderSub;
 }
 
 /**
@@ -48,7 +53,7 @@ export function conversationHoldsHistoryImageKey(
   const parts = (fileKey || '').split('/');
   if (parts[1] !== conversationId) return false;
   if (parts[0] === 'battle-images') return parts.length >= 3;
-  return senderOwnsAttachmentKey(fileKey, senderArn);
+  return senderOwnsAttachmentKey(fileKey, channelArn, senderArn);
 }
 
 export interface S3GetClient {

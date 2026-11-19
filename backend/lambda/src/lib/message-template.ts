@@ -73,7 +73,8 @@ function renderSection(text: string, values: Record<string, string>): string {
   const lines: string[] = [];
   for (const line of text.split('\n')) {
     const spanned = line.replace(OPTIONAL_SPAN, (_m, inner: string) => (fieldsIn(inner).some(empty) ? '' : inner));
-    if (fieldsIn(spanned).some(empty)) {
+    // A LINE MADE ONLY OF OPTIONAL SPANS, every one left out, is left out too, never kept as an empty line.
+    if (fieldsIn(spanned).some(empty) || (!spanned.trim() && line.trim())) {
       dropped = true;
       continue;
     }

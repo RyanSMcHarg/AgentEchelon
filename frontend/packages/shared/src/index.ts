@@ -34,6 +34,7 @@ export {
 } from './services/credentialExchange';
 export type { VendedCredentials, ExchangeAnswer, ConsoleRole } from './services/credentialExchange';
 export { resolvePersonIdentity, IdentitySupersededError } from './services/personIdentity';
+export { onSessionEnd, type SessionEndReason } from './services/sessionEpoch';
 export { capturePendingInvitation, takeInvitationOutcome, restorePendingInvitation, type InvitationOutcome } from './services/pendingInvitation';
 export { capturePendingUpgrade, peekPendingUpgrade, discardPendingUpgrade, requestPendingBindSecret, takeUpgradeOutcome, settlePendingUpgrade, type PendingUpgrade, type UpgradeOutcome, type UpgradePath } from './services/pendingUpgrade';
 export type { PersonIdentity } from './services/personIdentity';

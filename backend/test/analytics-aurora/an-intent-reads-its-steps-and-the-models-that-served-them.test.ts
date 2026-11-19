@@ -84,7 +84,7 @@ describe('intent_steps', () => {
     }));
     expect(res.statusCode).toBe(200);
     const [sql, args] = mockDbQuery.mock.calls[0];
-    expect(args.slice(0, 8)).toEqual([WINDOW, 'image_generation', 'premium', 'premium', null, 'primary', 4, 'generate']);
+    expect(args.slice(0, 8)).toEqual([WINDOW, 'image_generation', 'premium', 'premium', null, 'primary', [4], 'generate']);
     expect(sql).toMatch(/COALESCE\(e\.task_type, e\.intent\) = \$2/);
     expect(sql).toMatch(/\$8::varchar IS NULL OR e\.task_step = \$8/);
     expect(sql).toMatch(/\$5::text\[\] IS NULL OR e\.conversation_classification = ANY\(\$5\)/);

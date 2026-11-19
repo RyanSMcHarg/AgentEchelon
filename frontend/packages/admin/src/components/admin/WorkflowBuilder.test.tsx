@@ -10,10 +10,11 @@
  * the runtime does not run (B5); a drag saves the step's point into the layout, a saved point is where the step is
  * drawn, and a removed step's point is dropped (B7); and the list view is the same edits.
  */
+import { agentStepOpsRoom } from '../../test/agentStepOpsRoom';
 import { useState } from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
-import { PLATFORM_EVENT_WORKFLOWS, type EventWorkflow } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
+import { SHIPPED_EVENT_WORKFLOWS, type EventWorkflow } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
 import type { WorkflowLayout } from '../../../../../../backend/lambda/src/lib/workflow-layout.ts';
 import WorkflowBuilder from './WorkflowBuilder';
 import * as svc from '../../services/profileService';
@@ -32,7 +33,7 @@ const TEMPLATES = [
   { name: 'ops-first-look', kind: 'prompt' as const, source: '', origin: 'shipped' as const },
 ];
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v));
-const OPS: EventWorkflow = clone(PLATFORM_EVENT_WORKFLOWS['ops-room']);
+const OPS: EventWorkflow = agentStepOpsRoom();
 
 function Harness({ initial, layout: initialLayout, serverErrors, onChange, onLayout }: {
   initial: Record<string, EventWorkflow>; layout?: WorkflowLayout; serverErrors?: string[];
@@ -69,7 +70,7 @@ describe('B1: the workflow is a flow of steps from its event', () => {
   });
 
   it('a welcome says it starts on WelcomeIntent', () => {
-    renderBuilder({ greet: clone(PLATFORM_EVENT_WORKFLOWS.welcome) });
+    renderBuilder({ greet: clone(SHIPPED_EVENT_WORKFLOWS.welcome) });
     expect(screen.getByTestId('wfb-trigger')).toHaveTextContent('Starts on WelcomeIntent');
   });
 });
@@ -160,7 +161,7 @@ describe('B4: Preview run', () => {
     fireEvent.click(screen.getByTestId('wfb-preview'));
     await waitFor(() => expect(screen.getByTestId('wfb-preview-result')).toBeTruthy());
     expect(preview).toHaveBeenCalledWith('ops-premium', 'ops', OPS, { values: {}, outcomes: { 'first-look': 'failure' } });
-    expect(screen.getByTestId('wfb-preview-result')).toHaveTextContent('says ops-room-opening to the room');
+    expect(screen.getByTestId('wfb-preview-result')).toHaveTextContent('says ops-room-opening to the conversation');
     expect(screen.getByTestId('wfb-preview-end')).toHaveTextContent('The run ends (success).');
     expect(screen.getByTestId('wfb-node-opening').className).toMatch(/admin-wfb-node-visited/);
   });
@@ -187,7 +188,7 @@ describe('B5: without a mouse, and nothing the runtime does not run', () => {
     fireEvent.keyDown(node, { key: 'ArrowDown', shiftKey: true });
     expect(screen.getByTestId('wfb-announce')).toHaveTextContent(/opening moved to/);
     expect(node.getAttribute('aria-describedby')).toBe('wfb-keys');
-    expect(document.getElementById('wfb-keys')).toHaveTextContent(/Arrow keys move it/);
+    expect(document.getElementById('wfb-keys')).toHaveTextContent(/arrow keys move it/);
     fireEvent.click(node);
     expect(node).toHaveAttribute('aria-pressed', 'true');
   });
@@ -196,7 +197,7 @@ describe('B5: without a mouse, and nothing the runtime does not run', () => {
     const { onChange } = renderBuilder();
     expect(screen.getByTestId('wfb-palette-condition').tagName).not.toBe('BUTTON');
     fireEvent.click(screen.getByTestId('wfb-palette-deadline-help'));
-    expect(screen.getByTestId('wfb-palette-deadline-help-panel')).toHaveTextContent(/No step waits on a timer/);
+    expect(screen.getByTestId('wfb-palette-deadline-help-panel')).toHaveTextContent(/Deadlines are set on task steps, not on the workflow/);
     expect(onChange).not.toHaveBeenCalled();
   });
 
@@ -248,5 +249,35 @@ describe('one source of editing', () => {
     expect(Object.values(last()!.ops.states).filter((d) => d.disposition)).toHaveLength(2);
     fireEvent.click(screen.getByTestId('wfb-view-canvas'));
     expect(screen.getByTestId('wfb-canvas')).toBeTruthy();
+  });
+});
+
+describe('Preview run walks the path a request takes when the assistant it asks is absent', () => {
+  it('offers the absent ending only on a task step that names who does the work, and sends it', async () => {
+    preview.mockResolvedValue({ steps: [{ step: 'first-look', outcome: 'no-worker' }], acts: [], ended: 'success' });
+    const asking = clone(OPS);
+    asking.states['first-look'] = { task: { machine: 'incident_first_look', by: { assistantRole: 'ops' }, continue: 'opened' }, onSuccess: 'done', onFailure: 'done' };
+    asking.states['greet-lead'] = { agent: { prompt: 'ops-first-look', tools: [], to: 'room', deadlineMs: 20_000, fallback: { send: { to: 'room', template: 'ops-room-opening' } } }, onSuccess: 'first-look', onFailure: 'first-look' };
+    renderBuilder({ ops: asking });
+    const endings = (step: string) => [...(screen.getByTestId(`wfb-ending-${step}`) as HTMLSelectElement).options].map((o) => o.value);
+    expect(endings('first-look')).toEqual(['success', 'failure', 'deadline', 'absent']);
+    expect(endings('greet-lead')).toEqual(['success', 'failure']);
+    fireEvent.change(screen.getByTestId('wfb-ending-first-look'), { target: { value: 'absent' } });
+    fireEvent.click(screen.getByTestId('wfb-preview'));
+    await waitFor(() => expect(preview).toHaveBeenCalled());
+    expect(preview.mock.calls[0][3]).toEqual({ values: {}, outcomes: { 'first-look': 'absent' } });
+  });
+});
+
+describe('a step no edge reaches', () => {
+  it('is flagged on its node and in its inspector as never running, and is not a problem the server refuses', () => {
+    const stray = clone(OPS);
+    stray.states.stray = { send: { to: 'room', template: 'workflow-opening' }, onSuccess: 'done' };
+    renderBuilder({ ops: stray });
+    expect(screen.getByTestId('wfb-node-stray-unreached')).toHaveTextContent('Never runs');
+    expect(screen.queryByTestId('wfb-node-opening-unreached')).toBeNull();
+    fireEvent.click(screen.getByTestId('wfb-node-stray'));
+    expect(screen.getByTestId('wfb-step-unreached')).toHaveTextContent('stray never runs. Connect a step to it, or make it the start.');
+    expect(screen.getByTestId('wfb-status')).toHaveTextContent("Meets the server's rules");
   });
 });

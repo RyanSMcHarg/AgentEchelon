@@ -82,7 +82,10 @@ describe('a notice kind carries the metadata its kind declares, built from check
   it('a welcome is emailed to the member it names, by person', () => {
     const riley = 'arn:aws:chime:us-east-1:111122223333:app-instance/i/user/0192f0e0-0000-7000-8000-000000000001';
     expect(noticeMetadata('memberWelcome', { name: 'Riley', recap: 'x', notifyPerson: riley, notifySubject: 'Added' }))
-      .toEqual({ systemAnnouncement: 'join_summary', notify: { email: true }, notifyKind: 'conversation-shared', notifySubject: 'Added', notifyTargets: [{ person: riley }] });
+      .toEqual({
+        systemAnnouncement: 'join_summary', notify: { email: true }, notifyKind: 'conversation-shared', notifySubject: 'Added',
+        notifyBody: "You've been added to x.", notifyTargets: [{ person: riley }],
+      });
   });
 
   it('a welcome said in a conversation links its email into THAT conversation, by the channel it is posted in', () => {
@@ -91,6 +94,7 @@ describe('a notice kind carries the metadata its kind declares, built from check
     expect(noticeMetadata('memberWelcome', { name: 'Riley', recap: 'x', notifyPerson: riley }, { channelArn: room }))
       .toEqual({
         systemAnnouncement: 'join_summary', notify: { email: true }, notifyKind: 'conversation-shared',
+        notifySubject: "You've been added to x", notifyBody: "You've been added to x.",
         notifyTargets: [{ person: riley }], notifyConversationId: 'conv-ops-new',
       });
     // No variable can name the link: the conversation is where the router posts the notice.

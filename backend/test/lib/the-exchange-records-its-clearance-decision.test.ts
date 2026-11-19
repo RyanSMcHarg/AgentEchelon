@@ -70,8 +70,6 @@ describe('the record the exchange writes', () => {
     expect(clearanceBasisOf(MAPPED, { roles: ['analyst', 'stranger'] })).toEqual({ source: 'mapping', claim: 'roles', matched: ['analyst'] });
     const fixed = oidcIssuer('fixed-oidc', { fixed: ['basic'], classifications: ['basic'] });
     expect(clearanceBasisOf(fixed, {})).toEqual({ source: 'fixed', matched: ['basic'] });
-    const one = oidcIssuer('one', { oneChannel: 'basic', classifications: ['basic'] } as TrustedIssuer['clearance']);
-    expect(clearanceBasisOf(one, {})).toBeNull();
   });
 });
 

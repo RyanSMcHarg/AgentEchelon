@@ -49,7 +49,7 @@ const ModelStrategyTab: React.FC = () => {
       </div>
 
       <section className="admin-section">
-        <h3>{t('admin.modelStrategy.providerPosture')}</h3>
+        <h2>{t('admin.modelStrategy.providerPosture')}</h2>
         <div className="strategy-provider-grid">
           {PROVIDER_POSITIONING.map((provider) => (
             <article key={provider.provider} className="strategy-provider-card">
@@ -61,14 +61,14 @@ const ModelStrategyTab: React.FC = () => {
       </section>
 
       <section className="admin-section">
-        <h3>{t('admin.modelStrategy.intentRouting')}</h3>
+        <h2>{t('admin.modelStrategy.intentRouting')}</h2>
         <div className="strategy-route-grid">
           {INTENT_STRATEGY_CARDS.map((route) => (
             <article key={route.intent} className="strategy-route-card">
               <div className="strategy-route-header">
                 <div>
                   <p className="strategy-eyebrow">{route.label}</p>
-                  <h4>{modelLookup[route.primaryModel].displayName}</h4>
+                  <h3>{modelLookup[route.primaryModel].displayName}</h3>
                 </div>
               </div>
               <p className="strategy-copy">{route.rationale}</p>
@@ -82,14 +82,14 @@ const ModelStrategyTab: React.FC = () => {
       </section>
 
       <section className="admin-section">
-        <h3>{t('admin.modelStrategy.modelCatalog')}</h3>
+        <h2>{t('admin.modelStrategy.modelCatalog')}</h2>
         <div className="strategy-model-grid">
           {MODEL_STRATEGY_MODELS.map((model) => (
             <article key={model.key} className="strategy-model-card">
               <div className="strategy-model-header">
                 <div>
                   <p className="strategy-eyebrow">{model.provider}</p>
-                  <h4>{model.displayName}</h4>
+                  <h3>{model.displayName}</h3>
                 </div>
                 <div className="strategy-chip-row">
                   <span className={`strategy-chip strategy-chip-${labelTone(model.costClass)}`}>

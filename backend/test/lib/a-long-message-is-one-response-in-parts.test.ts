@@ -237,7 +237,7 @@ describe('every post of model-written or template text uses the one splitter', (
       'text: composed.access,', // its access lines
     ]) expect(router).toContain(text);
     // The intake offer, the welcome's opening, a workflow send, a notice, and the turn's own reply on a flow entry.
-    expect(router.match(/await sendInParts\(chimeClient, \{\s*ChannelArn: (args\.)?channelArn,\s*text: content,/g)?.length).toBe(5);
+    expect(router.match(/sendInParts\(chimeClient, \{\s*ChannelArn: (args\.)?channelArn,\s*text: content,/g)?.length).toBe(5);
     expect(router).toMatch(/const sent = await sendInParts\(chimeClient, \{\s*ChannelArn: channelArn,\s*text: content,/);
     expect(router).not.toMatch(/^\s*Content: content,$/m);
   });
@@ -269,16 +269,23 @@ describe('every post of model-written or template text uses the one splitter', (
     };
     walk(path.join(__dirname, '..', '..', 'lambda', 'src'));
     expect(singles.sort()).toEqual([
-      // The answer's first part where no placeholder exists; delivery posts the rest as continuations.
-      'assistant-async-processor.ts:1',
+      // The answer's first part where no placeholder exists; delivery posts the rest as continuations. And a proposal's
+      // card, one message because its confirm button rides that message's metadata.
+      'assistant-async-processor.ts:2',
       // A person's own email reply, sent as that person: a person's message, never split into several turns.
       'email-reply.ts:1',
-      // Four "..." carriers a reading writes into, updated in place.
-      'lib/async-processor-core.ts:4',
+      // Four "..." carriers a reading writes into, updated in place; and the one-line note a long answer ends on when the
+      // Amazon Chime SDK refuses one of its parts.
+      'lib/async-processor-core.ts:5',
+      // The dashboard's card, the one short message each refresh updates in place.
+      'lib/dashboard-tool.ts:1',
       // The queue's notice, the one message updated in place as more arrives.
       'lib/turn-queue-notice.ts:1',
-      // A handover instruction the receiving assistant takes as its turn's one message, and two placeholders.
-      'router-agent-handler.ts:3',
+      // A handover instruction the receiving assistant takes as its turn's one message, and two placeholders; a workflow's
+      // meeting ring and the ring or ring-off said to a meeting's conversation or to one person in it, each a control message
+      // with no text; and every meeting card (`postMeetingCard`: the cards in the parent conversation and in the meeting's own,
+      // and the transcription notice), each one short message a later event updates in place.
+      'router-agent-handler.ts:6',
     ]);
   });
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isTabAvailableIn, SECTIONS } from './AdminDashboard';
+import { isTabAvailableIn, isTabAvailableToTeam, profilesLanding, SECTIONS, TAB_CAPABILITY, TEAM_TABS, TABS_THAT_FETCH_NOTHING_HERE } from './AdminDashboard';
 
 // B6 regression guard: after 8f143e3 the Effectiveness section's tabs were ALL Aurora-only, so the
 // section (and every evaluation surface) vanished in Athena mode even though evaluation_scores is still
@@ -46,5 +46,41 @@ describe('AdminDashboard tab availability (B6: Athena keeps an evaluation surfac
     expect(aurora).not.toContain('evaluations');
     // The human-ACTION views are Aurora-only and stay reachable there.
     expect(aurora).toEqual(expect.arrayContaining(['flagged', 'ground_truth']));
+  });
+});
+
+describe('the Processes tab (SPEC-PROCESSES P9)', () => {
+  it('sits under Performance beside Overview, read with the same capability as Effectiveness', () => {
+    const performance = SECTIONS.find((s) => s.id === 'performance')!;
+    expect(performance.tabs.slice(0, 2)).toEqual(['effectiveness', 'processes']);
+    expect(TAB_CAPABILITY.processes).toBe(TAB_CAPABILITY.effectiveness);
+    expect(TAB_CAPABILITY.processes).toBe('view-analytics');
+  });
+
+  it('is Aurora mode only, as the process analytics are', () => {
+    expect(isTabAvailableIn('processes', 'aurora')).toBe(true);
+    expect(isTabAvailableIn('processes', 'athena')).toBe(false);
+  });
+
+  it('is a team tab, so a team reads the processes its own assistants ran, on its team route', () => {
+    expect(TEAM_TABS.has('processes')).toBe(true);
+    expect(isTabAvailableToTeam('processes', 'aurora', false)).toBe(true);
+    expect(isTabAvailableToTeam('processes', 'athena', false)).toBe(false);
+    expect(isTabAvailableToTeam('processes', 'aurora', true)).toBe(false);
+  });
+
+  it('issues its own query, so the dashboard fan-out asks for nothing on it', () => {
+    expect(TABS_THAT_FETCH_NOTHING_HERE.processes).toBeTruthy();
+  });
+});
+
+describe('browser history landing on the Assistants tab', () => {
+  it('opens the workflow an entry names, on its own assistant, over the assistant analytics were opened from', () => {
+    expect(profilesLanding('advisor', { assistant: 'concierge', workflow: 'welcome' })).toEqual({ link: { assistant: 'concierge', workflow: 'welcome' } });
+  });
+
+  it('returns to the assistant analytics were opened from when the entry names no workflow, else the list', () => {
+    expect(profilesLanding('advisor', null)).toEqual({ reopen: 'advisor' });
+    expect(profilesLanding(null, null)).toEqual({ link: null });
   });
 });

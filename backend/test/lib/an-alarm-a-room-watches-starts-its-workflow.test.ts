@@ -18,15 +18,15 @@ import {
   ALARM_NAME,
   EVENTS_SELECTING_THEIR_WORKFLOW,
   EVENT_WORKFLOW_EVENTS,
-  PLATFORM_EVENT_WORKFLOWS,
+  SHIPPED_EVENT_WORKFLOWS,
   alarmWatchKey,
   declaredWorkflowOn,
-  eventNaturalKey,
   eventRunKey,
   eventWorkflowErrors,
   workflowSendEmailKind,
   type EventWorkflow,
 } from '../../lambda/src/lib/event-workflow';
+import { eventNaturalKey } from '../../lambda/src/lib/event-natural-key';
 import { EVENT_FIELDS, buildSourceTable, sourceLookup, whenErrors } from '../../lambda/src/lib/variables';
 import { OPENER_FIELDS, PLATFORM_EVENT_FIELDS, openerWatchesAlarms } from '../../lib/config/event-openers';
 import { CONVERSATION_TYPES } from '../../lib/config/conversation-types';
@@ -39,7 +39,7 @@ const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
 
 const APP = 'arn:aws:chime:us-east-1:111122223333:app-instance/ai';
 const CHANNEL = `${APP}/channel/ch-1`;
-const WATCH = PLATFORM_EVENT_WORKFLOWS['incident-watch'];
+const WATCH = SHIPPED_EVENT_WORKFLOWS['incident-watch'];
 
 describe('the event and its fields', () => {
   it('is a built event that selects its own workflow, names no person, and emails nobody', () => {
@@ -59,9 +59,9 @@ describe('the event and its fields', () => {
     expect(whenErrors({ 'event:alarmState': 'RECOVERED' }, lookup, { event: 'alarm-state-changed', selects: 'room' }).join()).toMatch(/is an enum of ALARM, OK, INSUFFICIENT_DATA/);
   });
 
-  it('the platform\'s incident watch tells the room the state, then reads the health again, and opens with whatever it likes', () => {
+  it('the platform\'s incident watch tells the room the state, then asks the ops assistant to read the health again, and opens with whatever it likes', () => {
     expect(WATCH).toMatchObject({ on: 'alarm-state-changed', types: ['ops'], initial: 'announce' });
-    expect(WATCH.states.recheck.agent).toMatchObject({ prompt: 'ops-incident-recheck', tools: ['read_deployment_health'], reads: 'messages', to: 'room' });
+    expect(WATCH.states.recheck.task).toMatchObject({ machine: 'deployment_health', by: { assistantRole: 'ops' }, ask: { template: 'incident-recheck-ask' } });
     expect(eventWorkflowErrors('incident-watch', WATCH)).toEqual([]);
     const agentFirst: EventWorkflow = { ...clone(WATCH), initial: 'recheck' };
     expect(eventWorkflowErrors('w', agentFirst)).toEqual([]);
@@ -98,22 +98,40 @@ describe('the router verifies the change before anything runs', () => {
     })).toEqual({ ran: false, reason: 'the conversation does not watch the alarm at this classification' });
   });
 
-  it('checks the watch, the room\'s tags, the alarm\'s state now, the primary and the workflow, in that order, before the run', () => {
+  it('a record that cannot be read is never an answer: the change throws, so it is delivered again', async () => {
+    const throttled = async () => { throw Object.assign(new Error('rate'), { name: 'ThrottlingException' }); };
+    await expect(handleAlarmStateChanged({ alarmName: 'AgentEchelon-x', state: 'ALARM' }, { watch: throttled })).rejects.toThrow('rate');
+    await expect(handleAlarmStateChanged({ alarmName: 'AgentEchelon-x', state: 'ALARM' }, {
+      watch: async () => ({ room: CHANNEL, classification: 'premium' }), watches: throttled,
+    })).rejects.toThrow('rate');
+    const router = read('router-agent-handler.ts');
+    const fn = router.slice(router.indexOf('export async function handleAlarmStateChanged('), router.indexOf('export async function handleDeadlineCancel('));
+    expect(fn).not.toMatch(/.catch(() => (null|undefined))/);
+    const watches = router.slice(router.indexOf('async function conversationWatches('), router.indexOf('let cloudwatch'));
+    expect(watches).toContain('alarmWatchOf(alarmWatchKey(alarmName), { strict: true })');
+    expect(watches).toContain('readChannelContext(channelArn, { consistent: true })');
+  });
+
+  it('checks the watch, the room\'s tags, the alarm\'s state now, the owning assistant and its workflow, in that order, before the run', () => {
     const router = read('router-agent-handler.ts');
     const fn = router.slice(router.indexOf('export async function handleAlarmStateChanged('), router.indexOf('export async function handleDeadlineCancel('));
     const order = [
-      'ALARM_NAME.test(alarmName)', '(deps.watch ?? alarmWatchOf)(alarmWatchKey(alarmName))', '(deps.watches ?? conversationWatches)(channelArn, alarmName)',
-      'readChannelTags(chimeClient, channelArn)', 'tags[CLASSIFICATION_TAG] !== STATIC_CLASSIFICATION', "tags.archived === 'true'",
-      '(deps.stateNow ?? alarmStateNow)(alarmName)', 'now.state !== r.state', 'primaryAssistantOf(', "declaredWorkflowOn(served?.version.eventWorkflows, 'alarm-state-changed')", 'runWorkflowFor(',
+      'ALARM_NAME.test(alarmName)', '(deps.watch ?? alarmWatchOf)(alarmWatchKey(alarmName), { strict: true })', '(deps.watches ?? conversationWatches)(channelArn, alarmName)',
+      'roomRefusal(await readChannelTags(chimeClient, channelArn))',
+      '(deps.stateNow ?? alarmStateNow)(alarmName, { strict: true })', 'now.state !== r.state', 'eventWorkflowOwner(', "declaredWorkflowOn(served?.version.eventWorkflows, 'alarm-state-changed')", 'runWorkflowFor(',
     ].map((t) => fn.indexOf(t));
     expect(order.every((i) => i > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     // The run is keyed by the time CloudWatch reports, never one the payload carries.
     expect(fn).toMatch(/const alarm: AlarmChange = \{ name: alarmName, state: now\.state, changedAt: now\.changedAt \};/);
-    // The watch is the room's own row and the alarm's record, both server-only, and the continuation reads them again.
+    // The watch is the room's own row and the alarm's record, both server-only, read before a run starts.
     expect(router).toMatch(/if \(!watch \|\| watch\.room !== channelArn \|\| watch\.classification !== STATIC_CLASSIFICATION\) return null;/);
     expect(router).toMatch(/if \(!row \|\| row\.watchedAlarm !== alarmName\) return null;/);
-    expect(router).toMatch(/if \(!\(await conversationWatches\(channelArn, alarm\.name\)\)\) return refuse\('the conversation no longer watches the alarm'\);/);
+    // A RUN THE ALARM STARTED FINISHES (owner decision, 2026-11-15): its continuation does not re-read the watch, so a
+    // conversation that stops watching the alarm stops new runs and an open one still reaches its end.
+    const continuation = router.slice(router.indexOf('export async function handleEventContinuation('));
+    expect(continuation.slice(0, continuation.indexOf('\n}\n'))).not.toMatch(/conversationWatches\(/);
+    expect(continuation).toContain("if (wf.on === 'alarm-state-changed' && !alarm) return refuse('the run names no alarm');");
   });
 });
 

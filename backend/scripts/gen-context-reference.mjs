@@ -26,8 +26,8 @@ const OUT = path.join(REPO_ROOT, 'docs', 'reference', 'context-catalog-reference
 // would put one account's identifiers into a tracked document for no reader benefit.
 const { entries, source } = loadContextSourceCatalog({
   classification: '<classification>',
-  attachmentsBucketArn: 'arn:aws:s3:::<attachments-bucket>',
-  attachmentsBucketName: '<attachments-bucket>',
+  companyBucketArn: 'arn:aws:s3:::<company-bucket>',
+  companyBucketName: '<company-bucket>',
   userProfileTableArn: 'arn:aws:dynamodb:<region>:<account>:table/<user-profile>',
   userProfileTableName: '<user-profile>',
   region: '<region>',

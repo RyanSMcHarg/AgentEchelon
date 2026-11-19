@@ -74,7 +74,7 @@
   align-items: center;
 }
 
-.um-toolbar h3 {
+.um-toolbar h2 {
   font-size: var(--text-lg);
   font-weight: 600;
   color: var(--text-primary);
@@ -381,7 +381,7 @@
   background: var(--surface-50, #0f0f11);
 }
 
-.um-external-idp h3 {
+.um-external-idp h2 {
   margin: 0 0 0.75rem;
   font-size: var(--text-md);
 }

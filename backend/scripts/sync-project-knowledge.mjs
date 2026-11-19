@@ -5,7 +5,7 @@
  * can answer "what is this / how does X work" about the platform they run on.
  *
  * Two outputs (per the launch decision: curated + RAG), each CLASSIFICATION-SCOPED:
- *   1. CURATED (this script, offline), written under backend/demo/platform-knowledge/ and uploaded by
+ *   1. CURATED (this script, offline), written under demo/stratum-company/platform-knowledge/ and uploaded by
  *      seed-demo to the `platform-knowledge/{classification}/` S3 prefixes:
  *        - `basic/`: the PUBLIC OVERVIEW only - what the platform is, its purpose, licence, author and
  *          repository. The external classification learns what the platform does and nothing of how.
@@ -13,7 +13,7 @@
  *      An assistant reads only the prefixes its classification grants (IAM on the role and on the vended
  *      session), and `load_platform_info` asks only for those.
  *   2. RAG (Aurora only, needs a deploy): with `--rag`, the full repo docs + public blog are uploaded to
- *      the Aurora archive bucket under `rag/agentechelon/{INTERNAL_CLASSIFICATION}/`. The DocumentIngestion
+ *      the company bucket (the Conversations stack's `CompanyBucketName`, in an Aurora-mode deployment) under `rag/agentechelon/{INTERNAL_CLASSIFICATION}/`. The DocumentIngestion
  *      Lambda chunks + Titan-embeds them tagged with that classification, so row-level security admits them
  *      only for a classification that grants it. A key is put when it is new, changed, or holds no chunks in
  *      the database, so a run re-triggers an ingest that failed and leaves an ingested key alone.
@@ -51,7 +51,7 @@ const DOCS_DIR = path.join(REPO_ROOT, 'docs');
 const INTERNAL_CLASSIFICATION = 'standard';
 /** Where the corpus was ingested before it was scoped; its keys are overwritten with stubs so their chunks are cleared. */
 const RETIRED_RAG_PREFIX = 'rag/agentechelon/basic/';
-const KNOWLEDGE_DIR = path.join(REPO_ROOT, 'backend', 'demo', 'platform-knowledge');
+const KNOWLEDGE_DIR = path.join(REPO_ROOT, 'demo', 'stratum-company', 'platform-knowledge');
 const OUTPUT = path.join(KNOWLEDGE_DIR, INTERNAL_CLASSIFICATION, 'agentechelon-about.json');
 const OUTPUT_PUBLIC = path.join(KNOWLEDGE_DIR, 'basic', 'agentechelon-about.json');
 const RAG = process.argv.includes('--rag');
@@ -141,7 +141,7 @@ function repoDocPaths() {
  * with restricted content is not a degraded feature - it is the isolation guarantee not holding.
  */
 function assertNoRestrictedDemoData(paths) {
-  const dir = path.join(REPO_ROOT, 'backend', 'demo', 'context', 'standard', 'employee-directory.json');
+  const dir = path.join(REPO_ROOT, 'demo', 'stratum-company', 'context', 'standard', 'employee-directory.json');
   if (!fs.existsSync(dir)) return; // no demo dataset in this checkout - nothing to protect
   let names = [];
   try {
@@ -318,7 +318,7 @@ function publishedRepository() {
 /**
  * A remote as a browsable https URL, or '' when it cannot be said confidently.
  *
- * `git@github-mcharg:owner/repo.git` is an SSH HOST ALIAS - a local `~/.ssh/config` name that
+ * `git@github-work:owner/repo.git` is an SSH HOST ALIAS - a local `~/.ssh/config` name that
  * resolves to github.com on one machine and means nothing anywhere else. Publishing it as a URL
  * would hand somebody an address that does not exist, which is worse than omitting it, so an alias
  * is only rewritten when it plainly names a known forge.
@@ -420,7 +420,7 @@ if (RAG) {
 }
 
 /**
- * --rag: upload the FULL repo docs + public blog to the Aurora archive bucket under
+ * --rag: upload the FULL repo docs + public blog to the company bucket under
  * rag/agentechelon/{INTERNAL_CLASSIFICATION}/. The DocumentIngestion Lambda (S3 PutObject notification on
  * `rag/`) chunks + Titan-embeds + stores them in the pgvector `embeddings` table, tagged with that
  * classification, so only a classification that grants it can retrieve them. Then every key under the
@@ -454,9 +454,15 @@ async function ingestToRag() {
   const desc = await cfn.send(new DescribeStacksCommand({ StackName: stackName }));
   const outputs = {};
   for (const o of desc.Stacks?.[0]?.Outputs || []) outputs[o.OutputKey] = o.OutputValue;
-  const bucket = outputs['ArchiveBucketName'];
+  if (outputs['AnalyticsMode'] !== 'aurora') {
+    throw new Error(`Stack "${stackName}" is not an Aurora-mode archive (AnalyticsMode=${outputs['AnalyticsMode'] ?? 'absent'}). RAG needs analyticsMode=aurora. Set AE_ANALYTICS_STACK if your stack is named differently.`);
+  }
+  // The corpus lives in the company bucket, published by the Conversations stack.
+  const conversationsStack = process.env.AE_CONVERSATIONS_STACK || `${resolveStackPrefix(process.env)}Conversations`;
+  const conv = await cfn.send(new DescribeStacksCommand({ StackName: conversationsStack }));
+  const bucket = conv.Stacks?.[0]?.Outputs?.find((o) => o.OutputKey === 'CompanyBucketName')?.OutputValue;
   if (!bucket) {
-    throw new Error(`ArchiveBucketName output not found on stack "${stackName}". RAG needs an Aurora-mode deploy (analyticsMode=aurora). Set AE_ANALYTICS_STACK if your stack is named differently.`);
+    throw new Error(`CompanyBucketName output not found on stack "${conversationsStack}". Set AE_CONVERSATIONS_STACK if your stack is named differently.`);
   }
   const s3 = new S3Client({ region });
   const PREFIX = `rag/agentechelon/${INTERNAL_CLASSIFICATION}/`;

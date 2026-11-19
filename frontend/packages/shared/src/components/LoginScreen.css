@@ -57,19 +57,7 @@
   pointer-events: none;
 }
 
-/* Admin console variant — operator (amber) accent + badge, so the admin
-   sign-in reads as a distinct, privileged surface vs the chat login. Scoped
-   overrides of the brand accent tokens flip the corner glow and the Sign-in
-   button (.btn-primary uses --accent-400/500) to amber, while the chat login
-   keeps the brand violet. */
-.login-screen--admin {
-  --accent-300: #FCD34D;
-  --accent-400: #F59E0B;
-  --accent-500: #D97706;
-  --accent-600: #B45309;
-  --text-on-accent: #1C1917;
-}
-
+/* The console's sign-in carries a badge and takes its accent from the console's own theme (admin-theme.css). */
 .admin-console-badge {
   display: inline-block;
   margin-bottom: var(--space-3);

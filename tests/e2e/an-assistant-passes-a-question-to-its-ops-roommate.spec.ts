@@ -18,7 +18,7 @@ guardConsoleErrors();
 /**
  * AN ASSISTANT PASSES A QUESTION THAT IS ITS ROOMMATE'S, AND KEEPS ONE THAT IS ITS OWN.
  *
- * Act 3.3 of the new-assistant demo, as a test. An `ops` conversation has two assistants of one
+ * Act 3.3 of the portable-assistants demo, as a test. An `ops` conversation has two assistants of one
  * classification: Advisor (the premium primary) and Ops (the ops role, which alone reads this
  * deployment's CloudWatch telemetry). Asked a telemetry question by name, Advisor must say the
  * question is Ops's and hand it over, and Ops must then answer it - nobody adds Ops to anything and

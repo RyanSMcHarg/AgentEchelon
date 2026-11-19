@@ -33,7 +33,7 @@ import { InvokeModelCommand } from '@aws-sdk/client-bedrock-runtime';
 const TITAN = 'amazon.titan-image-generator-v2:0';
 const NOVA = 'amazon.nova-canvas-v1:0';
 const STABILITY_CORE = 'stability.stable-image-core-v1:1';
-const OPENAI_GPT_IMAGE = 'gpt-image-1';
+const OPENAI_GPT_IMAGE = 'gpt-image-2';
 const FAL_FLUX = 'fal-ai/flux-pro/v1.1';
 
 function enc(o: unknown): Uint8Array {
@@ -55,9 +55,9 @@ describe('registry: lifecycle + hosting fields', () => {
   });
 
   it('OpenAI + FAL entries are active / external-http with their authEnvVar', () => {
-    expect(IMAGE_GEN_MODELS.openai_gpt_image_1.lifecycle).toBe('active');
-    expect(IMAGE_GEN_MODELS.openai_gpt_image_1.hosting).toBe('external-http');
-    expect(IMAGE_GEN_MODELS.openai_gpt_image_1.authEnvVar).toBe('OPENAI_API_KEY');
+    expect(IMAGE_GEN_MODELS.openai_gpt_image_2.lifecycle).toBe('active');
+    expect(IMAGE_GEN_MODELS.openai_gpt_image_2.hosting).toBe('external-http');
+    expect(IMAGE_GEN_MODELS.openai_gpt_image_2.authEnvVar).toBe('OPENAI_API_KEY');
     expect(IMAGE_GEN_MODELS.fal_flux_pro_1_1.lifecycle).toBe('active');
     expect(IMAGE_GEN_MODELS.fal_flux_pro_1_1.hosting).toBe('external-http');
     expect(IMAGE_GEN_MODELS.fal_flux_pro_1_1.authEnvVar).toBe('FAL_KEY');
@@ -76,7 +76,7 @@ describe('listImageGenModels', () => {
     const keys = active.map((m) => m.key).sort();
     expect(keys).toEqual([
       'fal_flux_pro_1_1',
-      'openai_gpt_image_1',
+      'openai_gpt_image_2',
       'stability_image_core',
       'stability_image_ultra',
     ]);
@@ -120,7 +120,7 @@ describe('shapeImageGenRequest: per-provider body shapes', () => {
     expect(b.prompt).toBe('a cat in a hat');
     expect(b.n).toBe(1);
     expect(b.size).toBe('1024x1024');
-    // gpt-image-1 returns base64 by default and REJECTS response_format
+    // gpt-image-2 returns base64 by default and REJECTS response_format
     // (a DALL-E-3 param) with HTTP 400, so we must NOT send it.
     expect(b.response_format).toBeUndefined();
   });
@@ -237,7 +237,7 @@ describe('invokeImageGenModel: external-HTTP routing', () => {
     const body = JSON.parse(initObj.body);
     expect(body.model).toBe(OPENAI_GPT_IMAGE);
     expect(body.prompt).toBe('a cat');
-    // gpt-image-1 rejects response_format (DALL-E-3 param); must not send it.
+    // gpt-image-2 rejects response_format (DALL-E-3 param); must not send it.
     expect(body.response_format).toBeUndefined();
     expect(result.images).toEqual(['openai-base64']);
     expect(result.modelId).toBe(OPENAI_GPT_IMAGE);

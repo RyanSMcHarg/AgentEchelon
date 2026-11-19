@@ -35,7 +35,7 @@ import {
   ListTagsForResourceCommand,
   TagResourceCommand,
 } from '@aws-sdk/client-chime-sdk-identity';
-import { callerPersonId, callerPersonArn, consoleSessionOf, respond as authRespond } from './lib/auth.js';
+import { callerPersonId, callerPersonArn, consoleSessionOf, trustedIamAdminPrincipal, respond as authRespond } from './lib/auth.js';
 import {
   OWNER_TEAM_TAG,
   OWNER_TEAM_CLEARED,
@@ -215,6 +215,17 @@ async function api(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> 
   const respond = (code: number, body: unknown) => authRespond(code, body, origin);
   if (event.httpMethod === 'OPTIONS') return respond(200, { ok: true });
 
+  // THIS INSTANCE'S ADMINISTRATORS ONLY, the second layer behind the gateway (`trustedIamAdminPrincipal`): a session
+  // another instance minted is refused here, whatever grant admitted it.
+  const principal = trustedIamAdminPrincipal(event);
+  if (!principal) {
+    // Both refuse; a team console session on the administrator's route is told where a team assigns.
+    const userArn = (event.requestContext?.identity as { userArn?: string | null } | undefined)?.userArn;
+    if (consoleSessionOf(userArn)?.kind === 'team' && !scopedAssistant(event)) {
+      return respond(403, { error: 'This route is an administrator\'s; a team assigns on its assistant\'s own route', code: 'ADMIN_ROUTE' });
+    }
+    return respond(403, { error: 'This session is not one of this instance\'s administrators', code: 'NOT_THIS_INSTANCE' });
+  }
   // The gateway admitted a session holding `manage-ownership`; the actor is the person it names.
   const actor = await callerPersonId(event);
   if (!actor) return respond(401, { error: 'Unauthorized' });
@@ -222,8 +233,7 @@ async function api(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> 
   // TWO ROUTES, TWO CALLERS. The admin route lists and assigns every assistant; the team route names one
   // assistant the caller's team owns. Each refuses the other's session, behind IAM, which grants each
   // role only its own route.
-  const userArn = (event.requestContext?.identity as { userArn?: string | null } | undefined)?.userArn;
-  const teamSession = consoleSessionOf(userArn)?.kind === 'team';
+  const teamSession = principal === 'team';
   const scoped = scopedAssistant(event);
   if (teamSession && !scoped) {
     return respond(403, { error: 'This route is an administrator\'s; a team assigns on its assistant\'s own route', code: 'ADMIN_ROUTE' });

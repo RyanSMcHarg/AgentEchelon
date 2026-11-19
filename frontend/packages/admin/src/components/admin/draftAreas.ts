@@ -9,7 +9,7 @@
 import type { ProfileDefinitionBody } from '../../services/profileService';
 
 /** The areas, in the order the cards show them and the wizard walks them. */
-export const DRAFT_AREAS = ['identity', 'abilities', 'models', 'routing', 'welcome', 'messages', 'events', 'variables'] as const;
+export const DRAFT_AREAS = ['identity', 'abilities', 'settings', 'models', 'routing', 'messages', 'events', 'processes', 'variables'] as const;
 export type DraftArea = typeof DRAFT_AREAS[number];
 
 /**
@@ -28,25 +28,26 @@ const workflowsWhere = (b: Body, welcome: boolean): Workflows =>
 /** The body fields each area owns, as `path -> value`. A path names the field a person would look for. */
 export function areaFields(area: DraftArea, b: Body): Record<string, unknown> {
   switch (area) {
-    case 'identity': return { displayName: b.displayName, persona: b.persona };
-    case 'abilities': return { tools: b.tools, guardrailId: b.guardrailId, contextSources: b.contextSources };
+    case 'identity': return { displayName: b.displayName, persona: b.persona, boundary: b.boundary };
+    case 'abilities': return { tools: b.tools, contextSources: b.contextSources };
+    case 'settings': return { guardrailId: b.guardrailId };
     case 'models': {
       const { routing: _routing, ...models } = (b.models ?? {});
       return { models, modelKey: b.modelKey };
     }
     case 'routing': return { 'models.routing': b.models?.routing };
-    case 'welcome': {
-      const own = Object.fromEntries(Object.entries(workflowsWhere(b, true)).map(([n, wf]) => [`eventWorkflows.${n}`, wf]));
-      return { ...own, welcome: b.welcome };
-    }
     case 'messages': return { messages: b.messages, copy: b.copy };
-    case 'events': return Object.fromEntries(Object.entries(workflowsWhere(b, false)).map(([n, wf]) => [`eventWorkflows.${n}`, wf]));
+    case 'events': return {
+      ...Object.fromEntries(Object.entries(b.eventWorkflows ?? {}).map(([n, wf]) => [`eventWorkflows.${n}`, wf])),
+      welcome: b.welcome,
+    };
+    case 'processes': return Object.fromEntries(Object.entries(b.processes ?? {}).map(([n, p]) => [`processes.${n}`, p]));
     case 'variables': return { variables: b.variables };
   }
 }
 
 /** The top-level body fields some area owns; every other field changed is reported under `other`. */
-const OWNED = new Set(['displayName', 'persona', 'tools', 'guardrailId', 'contextSources', 'models', 'modelKey', 'eventWorkflows', 'welcome', 'messages', 'copy', 'variables']);
+const OWNED = new Set(['displayName', 'persona', 'tools', 'guardrailId', 'contextSources', 'models', 'modelKey', 'eventWorkflows', 'welcome', 'processes', 'messages', 'copy', 'variables']);
 
 /** A value compared by content: keys sorted, absent and `undefined` alike. */
 export function stable(v: unknown): string {
@@ -114,9 +115,9 @@ export function areaSummary(area: DraftArea, b: Body, t: T, profileName = ''): s
         ? k('identityPersona', { name, count: b.persona.length })
         : k('identityNoPersona', { name });
     }
+    case 'settings': return k('settings', { guardrail: b.guardrailId || k('guardrailDefault') });
     case 'abilities': {
-      const guardrail = b.guardrailId || k('guardrailDefault');
-      return k('abilities', { tools: b.tools?.length ?? 0, sources: b.contextSources?.length ?? 0, guardrail });
+      return k('abilities', { tools: b.tools?.length ?? 0, sources: b.contextSources?.length ?? 0 });
     }
     case 'models': {
       const m = (b.models ?? {});
@@ -131,22 +132,24 @@ export function areaSummary(area: DraftArea, b: Body, t: T, profileName = ''): s
       const n = b.models?.routing?.length ?? 0;
       return n ? k('routing', { count: n }) : k('routingNone');
     }
-    case 'welcome': {
-      const own = Object.values(workflowsWhere(b, true));
-      if (!own.length) return k('welcomePlatform');
-      const types = [...new Set(own.flatMap((wf) => wf.types ?? []))];
-      const everyRoom = own.some((wf) => !wf.types?.length);
-      const rooms = [...types, ...(everyRoom ? [k('welcomeEveryOtherRoom')] : [])].join(', ');
-      return k('welcome', { rooms });
-    }
     case 'messages': {
       const n = Object.keys(b.messages ?? {}).length;
       return n ? k('messages', { count: n }) : k('messagesNone');
     }
     case 'events': {
-      const own = Object.values(workflowsWhere(b, false));
-      if (!own.length) return k('eventsNone');
-      return k('events', { count: own.length, events: [...new Set(own.map((wf) => wf.on))].join(', ') });
+      // The welcome first, as every version has one (its own, or the built-in), then the other workflows.
+      const welcomes = Object.values(workflowsWhere(b, true));
+      const types = [...new Set(welcomes.flatMap((wf) => wf.types ?? []))];
+      const everyRoom = welcomes.some((wf) => !wf.types?.length);
+      const welcome = !welcomes.length ? k('welcomePlatform')
+        : k('welcome', { rooms: [...types, ...(everyRoom ? [k('welcomeEveryOtherRoom')] : [])].join(', ') });
+      const others = Object.values(workflowsWhere(b, false));
+      const rest = others.length ? k('events', { count: others.length, events: [...new Set(others.map((wf) => wf.on))].join(', ') }) : k('eventsNone');
+      return `${welcome} ${rest}`;
+    }
+    case 'processes': {
+      const labels = Object.values(b.processes ?? {}).map((p) => p.label);
+      return labels.length ? k('processes', { count: labels.length, labels: labels.join(', ') }) : k('processesNone');
     }
     case 'variables': {
       const names = Object.keys(b.variables ?? {});

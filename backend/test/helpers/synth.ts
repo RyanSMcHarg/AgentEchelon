@@ -30,6 +30,10 @@ export const CLASSIFICATION_TEST_PROPS = {
   appInstanceArn: TEST_APP_INSTANCE_ARN,
   attachmentsBucketName: 'test-bucket',
   attachmentsBucketArn: 'arn:aws:s3:::test-bucket',
+  companyBucketName: 'test-company-bucket',
+  companyBucketArn: 'arn:aws:s3:::test-company-bucket',
+  profileBucketName: 'test-profile-bucket',
+  profileBucketArn: 'arn:aws:s3:::test-profile-bucket',
   // The credential exchange's role, which the classification's vend role trusts (bin passes Identity's).
   credentialExchangeRoleArn: 'arn:aws:iam::123456789012:role/test-credential-exchange',
 };
@@ -106,6 +110,8 @@ export const adminServicesStacks = memo((context) => {
     offboardingFunction: identity.offboardingFunction,
     
     attachmentsBucketArn: conversations.attachmentsBucket.bucketArn,
+    companyBucketName: conversations.companyBucket.bucketName,
+    profileBucketArn: conversations.profileBucket.bucketArn,
     feedbackTable: { tableName: conversations.feedbackTable.tableName, tableArn: conversations.feedbackTable.tableArn },
     archiveBucketArn: archive.archiveBucketArn,
     experimentsTable: experiments?.experimentsTable,
@@ -115,6 +121,7 @@ export const adminServicesStacks = memo((context) => {
     env: TEST_ENV,
     routes: adminServices.routes,
     consoleRoles: adminServices.consoleRoles,
+    adminPlaneRole: adminServices.adminPlaneRole,
     appInstanceArn: messaging.appInstanceArn,
     selfPoolId: identity.selfPoolId,
     selfClientIds: identity.selfClientIds,
@@ -143,6 +150,8 @@ export const adminServicesOnLiterals = memo((context) => {
     offboardingFunction: lambda.Function.fromFunctionArn(host, 'Offboarding', 'arn:aws:lambda:us-east-1:123456789012:function:test-offboarding'),
 
     attachmentsBucketArn: 'arn:aws:s3:::test-attachments',
+    companyBucketName: 'test-company',
+    profileBucketArn: 'arn:aws:s3:::test-profile',
     feedbackTable: { tableName: 'test-feedback', tableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/test-feedback' },
     archiveBucketArn: 'arn:aws:s3:::test-archive',
     battle: false,

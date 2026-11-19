@@ -108,8 +108,8 @@ export interface ClassificationArchiveFunctionsProps {
   /** Whether the archive connects through its optional RDS Proxy (`enableRdsProxy`). */
   rdsProxy: boolean;
   /**
-   * The classification's guardrails and the bucket its version bodies live in, which its golden run reads (ADR-065).
-   * Absent, no golden run is built.
+   * The classification's guardrails, the profile bucket its version bodies live in and an
+   * upload's entries are handed over in (`golden-uploads/`), which its golden run reads (ADR-065). Absent, no golden run is built.
    */
   goldenRun?: {
     defaultGuardrailId: string;
@@ -117,6 +117,8 @@ export interface ClassificationArchiveFunctionsProps {
     guardrailArns: string[];
     bodyBucketName: string;
     bodyBucketArn: string;
+    uploadBucketName: string;
+    uploadBucketArn: string;
   };
 }
 
@@ -259,7 +261,7 @@ export class ClassificationArchiveFunctions extends Construct {
         // removed with the version written, so the text is not kept as a noncurrent version (ADR-065 decision 7).
         new iam.PolicyStatement({
           actions: ['s3:GetObject', 's3:GetObjectVersion', 's3:DeleteObject', 's3:DeleteObjectVersion'],
-          resources: [`${g.bodyBucketArn}/golden-uploads/${c}/*`],
+          resources: [`${g.uploadBucketArn}/golden-uploads/${c}/*`],
         }),
       ]);
       const goldenRun = new lambdaNodeJs.NodejsFunction(this, 'GoldenRun', {
@@ -278,6 +280,7 @@ export class ClassificationArchiveFunctions extends Construct {
           GUARDRAIL_ID: g.defaultGuardrailId,
           GUARDRAIL_VERSION: g.defaultGuardrailVersion,
           PROFILE_BODY_BUCKET: g.bodyBucketName,
+          GOLDEN_UPLOAD_BUCKET: g.uploadBucketName,
           DEIDENTIFY_GUARDRAIL_ID: read(SHARED_SSM.deidentifyGuardrailId),
           DEIDENTIFY_GUARDRAIL_VERSION: read(SHARED_SSM.deidentifyGuardrailVersion),
         },

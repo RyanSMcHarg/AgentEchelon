@@ -8,8 +8,8 @@
  * the assistant role, and publishes the resolved ids so an operator (and the admin console) can select.
  *
  * The security boundary (§7): a profile SELECTS a catalog guardrail; it can never point at an arbitrary
- * resource, because the IAM grant is per PROVISIONED guardrail — an unprovisioned id AccessDenies and the
- * apply path fails OPEN (never drops a reply).
+ * resource, because the IAM grant is per PROVISIONED guardrail — an unprovisioned id AccessDenies, the
+ * apply path falls back to the deployment default, and a default that cannot be applied withholds the turn.
  */
 import type * as bedrock from 'aws-cdk-lib/aws-bedrock';
 import { buildGuardrailPolicy } from '../constructs/bedrock-guardrails';

@@ -41,7 +41,7 @@ describe('the variable picker', () => {
   it('lists the version\'s variables first, then every published source, with type, trust and whether it decides', () => {
     const rows = pickerRows(PUBLISHED, VARIABLES);
     expect(rows.slice(0, 2).map((r) => r.name)).toEqual(['firstName', 'stage']);
-    render(<VariablePicker published={PUBLISHED} variables={VARIABLES} purpose="insert" onPick={() => {}} testId="p" />);
+    render(<VariablePicker published={PUBLISHED} variables={VARIABLES} purpose="decide" onPick={() => {}} testId="p" />);
     expect(row('p', 'ctx:x-deal.stage').textContent).toMatch(/string.*Operator.*Yes/);
     expect(row('p', 'ctx:x-deal.note').textContent).toMatch(/Member text.*No, inserted only/);
     expect(row('p', 'person:clearance').textContent).toMatch(/set.*Platform.*A fact about one person/);

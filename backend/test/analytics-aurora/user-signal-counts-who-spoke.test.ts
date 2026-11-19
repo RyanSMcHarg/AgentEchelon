@@ -162,3 +162,18 @@ describe('the fold is scoped to the population the rows came from', () => {
     expect(outOfScope).toBe(1);
   });
 });
+
+describe('the vote scope is keyed by the id a vote carries', () => {
+  // A vote is stored under the Amazon Chime SDK message id the chat app voted on. The scope that places votes in the
+  // rollup's population must be keyed by the same id (`messages.message_id`), never the projection's own row id
+  // (`exchanges.agent_message_id`, a `messages.id` UUID), or no vote is ever in scope and every intent reads unrated.
+  it('selects the Chime message id for each turn in the population', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const src: string = require('fs').readFileSync(require('path').join(__dirname, '../../lambda/src/analytics-aurora/analytics-query.ts'), 'utf8');
+    const at = src.indexOf('const voteScope = new Map');
+    const scopeSql = src.slice(src.lastIndexOf('const scopedMessages = await query(', at), at);
+    expect(scopeSql).toMatch(/SELECT m\.message_id AS message_id/);
+    expect(scopeSql).toMatch(/JOIN messages m ON m\.id = e\.agent_message_id/);
+    expect(scopeSql).not.toMatch(/e\.agent_message_id::text AS message_id/);
+  });
+});

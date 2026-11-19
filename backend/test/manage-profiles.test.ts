@@ -3,6 +3,28 @@
  * The lifecycle/manifest logic is unit-tested separately; here we prove the capability gate and route
  * dispatch, since this is the WRITE surface (§7).
  */
+/**
+ * In-memory S3 for the profile body store, read only when a test sets `PROFILE_BODY_BUCKET` (as the deployed function
+ * has it). Every other test leaves the bucket unset, so nothing reaches this. Named `mock*` so the hoisted factory may
+ * close over it.
+ */
+const mockS3Objects = new Map<string, string>();
+jest.mock('@aws-sdk/client-s3', () => {
+  const actual = jest.requireActual('@aws-sdk/client-s3');
+  class S3Client {
+    async send(cmd: { constructor: { name: string }; input: { Bucket: string; Key: string; Body?: string } }): Promise<unknown> {
+      const addr = `${cmd.input.Bucket}/${cmd.input.Key}`;
+      if (cmd.constructor.name === 'PutObjectCommand') { mockS3Objects.set(addr, String(cmd.input.Body)); return {}; }
+      if (cmd.constructor.name === 'GetObjectCommand') {
+        const body = mockS3Objects.get(addr);
+        if (body === undefined) throw Object.assign(new Error('not found'), { name: 'NoSuchKey' });
+        return { Body: { transformToString: async () => body } };
+      }
+      throw new Error(`the in-memory S3 does not answer ${cmd.constructor.name}`);
+    }
+  }
+  return { ...actual, S3Client };
+});
 const send = jest.fn();
 jest.mock('@aws-sdk/client-ssm', () => {
   const actual = jest.requireActual('@aws-sdk/client-ssm');
@@ -47,6 +69,13 @@ jest.mock('../lambda/src/lib/assistant-scope', () => {
 import type { APIGatewayProxyEvent } from 'aws-lambda';
 import { handler, candidateRefusal, variantDeltaOf, battleSideOfVariant, controlMismatch } from '../lambda/src/manage-profiles';
 import { edgeContext } from './helpers/edge-context';
+
+/** A direct invoke through a caller's alias, as Lambda names it in `context.invokedFunctionArn`. */
+const via = (qualifier?: string) => ({
+  invokedFunctionArn: `arn:aws:lambda:us-east-1:123456789012:function:ae-manage-profiles${qualifier ? `:${qualifier}` : ''}`,
+});
+const VIA_BUILDS = via('assistant-builds');
+const VIA_EXPERIMENTS = via('experiments');
 
 function evt(over: Partial<APIGatewayProxyEvent> & { groups?: string; sub?: string; path?: string; method?: string }): APIGatewayProxyEvent {
   const { groups = 'admins', sub = 'u-1', path = '/admin/profiles', method = 'GET', ...rest } = over;
@@ -363,7 +392,7 @@ describe('arming pins two versions: the live active one as the control, a candid
     experiment(experimentType, variants, { battleEnabled: true, challengerAssistant: alt });
   type Derived = { ok: boolean; controlPin: { profileName: string; version: number }; altPin: { profileName: string; version: number }; code?: string };
   const derive = async (exp: Record<string, unknown>) => (await handler(
-    { aeDeriveExperimentVersions: { experiment: exp, actor: 'arn:admin' } } as never,
+    { aeDeriveExperimentVersions: { experiment: exp, actor: 'arn:admin' } } as never, VIA_EXPERIMENTS,
   )) as unknown as Derived;
   let store: ReturnType<typeof import('./helpers/fake-ssm-store').fakeSsmStore>;
   let liveVersion: number;
@@ -420,12 +449,12 @@ describe('arming pins two versions: the live active one as the control, a candid
   });
 
   it('base_model, not a battle: the control is the live version and the candidate changes only the base model', async () => {
-    const r = await derive(experiment('base_model', [{ variantId: 'control', modelKey: 'opus' }, { variantId: 'treatment', modelKey: 'sonnet' }]));
+    const r = await derive(experiment('base_model', [{ variantId: 'control', modelKey: 'sonnet' }, { variantId: 'treatment', modelKey: 'opus' }]));
     expect(r.ok).toBe(true);
     expect(r.controlPin).toMatchObject({ profileName: live, version: liveVersion });
     const base = await liveBody();
     const candidate = await versionOf(r.altPin);
-    expect(candidate).toMatchObject({ modelKey: 'sonnet', models: { default: 'sonnet' } });
+    expect(candidate).toMatchObject({ modelKey: 'opus', models: { default: 'opus' } });
     expect(candidate?.models?.byIntent).toEqual(base?.models?.byIntent);
     expect(candidate?.models?.classifier).toBe(base?.models?.classifier);
   });
@@ -444,7 +473,7 @@ describe('arming pins two versions: the live active one as the control, a candid
   });
 
   it('a control that differs from the live version is refused, and so is one with no live version to pin', async () => {
-    const r = await derive(experiment('base_model', [{ variantId: 'control', modelKey: 'sonnet' }, { variantId: 'treatment', modelKey: 'opus' }]));
+    const r = await derive(experiment('base_model', [{ variantId: 'control', modelKey: 'opus' }, { variantId: 'treatment', modelKey: 'sonnet' }]));
     expect(r).toMatchObject({ ok: false, code: 'CONTROL_DIFFERS_FROM_LIVE' });
     const { fakeSsmStore } = await import('./helpers/fake-ssm-store');
     const empty = fakeSsmStore();
@@ -493,7 +522,7 @@ describe('arming pins two versions: the live active one as the control, a candid
   it('accepts the request under its earlier name, and a direct API Gateway request never reaches it', async () => {
     const legacy = (await handler({ aeDeriveBattleSides: { experiment: battle('base_model', [
       { variantId: 'control' }, { variantId: 'treatment', modelKey: 'sonnet' },
-    ]), actor: 'arn:admin' } } as never)) as unknown as Derived;
+    ]), actor: 'arn:admin' } } as never, VIA_EXPERIMENTS)) as unknown as Derived;
     expect(legacy.ok).toBe(true);
     // An API request carries a method, so the internal shape in its body is just an unknown route.
     const res = await handler(evt({ method: 'POST', path: '/admin/profiles/derive', body: JSON.stringify({ aeDeriveExperimentVersions: {} }) }));
@@ -532,7 +561,7 @@ describe('promotion copies the measured candidate into the live assistant (§3.6
       experimentId: 'exp-p', status: 'active', experimentType: 'base_model', tiers: ['premium'], servesVersions: true,
       variants: [{ variantId: 'control', weight: 50 }, { variantId: 'treatment', modelKey: 'sonnet', weight: 50 }],
     };
-    const r = (await handler({ aeDeriveExperimentVersions: { experiment: exp, actor: 'arn:admin' } } as never)) as unknown as {
+    const r = (await handler({ aeDeriveExperimentVersions: { experiment: exp, actor: 'arn:admin' } } as never, VIA_EXPERIMENTS)) as unknown as {
       controlPin: { profileName: string; version: number }; altPin: { profileName: string; version: number };
     };
     type Pin = { profileName: string; version: number };
@@ -541,7 +570,7 @@ describe('promotion copies the measured candidate into the live assistant (§3.6
     };
   };
   const promote = async (experiment: Record<string, unknown>) => (await handler(
-    { aePromoteCandidate: { experiment, actor: 'arn:admin' } } as never,
+    { aePromoteCandidate: { experiment, actor: 'arn:admin' } } as never, VIA_EXPERIMENTS,
   )) as unknown as { ok: boolean; code?: string; version: number; configId: string; promotedFrom: Record<string, unknown> };
 
   it('activates a copy that hashes to the candidate, recording promotedFrom', async () => {
@@ -656,6 +685,8 @@ describe('a runtime assistant is managed here while the directory says it is act
     // A classification's primary is listed as declared and is not retirable; a console-created one is.
     expect(rows.advisor).toMatchObject({ origin: 'deployed', retirable: false });
     expect(rows['finance-advisor']).toMatchObject({ origin: 'console', retirable: true });
+    // What "inherit" restores is the directory entry's name, or the assistant id where the entry holds none.
+    expect(rows['finance-advisor']).toMatchObject({ provisionedDisplayName: 'finance-advisor' });
     // A declared assistant RETIRED IN THE CONSOLE is not a profile to open: it is a retired row, like any other.
     expect(rows['ops-premium']).toBeUndefined();
     const roster = Object.fromEntries((body.runtimeAssistants as Array<{ assistant: string }>).map((r) => [r.assistant, r as Record<string, unknown>]));
@@ -735,16 +766,16 @@ describe('a runtime assistant is managed here while the directory says it is act
       [`${ROOT}/assistant-assignments/premium/primary/assistants/finance-advisor`]: record,
       [`${ROOT}/assistant/premium/assistant-intent-pack`]: JSON.stringify({ extends: 'default', intents: [] }),
     });
-    const seeded = await handler({ aeSeedFirstDraft: { assistant: 'finance-advisor', actor: 'admin-1' } } as never) as unknown as { seeded: boolean };
+    const seeded = await handler({ aeSeedFirstDraft: { assistant: 'finance-advisor', actor: 'admin-1' } } as never, VIA_BUILDS) as unknown as { seeded: boolean };
     expect(seeded.seeded).toBe(true);
     store({
       [`${ROOT}/assistant-directory/finance-advisor`]: entry('active'),
       [`${ROOT}/assistant-assignments/premium/primary/assistants/finance-advisor`]: record,
       [`${ROOT}/assistant/finance-advisor/draft`]: JSON.stringify({ schemaVersion: 1, profileName: 'finance-advisor', modelKey: 'sonnet', configId: 'c1' }),
     });
-    const again = await handler({ aeSeedFirstDraft: { assistant: 'finance-advisor' } } as never) as unknown as { seeded: boolean; reason: string };
+    const again = await handler({ aeSeedFirstDraft: { assistant: 'finance-advisor' } } as never, VIA_BUILDS) as unknown as { seeded: boolean; reason: string };
     expect(again).toMatchObject({ seeded: false, reason: 'it already has a draft' });
-    const declared = await handler({ aeSeedFirstDraft: { assistant: 'advisor' } } as never) as unknown as { seeded: boolean };
+    const declared = await handler({ aeSeedFirstDraft: { assistant: 'advisor' } } as never, VIA_BUILDS) as unknown as { seeded: boolean };
     expect(declared.seeded).toBe(false);
   });
 
@@ -755,10 +786,10 @@ describe('a runtime assistant is managed here while the directory says it is act
       [`${ROOT}/assistant-directory/tax-advisor`]: JSON.stringify({ classification: 'premium', role: 'primary', status: 'active', displayName: 'Tax Desk' }),
       [`${ROOT}/assistant/finance-advisor/draft`]: JSON.stringify({ schemaVersion: 1, profileName: 'finance-advisor', modelKey: 'sonnet', displayName: 'tax desk', configId: 'c1' }),
     });
-    const edit = await post('/admin/profiles/draft', { profileName: 'finance-advisor', patch: { displayName: ' TAX DESK ' } });
+    const edit = await post('/admin/profiles/draft', { profileName: 'finance-advisor', patch: { displayName: ' TAX DESK ' }, configId: 'c1' });
     expect(edit.statusCode).toBe(409);
     expect(JSON.parse(edit.body).code).toBe('ASSISTANT_DISPLAY_NAME_TAKEN');
-    const activate = await post('/admin/profiles/activate', { profileName: 'finance-advisor' });
+    const activate = await post('/admin/profiles/activate', { profileName: 'finance-advisor', configId: 'c1' });
     expect(activate.statusCode).toBe(409);
     expect(JSON.parse(activate.body).code).toBe('ASSISTANT_DISPLAY_NAME_TAKEN');
     const writes = send.mock.calls.map(([c]) => c.constructor.name).filter((n: string) => n === 'PutParameterCommand' || n === 'LabelParameterVersionCommand');
@@ -784,7 +815,7 @@ describe('a runtime assistant is managed here while the directory says it is act
       [`${ROOT}/assistant/finance-advisor/draft`]: JSON.stringify({ ...JSON.parse(draft.input.Value), displayName: 'Penny' }),
       [`${ROOT}/assistant/premium/context-sources`]: JSON.stringify([{ key: 'user-profile' }]),
     });
-    const res = await post('/admin/profiles/activate', { profileName: 'finance-advisor' });
+    const res = await post('/admin/profiles/activate', { profileName: 'finance-advisor', configId: JSON.parse(draft.input.Value).configId });
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).identityRename).toBe('applied');
     expect(lambdaInvokes).toEqual([{ FunctionName: process.env.RUNTIME_NAME_APPLIER_ARN, payload: { assistant: 'finance-advisor', displayName: 'Penny' } }]);
@@ -843,9 +874,24 @@ describe('a runtime assistant is managed here while the directory says it is act
         profileName: 'finance-advisor', modelKey: 'sonnet', persona: 'You help with finance.', configId: 'c1',
       }),
     });
-    const res = await post('/admin/profiles/activate', { profileName: 'finance-advisor' });
+    const res = await post('/admin/profiles/activate', { profileName: 'finance-advisor', configId: 'c1' });
     expect(res.statusCode).toBe(422);
     expect(JSON.parse(res.body).errors).toEqual(expect.arrayContaining([expect.stringMatching(/must carry its own intentPack/)]));
+  });
+
+  it('Validate refuses the same draft for the same reason, so a passing Validate is not refused by Activate for it', async () => {
+    store({
+      [`${ROOT}/assistant-directory/finance-advisor`]: entry('active'),
+      [`${ROOT}/assistant-assignments/premium/primary/assistants/finance-advisor`]: record,
+      [`${ROOT}/assistant/finance-advisor/draft`]: JSON.stringify({
+        profileName: 'finance-advisor', modelKey: 'sonnet', persona: 'You help with finance.', configId: 'c1',
+      }),
+    });
+    const res = await post('/admin/profiles/validate', { profileName: 'finance-advisor' });
+    expect(res.statusCode).toBe(200);
+    const out = JSON.parse(res.body);
+    expect(out.valid).toBe(false);
+    expect(out.errors).toEqual(expect.arrayContaining([expect.stringMatching(/must carry its own intentPack/)]));
   });
 
   // ── WHERE A NEW ASSISTANT'S FIRST DRAFT STARTS (owner decision, 2026-10-24) ──────────────────────────
@@ -873,7 +919,7 @@ describe('a runtime assistant is managed here while the directory says it is act
       [`${ROOT}/assistant-assignments/premium/primary/assistants/finance-advisor`]: record,
       [`${ROOT}/assistant/premium/assistant-intent-pack`]: JSON.stringify(PACK),
     });
-    const out = await handler({ aeSeedFirstDraft: { assistant: 'finance-advisor', actor: 'admin-1' } } as never) as unknown as { seeded: boolean };
+    const out = await handler({ aeSeedFirstDraft: { assistant: 'finance-advisor', actor: 'admin-1' } } as never, VIA_BUILDS) as unknown as { seeded: boolean };
     expect(out.seeded).toBe(true);
     expect(draftWritten()).toMatchObject({
       displayName: 'Penny', modelKey: 'sonnet', intentPack: PACK, models: { default: 'sonnet', classifier: 'haiku' },
@@ -882,20 +928,61 @@ describe('a runtime assistant is managed here while the directory says it is act
     expect(draftWritten().contextSources).toEqual(['user-profile']);
   });
 
-  it("leaves the classification's task graphs out of a first draft from its defaults, so the draft can be activated", async () => {
-    // Measured on a deployment: the premium pack declares `machines`, the seed copied the pack whole, and
-    // activation refused the draft (`intentPack.machines is not read from a profile version`).
+  it("does not copy the classification's machines block whole into a first draft, so the draft can be activated", async () => {
+    // The premium pack declares `machines`, which may name a platform key a version is refused. The draft is given its
+    // own multi-step intents' machines instead, where the deployment has a body store (`withStartingMachines`); this
+    // handler has none, so it carries none.
     const withMachines = { ...PACK, machines: { quarterly_report: { initial: 'gather', states: { gather: { transitions: [] } } } } };
     store({
       [`${ROOT}/assistant-directory/finance-advisor`]: created,
       [`${ROOT}/assistant-assignments/premium/primary/assistants/finance-advisor`]: record,
       [`${ROOT}/assistant/premium/assistant-intent-pack`]: JSON.stringify(withMachines),
     });
-    const out = await handler({ aeSeedFirstDraft: { assistant: 'finance-advisor' } } as never) as unknown as { seeded: boolean };
+    const out = await handler({ aeSeedFirstDraft: { assistant: 'finance-advisor' } } as never, VIA_BUILDS) as unknown as { seeded: boolean };
     expect(out.seeded).toBe(true);
     const draft = draftWritten();
     expect(draft.intentPack).toEqual(PACK);
     expect(draft.intentPack).not.toHaveProperty('machines');
+  });
+
+  it('a classification with no pack parameter seeds the platform default, and the draft activates as seeded', async () => {
+    // Only premium carries a pack parameter, and a runtime assistant's version must carry its own intentPack (an
+    // activation without one is a 422). A team assistant created on basic or standard serves the platform default,
+    // so that is what its seeded draft carries.
+    const { DEFAULT_INTENT_PACK } = jest.requireActual('../lambda/src/lib/intent-pack');
+    // THE DEPLOYED FUNCTION HAS A BODY STORE (`admin-assistant-administration.ts`): the platform pack is larger than a
+    // parameter holds, so it is kept in S3 beside the definition, as every version's pack is there.
+    process.env.PROFILE_BODY_BUCKET = 'profile-bodies';
+    mockS3Objects.clear();
+    try {
+    store({
+      [`${ROOT}/assistant-directory/finance-advisor`]: created,
+      [`${ROOT}/assistant-assignments/premium/primary/assistants/finance-advisor`]: record,
+    });
+    const out = await handler({ aeSeedFirstDraft: { assistant: 'finance-advisor' } } as never, VIA_BUILDS) as unknown as { seeded: boolean };
+    expect(out).toMatchObject({ seeded: true });
+    const draft = draftWritten();
+    const packBody = [...mockS3Objects].find(([k]) => k.endsWith('/intentPack'))?.[1];
+    expect(packBody).toBeDefined();
+    const pack = JSON.parse(packBody!);
+    expect(pack.intents.map((i: { key: string }) => i.key)).toEqual(DEFAULT_INTENT_PACK.intents.map((i: { key: string }) => i.key));
+    // THE DRAFT SAYS WHAT IT RUNS (ADR-066 decision 1): the machine of each multi-step intent it carries, none of them the
+    // platform's.
+    const multiStep = DEFAULT_INTENT_PACK.intents.filter((i: { delivery: string }) => i.delivery === 'TASK_MULTI_STEP').map((i: { key: string }) => i.key);
+    expect(Object.keys(pack.machines).sort()).toEqual(multiStep.sort());
+
+    store({
+      [`${ROOT}/assistant-directory/finance-advisor`]: created,
+      [`${ROOT}/assistant-assignments/premium/primary/assistants/finance-advisor`]: record,
+      [`${ROOT}/assistant/finance-advisor/draft`]: JSON.stringify(draft),
+      [`${ROOT}/assistant/premium/context-sources`]: JSON.stringify([{ key: 'user-profile' }]),
+    });
+    const res = await post('/admin/profiles/activate', { profileName: 'finance-advisor', configId: draft.configId });
+    expect(JSON.parse(res.body).errors ?? []).not.toEqual(expect.arrayContaining([expect.stringMatching(/must carry its own intentPack/)]));
+    expect({ status: res.statusCode, version: JSON.parse(res.body).version }).toEqual({ status: 200, version: 1 });
+    } finally {
+      delete process.env.PROFILE_BODY_BUCKET;
+    }
   });
 
   it('lands a profile file as the first draft, with the create\'s name and models written over the file\'s', async () => {
@@ -904,7 +991,7 @@ describe('a runtime assistant is managed here while the directory says it is act
       [`${ROOT}/assistant-assignments/premium/primary/assistants/finance-advisor`]: record,
     });
     const manifest = { ...advisorManifest, body: { ...advisorManifest.body, displayName: 'Advisor', models: { default: 'opus', classifier: 'opus' } } };
-    const out = await handler({ aeSeedFirstDraft: { assistant: 'finance-advisor', startingPoint: { kind: 'manifest', manifest } } } as never) as unknown as { seeded: boolean };
+    const out = await handler({ aeSeedFirstDraft: { assistant: 'finance-advisor', startingPoint: { kind: 'manifest', manifest } } } as never, VIA_BUILDS) as unknown as { seeded: boolean };
     expect(out.seeded).toBe(true);
     const draft = draftWritten();
     expect(draft).toMatchObject({ profileName: 'finance-advisor', displayName: 'Penny', modelKey: 'sonnet', persona: 'You advise.', intentPack: PACK });
@@ -919,7 +1006,7 @@ describe('a runtime assistant is managed here while the directory says it is act
       [`${ROOT}/assistant-assignments/premium/primary/assistants/finance-advisor`]: record,
       [`${ROOT}/assistant/advisor/definition:active`]: advisorActive,
     });
-    const out = await handler({ aeSeedFirstDraft: { assistant: 'finance-advisor', startingPoint: { kind: 'copy', from: 'advisor' } } } as never) as unknown as { seeded: boolean };
+    const out = await handler({ aeSeedFirstDraft: { assistant: 'finance-advisor', startingPoint: { kind: 'copy', from: 'advisor' } } } as never, VIA_BUILDS) as unknown as { seeded: boolean };
     expect(out.seeded).toBe(true);
     const draft = draftWritten();
     expect(draft).toMatchObject({
@@ -943,7 +1030,7 @@ describe('a runtime assistant is managed here while the directory says it is act
     store({ [`${ROOT}/assistant/concierge/definition:active`]: advisorActive });
     const out = await handler({
       aeCheckStartingPoint: { assistant: 'finance-advisor', classification: 'premium', startingPoint: { kind: 'copy', from } },
-    } as never) as unknown as { errors: string[] };
+    } as never, VIA_BUILDS) as unknown as { errors: string[] };
     expect(out.errors).toEqual([expect.stringMatching(reason)]);
   });
 
@@ -951,7 +1038,7 @@ describe('a runtime assistant is managed here while the directory says it is act
     store({});
     const check = (manifest: unknown, choices: Record<string, string> = {}) => handler({
       aeCheckStartingPoint: { assistant: 'new-advisor', classification: 'basic', startingPoint: { kind: 'manifest', manifest }, choices },
-    } as never) as unknown as Promise<{ errors: string[] }>;
+    } as never, VIA_BUILDS) as unknown as Promise<{ errors: string[] }>;
     // The create's own model is checked, not the file's: basic selects haiku, not sonnet.
     expect((await check(advisorManifest, { modelKey: 'haiku', classifierModelKey: 'default' })).errors).toEqual([]);
     expect((await check(advisorManifest, { modelKey: 'sonnet' })).errors).toEqual(expect.arrayContaining([expect.stringMatching(/'sonnet' is not available to the target classification 'basic'/)]));
@@ -988,7 +1075,50 @@ describe('a runtime assistant is managed here while the directory says it is act
   it('refuses a starting point that is not one, by shape', async () => {
     const out = await handler({
       aeCheckStartingPoint: { assistant: 'new-advisor', classification: 'premium', startingPoint: { kind: 'clone' } },
-    } as never) as unknown as { errors: string[] };
+    } as never, VIA_BUILDS) as unknown as { errors: string[] };
     expect(out.errors).toEqual([expect.stringMatching(/startingPoint.kind must be/)]);
   });
+});
+
+// EACH DIRECT OPERATION IS SERVED ONLY THROUGH ITS CALLER'S ALIAS (`profile-direct-callers.ts`): IAM grants
+// `manage-assistants` the invoke on `assistant-builds` alone and `admin-experiments` on `experiments` alone, and the
+// handler serves an alias only its caller's operations, so neither caller can ask for the other's.
+describe('direct operations, by the alias they come through', () => {
+  type Refusal = { ok: boolean; status: number; code: string };
+  const ask = async (payload: Record<string, unknown>, context?: { invokedFunctionArn: string }) =>
+    (await handler(payload as never, context)) as unknown as Refusal;
+  const EXPERIMENT_OPS = {
+    aeDeriveExperimentVersions: { experiment: { experimentId: 'e1' }, actor: 'arn:admin' },
+    aeDeriveBattleSides: { experiment: { experimentId: 'e1' }, actor: 'arn:admin' },
+    aeApplyAltAlias: { alt: 'advisor-alt', alias: 'Challenger' },
+    aePromoteCandidate: { experiment: { experimentId: 'e1' }, actor: 'arn:admin' },
+  };
+  const BUILD_OPS = {
+    aeSeedFirstDraft: { assistant: 'finance-advisor', actor: 'admin-1' },
+    aeCheckStartingPoint: { assistant: 'finance-advisor', classification: 'premium', startingPoint: { kind: 'copy', from: 'advisor' } },
+  };
+
+  it.each(Object.entries(EXPERIMENT_OPS))('refuses %s through the builds alias, unqualified, or another alias, and reads nothing', async (op, body) => {
+    for (const context of [VIA_BUILDS, via(), via('$LATEST'), via('experiments-x'), undefined]) {
+      expect(await ask({ [op]: body }, context)).toEqual({ ok: false, status: 403, error: expect.any(String), code: 'DIRECT_OP_REFUSED' });
+    }
+    expect(send).not.toHaveBeenCalled();
+    expect(lambdaInvokes.filter((i) => JSON.stringify(i.payload).includes('Challenger'))).toEqual([]);
+  });
+
+  it.each(Object.entries(BUILD_OPS))('refuses %s through the experiments alias, unqualified, or another alias, and reads nothing', async (op, body) => {
+    for (const context of [VIA_EXPERIMENTS, via(), via('$LATEST'), undefined]) {
+      expect(await ask({ [op]: body }, context)).toEqual({ ok: false, status: 403, error: expect.any(String), code: 'DIRECT_OP_REFUSED' });
+    }
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('refuses a payload that names another caller\'s operation beside its own', async () => {
+    const mixed = { aeSeedFirstDraft: BUILD_OPS.aeSeedFirstDraft, aePromoteCandidate: EXPERIMENT_OPS.aePromoteCandidate };
+    expect(await ask(mixed, VIA_BUILDS)).toMatchObject({ status: 403, code: 'DIRECT_OP_REFUSED' });
+    expect(await ask(mixed, VIA_EXPERIMENTS)).toMatchObject({ status: 403, code: 'DIRECT_OP_REFUSED' });
+    expect(send).not.toHaveBeenCalled();
+  });
+  // Each caller's own operations through its own alias are served: every seed, check, derivation and promotion
+  // test above asks through its caller's alias.
 });

@@ -24,7 +24,7 @@
 - **Its own answering instructions.** `instructions` is what the answering model reads, as distinct from `description`, which only the classifier sees.
 - **Its own advertisement.** `summary` is one line a person reads, saying what they get. Absence means the intent is recognized and not advertised, which is the default so that advertising is a decision.
 
-**The classifier is handed the taxonomy on every turn.** The pack renders as the category list in the classifier prompt, the model returns a category name, and the name is matched against the pack's own keys. An unmatched reply resolves to the general intent rather than to a guess. Two alternative classifier modes exist, chosen per profile in deployment config: `llm` hands the taxonomy to the classifier model every turn as above, and `keyword` matches each intent's `keywords` against the message with no model call; the sample's `ops-premium` profile chooses `keyword` deliberately.
+**The classifier is handed the taxonomy on every turn.** The pack renders as the category list in the classifier prompt, the model returns a category name, and the name is matched against the pack's own keys. An unmatched reply resolves to the general intent rather than to a guess. Two alternative classifier modes exist, chosen per profile in deployment config: `llm` hands the taxonomy to the classifier model every turn as above, and `keyword` matches each intent's `keywords` against the message with no model call; no shipped profile chooses `keyword`.
 
 **Two rules bound an open key space, both enforced at the write path.** A route must be reachable from some intent the pack declares, and an intent narrows and never widens the profile's tools. An open key space grants nothing on its own, because routing is a lookup: a key no strategy declares resolves to the profile's base model.
 
@@ -155,7 +155,7 @@ Personas are defined in [PERSONAS.md](../../../overview/PERSONAS.md) and are not
 
 - [SPEC-ASSISTANT-CONFIG.md](./SPEC-ASSISTANT-CONFIG.md) - the broader configuration pillar this is one field of
 - [SPEC-PORTABLE-PROFILES.md](./SPEC-PORTABLE-PROFILES.md) - the versioned artifact a pack rides, and where a pack body is stored
-- [SPEC-TASK-STATE-TRANSITIONS.md](../conversation/SPEC-TASK-STATE-TRANSITIONS.md) - sections 9 to 12, the half of the `machines` contract a pack's schema cannot express
+- [DESIGN-TASK-STATE-TRANSITIONS.md](../conversation/DESIGN-TASK-STATE-TRANSITIONS.md) - sections 9 to 12, the half of the `machines` contract a pack's schema cannot express
 - [SPEC-CONTEXT-AWARE-MODEL-ROUTING.md](./SPEC-CONTEXT-AWARE-MODEL-ROUTING.md) - the segment and language signals that sit ahead of the intent route
 - [SPEC-BILINGUAL-CONVERSATIONS.md](./SPEC-BILINGUAL-CONVERSATIONS.md) - the language signal, which the taxonomy does not carry
 - [MODEL_STRATEGY.md](../../../guides/developer/MODEL_STRATEGY.md) - the catalog and the route strategy an intent key feeds
@@ -169,7 +169,7 @@ Personas are defined in [PERSONAS.md](../../../overview/PERSONAS.md) and are not
 
 An intent definition carries a stable `key` (the classified value, the model route and the task type), the `description` the classifier is shown, the `keywords` the no-model classifier matches, and the `delivery` shape - one reply, a reply updated in place, or a tracked multi-step task. It may also carry `instructions` for the answering model, a narrowed `tools` list, a `maxTokens` and a coarse `verbosity`, and a person-facing `summary`.
 
-A pack carries its `intents`, an optional `extends: 'default'`, and, on the per-deployment parameter only, an optional `machines` block keyed by task type and merged over the platform defaults. A pack carried by a profile version may not carry `machines`: task graphs are global, a version selects among them with `workflows`, and the write path refuses a version whose pack declares one.
+A pack carries its `intents`, an optional `extends: 'default'`, and an optional `machines` block keyed by task type. On a classification's parameter the block merges over the platform defaults and is the starting point a new draft copies; on a profile version it is the version's own machines for its intents (ADR-066), run over the classification's and platform's set, and the write path refuses a key that names a platform machine (`PLATFORM_MACHINE_KEYS`).
 
 Invalid values are dropped rather than kept: a non-positive answer budget, an unknown verbosity, a non-string entry in a state's requirement list. A duplicate key is a silent override rather than a harmless repeat, so it is reported.
 
@@ -237,7 +237,7 @@ The answer guidance sits in the per-turn suffix, after the cache point, because 
 
 #### Message or file
 
-Off the task path the intent decides; on it the task machine still does. The decision and its diagram are in [SPEC-TASK-STATE-TRANSITIONS section 10](../conversation/SPEC-TASK-STATE-TRANSITIONS.md#10-delivery-attachment-or-inline-and-how-an-author-steers-it).
+Off the task path the intent decides; on it the task machine still does. The decision and its diagram are in [DESIGN-TASK-STATE-TRANSITIONS section 10](../conversation/DESIGN-TASK-STATE-TRANSITIONS.md#10-delivery-attachment-or-inline-and-how-an-author-steers-it).
 
 #### Default guidance for the platform intents
 
@@ -255,7 +255,7 @@ A snippet and a code deliverable are separate intents, and so are producing a de
 | `data_extraction` | task | A table first; values verbatim from the source | document from the machine | 0 | `no-file-claim` |
 | `guided_troubleshooting` | task | One step at a time, with the result to look for | `message` | 0.2 | none |
 | `image_generation` | reply updated in place | Describe the image; the image path delivers it | image path | default | none |
-| `platform_question` | reply updated in place | One line in the platform pack, "Answer from platform information.": by the size budget it carries a description, the keyword `agentechelon` and a one-line instruction, and names no tools, so the turn keeps every tool; a declaring pack sets the depth (the demo packs in `backend/demo/intent-packs.ts`: basic explains what AgentEchelon is and does, the internal packs add configuration and code examples and architecture) | default | default | none |
+| `platform_question` | reply updated in place | One line in the platform pack, "Answer from platform information.": by the size budget it carries a description, the keyword `agentechelon` and a one-line instruction, and names no tools, so the turn keeps every tool; a declaring pack sets the depth (the demo packs in `demo/stratum-company/intent-packs.ts`: basic explains what AgentEchelon is and does, the internal packs add configuration and code examples and architecture) | default | default | none |
 
 On a task intent, `require` is prompt guidance for the delivering step: the shape check runs off the task path only, and the delivering step runs its own deliverable check (length, chat wrapper, a question to the reader, and a claimed file), so of the named checks only `no-file-claim` has an enforced equivalent there; `code-block` and `sections` are not enforced on a task.
 
@@ -271,7 +271,7 @@ The same gate as the rest of a definition (`validateIntentPackBody`): known `for
 
 ### Before writing a `machines` block
 
-Read [SPEC-TASK-STATE-TRANSITIONS.md](../conversation/SPEC-TASK-STATE-TRANSITIONS.md) sections 9 to 12. They state the half of the contract the schema cannot express: which decisions belong to the platform and which to the deployment (section 9), how a delivering state chooses between an attachment and an inline answer and what a state's prompt may therefore claim about a file (section 10), the defaults an author gets no warning about (section 11), and who a step awaits (section 12). Finality is declared rather than inferred, and a state's wait declaration is the signal that topic-drift detection, intent classification and model selection all read to tell a continuation from a new subject. A state that waits on a person without declaring it compiles, validates, and then loses all three.
+Read [DESIGN-TASK-STATE-TRANSITIONS.md](../conversation/DESIGN-TASK-STATE-TRANSITIONS.md) sections 9 to 12. They state the half of the contract the schema cannot express: which decisions belong to the platform and which to the deployment (section 9), how a delivering state chooses between an attachment and an inline answer and what a state's prompt may therefore claim about a file (section 10), the defaults an author gets no warning about (section 11), and who a step awaits (section 12). Finality is declared rather than inferred, and a state's wait declaration is the signal that topic-drift detection, intent classification and model selection all read to tell a continuation from a new subject. A state that waits on a person without declaring it compiles, validates, and then loses all three.
 
 A waiting state declares the party it awaits; the older boolean spelling is still accepted and means the same thing, so a pack written against it keeps working. A state naming a party the platform does not resolve is refused, and the whole block falls back to the platform defaults rather than shipping steps that can never find an owner.
 
@@ -281,7 +281,7 @@ A pack machine keeps every field a task state may declare, and that is worth sta
 
 A per-deployment pack is a body on the same object store a profile version's persona and pack use, and its parameter holds a pointer (FR23). A workflow declares a prompt on every step, so a pack outgrows any parameter tier; on the body store the parameter's value limit is not the pack's limit.
 
-- **The key names its owner.** The body is written to `classification-packs/<classification>/<sha256>/intentPack` in the deployment's attachments bucket (`classificationPackKey` in `backend/lambda/src/lib/profile-bodies.ts`), apart from the `profiles/` family a version's bodies use. The classification is a key segment, so IAM names one classification's prefix: that classification's router, task service and processor read it, and the processor's boundary admits it, while no other classification's functions do. The deploy-time writer of that classification holds the only write, on that prefix only.
+- **The key names its owner.** The body is written to `classification-packs/<classification>/<sha256>/intentPack` in the deployment's profile bucket (`classificationPackKey` in `backend/lambda/src/lib/profile-bodies.ts`), apart from the `profiles/` family a version's bodies use. The classification is a key segment, so IAM names one classification's prefix: that classification's router, task service and processor read it, and the processor's boundary admits it, while no other classification's functions do. The deploy-time writer of that classification holds the only write, on that prefix only.
 - **The pointer is `{ "ref": { "key", "configId" } }`**, where `configId` is the SHA-256 of the body. The key is content-addressed and never overwritten, so a changed pack is a new object beside the old one, and pointing the parameter back at an earlier id is a rollback that still finds its bytes.
 - **Body first, then pointer.** CDK writes the body with a custom resource and makes the parameter depend on it; `writeClassificationPack` in `backend/lambda/src/lib/intent-pack.ts`, which the seeder uses, puts the body and only then the parameter. A parameter never names a body that is not there.
 - **The whole serialized pack is bounded** at the write by `MAX_INTENT_PACK_BYTES`, the same bound a version-carried pack has, with the measurement named. CDK refuses an oversize `-c assistantIntentPack` at synth, and the seeder refuses before it writes anything. Bounding one intent does not bound how many a pack declares, and a pack is prompt weight on every classified turn.

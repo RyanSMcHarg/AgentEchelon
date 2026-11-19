@@ -24,7 +24,7 @@ import type {
   Classification,
 } from '../../../lib/config/model-strategy.js';
 import type { ClassificationModels } from '../../../lib/config/profiles.js';
-import { resolveModelForIntent, type ModelResolution } from './model-resolver.js';
+import { resolveModelForIntent, versionRouteStrategy, type ModelResolution } from './model-resolver.js';
 import { stepDelivers, type IntentRoute, type ModelFrom, type StepOutput } from './step-models.js';
 import { bedrockInvokeId } from '../../../lib/config/model-strategy.js';
 import type { When } from './variables.js';
@@ -172,6 +172,47 @@ export function routedModel(ctx: RoutingContext, deps: Pick<ResolveModelPlanDeps
   });
 }
 
+/** What a step of an intent's workflow runs on, as `stepModelOf` reads it: the model, its fallback, and the rule that chose it. */
+export interface StepModelPreview {
+  modelKey: string | undefined;
+  fallbackKey: string | undefined;
+  /** `step` for the version's override, `route` / `general` / `base` for the route's choice, `image` for the image route. */
+  from: 'step' | 'route' | 'general' | 'base' | 'image';
+}
+
+/**
+ * THE MODEL A STEP OF AN INTENT'S WORKFLOW RUNS ON in a version, for a turn whose message is classified as that intent
+ * (ADR-064 decision B): the processor's own resolution (`versionRouteStrategy`, `routedModel`), with the version's base
+ * model as the selection's default. An image step is drawn on the intent's image route (`imagePrimaryForIntent`, through
+ * `imageModel`). Pure, so the console says what the runtime picks. A message classified as another intent runs a
+ * non-delivering step on that intent's route instead.
+ */
+export function stepModelOf(input: {
+  classification: Classification;
+  intent: string;
+  step: string;
+  produces: StepOutput | undefined;
+  routes: Record<string, IntentRoute> | undefined;
+  baseModelKey: string | undefined;
+  selection: ClassificationModels;
+  catalog: Record<BackendModelKey, BackendModelDefinition>;
+  /** The image model an image step is drawn on (`imagePrimaryForIntent` over the version's models). */
+  imageModel?: { primary?: string; fallback?: string };
+}): StepModelPreview {
+  if (input.produces === 'image') return { modelKey: input.imageModel?.primary, fallbackKey: input.imageModel?.fallback, from: 'image' };
+  const base = input.baseModelKey && input.selection.selected.includes(input.baseModelKey) ? input.baseModelKey : input.selection.default;
+  const routed = routedModel({
+    classification: input.classification, intent: input.intent, continuesActiveWork: true,
+    task: { intent: input.intent, step: input.step, produces: input.produces ?? 'text' },
+  }, {
+    catalog: input.catalog,
+    strategy: versionRouteStrategy({ byIntent: input.routes }, base),
+    models: { ...input.selection, default: base },
+    routes: input.routes,
+  });
+  return { modelKey: routed.primaryModelKey, fallbackKey: routed.fallbackModelKey ?? undefined, from: routed.from };
+}
+
 /**
  * Resolve a model PLAN from a routing context. Rule order (first match wins; every rule
  * inherits the classification safety enforced by `resolveModelForIntent`):
@@ -182,7 +223,7 @@ export function routedModel(ctx: RoutingContext, deps: Pick<ResolveModelPlanDeps
  * Every turn the processor answers is resolved here, once (SPEC-CONTEXT-AWARE-MODEL-ROUTING FR1).
  */
 export function resolveModelPlan(ctx: RoutingContext, deps: ResolveModelPlanDeps): ModelPlan {
-  const { catalog, strategy, models } = deps;
+  const { catalog, models } = deps;
 
   // Rules 3 + 4: the route's choice for this turn (with classification safety) is the baseline.
   const base = routedModel(ctx, deps);

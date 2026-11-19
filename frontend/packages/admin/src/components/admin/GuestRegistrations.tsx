@@ -88,7 +88,7 @@ const GuestRegistrations: React.FC<{ api?: RegistrationsApi }> = ({ api }) => {
 
   return (
     <div className="admin-section" data-testid="guest-registrations">
-      <h3>{t('admin.guestFunnel.registrations.title')}</h3>
+      <h2>{t('admin.guestFunnel.registrations.title')}</h2>
       <p className="admin-tab-description">{t('admin.guestFunnel.registrations.help')}</p>
       {notice && <p className="admin-tab-description" role="status">{notice}</p>}
       {state.kind !== 'ready' && (

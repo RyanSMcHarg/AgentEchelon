@@ -87,7 +87,10 @@ function fromUser(u: UserType): PoolRecord {
 /** An address the pool's filter grammar can carry safely: no quote, backslash, control or space. */
 const SAFE_FILTER_VALUE = /^[^\s"\\\x00-\x1f]{1,254}$/;
 
-const isUserNotFound = (err: unknown): boolean => (err as { name?: string } | null)?.name === 'UserNotFoundException';
+/** The pages of 60 one address lookup reads at most: 3,000 accounts carrying one address. */
+export const ADDRESS_LOOKUP_MAX_PAGES = 50;
+
+const isUserNotFound =(err: unknown): boolean => (err as { name?: string } | null)?.name === 'UserNotFoundException';
 
 /**
  * THE POOL USERNAME A SUBJECT IS ADDRESSED BY, or null when the pool holds no user with that `sub`.
@@ -163,7 +166,10 @@ export interface CognitoPoolDirectory {
   usersInGroup(group: string): Promise<PoolRecord[]>;
   /** One subject's record, or null when the pool has no such user. Throws on any other failure. */
   record(subjectOrUsername: string): Promise<PoolRecord | null>;
-  /** The subjects whose verified-or-not `email` attribute is exactly `address`. */
+  /**
+   * Every subject whose verified-or-not `email` attribute is exactly `address`, across every page. Throws when the
+   * pool cannot be read or more accounts carry the address than one lookup reads.
+   */
   byEmail(address: string): Promise<PoolRecord[]>;
   /** The subject a username names, or null. */
   byUsername(username: string): Promise<PoolRecord | null>;
@@ -220,8 +226,19 @@ export function cognitoPoolDirectory(poolId: string, client?: Sender): CognitoPo
     },
     async byEmail(address) {
       if (!SAFE_FILTER_VALUE.test(address)) return [];
-      const res = await cognito().send(new ListUsersCommand({ UserPoolId: poolId, Filter: `email = "${address}"`, Limit: 2 }));
-      return (res.Users || []).map(fromUser);
+      // EVERY ACCOUNT CARRYING THE ADDRESS, read page by page. The pool filters on `email` alone (its filter grammar
+      // takes one attribute and has no `email_verified`), so the verified account is found however many accounts
+      // claim the same address. The read is bounded; past the bound it throws, so a lookup never answers from a
+      // partial list.
+      const out: PoolRecord[] = [];
+      let PaginationToken: string | undefined;
+      for (let page = 0; page < ADDRESS_LOOKUP_MAX_PAGES; page++) {
+        const res = await cognito().send(new ListUsersCommand({ UserPoolId: poolId, Filter: `email = "${address}"`, Limit: 60, PaginationToken }));
+        for (const u of res.Users || []) out.push(fromUser(u));
+        PaginationToken = res.PaginationToken;
+        if (!PaginationToken) return out;
+      }
+      throw Object.assign(new Error('the address is carried by more accounts than one lookup reads'), { name: 'AddressLookupBoundExceeded' });
     },
     async byUsername(username) {
       if (!SAFE_FILTER_VALUE.test(username)) return null;

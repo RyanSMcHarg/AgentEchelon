@@ -2,12 +2,17 @@
  * The assistant profile CLI: draft, validate, activate and roll back an assistant's profile from a
  * terminal, with no console.
  *
- *   npm run assistant -- draft <profile>                       clone the active version into a draft
- *   npm run assistant -- draft <profile> --patch <file.json>   edit the draft's runtime-editable fields
- *   npm run assistant -- draft <profile> --set key=value ...   the same, one field at a time
- *   npm run assistant -- validate <profile>                    validate the draft
- *   npm run assistant -- activate <profile>                    promote the draft to a new active version
- *   npm run assistant -- rollback <profile> --version <n>      move `active` onto an existing version
+ *   npm run assistant -- draft <profile> [--replace <id>]                    clone the active version into a draft
+ *   npm run assistant -- draft <profile> --config <id> --patch <file.json>   edit the draft's runtime-editable fields
+ *   npm run assistant -- draft <profile> --config <id> --set key=value ...   the same, one field at a time
+ *   npm run assistant -- validate <profile>                                  validate the draft
+ *   npm run assistant -- activate <profile> --config <id>                    promote that draft to a new active version
+ *   npm run assistant -- rollback <profile> --version <n>                    move `active` onto an existing version
+ *
+ * A DRAFT IS NAMED BY ITS configId wherever a command would replace or promote it: an edit by the draft it was based on
+ * (`--config`), an activation by the draft that was reviewed (`--config`, required), a new version over an existing
+ * draft by the draft it replaces (`--replace`). Each answer prints the configId the next command names
+ * (`draftConfigId`, or `configId` from validate), and the API refuses a draft saved since (`409 DRAFT_CHANGED`).
  *
  * EVERY CALL IS A SIGNED CALL TO THE PROFILE API, never a write to the profile store. The profile routes
  * are IAM-authorized admin routes on `AdminApi`, and the management API is the only
@@ -29,12 +34,12 @@ const USAGE = [
   'usage: npm run assistant -- <command> <profile> [options]',
   '',
   'commands:',
-  '  draft <profile>                      clone the active version into a fresh draft',
-  '  draft <profile> --patch <file.json>  edit the draft (a JSON object of runtime-editable fields)',
-  '  draft <profile> --set key=value      edit one field of the draft (repeatable; the value is JSON when it parses)',
-  '  validate <profile>                   validate the draft',
-  '  activate <profile>                   promote the draft to a new active version',
-  '  rollback <profile> --version <n>     move active onto an existing version',
+  '  draft <profile> [--replace <id>]                   clone the active version into a fresh draft (--replace names a draft it replaces)',
+  '  draft <profile> --config <id> --patch <file.json>  edit the draft <id> (a JSON object of runtime-editable fields)',
+  '  draft <profile> --config <id> --set key=value      edit one field of the draft <id> (repeatable; the value is JSON when it parses)',
+  '  validate <profile>                                 validate the draft (prints its configId)',
+  '  activate <profile> --config <id>                   promote the draft <id> to a new active version',
+  '  rollback <profile> --version <n>                   move active onto an existing version',
   '',
   'options:',
   '  --api <url>      the profile API (.../admin/profiles); default AE_MANAGE_PROFILES_API_URL or the AdminApi output',
@@ -61,7 +66,7 @@ function parseArgs(argv, { readFile } = {}) {
   for (let i = 0; i < rest.length; i += 1) {
     const flag = rest[i];
     const value = rest[i + 1];
-    if (!['--patch', '--set', '--version', '--api', '--region'].includes(flag)) throw new UsageError(`unknown option '${flag}'\n\n${USAGE}`);
+    if (!['--patch', '--set', '--version', '--config', '--replace', '--api', '--region'].includes(flag)) throw new UsageError(`unknown option '${flag}'\n\n${USAGE}`);
     if (value === undefined) throw new UsageError(`${flag} needs a value`);
     i += 1;
     if (flag === '--patch') {
@@ -78,6 +83,10 @@ function parseArgs(argv, { readFile } = {}) {
       const n = Number(value);
       if (!Number.isInteger(n) || n < 1) throw new UsageError(`--version takes a version number (1 or more), not '${value}'`);
       out.version = n;
+    } else if (flag === '--config') {
+      out.configId = value;
+    } else if (flag === '--replace') {
+      out.replaceConfigId = value;
     } else if (flag === '--api') {
       out.api = value;
     } else {
@@ -87,6 +96,14 @@ function parseArgs(argv, { readFile } = {}) {
   if (command === 'rollback' && out.version === undefined) throw new UsageError(`rollback needs --version <n>\n\n${USAGE}`);
   if (command !== 'rollback' && out.version !== undefined) throw new UsageError('--version is for rollback only');
   if (command !== 'draft' && out.patch) throw new UsageError('--patch and --set are for draft only');
+  if (command === 'activate' && !out.configId) throw new UsageError(`activate needs --config <id>, the configId of the draft being activated
+
+${USAGE}`);
+  if (command === 'draft' && out.patch && !out.configId) throw new UsageError(`an edit needs --config <id>, the configId of the draft it was based on
+
+${USAGE}`);
+  if (out.configId && !(command === 'activate' || (command === 'draft' && out.patch))) throw new UsageError('--config is for activate and for a draft edit only');
+  if (out.replaceConfigId && !(command === 'draft' && !out.patch)) throw new UsageError('--replace is for a new draft only');
   return out;
 }
 
@@ -97,9 +114,12 @@ function parseArgs(argv, { readFile } = {}) {
 function requestFor(apiBase, parsed) {
   const base = String(apiBase).replace(/\/+$/, '');
   const { command, profileName } = parsed;
-  if (command === 'draft' && !parsed.patch) return { url: `${base}/version`, body: { profileName } };
-  if (command === 'draft') return { url: `${base}/draft`, body: { profileName, patch: parsed.patch } };
+  if (command === 'draft' && !parsed.patch) {
+    return { url: `${base}/version`, body: { profileName, ...(parsed.replaceConfigId ? { replaceConfigId: parsed.replaceConfigId } : {}) } };
+  }
+  if (command === 'draft') return { url: `${base}/draft`, body: { profileName, patch: parsed.patch, configId: parsed.configId } };
   if (command === 'rollback') return { url: `${base}/rollback`, body: { profileName, version: parsed.version } };
+  if (command === 'activate') return { url: `${base}/activate`, body: { profileName, configId: parsed.configId } };
   return { url: `${base}/${command}`, body: { profileName } };
 }
 

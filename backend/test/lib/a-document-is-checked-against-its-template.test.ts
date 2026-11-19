@@ -11,7 +11,7 @@ import { join } from 'path';
 import { parseTemplate, checkAgainstTemplate, describeMissingStructure } from '../../lambda/src/lib/document-template';
 import { deliverableIssues, correctionProgressLine } from '../../lambda/src/lib/deliverable-check';
 
-const TEMPLATE = parseTemplate(readFileSync(join(__dirname, '..', '..', 'demo', 'templates', 'quarterly-account-review.md'), 'utf8'));
+const TEMPLATE = parseTemplate(readFileSync(join(__dirname, '..', '..', '..', 'demo', 'stratum-company', 'templates', 'quarterly-account-review.md'), 'utf8'));
 
 const ENGLISH = `# Quarterly account review: Coastal Health, Q3
 

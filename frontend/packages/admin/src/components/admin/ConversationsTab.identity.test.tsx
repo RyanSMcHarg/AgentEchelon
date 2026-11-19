@@ -39,7 +39,7 @@ const MESSAGES: AdminConversationMessage[] = [
 ];
 
 const renderTab = () => render(
-  <ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />,
+  <ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />,
 );
 
 describe('ConversationsTab - who a participant is', () => {

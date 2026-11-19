@@ -12,6 +12,7 @@
 
 import {
   parseSplitSelection,
+  refusedByAudience,
   selectionFromTheirWords,
   splitOfferDirective,
   stripSplitSelection,
@@ -102,6 +103,14 @@ describe('what the assistant is told while an offer is outstanding', () => {
     expect(directive).toContain('reply to them normally, in your own voice');
   });
 
+  it('marks a subject taken from private messages, and tells the model not to name it in the reply', () => {
+    const offered = [...OFFERED, { label: 'my expenses query', messageIds: ['m9'], private: true }];
+    const directive = splitOfferDirective(offered);
+    expect(directive).toMatch(/PRIVATE MESSAGES[\s\S]*\n  my expenses query\n/);
+    expect(directive).toContain('Never name one in a reply the conversation can read');
+    expect(splitOfferDirective(OFFERED)).not.toContain('PRIVATE MESSAGES');
+  });
+
   it('says nothing at all when there is no offer outstanding', () => {
     expect(splitOfferDirective([])).toBe('');
   });
@@ -119,6 +128,14 @@ describe('what the assistant is told while an offer is outstanding', () => {
  * and an implementation that treated any selection as "split it all" passes every two-subject test
  * while doing the one thing the design forbids.
  */
+describe('who is told a subject did not move', () => {
+  it('keeps a private label out of what the room reads', () => {
+    const offered = [...OFFERED, { label: 'My expenses query', messageIds: ['m9'], private: true }];
+    expect(refusedByAudience(['billing', 'my expenses query'], offered)).toEqual({ room: ['billing'], privately: ['my expenses query'] });
+    expect(refusedByAudience(['billing'], OFFERED)).toEqual({ room: ['billing'], privately: [] });
+  });
+});
+
 describe('choosing some of several', () => {
   const THREE = [
     { label: 'billing', messageIds: ['m1', 'm4'] },

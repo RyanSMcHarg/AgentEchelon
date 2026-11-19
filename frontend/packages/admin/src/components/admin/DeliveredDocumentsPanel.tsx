@@ -126,23 +126,23 @@ const DeliveredDocumentsPanel: React.FC<{ dateRange: AnalyticsDateRange | undefi
 
   return (
     <div className="admin-section" role="region" aria-label={t('admin.deliveredDocuments.aria')}>
-      <h4>
+      <h3>
         {t('admin.deliveredDocuments.title')}{' '}
         <InfoTooltip label={t('admin.deliveredDocuments.title')} content={t('admin.deliveredDocuments.tip')} />
-      </h4>
+      </h3>
       <p className="admin-tab-description">{t('admin.deliveredDocuments.description')}</p>
       {error && <p className="admin-error" role="alert">{error}</p>}
       {!error && rows === null && <p className="admin-help-text">{t('admin.deliveredDocuments.loading')}</p>}
       {!error && rows !== null && rows.length === 0 && <p className="admin-tab-empty">{t('admin.deliveredDocuments.empty')}</p>}
       {byIntent.length > 0 && (
         <>
-          <h5>{t('admin.deliveredDocuments.byIntent')}</h5>
+          <h4>{t('admin.deliveredDocuments.byIntent')}</h4>
           <DataTable data={byIntent} columns={columns(t('admin.deliveredDocuments.column.intent'))} />
         </>
       )}
       {byTaskType.length > 0 && (
         <>
-          <h5>{t('admin.deliveredDocuments.byTaskType')}</h5>
+          <h4>{t('admin.deliveredDocuments.byTaskType')}</h4>
           <DataTable data={byTaskType} columns={columns(t('admin.deliveredDocuments.column.taskType'))} />
         </>
       )}

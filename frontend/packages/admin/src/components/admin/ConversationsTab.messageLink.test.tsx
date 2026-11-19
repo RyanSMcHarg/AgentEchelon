@@ -53,7 +53,7 @@ describe('the conversation viewer opens at a message', () => {
     vi.mocked(svc.listAdminConversationMessages).mockResolvedValue(MESSAGES);
     render(
       <ConversationsTab
-        summaryData={null} driftData={null} isLoading={false}
+        driftData={null} isLoading={false}
         deepLinkChannelArn={CHANNEL}
         deepLinkMessage={{ messageId: 'm-31', at: MESSAGES[31].timestamp, kind: 'battle' }}
       />,
@@ -83,7 +83,7 @@ describe('the conversation viewer opens at a message', () => {
       .mockResolvedValueOnce([...MESSAGES, latest]);
     render(
       <ConversationsTab
-        summaryData={null} driftData={null} isLoading={false}
+        driftData={null} isLoading={false}
         deepLinkChannelArn={CHANNEL}
         deepLinkMessage={{ messageId: 'm-new', at: latest.timestamp, kind: 'battle' }}
       />,
@@ -100,7 +100,7 @@ describe('the conversation viewer opens at a message', () => {
     const at = new Date(T0 + 12 * 60_000 + 20_000).toISOString();
     render(
       <ConversationsTab
-        summaryData={null} driftData={null} isLoading={false}
+        driftData={null} isLoading={false}
         deepLinkChannelArn={CHANNEL}
         deepLinkMessage={{ messageId: 'm-gone', at, kind: 'battle' }}
       />,
@@ -118,7 +118,7 @@ describe('the conversation viewer opens at a message', () => {
     const at = MESSAGES[3].timestamp;
     render(
       <ConversationsTab
-        summaryData={null} driftData={null} isLoading={false}
+        driftData={null} isLoading={false}
         deepLinkChannelArn={CHANNEL}
         deepLinkMessage={{ messageId: 'm-gone', at }}
       />,
@@ -129,7 +129,7 @@ describe('the conversation viewer opens at a message', () => {
 
   it('opens without a highlight when there is no link', async () => {
     vi.mocked(svc.listAdminConversationMessages).mockResolvedValue(MESSAGES);
-    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
+    render(<ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
     await screen.findByText('message number 0');
     expect(focusedRow()).toBeNull();
     expect(scrolled).not.toHaveBeenCalled();

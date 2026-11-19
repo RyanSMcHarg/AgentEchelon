@@ -44,17 +44,6 @@ export function trustedIssuersJson(stack: cdk.Stack, selfPoolId: string): string
 }
 
 /**
- * The person-facing routes a one-conversation person calls, as `METHOD /path`. Nothing else admits them:
- * the edge authorizer allows a one-conversation issuer's token on these alone (`EDGE_ROUTES`), and each
- * handler refuses them again unless it admits them (`callerPerson`, lambda/src/lib/auth.ts), so the path
- * keeps two layers (tenet D3).
- *
- *  - the credential exchange, which vends them their one conversation;
- *  - conversation creation, which opens or re-opens it.
- */
-export const ONE_CHANNEL_ROUTES: readonly string[] = ['POST /exchange-credentials', 'POST /create-conversation'];
-
-/**
  * The person-facing routes a guest (the guest issuer's token) calls with that token: the credential
  * exchange, which vends their one conversation, and path B's registration (`guest-upgrade.ts`), which
  * records the visitor's registration for the conversation the token names. Guest start and guest refresh

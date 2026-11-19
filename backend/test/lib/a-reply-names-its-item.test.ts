@@ -183,7 +183,7 @@ describe('the router resolves a reference before ranking', () => {
   });
 
   it('answers a reference that names nothing, only to the sender, and stops', () => {
-    const notFound = block.slice(block.indexOf('if (reference && !referenced && answerable.length'));
+    const notFound = block.slice(block.indexOf('if (reference && !referenced && !requestedElsewhere && answerable.length'));
     // Worded from the assistant's `task-ref-not-found` template, with its version's legacy line and stored templates.
     expect(notFound).toContain('const { copy } = await turnWords();');
     expect(notFound).toContain('{ copy },');
@@ -326,6 +326,20 @@ describe('the channel flow routes a bare reference only when the sender may answ
     expect(flow).toContain('const metadataTaskId = extractTaskAnswerHint(args.metadata)?.taskId;');
     expect(flow).toContain('const reference = metadataTaskId ? null : parseTaskReference(args.text);');
     expect(flow).toContain("referenceTarget.namedBy === 'metadata' && { answersTaskId: referenceTarget.taskId }");
+  });
+
+  // ONE ENTRY PER MESSAGE (ADR-036). The client answers a private item with its id AND a `Target`, which Amazon Chime SDK
+  // routes to the assistant's Amazon Lex entry; the flow cannot see the `Target`, so dispatching too ran the turn twice,
+  // the second queued behind its own first (measured on dev 2026-11-14, an incident lead's reply to its task card).
+  it('DENY: a private item named by id is the targeted entry\'s turn, never the flow\'s; a typed reference still routes', () => {
+    const gate = fn.indexOf('if (metadataTaskId && found.private) {');
+    expect(gate).toBeGreaterThan(0);
+    expect(fn.slice(gate, gate + 260)).toMatch(/return null;/);
+    // Decided before the owning assistant is spliced in or any turn is dispatched.
+    expect(gate).toBeLessThan(fn.indexOf('const splicedBotArn'));
+    // The client side of the contract: a private item's answer carries the Target and the id together.
+    const input = fs.readFileSync(path.resolve(__dirname, '../../../frontend/packages/chat/src/components/MessageInput.tsx'), 'utf8');
+    expect(input).toContain('? { targetArn: taskAnswer.botArn!, taskId: taskAnswer.taskId }');
   });
 
   // THE DEFECT MOVING THE REFERENCE OUT OF THE BODY WOULD OTHERWISE HAVE INTRODUCED.

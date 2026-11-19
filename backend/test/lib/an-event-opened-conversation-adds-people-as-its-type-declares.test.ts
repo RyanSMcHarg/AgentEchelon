@@ -13,6 +13,11 @@ const mockSsmSend = jest.fn();
 const mockCreate = jest.fn();
 const mockResolveAllowedSet = jest.fn();
 
+// THE CONCERNED ROOM'S ROW, as the nesting rule reads it (`openIsNestedBy`): a top-level room, which may open a child.
+jest.mock('../../lambda/src/lib/channel-context-client', () => ({
+  ...jest.requireActual('../../lambda/src/lib/channel-context-client'),
+  readChannelContext: async () => null,
+}));
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn(() => ({ send: mockMessagingSend })),
   SendChannelMessageCommand: jest.fn().mockImplementation((input) => ({ __type: 'SendMessage', input })),
@@ -33,6 +38,8 @@ jest.mock('../../lambda/src/lib/service-admin-bearer', () => ({
 }));
 jest.mock('../../lambda/src/lib/default-agents', () => ({
   resolveDefaultAgents: async () => [],
+  // The team room's optional assistant is added where the deployment declares it; none is declared here.
+  liveAssistantsByHandleOrThrow: async () => new Map(),
 }));
 jest.mock('../../lambda/src/lib/membership-source', () => ({
   defaultDirectory: () => ({}),

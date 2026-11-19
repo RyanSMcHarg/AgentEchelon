@@ -65,9 +65,8 @@ describe('the role of a principal comes off its ARN', () => {
   });
 
   it('is ONE definition, shared with the membership audit', () => {
-    // The audit had this taxonomy and was the only thing that knew it. A second copy in archival
-    // would be two principal taxonomies free to disagree - the exact drift the classification work
-    // spent this session removing from the raw Lambdas.
+    // One taxonomy serves the audit and archival, so the two cannot disagree about a principal. A
+    // second copy in archival would be two taxonomies free to drift apart.
     const audit = src('membership-audit.ts');
     expect(`audit imports it: ${audit.includes("from './lib/principal-role.js'")}`)
       .toBe('audit imports it: true');
@@ -113,7 +112,11 @@ describe('archival keeps the role axis apart from the classification axis', () =
     // Two inserts mint exchanges - the in-batch pairer and the late database pairer - and the late
     // one mints most of them. A fix applied to one is the defect this file already documents once:
     // the in-batch path had the conversation fallback and the late path never learned it.
-    const inserts = s.match(/INSERT INTO exchanges \(/g) || [];
+    // A TURN THE PLATFORM STARTED (migration 106) has no sender to record: its writer is counted apart and carries no role.
+    const platformAt = s.indexOf('async function createPlatformExchanges(');
+    const platform = s.slice(platformAt, s.indexOf('\n}\n', platformAt));
+    expect(platform).not.toMatch(/user_role/);
+    const inserts = (s.match(/INSERT INTO exchanges \(/g) || []).slice(0, -(platform.match(/INSERT INTO exchanges \(/g) || []).length || undefined);
     expect(`exchange inserts found: ${inserts.length >= 2}`).toBe('exchange inserts found: true');
     const roleCols = s.match(/channel_arn, conversation_classification, user_role, person_id, assistant/g) || [];
     expect(`inserts carrying user_role: ${roleCols.length}`).toBe(`inserts carrying user_role: ${inserts.length}`);

@@ -33,6 +33,7 @@
  * on the prefix only. Writing a classification pack is exclusive to that classification stack's
  * deploy-time writer, on its own prefix only.
  */
+import { roleTasksOf } from './intent-workflow.js';
 import { createHash } from 'crypto';
 import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import type { ProfileDefinition } from './active-profile.js';
@@ -40,13 +41,15 @@ import type { StoredIntentPack } from './intent-pack.js';
 import type { WorkflowLayout } from './workflow-layout.js';
 import { BOUNDED_REQUEST_HANDLER } from './bounded-request-handler.js';
 import { sessionClient } from './assistant-session.js';
+import { writesAsTeam } from './team-scoped-writer.js';
+import { canonicalize } from './canonical-json.js';
 
 /** The body fields large enough to warrant indirection. Both are prose/JSON authored per version. */
-export type ProfileBodyField = 'persona' | 'intentPack';
+export type ProfileBodyField = 'persona' | 'intentPack' | 'intentWorkflows' | 'eventWorkflows';
 
 /** Where a body lives. Stored in the definition in place of the body itself. */
 export interface ProfileBodyRef {
-  /** S3 key. The bucket is the deployment's own attachments bucket, resolved at read time from the
+  /** S3 key. The bucket is the deployment's own profile bucket, resolved at read time from the
    *  environment rather than stored - a stored bucket name would travel with an export and point a
    *  target instance at the SOURCE account's bucket, which the security model forbids. */
   key: string;
@@ -68,9 +71,12 @@ export function bodyKey(profileName: string, configId: string, field: ProfileBod
   return `${PREFIX}/${profileName}/${configId}/${field}`;
 }
 
-/** The bucket bodies live in, from the environment. Absent ⇒ this deployment has no body store wired. */
+/**
+ * The bucket bodies live in, from the environment: the profile bucket, which holds what an assistant is and nothing a
+ * conversation produced. Absent ⇒ this deployment has no body store wired.
+ */
 export function bodyBucket(): string | undefined {
-  return process.env.PROFILE_BODY_BUCKET || process.env.CONTEXT_BUCKET || undefined;
+  return process.env.PROFILE_BODY_BUCKET || undefined;
 }
 
 /**
@@ -91,12 +97,18 @@ export async function putBody(
   const bucket = deps?.bucket ?? bodyBucket();
   if (!bucket) {
     throw new Error(
-      `[ProfileBodies] no body bucket configured (PROFILE_BODY_BUCKET/CONTEXT_BUCKET); cannot store the `
+      `[ProfileBodies] no body bucket configured (PROFILE_BODY_BUCKET); cannot store the `
       + `${field} for ${profileName}. Storing it inline would re-impose the 4096-character definition cap.`,
     );
   }
   const key = bodyKey(profileName, configId, field);
-  return putBodyAt(key, configId, value, field === 'intentPack' ? 'application/json' : 'text/plain; charset=utf-8', { ...deps, bucket });
+  return putBodyAt(key, configId, value, field === 'persona' ? 'text/plain; charset=utf-8' : 'application/json', { ...deps, bucket });
+}
+
+/** The body store's writer: the function's own client, or the team writer session's while a team route holds one. */
+function bodyWriter(): S3Client {
+  const config = { region: process.env.AWS_REGION || 'us-east-1', requestHandler: BOUNDED_REQUEST_HANDLER };
+  return writesAsTeam(sessionClient(S3Client, config), 's3', (credentials) => new S3Client({ ...config, requestHandler: BOUNDED_REQUEST_HANDLER, credentials }));
 }
 
 /** The one S3 write both key families go through. The caller has already resolved the bucket. */
@@ -107,7 +119,8 @@ async function putBodyAt(
   contentType: string,
   deps: { s3?: S3Client; bucket: string },
 ): Promise<ProfileBodyRef> {
-  const s3 = deps.s3 ?? sessionClient(S3Client, { region: process.env.AWS_REGION || 'us-east-1', requestHandler: BOUNDED_REQUEST_HANDLER });
+  // On a team route the write goes out on the route's team writer session, which writes `profiles/<its assistant>/*` alone.
+  const s3 = deps.s3 ?? bodyWriter();
   await s3.send(new PutObjectCommand({ Bucket: deps.bucket, Key: key, Body: value, ContentType: contentType }));
   return { key, configId };
 }
@@ -158,7 +171,7 @@ export async function putClassificationPack(
   const bucket = deps?.bucket ?? bodyBucket();
   if (!bucket) {
     throw new Error(
-      `[ProfileBodies] no body bucket configured (PROFILE_BODY_BUCKET/CONTEXT_BUCKET); cannot store the `
+      `[ProfileBodies] no body bucket configured (PROFILE_BODY_BUCKET); cannot store the `
       + `intent pack of classification '${classification}'.`,
     );
   }
@@ -290,6 +303,43 @@ export async function withLayout(def: ProfileDefinition, deps?: BodyStoreDeps): 
   return layout ? { ...def, layout } : def;
 }
 
+/**
+ * THE KEPT WELCOME'S KEY: `profiles/{profileName}/{configId}/kept-welcome/{contentId}` (ADR-067 G40), on the layout's
+ * terms: under the version's configId and its own content id, in the `profiles/` family manage-profiles already writes.
+ */
+export function keptWelcomeKey(profileName: string, configId: string, contentId: string): string {
+  return `${PREFIX}/${profileName}/${configId}/kept-welcome/${contentId}`;
+}
+
+/** The kept welcome a pointer names, or undefined when the pointer is not this version's own or the body cannot be read. */
+export async function readKeptWelcome(
+  def: Pick<ProfileDefinition, 'profileName' | 'configId' | 'keptWelcomeWorkflowRef'>, deps?: BodyStoreDeps,
+): Promise<ProfileDefinition['keptWelcomeWorkflow']> {
+  const ref = def.keptWelcomeWorkflowRef;
+  if (!ref) return undefined;
+  const contentId = ref.key.split('/').pop() ?? '';
+  if (ref.configId !== def.configId || ref.key !== keptWelcomeKey(def.profileName, def.configId, contentId)) {
+    console.warn('[ProfileBodies] a kept welcome pointer that is not this version\'s own is read as none', { profileName: def.profileName });
+    return undefined;
+  }
+  try {
+    const raw = await getBody(ref, def.configId, deps);
+    if (raw === undefined || contentIdOf(raw) !== contentId) throw new Error('content id mismatch');
+    return JSON.parse(raw) as ProfileDefinition['keptWelcomeWorkflow'];
+  } catch (err) {
+    console.warn('[ProfileBodies] a kept welcome that could not be read is read as none', { profileName: def.profileName, err: (err as Error)?.name });
+    return undefined;
+  }
+}
+
+/** A definition with the console's own bodies read back inline, the layout and the kept welcome, their pointers kept. */
+export async function withConsoleBodies(def: ProfileDefinition, deps?: BodyStoreDeps): Promise<ProfileDefinition> {
+  const out = await withLayout(def, deps);
+  if (out.keptWelcomeWorkflow || !out.keptWelcomeWorkflowRef) return out;
+  const kept = await readKeptWelcome(out, deps);
+  return kept ? { ...out, keptWelcomeWorkflow: kept } : out;
+}
+
 export interface BodyStoreDeps {
   s3?: S3Client;
   bucket?: string;
@@ -314,9 +364,10 @@ export interface BodyStoreDeps {
 export async function offloadBodies(def: ProfileDefinition, deps?: BodyStoreDeps): Promise<ProfileDefinition> {
   const bucket = deps?.bucket ?? bodyBucket();
   if (!bucket) {
-    // WITH NO BODY STORE A LAYOUT IS NOT KEPT: it never goes inline, and the canvas places each step automatically.
-    if (!def.layout) return def;
-    const { layout: _dropped, ...rest } = def;
+    // WITH NO BODY STORE A LAYOUT IS NOT KEPT: it never goes inline, and the canvas places each step automatically. A kept
+    // welcome is not kept either, so a switch back to Workflow starts from the built-in welcome.
+    if (!def.layout && !def.keptWelcomeWorkflow) return def;
+    const { layout: _dropped, keptWelcomeWorkflow: _droppedKept, ...rest } = def;
     return rest as ProfileDefinition;
   }
   let out = def;
@@ -340,6 +391,31 @@ export async function offloadBodies(def: ProfileDefinition, deps?: BodyStoreDeps
     const { intentPack: _movedPack, ...rest } = out;
     out = { ...rest, intentPackRef };
   }
+  // THE INTENT WORKFLOWS ARE A BODY TOO, for the pack's reason: every multi-step intent declares its
+  // workflow, so they grow with the taxonomy, and inline they would make the parameter's cap the limit on it.
+  if (def.intentWorkflows) {
+    const intentWorkflowsRef = await putBody(
+      def.profileName, def.configId, 'intentWorkflows', JSON.stringify(def.intentWorkflows), { ...deps, bucket },
+    );
+    const { intentWorkflows: _movedWorkflows, intentRoleTasks: _stale, ...rest } = out;
+    // The role tasks they give stay on the definition, names only, so the listing reads them without the body (WT78).
+    const intentRoleTasks = roleTasksOf(def.intentWorkflows as never);
+    out = { ...rest, intentWorkflowsRef, ...(intentRoleTasks.length ? { intentRoleTasks } : {}) };
+  }
+  // THE EVENT WORKFLOWS ARE A BODY TOO, for the intent workflows' reason: an assistant with the demo's ops workflows sits
+  // within one more workflow of the 4096-character definition, so inline they would make the parameter's cap the limit on
+  // how many workflows a version declares. What the listing reads stays on the definition, names only.
+  if (def.eventWorkflows && Object.keys(def.eventWorkflows).length) {
+    const eventWorkflowsRef = await putBody(
+      def.profileName, def.configId, 'eventWorkflows', JSON.stringify(def.eventWorkflows), { ...deps, bucket },
+    );
+    const { eventWorkflows: _movedEvents, eventWorkflowsListed: _staleListed, eventRoleTasks: _staleTasks, ...rest } = out;
+    const eventWorkflowsListed = Object.entries(def.eventWorkflows)
+      .filter(([, wf]) => typeof wf?.on === 'string')
+      .map(([name, wf]) => ({ name, on: wf.on as string, ...(Array.isArray(wf.types) && wf.types.length ? { types: [...wf.types] } : {}) }));
+    const eventRoleTasks = roleTasksOf(def.eventWorkflows as never);
+    out = { ...rest, eventWorkflowsRef, eventWorkflowsListed, ...(eventRoleTasks.length ? { eventRoleTasks } : {}) };
+  }
   // THE CANVAS LAYOUT IS A BODY TOO (ADR-061 decision 7), and never stays inline: written under this version's key with its
   // own content id, and the definition keeps the pointer. A definition handed in with a pointer and no layout keeps
   // the pointer it has.
@@ -348,6 +424,13 @@ export async function offloadBodies(def: ProfileDefinition, deps?: BodyStoreDeps
     const body = canonicalLayout(def.layout);
     const layoutRef = await putBodyAt(layoutKey(def.profileName, def.configId, contentIdOf(body)), def.configId, body, 'application/json', { ...deps, bucket });
     out = { ...rest, layoutRef };
+  }
+  // THE KEPT WELCOME IS A CONSOLE BODY TOO, stored the layout's way (ADR-067 G40).
+  if (def.keptWelcomeWorkflow) {
+    const { keptWelcomeWorkflow: _movedKept, keptWelcomeWorkflowRef: _previousKept, ...rest } = out;
+    const body = JSON.stringify(canonicalize(def.keptWelcomeWorkflow));
+    const keptWelcomeWorkflowRef = await putBodyAt(keptWelcomeKey(def.profileName, def.configId, contentIdOf(body)), def.configId, body, 'application/json', { ...deps, bucket });
+    out = { ...rest, keptWelcomeWorkflowRef };
   }
   return out;
 }
@@ -368,14 +451,18 @@ export async function offloadBodies(def: ProfileDefinition, deps?: BodyStoreDeps
 export async function hydrateBodies(def: ProfileDefinition, deps?: BodyStoreDeps): Promise<ProfileDefinition> {
   const needsPersona = !!def.personaRef && def.persona === undefined;
   const needsPack = !!def.intentPackRef && def.intentPack === undefined;
-  if (!needsPersona && !needsPack) return def;
+  const needsWorkflows = !!def.intentWorkflowsRef && def.intentWorkflows === undefined;
+  const needsEvents = !!def.eventWorkflowsRef && def.eventWorkflows === undefined;
+  if (!needsPersona && !needsPack && !needsWorkflows && !needsEvents) return def;
 
   // FETCHED TOGETHER, not one after the other. This sits on the per-turn cold path (the profile cache
   // misses every 30 seconds, and on a cold container), so two serial S3 round trips would be two
   // round trips of added first-turn latency where one will do.
-  const [persona, packRaw] = await Promise.all([
+  const [persona, packRaw, workflowsRaw, eventsRaw] = await Promise.all([
     needsPersona ? getBody(def.personaRef!, def.configId, deps) : Promise.resolve(undefined),
     needsPack ? getBody(def.intentPackRef!, def.configId, deps) : Promise.resolve(undefined),
+    needsWorkflows ? getBody(def.intentWorkflowsRef!, def.configId, deps) : Promise.resolve(undefined),
+    needsEvents ? getBody(def.eventWorkflowsRef!, def.configId, deps) : Promise.resolve(undefined),
   ]);
 
   let out = def;
@@ -414,6 +501,44 @@ export async function hydrateBodies(def: ProfileDefinition, deps?: BodyStoreDeps
     }
     const { intentPackRef: _followedPack, ...rest } = out;
     out = { ...rest, intentPack: parsed };
+  }
+  if (needsWorkflows) {
+    // Fail closed, as the pack does: a version whose workflows could not be read would run its requests with none of the
+    // steps it declares while reporting this version's configId.
+    if (workflowsRaw === undefined) {
+      throw new Error(
+        `[ProfileBodies] '${def.profileName}' version ${def.configId} points at ${def.intentWorkflowsRef!.key}, `
+        + 'which could not be read (absent object, or no body bucket configured on this deployment). '
+        + 'Refusing to resolve the version without the intent workflows it declares.',
+      );
+    }
+    let workflows: ProfileDefinition['intentWorkflows'];
+    try {
+      workflows = JSON.parse(workflowsRaw) as ProfileDefinition['intentWorkflows'];
+    } catch (err) {
+      throw new Error(`[ProfileBodies] '${def.profileName}' version ${def.configId} has an intent-workflows body at ${def.intentWorkflowsRef!.key} that is not valid JSON (${(err as Error).message}).`);
+    }
+    const { intentWorkflowsRef: _followedWorkflows, ...rest } = out;
+    out = { ...rest, intentWorkflows: workflows };
+  }
+  if (needsEvents) {
+    // Fail closed, as the intent workflows do: a version whose event workflows could not be read would run every event on the
+    // platform's built-in workflows while reporting this version's configId.
+    if (eventsRaw === undefined) {
+      throw new Error(
+        `[ProfileBodies] '${def.profileName}' version ${def.configId} points at ${def.eventWorkflowsRef!.key}, `
+        + 'which could not be read (absent object, or no body bucket configured on this deployment). '
+        + 'Refusing to resolve the version without the event workflows it declares.',
+      );
+    }
+    let events: ProfileDefinition['eventWorkflows'];
+    try {
+      events = JSON.parse(eventsRaw) as ProfileDefinition['eventWorkflows'];
+    } catch (err) {
+      throw new Error(`[ProfileBodies] '${def.profileName}' version ${def.configId} has an event-workflows body at ${def.eventWorkflowsRef!.key} that is not valid JSON (${(err as Error).message}).`);
+    }
+    const { eventWorkflowsRef: _followedEvents, ...rest } = out;
+    out = { ...rest, eventWorkflows: events };
   }
   return out;
 }

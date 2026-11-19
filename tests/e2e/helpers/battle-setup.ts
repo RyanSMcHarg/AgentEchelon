@@ -24,12 +24,14 @@ import * as path from 'path';
 import { signIn, idTokenOf, createConversation } from './agent-helpers';
 import { getTestCredentials } from './test-credentials';
 import { aws } from './task-backend';
+import { activeProfileVersion, storedProfileVersion } from './profile-versions';
 import { BATTLE_EXP_FILE } from '../../playwright.config';
 import { raceBackendErrors } from './backend-errors';
 import { retireStrandedE2eExperiments } from './experiment-sweep';
 import { SSM_ROOT } from './stack-prefix';
 import { adminApiServes, adminUrl, personApiServes } from './api-urls';
 import { fillSecret } from './unrecorded-secret';
+import { turnRecord, field } from './turn-record';
 
 export const BATTLE_E2E_ENABLED = process.env.BATTLE_E2E === '1' || process.env.BATTLE_E2E === 'true';
 
@@ -134,6 +136,18 @@ export function battleExpId(): string {
 /** This run's IMAGE generation-out experiment id (both variants carry an image-gen model). */
 export function battleImageExpId(): string {
   return remintedThisProcess?.image ?? readOrMintExpIds().image;
+}
+/**
+ * This run's INTENT battle experiment id: an `intent` experiment on a routed text intent, which varies that intent's
+ * route (a base-model experiment never reaches a routed intent, by design). Derived from the text id rather than
+ * persisted beside the pair, so it is minted, re-minted and retired with it.
+ */
+export function battleIntentExpId(): string {
+  return `${battleExpId()}-intent`;
+}
+/** Every battle experiment this run may arm. A classification runs one at a time, so arming one pauses the rest. */
+function runBattleExpIds(): string[] {
+  return [battleExpId(), battleImageExpId(), battleIntentExpId()];
 }
 /**
  * Mint a FRESH pair for this run (called by the setup project), so every test in the run agrees on
@@ -253,6 +267,14 @@ export function liveAssistantFor(classification: string, role = 'primary'): stri
   return assistant;
 }
 
+/** A model key other than the one the classification's live assistant runs as its base, for an arm that must differ from it. */
+function modelOtherThanLive(classification: string): string {
+  const live = liveAssistantFor(classification);
+  const version = activeProfileVersion(live);
+  const body = version === null ? null : storedProfileVersion(live, version);
+  return (body?.models?.default ?? body?.modelKey) === 'sonnet' ? 'opus' : 'sonnet';
+}
+
 /**
  * THE CHALLENGER AN EXPERIMENT NAMES, as `challengerAssistant`: the alt of the experiment's own
  * classification, by assistant id, checked against a provisioned alt so a spec cannot arm a battle the
@@ -318,7 +340,7 @@ export async function enableBattleForClassification(page: Page, classification =
  */
 export async function ensureBattleExperimentExists(
   page: Page,
-  opts: { challenger?: string; control?: string; treatment?: string; expId?: string; image?: boolean } = {},
+  opts: { challenger?: string; control?: string; treatment?: string; expId?: string; image?: boolean; intent?: string } = {},
 ): Promise<void> {
   const challenger = opts.challenger ?? challengerFor('premium');
   const expId = opts.expId ?? battleExpId();
@@ -327,7 +349,7 @@ export async function ensureBattleExperimentExists(
   // Already armed (this or a prior run)? Reuse it. openAdminExperiments already waited for the list
   // heading, but the row itself can lag the initial render; give it a real window (not 3s) so a slow
   // list never forces a spurious re-create.
-  const existing = page.locator(`tr:has-text("${expId}")`).first();
+  const existing = page.locator(`tr:has([data-experiment-id="${expId}"])`).first();
   if (await existing.isVisible({ timeout: 15_000 }).catch(() => false)) {
     await leaveAdmin(page);
     return;
@@ -365,20 +387,21 @@ export async function ensureBattleExperimentExists(
       // run's own sibling (the text and image battles are a pair, and only one may be active - the
       // same rule activateBattleExperiment applies), which is PAUSED so it can be resumed; and any
       // `e2e-` experiment a killed run stranded, which is retired.
-      const sibling = expId === battleExpId() ? battleImageExpId() : battleExpId();
       const before = await api.get(experimentsApi);
       expect(before.ok(), `list experiments before arming ${expId}: ${before.status()}`).toBeTruthy();
       const beforeBody = await before.json().catch(() => ({} as Record<string, unknown>));
       const beforeRows = beforeBody.experiments ?? beforeBody.data ?? beforeBody;
-      const siblingRow = (Array.isArray(beforeRows) ? beforeRows : []).find(
-        (e: Record<string, unknown>) => (e.experimentId ?? e.id) === sibling,
-      );
-      if (siblingRow?.status === 'active') {
-        const paused = await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(sibling)}/status`), { data: { status: 'paused' } });
-        expect(paused.ok(), `pause sibling ${sibling} before arming: ${paused.status()} ${await paused.text()}`).toBeTruthy();
+      for (const sibling of runBattleExpIds().filter((id) => id !== expId)) {
+        const siblingRow = (Array.isArray(beforeRows) ? beforeRows : []).find(
+          (e: Record<string, unknown>) => (e.experimentId ?? e.id) === sibling,
+        );
+        if (siblingRow?.status === 'active') {
+          const paused = await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(sibling)}/status`), { data: { status: 'paused' } });
+          expect(paused.ok(), `pause sibling ${sibling} before arming: ${paused.status()} ${await paused.text()}`).toBeTruthy();
+        }
       }
       await retireStrandedE2eExperiments(api, experimentsApi, {
-        keep: [battleExpId(), battleImageExpId(), ...armedThisProcess],
+        keep: [...runBattleExpIds(), ...armedThisProcess],
         label: 'battle-setup',
       });
 
@@ -391,14 +414,15 @@ export async function ensureBattleExperimentExists(
           status: 'active',
           // An image battle is an `intent` experiment on `image_generation`; a text battle varies
           // the base model. Same arming path either way.
-          experimentType: opts.image ? 'intent' : 'base_model',
+          // An intent battle varies one routed intent's model (`opts.intent`); a base-model battle reaches only unrouted turns.
+          experimentType: opts.image || opts.intent ? 'intent' : 'base_model',
           // Carried so the channel config gets a `briefingIntent` (channel-battle.ts sets it from
           // `exp.intent` whatever the type), which is what steers the briefing's coaching line and
           // starter chips. A base_model experiment IGNORES intent for resolution - validation says so
           // explicitly - so this changes the briefing and nothing else. Without it the banner falls back
           // to GENERIC steering, and B-E2 ("chips match the experiment intent") asserts a claim the
           // arranged experiment never made.
-          intent: opts.image ? 'image_generation' : 'general',
+          intent: opts.image ? 'image_generation' : (opts.intent ?? 'general'),
           tiers: ['premium'], // BATTLE_TIER_PREMIUM_ONLY guard
           battleEnabled: true,
           challengerAssistant: challenger,
@@ -413,8 +437,10 @@ export async function ensureBattleExperimentExists(
               ]
               : [
                 // The control is the live assistant's active version (§3.5); it names a model only when asked to.
+                // THE TREATMENT IS A DIFFERENT MODEL FROM THE ONE LIVE NOW, read rather than assumed, since the model is
+                // the one thing a base-model experiment varies.
                 { variantId: 'control', ...(opts.control ? { modelKey: opts.control } : {}), weight: 50 },
-                { variantId: 'treatment', modelKey: opts.treatment ?? 'opus', weight: 50 },
+                { variantId: 'treatment', modelKey: opts.treatment ?? modelOtherThanLive('premium'), weight: 50 },
               ]),
           ],
           objective: { metric: 'quality', target: 10, statement: 'E2E battle: decide the premium base model.' },
@@ -519,7 +545,7 @@ export async function ensureBattleExperimentExists(
  * caller relies on next.
  */
 export async function activateBattleExperiment(page: Page, expId: string = battleExpId()): Promise<void> {
-  const sibling = expId === battleExpId() ? battleImageExpId() : battleExpId();
+  const siblings = runBattleExpIds().filter((id) => id !== expId);
   const experimentsApi = adminApiServes('experiments') ? adminUrl('assistant-admin', '/admin/experiments') : '';
   expect(
     experimentsApi,
@@ -564,10 +590,11 @@ export async function activateBattleExperiment(page: Page, expId: string = battl
     // Exclusivity: at most ONE active battle experiment per classification. The channel enable carries
     // no experimentId (the toggle has no picker), so the backend auto-resolves the single active one -
     // two actives is ambiguous and one active sibling holds the challenger.
-    const siblingStatus = statusOf(sibling);
-    if (siblingStatus === 'active') {
-      const resp = await setStatus(sibling, 'paused');
-      expect(resp.ok(), `pause sibling ${sibling}: ${resp.status()} ${await resp.text()}`).toBeTruthy();
+    for (const sibling of siblings) {
+      if (statusOf(sibling) === 'active') {
+        const resp = await setStatus(sibling, 'paused');
+        expect(resp.ok(), `pause sibling ${sibling}: ${resp.status()} ${await resp.text()}`).toBeTruthy();
+      }
     }
 
     const own = statusOf(expId);
@@ -599,7 +626,7 @@ export async function newBattleChannel(page: Page, title: string, expId: string 
   await createConversation(page, title, 'Premium');
   await page.locator('.message-textarea').waitFor({ state: 'visible', timeout: 15_000 });
 
-  await page.locator('button[aria-label="Show channel members"]').click();
+  await page.locator('button[aria-label="Show members"]').click();
   const section = page.locator('section.channel-members-panel-battle');
   await expect(section).toBeVisible({ timeout: 10_000 });
   // Battle enable is a plain ON/OFF toggle: the backend auto-resolves the
@@ -625,10 +652,10 @@ export async function newBattleChannel(page: Page, title: string, expId: string 
   }
   await expect(live).toBeVisible();
   // Close the members panel so it doesn't overlay the composer. The toggle
-  // button's label flips to "Hide channel members" while the panel is OPEN —
+  // button's label flips to "Hide members" while the panel is OPEN —
   // clicking the "Show…" label here is a no-op that leaves the panel covering
   // the textarea (every subsequent composer action then hangs).
-  await page.locator('button[aria-label="Hide channel members"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.locator('button[aria-label="Hide members"]').first().click({ timeout: 5000 }).catch(() => {});
   await page.locator('section.channel-members-panel-battle').waitFor({ state: 'hidden', timeout: 10_000 }).catch(() => {});
 }
 
@@ -662,9 +689,86 @@ async function fireBattleRaw(page: Page, prompt: string): Promise<void> {
   await page.keyboard.press('Enter');
 }
 
-export async function fireBattle(page: Page, prompt: string, timeoutMs = 260_000): Promise<number> {
+/**
+ * EVERY SIDE OF THE DUEL ANSWERED, READ FROM WHAT THE TURN RECORDED. Battle responses are inspected in detail on
+ * every run.
+ *
+ * A duel's shape - two bubbles, chips, a scorecard, a countable pick - is satisfied by two refusals, two error
+ * replies or a model fallback answering for the variant under test, and every comparison built on it is then
+ * void. So each side's reply is checked against its own analytics record, never against its wording (tenet D11):
+ * the input guardrail did not block it, no fallback answered for it, and its model produced output (tokens, or
+ * images on an image duel). Each side is printed in full beside its model, tokens and findings, so the run's log
+ * is a record a person can read, and attached to the test.
+ *
+ * `sideIds` are the message ids of the duel's round-1 replies, in the order they render.
+ */
+/** What an intent battle varies: the one intent its arms route differently. Absent for a base-model battle. */
+export interface DuelVaries { intent: string }
+
+export async function inspectDuelSides(page: Page, sideIds: string[], prompt: string, varies?: DuelVaries): Promise<void> {
+  const report: string[] = [`--- duel sides for "${prompt.slice(0, 100)}" ---`];
+  const problems: string[] = [];
+  const models: Array<{ model: string; from: string; intent: string }> = [];
+  for (const [i, messageId] of sideIds.entries()) {
+    // THE RECORD FIRST: it is written once the reply is final, so the text read after it is the answer, not the
+    // placeholder a slower side still showed when the scorecard settled.
+    const rec = await turnRecord(messageId, 90_000);
+    const side = { messageId, text: (await page.locator(`[data-message-id="${messageId}"]`).first().innerText().catch(() => '')) || '' };
+    const variant = String(field(rec, 'variantId') ?? '-');
+    const model = String(field(rec, 'bedrockModel') ?? '-').split('/').pop() ?? '-';
+    // WHICH RULE CHOSE THE MODEL: `base` (the version's base model, which a base-model experiment varies) or
+    // `route` (the version's route for this intent, which every arm keeps by design).
+    const from = String(field(rec, 'modelFrom') ?? '-');
+    models.push({ model, from, intent: String(field(rec, 'intent') ?? '-') });
+    const outputTokens = Number(field(rec, 'outputTokens') ?? 0);
+    const images = Number(field(rec, 'imageCount') ?? 0);
+    const blocked = field(rec, 'guardrailBlocked') === true;
+    const fallback = field(rec, 'wasFallback') === true;
+    const findings = field(rec, 'guardrailFindings');
+    report.push(
+      `  [${i}] ${side.messageId} variant=${variant} model=${model} (from ${from}, intent ${field(rec, 'intent') ?? '-'}) outputTokens=${outputTokens} images=${images} `
+      + `guardrailBlocked=${blocked} fallback=${fallback}${fallback ? ` (${field(rec, 'fallbackReason') ?? 'no reason'})` : ''} `
+      + `findings=${JSON.stringify(findings ?? [])}`,
+      `      ${side.text.replace(/\s+/g, ' ').slice(0, 1200) || '(no text)'}`,
+    );
+    if (blocked) problems.push(`[${i}] ${variant}: the input guardrail blocked it; its model never ran`);
+    if (fallback) problems.push(`[${i}] ${variant}: a fallback answered for it (${field(rec, 'fallbackReason') ?? 'no reason'}), not the variant under test`);
+    if (outputTokens <= 0 && images <= 0) problems.push(`[${i}] ${variant}: its model produced no output`);
+    if (!side.text.trim() && images <= 0) problems.push(`[${i}] ${variant}: the reply carries no text`);
+  }
+  // THE TWO ARMS DIFFER WHERE THE EXPERIMENT REACHES, for the experiments these specs arm, whose only declared variable is a
+  // model. A base-model experiment varies "the base model only; it reaches every turn whose intent has no route"
+  // (DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP §3.5), so two sides that both ran their base model must differ, and a routed
+  // intent keeps its route in both arms by design (printed above, not refused). An intent experiment (`varies`) varies that
+  // intent's model, so both sides must have been classified to it, and their models must differ. An experiment varying
+  // something else, its instructions for example, can compare one model, and declares that here when one is added.
+  if (varies) {
+    const off = models.filter((m) => m.intent !== varies.intent);
+    if (off.length) problems.push(`the duel is for intent ${varies.intent}, but a side was classified ${off.map((m) => m.intent).join(', ')}`);
+    else if (models.length === 2 && models[0].model === models[1].model) {
+      problems.push(`both sides ran ${models[0].model} for ${varies.intent}: the intent experiment's arms are the same model`);
+    }
+  } else if (models.length === 2 && models.every((m) => m.from === 'base') && models[0].model === models[1].model) {
+    problems.push(`both sides ran their base model, ${models[0].model}: a base-model experiment's one variable is the same in both arms`);
+  }
+  console.log(report.join('\n'));
+  await test.info().attach('duel-sides', { body: report.join('\n'), contentType: 'text/plain' });
+  expect(problems, 'a duel side did not answer; the comparison it produced is void').toEqual([]);
+}
+
+/** The round-1 replies of the duel whose bubbles start at `from`: the ids of the first two battle bubbles rendered after it. */
+async function duelSidesFrom(page: Page, from: number): Promise<string[]> {
+  const bubbles = page.locator('.message.battle-message[data-message-id]');
+  const ids: string[] = [];
+  for (let i = from; i < from + 2; i++) ids.push((await bubbles.nth(i).getAttribute('data-message-id')) || '');
+  return ids;
+}
+
+export async function fireBattle(page: Page, prompt: string, timeoutMs = 260_000, varies?: DuelVaries): Promise<number> {
   // Window opens BEFORE the send: the handler can log before the UI registers anything.
   const windowStart = Date.now() - 2_000;
+  // This duel's sides are the battle bubbles that render after the ones already on screen.
+  const before = await page.locator('.message.battle-message[data-message-id]').count();
   await fireBattleRaw(page, prompt);
 
   // A duel that never renders is nearly always a handler that already failed, and this wait is 260s -
@@ -682,7 +786,9 @@ export async function fireBattle(page: Page, prompt: string, timeoutMs = 260_000
         timeout: timeoutMs,
       })
       .toMatch(/\d/);
-    return page.locator('.message.battle-message').count();
+    const count = await page.locator('.message.battle-message').count();
+    await inspectDuelSides(page, await duelSidesFrom(page, before), prompt, varies);
+    return count;
   }, windowStart, 'battle turn');
 }
 
@@ -691,7 +797,7 @@ export async function fireBattle(page: Page, prompt: string, timeoutMs = 260_000
  * altered behind it.
  *
  * An active experiment takes precedence over the active profile for the model it governs, and a
- * battle experiment is premium with a non-Opus control. Leaving one active means premium traffic keeps
+ * battle experiment is premium with a non-Opus treatment. Leaving one active means premium traffic keeps
  * splitting after the suite ends: the very next run of `agent-intents` reports "a premium conversation
  * was served by ... sonnet, not an Opus model" and reads as a routing regression rather than as
  * leftover test state. Observed exactly that in the first full validate sweep, where the `user` phase
@@ -732,7 +838,7 @@ export async function retireThisRunsBattleExperiments(page: Page): Promise<void>
 
   const api = signedAdminContext(idToken!);
   try {
-    for (const id of [battleExpId(), battleImageExpId()]) {
+    for (const id of runBattleExpIds()) {
       const resp = await api
         .post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), { data: { status: 'completed' } })
         .catch(() => null);

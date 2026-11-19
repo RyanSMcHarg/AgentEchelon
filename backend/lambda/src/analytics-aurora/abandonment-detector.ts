@@ -79,7 +79,7 @@ export async function handler(): Promise<{ checked: number; abandoned: number }>
       WHERE engagement_settled = FALSE
         AND (outcome IS NULL OR outcome = 'accepted')
         AND new_channel_arn IS NOT NULL
-        AND occurred_at < NOW() - ($1 || ' minutes')::interval
+        AND COALESCE(outcome_at, occurred_at) < NOW() - ($1 || ' minutes')::interval
       ORDER BY occurred_at
       LIMIT $2`,
     [String(ABANDONMENT_WINDOW_MIN), BATCH_LIMIT],

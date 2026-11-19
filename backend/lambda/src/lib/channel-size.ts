@@ -86,6 +86,8 @@ export interface ChannelSize {
   isOneToOne: boolean;
   /** True when the count could not be read. See `resolveChannelSize`. */
   unknown: boolean;
+  /** True when the roster stopped at the page bound, so `members` is a prefix and a check over every member must fail closed. */
+  truncated?: boolean;
   /**
    * True when the read was REFUSED rather than merely failing: the classification boundary spoke.
    *
@@ -126,6 +128,8 @@ export async function resolveChannelSize(
   client: ChimeSDKMessagingClient,
   channelArn: string,
   bearerArn: string,
+  /** A caller that reads a conversation the assistant may not be in (a thread relative) expects a refusal, and is not told it is a boundary fault. */
+  opts: { refusalExpected?: boolean } = {},
 ): Promise<ChannelSize> {
   // ONE SOURCE, AND IT IS THE LIVE READ. An event-written count from the Kinesis archival path is the
   // obvious way to spend a DynamoDB GetItem instead of an Amazon Chime SDK call, and it is rejected on
@@ -191,6 +195,7 @@ export async function resolveChannelSize(
     return {
       memberCount,
       members,
+      ...(nextToken ? { truncated: true } : {}),
       isOneToOne: memberCount <= ONE_TO_ONE_MEMBER_COUNT,
       unknown: false,
       refused: false,
@@ -201,6 +206,11 @@ export async function resolveChannelSize(
     // (ADR-042). Measured live on 2026-09-17: the deployed premium router is implicitDeny here for a
     // basic-tagged channel and allowed for a premium one. Before ADR-045 this catch reported that
     // denial as "treat the channel as a group" and the turn ran to completion.
+    // NOT A MEMBER is Amazon Chime SDK's own answer (`ForbiddenException`), which a caller reading a relative it may not be in
+    // expects. IAM's boundary refusal (`AccessDeniedException`) is logged below, expected or not.
+    if (opts.refusalExpected && (err as { name?: string })?.name === 'ForbiddenException') {
+      return { memberCount: 0, members: [], isOneToOne: false, unknown: true, refused: true };
+    }
     if (isAccessDenial(err)) {
       console.error(
         '[channel-size] ListChannelMemberships REFUSED; the channel classification boundary denied '

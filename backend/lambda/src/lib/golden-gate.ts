@@ -30,6 +30,8 @@ export interface IntentCoverage {
 export interface GoldenGateRead {
   entries: number;
   regressionEntries: number;
+  /** Live entries a run answers (those that used no tool); absent from a read that did not count them. */
+  answeredEntries?: number;
   /** Per intent of the draft's pack (ADR-065 decision 6). Absent on a read that named no intents. */
   coverage?: IntentCoverage[];
   /** Live entries whose intent the draft's pack does not declare. */

@@ -17,14 +17,16 @@
  * request at all.
  */
 import { SSM_STANDARD_TIER_MAX } from '../lambda/src/lib/seed-profile-definitions';
-import { stratumIntentPack, opsIntentPack } from '../demo/intent-packs';
+import { stratumIntentPack, opsIntentPack } from '../../demo/stratum-company/intent-packs';
 import { MAX_INTENT_PACK_BYTES } from '../lambda/src/lib/intent-pack';
-import { BASIC_PERSONA, STANDARD_PERSONA, PREMIUM_PERSONA, OPS_PERSONA } from '../demo/personas';
+import { BASIC_PERSONA, STANDARD_PERSONA, PREMIUM_PERSONA, OPS_PERSONA } from '../../demo/stratum-company/personas';
 import { serializeSeedDefinition } from '../lambda/src/lib/active-profile';
 import { defaultProfileRegistry } from '../lib/profile-registry';
-import { OPS_BOUNDARY } from '../demo/boundaries';
-import { OPS_WELCOME } from '../demo/welcomes';
+import { OPS_BOUNDARY } from '../../demo/stratum-company/boundaries';
+import { opsEventWorkflows } from '../../demo/portable-assistants/ops-assistant-manifest';
 import { legacyWelcomePlan } from '../lambda/src/lib/legacy-welcome-migration';
+import { offloadBodies } from '../lambda/src/lib/profile-bodies';
+import type { ProfileDefinition } from '../lambda/src/lib/active-profile';
 
 // CLASSIFICATIONS are classification values; the PROFILE serving each is a different string now that a
 // profile name may not be a classification value, so the seed helpers are given the profile name.
@@ -138,19 +140,20 @@ describe('every seeded value fits the parameter it is written to', () => {
     expect(size).toBeLessThanOrEqual(SSM_STANDARD_TIER_MAX);
   });
 
-  // THE WELCOME IS INLINE (W1): its workflows ride the parameter, so the ops assistant's, the largest the demo seeds,
-  // must fit beside everything else, as the seed writes it and as `npm run migrate-legacy-welcome` writes the retired
-  // welcome the seed wrote before (its fields repeated on the ops room's welcome, as the retired variant inherited them).
-  it('the ops definition fits with its welcome workflows, as seeded and as the migration carries the retired one', () => {
-    const fits = (eventWorkflows: Record<string, unknown>) => {
-      const def = JSON.parse(serializeSeedDefinition('ops-premium', OPS_PERSONA, opsIntentPack(), undefined, OPS_BOUNDARY, eventWorkflows as never) as string) as Record<string, unknown>;
-      delete def.persona;
-      delete def.intentPack;
-      return JSON.stringify(def).length;
+  // THE EVENT WORKFLOWS ARE A BODY (`profile-bodies.ts` offloadBodies): with the profile body store every deployment has,
+  // the ops assistant's workflows, the largest the demo seeds, go to the store and the parameter keeps their names. So
+  // what must fit is the definition as it is stored, as the seed writes it and as `npm run migrate-legacy-welcome` writes
+  // the retired welcome the seed wrote before (its fields repeated on the ops room's welcome, as the retired variant
+  // inherited them).
+  it('the ops definition fits with its welcome workflows, as seeded and as the migration carries the retired one', async () => {
+    const store = { s3: { send: async () => ({}) } as never, bucket: 'profiles' };
+    const fits = async (eventWorkflows: Record<string, unknown>) => {
+      const def = JSON.parse(serializeSeedDefinition('ops-premium', OPS_PERSONA, opsIntentPack(), undefined, OPS_BOUNDARY, eventWorkflows as never) as string) as ProfileDefinition;
+      return JSON.stringify(await offloadBodies(def, store)).length;
     };
     const fields = { companyName: 'x'.repeat(20), companyBlurb: 'x'.repeat(80), accessBlurb: 'x'.repeat(220), examples: ['x'.repeat(60), 'x'.repeat(50), 'x'.repeat(55)], platformNote: 'x'.repeat(130) };
     const migrated = legacyWelcomePlan({ ...fields, byConversationType: { ops: { template: 'x'.repeat(170) } } }, undefined).eventWorkflows;
-    for (const [what, size] of [['seeded', fits(OPS_WELCOME)], ['migrated', fits(migrated)]] as const) {
+    for (const [what, size] of [['seeded', await fits(opsEventWorkflows())], ['migrated', await fits(migrated)]] as const) {
       if (size > SSM_STANDARD_TIER_MAX) throw new Error(report(`ops definition with its ${what} welcome`, size));
       expect(size).toBeLessThanOrEqual(SSM_STANDARD_TIER_MAX);
     }

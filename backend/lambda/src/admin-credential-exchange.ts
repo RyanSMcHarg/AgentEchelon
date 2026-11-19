@@ -26,11 +26,16 @@
  * the person the session names, through their subjects at the `admin: true` issuers
  * (`refuseInactivePerson`). An account its issuer reports disabled or gone is refused, and an unreadable
  * directory vends nothing.
+ *
+ * EVERY REFUSAL IS RECORDED (`refusalsRecorded`, lib/vend.ts): an answer that vends nothing is written to
+ * the access log beside the grants, naming the person the console session or the token resolves to, the
+ * capability, conversation or assistant asked for, the stated reason and the refusal's code. A refusal
+ * whose record cannot be written is answered all the same.
  */
 import { AssumeRoleCommand } from '@aws-sdk/client-sts';
 import { CreateAppInstanceAdminCommand } from '@aws-sdk/client-chime-sdk-identity';
 import { DescribeChannelMembershipForAppInstanceUserCommand } from '@aws-sdk/client-chime-sdk-messaging';
-import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
+import { bucketNameOf, resolveAttachmentsBucketArn as resolveSharedAttachmentsBucketArn } from './lib/attachments-bucket.js';
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
 import { listAssistantIdentities, scopeFor, teamsOfGroups } from './lib/assistant-ownership.js';
 import { TEAM_NAME_PATTERN } from '../../lib/config/profiles.js';
@@ -65,8 +70,11 @@ import {
   ensureAppInstanceUser,
   isRefusal,
   literalChannelId,
+  noteRefusalFacts,
   refuseInactiveAccount,
   refuseInactivePerson,
+  refuseLapsedConsoleRole,
+  refusalsRecorded,
   reply,
   sts,
   tokenCallerOf,
@@ -96,8 +104,8 @@ const SESSION_POLICY_LIMIT = 2048;
 /**
  * THE ARCHIVE PLANE: a capability maps to the API Gateway resource ARN it authorizes, and the exchange
  * vends a session policy of `execute-api:Invoke` on exactly that resource, completed with the one
- * subject the vend is scoped to (intersected with the admin-plane role boundary, which carries the
- * wildcard). The ARNs are TEMPLATES carrying `{id}`.
+ * subject the vend is scoped to and with this instance's admin API (intersected with the admin-plane
+ * role's grant, which names the same API by its id). The ARNs are TEMPLATES carrying `{apiId}` and `{id}`.
  */
 const EXECUTE_API_CAPABILITY_RESOURCES: Record<string, string> = {
   'view-messages': process.env.EXCHANGE_EXECUTE_API_MESSAGES_ARN || '',
@@ -126,6 +134,20 @@ const EXECUTE_API_CAP_SCOPE: Record<string, 'channel' | 'principal'> = {
 };
 const EXECUTE_API_CAPS = new Set(Object.keys(EXECUTE_API_CAPABILITY_RESOURCES));
 
+/** An API Gateway API id: lower-case letters and digits, never a wildcard. */
+const API_ID = /^[a-z0-9]{1,32}$/;
+
+/**
+ * One archive-plane resource: the template completed with the API that carried the vend request and the
+ * one subject. The request reaches this function only through this instance's admin API (its invoke
+ * permission names that API alone), so `requestContext.apiId` is that API. A template without
+ * `{apiId}`, an absent or malformed API id, or an absent subject completes to '' and the vend is refused.
+ */
+export function archiveResourceFor(template: string, apiId: unknown, id: string): string {
+  if (!template.includes('{apiId}') || typeof apiId !== 'string' || !API_ID.test(apiId) || !id) return '';
+  return template.replace('{apiId}', apiId).replace('{id}', encodeURIComponent(id));
+}
+
 /**
  * THE S3 ATTACHMENT PLANE. S3 ARNs condition on the object-key prefix, so the session policy is
  * `s3:GetObject` on ONLY the named channel's keys:
@@ -140,27 +162,9 @@ const S3_ATTACHMENT_CAPS = new Set(Object.keys(S3_ATTACHMENT_CAP_PREFIXES));
 /** User-uploaded content is more sensitive than assistant output, and is flagged on its audit record. */
 const SENSITIVE_ATTACHMENT_CAPS = new Set(['attachment-read-uploads']);
 
-// The attachments bucket ARN, resolved at cold start from SSM. An absent value means the attachment
-// plane is unavailable and its vends 500 (misconfigured), never leak.
-const ATTACHMENTS_BUCKET_ARN_PARAM = process.env.EXCHANGE_ATTACHMENTS_BUCKET_ARN_PARAM || '';
-const ssm = new SSMClient({ region: AWS_REGION });
-let attachmentsBucketArn: string | null = null;
-async function resolveAttachmentsBucketArn(): Promise<string> {
-  if (attachmentsBucketArn !== null) return attachmentsBucketArn;
-  if (process.env.EXCHANGE_ATTACHMENTS_BUCKET_ARN) {
-    attachmentsBucketArn = process.env.EXCHANGE_ATTACHMENTS_BUCKET_ARN;
-    return attachmentsBucketArn;
-  }
-  if (!ATTACHMENTS_BUCKET_ARN_PARAM) { attachmentsBucketArn = ''; return ''; }
-  try {
-    const r = await ssm.send(new GetParameterCommand({ Name: ATTACHMENTS_BUCKET_ARN_PARAM }));
-    attachmentsBucketArn = r.Parameter?.Value || '';
-  } catch (err) {
-    console.error('[AdminCredentialExchange] attachments-bucket-arn SSM resolve failed:', err);
-    attachmentsBucketArn = '';
-  }
-  return attachmentsBucketArn;
-}
+// The attachments bucket ARN, found by name at call time through the one resolver both exchanges use. An absent value means
+// the attachment plane is unavailable and its vends 500 (misconfigured), never leak.
+const resolveAttachmentsBucketArn = () => resolveSharedAttachmentsBucketArn('[AdminCredentialExchange]');
 
 /**
  * THE SESSION POLICY THAT SCOPES A TEAM MEMBER TO THEIR ASSISTANTS AND THEIR TEAMS (DESIGN-ADMIN-CONSOLE 5.2).
@@ -310,6 +314,9 @@ async function teamAttachmentVend(event: any, assistant: string): Promise<HttpRe
   // THE ISSUER IS ASKED AGAIN, not the session: an account disabled since the session was issued vends nothing.
   const inactive = await refuseInactivePerson(event, userArnFor(APP_INSTANCE_ARN, caller.sub));
   if (inactive) return inactive;
+  // AND THE ROLE: a person removed from the team group since the session was issued vends nothing (R6).
+  const lapsed = await refuseLapsedConsoleRole(event, userArnFor(APP_INSTANCE_ARN, caller.sub), 'team-members');
+  if (lapsed) return lapsed;
   if (!TEAM_ATTACHMENT_ROLE_ARN) {
     console.error('[AdminCredentialExchange] TEAM_ATTACHMENT_ROLE_ARN is not configured');
     return deny(500, 'Attachment vend misconfigured');
@@ -367,7 +374,7 @@ async function teamAttachmentVend(event: any, assistant: string): Promise<HttpRe
     tier: 'team',
     identity: 'admin',
     scopedTo: channelArn,
-    bucket: bucketArn.replace(/^arn:aws:s3:::/, ''),
+    bucket: bucketNameOf(bucketArn),
     region: AWS_REGION,
   };
   return reply(event, 200, result);
@@ -425,10 +432,16 @@ async function consoleSession(event: any): Promise<HttpResult> {
       });
     }
     personId = state.personArn.split('/').pop() || '';
+    noteRefusalFacts(event, { personId });
   } catch (err) {
     console.error('[AdminCredentialExchange] could not resolve the person:', err);
     return reply(event, 500, { error: 'Credential exchange failed' });
   }
+  // THE ROLE IS READ LIVE BEFORE A SESSION IS ISSUED (DESIGN-REVOCATION-WINDOWS R6), as every per-capability vend
+  // reads it. The role above comes from the token's groups, which a removal from `admins` or a team reaches only
+  // at renewal, so without this a removed person keeps minting fresh console sessions on the token they hold.
+  const lapsed = await refuseLapsedConsoleRole(event, userArnFor(APP_INSTANCE_ARN, personId), role);
+  if (lapsed) return lapsed;
   // A TEAM MEMBER'S REACH IS THE ASSISTANTS THEIR TEAM OWNS, within their own clearance, read from the
   // ownership tags now: a reassignment takes effect on the next session with no deploy.
   let teamAssistants: string[] | undefined;
@@ -577,6 +590,9 @@ async function adminVend(event: any, capabilityKey: string): Promise<HttpResult>
   // THE ISSUER IS ASKED AGAIN, not the session: an account disabled since the session was issued vends nothing.
   const inactive = await refuseInactivePerson(event, userArnFor(APP_INSTANCE_ARN, personId));
   if (inactive) return inactive;
+  // AND THE ROLE: a person removed from `admins` since the session was issued vends nothing (R6).
+  const lapsed = await refuseLapsedConsoleRole(event, userArnFor(APP_INSTANCE_ARN, personId), 'admins');
+  if (lapsed) return lapsed;
   if (!EXCHANGE_ROLE_ADMIN_PLANE) {
     console.error('[AdminCredentialExchange] No exchange role ARN configured for admin-plane');
     return reply(event, 500, { error: 'Exchange misconfigured' });
@@ -597,7 +613,7 @@ async function adminVend(event: any, capabilityKey: string): Promise<HttpResult>
         const scope = EXECUTE_API_CAP_SCOPE[c];
         if (!template || !scope) return template;
         const id = scope === 'principal' ? scopeOwnerId : scopedChannelId;
-        return id ? template.replace('{id}', encodeURIComponent(id)) : '';
+        return archiveResourceFor(template, event?.requestContext?.apiId, id);
       });
       if (resources.some((r) => !r)) {
         console.error('[AdminCredentialExchange] No execute-api resource ARN configured for', archiveCaps);
@@ -681,7 +697,7 @@ async function adminVend(event: any, capabilityKey: string): Promise<HttpResult>
         tier: 'admin',
         identity: 'admin',
         scopedTo: scopeChannelArn || null,
-        bucket: bucketArn.replace(/^arn:aws:s3:::/, ''),
+        bucket: bucketNameOf(bucketArn),
         region: AWS_REGION,
       } satisfies ExchangeResult);
     }
@@ -734,14 +750,29 @@ async function adminVend(event: any, capabilityKey: string): Promise<HttpResult>
   }
 }
 
-export const handler = async (event: any): Promise<HttpResult> => {
+const exchange = async (event: any): Promise<HttpResult> => {
   // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
   await loadProfileRegistry();
   if (event?.httpMethod === 'OPTIONS') return { statusCode: 204, headers: cors(event), body: '' };
   const path: string = event?.path || '';
   const teamAttachment = TEAM_ATTACHMENT_ROUTE.exec(path);
-  if (teamAttachment) return teamAttachmentVend(event, decodeURIComponent(teamAttachment[1]));
+  if (teamAttachment) {
+    const assistant = decodeURIComponent(teamAttachment[1]);
+    noteRefusalFacts(event, { assistant: assistant.slice(0, 128), capabilities: ['attachment-read'] });
+    return teamAttachmentVend(event, assistant);
+  }
   const vendMatch = /\/exchange-credentials\/admin\/([a-z-]+)\/?$/.exec(path);
-  if (vendMatch) return adminVend(event, vendMatch[1]);
+  if (vendMatch) {
+    noteRefusalFacts(event, { capabilities: [vendMatch[1].slice(0, 64)] });
+    return adminVend(event, vendMatch[1]);
+  }
   return consoleSession(event);
 };
+
+/**
+ * Every answer that vends nothing is recorded as a refusal. Who asked is the person the signed request's
+ * console session names, or, on a console-session request, the person its token resolves to.
+ */
+export const handler = refusalsRecorded('admin', exchange, {
+  askerOf: (event) => consoleSessionCaller(event)?.sub,
+});

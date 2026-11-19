@@ -16,7 +16,7 @@
  * boundary; the negative assertions in tests/e2e/classification-context.spec.ts are what prove the
  * boundary actually holds.
  */
-import { BASIC_PERSONA, STANDARD_PERSONA, PREMIUM_PERSONA, OPS_PERSONA } from '../demo/personas';
+import { BASIC_PERSONA, STANDARD_PERSONA, PREMIUM_PERSONA, OPS_PERSONA } from '../../demo/stratum-company/personas';
 import { serializeSeedDefinition } from '../lambda/src/lib/active-profile';
 import { SSM_STANDARD_TIER_MAX } from '../lambda/src/lib/seed-profile-definitions';
 import { defaultProfileRegistry } from '../lib/profile-registry';

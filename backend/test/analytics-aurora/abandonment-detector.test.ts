@@ -194,8 +194,8 @@ describe('abandonment-detector handler', () => {
     const [sql] = mockedQuery.mock.calls[0];
     expect(sql).toMatch(/outcome IS NULL/);
     expect(sql).toMatch(/new_channel_arn IS NOT NULL/);
-    // And the time threshold.
-    expect(sql).toMatch(/occurred_at < NOW\(\) - /);
+    // And the time threshold, measured from the move, so a late yes gets the same grace as an early one.
+    expect(sql).toMatch(/COALESCE\(outcome_at, occurred_at\) < NOW\(\) - /);
   });
 
   it('countNonBotMessages query filters on is_bot = FALSE', async () => {

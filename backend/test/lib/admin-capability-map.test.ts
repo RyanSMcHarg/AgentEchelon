@@ -9,7 +9,12 @@ import {
   capabilityForPath,
   queryTypeAllowedOnPath,
   ANALYTICS_CAPABILITY_SUBPATHS,
+  CONTENT_CAPABILITY,
+  CONTENT_GET_PATHS,
+  isContentQuery,
+  isContentGetPath,
 } from '../../lambda/src/lib/admin-capability-map';
+import { ADMIN_CAPABILITIES } from '../../lib/config/admin-capabilities';
 
 describe('capabilityForQueryType', () => {
   it('assigns the sensitive queryTypes to their own capability', () => {
@@ -22,16 +27,17 @@ describe('capabilityForQueryType', () => {
   });
 
   it('decides a write that rides a read queryType by its action', () => {
-    // Reading the flagged queue is the analytics bundle; changing it is triage.
-    expect(capabilityForQueryType('flagged_responses')).toBe('view-analytics');
+    // Reading the flagged queue is content (each row carries the message and the answer); changing it
+    // is triage.
+    expect(capabilityForQueryType('flagged_responses')).toBe('view-events');
     for (const action of ['flag', 'unflag', 'review']) {
       expect(capabilityForQueryType('flagged_responses', action)).toBe('triage-responses');
     }
-    expect(capabilityForQueryType('ground_truth')).toBe('view-analytics');
+    expect(capabilityForQueryType('ground_truth')).toBe('view-events');
     expect(capabilityForQueryType('ground_truth', 'submit')).toBe('label-ground-truth');
     expect(capabilityForQueryType('classifier_replay_adjudicate')).toBe('label-ground-truth');
     // An action a read does not recognize as a write stays a read.
-    expect(capabilityForQueryType('flagged_responses', 'list')).toBe('view-analytics');
+    expect(capabilityForQueryType('flagged_responses', 'list')).toBe('view-events');
   });
 
   it('defaults every other (low-sensitivity) queryType to the analytics bundle', () => {
@@ -97,12 +103,14 @@ describe('the drills added for metric evidence are enforceable', () => {
     // Per-turn latency for one breakdown row. No identity, no user content: the same class as
     // latency_metrics, which it drills into.
     ['latency_exchanges'],
-    // The ratings themselves. Carries the prose a person wrote and the ASSISTANT's reply, and
-    // deliberately no userSub and no user message - so it is strictly less identifying than
-    // flagged_responses, which shows the user's own message and sits in the same class.
-    ['user_ratings'],
   ])('%s is a view-analytics read', (queryType) => {
     expect(capabilityForQueryType(queryType)).toBe('view-analytics');
+  });
+
+  it('user_ratings is content: it carries the rated answer and the note the person wrote', () => {
+    expect(capabilityForQueryType('user_ratings')).toBe('view-events');
+    expect(queryTypeAllowedOnPath('user_ratings', '/analytics/events-log')).toBe(true);
+    expect(queryTypeAllowedOnPath('user_ratings', '/analytics')).toBe(false);
   });
 
   it.each([['latency_exchanges'], ['user_ratings']])(
@@ -112,7 +120,9 @@ describe('the drills added for metric evidence are enforceable', () => {
       // to read a different data class by naming its queryType on that resource, and the reverse.
       // The real sub-path is 'events-log'; '/analytics/events' matches no capability and so falls
       // to the view-analytics default, which would have made this assertion pass for the wrong reason.
-      expect(queryTypeAllowedOnPath(queryType, '/analytics/events-log')).toBe(false);
+      const own = capabilityForQueryType(queryType);
+      if (own !== 'view-events') expect(queryTypeAllowedOnPath(queryType, '/analytics/events-log')).toBe(false);
+      if (own !== 'view-analytics') expect(queryTypeAllowedOnPath(queryType, '/analytics')).toBe(false);
       expect(queryTypeAllowedOnPath(queryType, '/analytics/user-activity')).toBe(false);
     },
   );
@@ -150,5 +160,52 @@ describe('a content-serving queryType is not served from the low-sensitivity bun
     expect(queryTypeAllowedOnPath('cross_conversation_context', '/analytics/events-log')).toBe(true);
     expect(queryTypeAllowedOnPath('cross_conversation_context', '/analytics/user-activity')).toBe(false);
     expect(queryTypeAllowedOnPath('cross_conversation_context', '/analytics/moderation-audit')).toBe(false);
+  });
+});
+
+/**
+ * EVERY READ THAT RETURNS WHAT WAS SAID REQUIRES THE CONTENT CAPABILITY, on every route that serves it.
+ * A role holding only `view-analytics` reaches labels and counts, and no transcript, summary, message
+ * or answer, by POST or by GET.
+ */
+describe('conversation content is view-events, on every route', () => {
+  const CONTENT = [
+    'channel_events', 'cross_conversation_context', 'conversation_summaries', 'evaluation_exchanges',
+    'flagged_responses', 'ground_truth', 'label_queue', 'user_ratings',
+  ];
+
+  it.each(CONTENT)('%s requires view-events and is refused on the analytics root', (queryType) => {
+    expect(capabilityForQueryType(queryType)).toBe(CONTENT_CAPABILITY);
+    expect(isContentQuery(queryType)).toBe(true);
+    expect(queryTypeAllowedOnPath(queryType, '/query')).toBe(false);
+    expect(queryTypeAllowedOnPath(queryType, '/query/events-log')).toBe(true);
+  });
+
+  it('keeps the aggregates, and the writes that ride a content read, out of the content class', () => {
+    for (const q of ['conversation_volumes', 'model_usage', 'latency_exchanges', 'execution_steps', 'golden_set']) {
+      expect(isContentQuery(q)).toBe(false);
+    }
+    expect(isContentQuery('flagged_responses', 'flag')).toBe(false);
+    expect(isContentQuery('ground_truth', 'submit')).toBe(false);
+  });
+
+  it('recognizes the content GET routes by their ending, and no other', () => {
+    for (const p of CONTENT_GET_PATHS) {
+      expect(isContentGetPath(`/${p}`)).toBe(true);
+      expect(isContentGetPath(`/query/${p}`)).toBe(true);
+    }
+    for (const p of ['/analytics/evaluation', '/analytics/evaluation/flows', '/analytics/drift', '/analytics/model-effectiveness']) {
+      expect(isContentGetPath(p)).toBe(false);
+    }
+  });
+
+  it('the catalog grants each content GET under view-events, and never under view-analytics', () => {
+    const paths = (key: string) => ADMIN_CAPABILITIES[key].resources
+      .filter((r) => r.api === 'analytics' && r.method === 'GET')
+      .map((r) => r.path);
+    for (const p of CONTENT_GET_PATHS) {
+      expect(paths('view-events')).toContain(p);
+      expect(paths('view-analytics')).not.toContain(p);
+    }
   });
 });

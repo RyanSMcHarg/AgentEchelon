@@ -57,11 +57,11 @@ describe('image-generation analytics metadata (per-image cost is priceable)', ()
       classification: 'premium',
       role: 'assistant',
       intent: 'image_generation',
-      bedrockResponse: { model: 'gpt-image-1', inputTokens: 0, outputTokens: 0 },
+      bedrockResponse: { model: 'gpt-image-2', inputTokens: 0, outputTokens: 0 },
       imageCount: 3,
     });
     expect(m.imageCount).toBe(3);
-    expect(m.bedrockModel).toBe('gpt-image-1');
+    expect(m.bedrockModel).toBe('gpt-image-2');
   });
 
   it('omits imageCount on a text turn (undefined, not 0)', () => {
@@ -79,7 +79,7 @@ describe('image-generation analytics metadata (per-image cost is priceable)', ()
       messageNumber: 2,
       classification: 'premium',
       role: 'assistant',
-      bedrockResponse: { model: 'gpt-image-1', inputTokens: 0, outputTokens: 0 },
+      bedrockResponse: { model: 'gpt-image-2', inputTokens: 0, outputTokens: 0 },
       imageCount: 1,
     });
     const slim = pickFrontendMetadata(m as unknown as Record<string, unknown>);

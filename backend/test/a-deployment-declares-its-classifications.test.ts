@@ -177,11 +177,13 @@ describe('a classification named but not declared is refused', () => {
     expect(typeIsServed('general', custom)).toBe(true);
     expect(classificationDeclarationErrors([], custom)).toEqual([]);
     expect(typeGroupContradictions(custom)).toEqual([]);
-    // Premium declaring its ops role without the role's profile: the ops type adds an assistant this deployment does not declare.
+    // Premium declaring its ops role without the role's profile: the ops incident type and an incident's customer messaging require an assistant this deployment
+    // does not declare; the team room adds it only where declared (`optionalAgents`), so it stands without it.
     const noOps = resolveDeploymentProfiles(['premium', 'ops-premium']);
     const registry = new ProfileRegistry({ ...noOps, profiles: noOps.profiles.filter((p) => p.name !== 'ops-premium') });
     expect(classificationDeclarationErrors([], registry)).toEqual([
       'conversation type "ops" adds the assistant "ops-premium", which this deployment\'s profiles do not declare',
+      'conversation type "customer-messaging" adds the assistant "ops-premium", which this deployment\'s profiles do not declare',
     ]);
   });
 });

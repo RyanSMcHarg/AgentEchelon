@@ -12,11 +12,13 @@
 import type {
   BackendModelDefinition,
   BackendModelKey,
-  RouteKey,
   IntentRouteDefinition,
   Classification,
+  RouteKey,
 } from '../../../lib/config/model-strategy.js';
-import { bedrockInvokeId } from '../../../lib/config/model-strategy.js';
+import { textRoutesOf } from './image-route.js';
+import type { IntentRoute } from './step-models.js';
+import { INTENT_ROUTE_STRATEGY, bedrockInvokeId, getModelCatalog } from '../../../lib/config/model-strategy.js';
 import type { ClassificationModels } from '../../../lib/config/profiles.js';
 
 // Re-export for convenience
@@ -153,6 +155,70 @@ export function routesAsServedByTheFloor(
     }
   }
   return { byIntent: out, raised };
+}
+
+/**
+ * THE PLATFORM ROUTES AS A VERSION ON `baseModelKey` SERVES THEM, explicitly: each route the retired
+ * classification floor would have raised says the base model, and a standalone greeting or acknowledgment
+ * keeps the route it was answered on (`routesAsServedByTheFloor`). A seed and a body with no routes carry
+ * these, so what a version says is what it serves. With no concrete base model the routes are as written.
+ */
+export function platformRoutesServedOn(baseModelKey: string | undefined): Record<string, { primary: string; fallback?: string }> {
+  const routes = seedByIntentFromGlobalStrategy();
+  // Cost classes are the catalog's own and do not depend on the region or account.
+  return routesAsServedByTheFloor(routes, baseModelKey, getModelCatalog('us-east-1', '') as Record<string, { costClass: 'low' | 'medium' | 'high' }>).byIntent ?? routes;
+}
+
+/** Seed a profile's `models.byIntent` from the legacy global strategy — a per-profile COPY, so building
+ *  the strategy back from it is byte-identical to feeding `INTENT_ROUTE_STRATEGY` directly. */
+export function seedByIntentFromGlobalStrategy(): Record<string, { primary: string; fallback?: string }> {
+  const out: Record<string, { primary: string; fallback?: string }> = {};
+  for (const r of INTENT_ROUTE_STRATEGY) out[r.intent] = { primary: r.primaryModel, fallback: r.fallbackModel };
+  return out;
+}
+
+/** A model key that names a model: not blank and not the `'default'` sentinel. */
+function concreteKey(v: string | undefined): string | undefined {
+  return v && v !== 'default' ? v : undefined;
+}
+
+/**
+ * Build the per-intent route strategy (`IntentRouteDefinition[]`, what `resolveModelForIntent` consumes)
+ * from a profile version's `models.byIntent`. `resolveModelForIntent` reads only `intent`/`primaryModel`/
+ * `fallbackModel`, so the other fields are placeholders. Returns null when the profile has no per-intent
+ * routing, so the caller falls back to the (legacy) global strategy. THIS is what moves per-intent model
+ * routing off the global table and onto the profile (U2 / SPEC-ASSISTANT-CONFIG §4).
+ */
+export function buildIntentStrategy(models: { default?: string; byIntent?: Record<string, IntentRoute> } | undefined): IntentRouteDefinition[] | null {
+  const byIntent = models?.byIntent;
+  if (!byIntent || Object.keys(byIntent).length === 0) return null;
+  // A per-intent route whose primary is the `'default'` sentinel means "no override — use the base model
+  // for this intent", so it is DROPPED from the strategy (the resolver then falls back to base). Only
+  // routes that name a concrete primary become strategy entries. An IMAGE route never does: the text
+  // resolver is never handed an image model, and an image-routed intent takes the image path instead.
+  const entries = Object.entries(textRoutesOf(byIntent)).filter(([, route]) => concreteKey(route.primary));
+  if (entries.length === 0) return null;
+  return entries.map(([intent, route]) => ({
+    intent: intent as RouteKey,
+    label: intent,
+    primaryModel: route.primary as BackendModelKey,
+    fallbackModel: (concreteKey(route.fallback) ?? route.primary) as BackendModelKey,
+    rationale: 'per-profile version (SPEC-ASSISTANT-CONFIG §4)',
+  }));
+}
+
+/**
+ * THE ROUTE STRATEGY A VERSION IS SERVED ON: its own routes; with none, the platform routes as served on its base model
+ * (`platformRoutesServedOn`); else the global table. One function, so the processor and the console's step preview read
+ * the same strategy.
+ */
+export function versionRouteStrategy(
+  models: Parameters<typeof buildIntentStrategy>[0],
+  baseModelKey: string | undefined,
+): IntentRouteDefinition[] {
+  return buildIntentStrategy(models)
+    ?? buildIntentStrategy({ byIntent: platformRoutesServedOn(baseModelKey) })
+    ?? INTENT_ROUTE_STRATEGY;
 }
 
 export interface ModelResolution {

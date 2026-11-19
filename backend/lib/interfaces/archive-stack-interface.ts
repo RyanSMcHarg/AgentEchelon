@@ -17,6 +17,14 @@ export interface IArchiveStackOutputs {
   /** S3 archive bucket name */
   readonly archiveBucketName: string;
 
+  /**
+   * THE SYSTEM OF RECORD, in either mode: the conversation archive bucket (`conversations/`, and a capability's own
+   * event families beside it), and the key it is encrypted with. In Athena mode it is the bucket above; in Aurora mode
+   * the bucket above holds the Aurora plane's documents and this one is the `ConversationArchive` construct's.
+   */
+  readonly conversationArchiveBucketName: string;
+  readonly conversationArchiveBucketArn: string;
+  readonly archiveKeyArn: string;
   /** Which archive backend is active. Also the stack's `AnalyticsMode` output. */
   readonly analyticsMode: 'athena' | 'aurora';
 

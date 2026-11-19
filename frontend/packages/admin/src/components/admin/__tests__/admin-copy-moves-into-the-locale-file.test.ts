@@ -90,7 +90,7 @@ const BASELINE: Record<string, number> = {
   'components/admin/TurnLatencyAudit.tsx': 1,
   'components/admin/UnsupportedAnalyticsBanner.tsx': 1,
   // components/admin/UserManagementTab.tsx: converted, entry removed
-  'components/admin/UsersTab.tsx': 7,
+  'components/admin/UsersTab.tsx': 6,
   // services/adminAttachmentService.ts: converted, entry removed
   // services/adminChime.ts: converted, entry removed
   // services/adminConversationService.ts: converted, entry removed

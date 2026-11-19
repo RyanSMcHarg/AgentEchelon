@@ -15,12 +15,33 @@ import { areaSummary, draftDiff } from './draftAreas';
 import { draftWith } from './unsavedAreas';
 import type { ProfileDefinitionBody, ProfileDraftPatch, RouteError } from '../../services/profileService';
 import { movedIntoPersona } from '../../../../../../backend/lambda/src/lib/persona-sections.ts';
+import { PROCESS_REFUSALS } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
+
+/** A process refusal the server answers as `<path>: <CODE>` (SPEC-PROCESSES P1), said in the console's own words. */
+export function processRefusalKey(error: string): { key: string; at: string } | null {
+  const m = /^(.+): ([A-Z_]+)$/.exec(error);
+  return m && (PROCESS_REFUSALS as readonly string[]).includes(m[2]) ? { key: `admin.processes.errors.${m[2]}`, at: m[1] } : null;
+}
 
 type T = (key: string, opts?: Record<string, unknown>) => string;
 
-/** What the server said of the draft: Validate's answer, or an activation's refusal. */
-/** The server's answer to Validate; `errorDetails` are the refusals the page anchors to an intent card or a step (ADR-064). */
-export interface DraftValidation { valid: boolean; errors: string[]; warnings?: string[]; errorDetails?: RouteError[] }
+/**
+ * WHAT THE SERVER SAID OF THE DRAFT: Validate's answer, or an activation's refusal (`source: 'activate'`). `errorDetails`
+ * are the refusals the page anchors to an intent card or a step (ADR-064). A refusal Activate gave never holds Activate
+ * back, because the server reads every check again on the next click; `golden` marks one the golden set's gate gave, which
+ * the page clears once the gate reads as passing.
+ */
+export interface DraftValidation {
+  valid: boolean;
+  errors: string[];
+  warnings?: string[];
+  errorDetails?: RouteError[];
+  source?: 'validate' | 'activate';
+  golden?: true;
+}
+
+/** Whether a result holds Activate back: Validate's refusal does, until the draft changes; Activate's own never does. */
+export const holdsActivate = (validation: DraftValidation | null): boolean => !!validation && !validation.valid && validation.source !== 'activate';
 
 /** Everything an area's controls are handed, apart from the draft and the patch. */
 export type AreaContext = Omit<AreaProps, 'draft' | 'onPatch'>;
@@ -52,14 +73,15 @@ export const DraftStep: React.FC<{
   return (
     <section className="admin-edit-step" aria-labelledby={`draft-step-${area}`} data-testid={`draft-step-${area}`}>
       <div className="admin-edit-card-head">
-        <h5 id={`draft-step-${area}`} ref={heading} tabIndex={-1}>{title}</h5>
+        <h4 id={`draft-step-${area}`} ref={heading} tabIndex={-1}>{title}</h4>
         <HelpToggle label={t('admin.draftCards.helpFor', { area: title })} testId={`draft-step-${area}-help`}>
           <p>{t(`admin.draftCards.help.${area}`)}</p>
         </HelpToggle>
         {edited && <span className="admin-badge" data-testid={`draft-step-${area}-unsaved`}>{t('admin.assistantPage.unsaved.mark')}</span>}
       </div>
       {/* The canvas layout rides in the patch beside the workflows, so an unsaved move is kept the same way. */}
-      <AreaFields area={area} draft={seeded} {...ctx} layout={unsaved?.layout ?? ctx.layout ?? undefined} onPatch={onUnsavedPatch} />
+      <AreaFields area={area} draft={seeded} {...ctx} layout={unsaved?.layout ?? ctx.layout ?? undefined}
+        keptWelcome={unsaved && 'keptWelcomeWorkflow' in unsaved ? unsaved.keptWelcomeWorkflow ?? undefined : ctx.keptWelcome} onPatch={onUnsavedPatch} />
       <p className="admin-edit-preview" aria-live="polite" data-testid="draft-step-preview">
         <strong>{t('admin.draftCards.preview')}</strong> {areaSummary(area, seeded, t, ctx.profileName)}
       </p>
@@ -75,7 +97,7 @@ export const DraftDiff: React.FC<{ draft: ProfileDefinitionBody; active: Profile
   const diff = draftDiff(active, draft);
   return (
     <section className="admin-edit-diff" aria-labelledby="draft-diff-title" data-testid="draft-diff">
-      <h5 id="draft-diff-title">{t(active ? 'admin.draftCards.diffTitle' : 'admin.draftCards.diffTitleNew')}</h5>
+      <h4 id="draft-diff-title">{t(active ? 'admin.draftCards.diffTitle' : 'admin.draftCards.diffTitleNew')}</h4>
       {diff.length === 0 ? <p className="admin-muted">{t('admin.draftCards.diffNone')}</p> : (
         <ul>
           {diff.map((d) => (
@@ -104,9 +126,9 @@ export const DraftValidationResult: React.FC<{ validation: DraftValidation | nul
       {validation.valid
         ? <div role="status" data-testid="draft-valid">{t('admin.profiles.draftValid')}</div>
         : (
-          <div className="admin-error" role="alert" data-testid="draft-refused">
-            <span>{t('admin.profiles.draftRefused')}</span>
-            <ul>{validation.errors.map((x) => <li key={x}>{x}</li>)}</ul>
+          <div className="admin-error" role="alert" data-testid="draft-refused" data-source={validation.source ?? 'validate'}>
+            <span>{t(validation.source === 'activate' ? 'admin.profiles.activateRefused' : 'admin.profiles.draftRefused')}</span>
+            <ul>{validation.errors.map((x) => <li key={x}>{processRefusalKey(x) ? t(processRefusalKey(x)!.key, { at: processRefusalKey(x)!.at }) : x}</li>)}</ul>
           </div>
         )}
       {validation.warnings?.length ? (
@@ -147,7 +169,7 @@ export const DiscardDraft: React.FC<{
   const lost = draftDiff(active, draft).map((d) => t(`admin.draftCards.area.${d.area}`));
   return (
     <section className="admin-import-preview" role="alertdialog" aria-labelledby="draft-discard-title" data-testid="draft-discard-confirm">
-      <h5 id="draft-discard-title">{t('admin.draftCards.discard.title')}</h5>
+      <h4 id="draft-discard-title">{t('admin.draftCards.discard.title')}</h4>
       <p data-testid="draft-discard-lost">
         {!active
           ? t('admin.draftCards.discard.lostAll')

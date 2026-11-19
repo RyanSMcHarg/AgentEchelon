@@ -198,7 +198,7 @@ describe('readGoldenUpload: the file', () => {
 });
 
 describe('the sample files read as their README says', () => {
-  const dir = path.join(__dirname, '../../demo/golden-set');
+  const dir = path.join(__dirname, '../../../demo/stratum-company/golden-set');
   const ANALYST = new Set(['greeting', 'directory_lookup', 'process_lookup', 'data_extraction', 'report_generation', 'guided_troubleshooting']);
   const read = (f: string, format: 'jsonl' | 'csv') => readGoldenUpload(format, fs.readFileSync(path.join(dir, f), 'utf8'), ANALYST);
 
@@ -521,7 +521,7 @@ describe('the routes start a batch and answer at once', () => {
 
   beforeEach(async () => {
     process.env.GOLDEN_RUN_PARAM_ROOT = GOLDEN_ROOT;
-    process.env.PROFILE_BODY_BUCKET = 'bodies';
+    process.env.GOLDEN_UPLOAD_BUCKET = 'attachments';
     mockInvoked.length = 0;
     mockInvocationTypes.length = 0;
     mockS3.put.length = 0;
@@ -541,7 +541,7 @@ describe('the routes start a batch and answer at once', () => {
     ) }));
     expect([res.statusCode, parse(res)]).toEqual([202, { profileName: 'advisor', batchId: expect.any(String), kind: 'upload', status: 'running', entries: 2, startedAfter: expect.any(String) }]);
     const { batchId } = parse(res);
-    expect(mockS3.put).toEqual([expect.objectContaining({ Bucket: 'bodies', Key: expect.stringMatching(new RegExp(`^golden-uploads/[a-z]+/advisor/${batchId}\\.json$`)) })]);
+    expect(mockS3.put).toEqual([expect.objectContaining({ Bucket: 'attachments', Key: expect.stringMatching(new RegExp(`^golden-uploads/[a-z]+/advisor/${batchId}\\.json$`)) })]);
     expect(JSON.parse(mockS3.put[0].Body as string)).toHaveLength(2);
     // The batch is read first (one already running is not started again), then the import is invoked as an Event.
     expect(mockInvoked).toEqual([
@@ -676,7 +676,7 @@ describe('a minimum the set could never hold', () => {
     mockStore.current = fakeSsmStore();
     await mockStore.current.client.send(new PutParameterCommand({ Name: `${GOLDEN_ROOT}/standard/golden-run-arn`, Value: 'arn:aws:lambda:us-east-1:1:function:standard-GoldenRun', Type: 'String' }));
     const { createDraft } = await import('../../lambda/src/lib/profile-lifecycle');
-    await createDraft(mockStore.current.client, ROOT, 'advisor', 'admin-sub');
+    const { configId } = await createDraft(mockStore.current.client, ROOT, 'advisor', 'admin-sub');
     mockAnswer.current = () => ({ entries: 0, regressionEntries: 0, run: null });
     const real = mockStore.current.client.send.bind(mockStore.current.client);
     // The active label's read fails (throttled); the draft and the pack still read.
@@ -687,7 +687,7 @@ describe('a minimum the set could never hold', () => {
     const res = await handler(evt('/admin/profiles/golden-gate', { profileName: 'advisor' }));
     expect(res.statusCode).toBe(200);
     expect(parse(res).gate).toMatchObject({ minUnread: true });
-    const refused = await handler(evt('/admin/profiles/activate', { profileName: 'advisor' }));
+    const refused = await handler(evt('/admin/profiles/activate', { profileName: 'advisor', configId }));
     expect(refused.statusCode).toBeGreaterThanOrEqual(500);
   });
 

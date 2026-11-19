@@ -24,8 +24,8 @@ const REFERENCE_PATH = path.join(__dirname, '..', '..', 'docs', 'reference', 'co
 /** Must match gen-context-reference.mjs exactly, or the check compares against a different render. */
 const GENERATOR_CONTEXT = {
   classification: 'standard',
-  attachmentsBucketArn: 'arn:aws:s3:::<attachments-bucket>',
-  attachmentsBucketName: '<attachments-bucket>',
+  companyBucketArn: 'arn:aws:s3:::<company-bucket>',
+  companyBucketName: '<company-bucket>',
   userProfileTableArn: 'arn:aws:dynamodb:<region>:<account>:table/<user-profile>',
   userProfileTableName: '<user-profile>',
   region: '<region>',

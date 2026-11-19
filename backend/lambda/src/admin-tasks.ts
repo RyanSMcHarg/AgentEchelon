@@ -246,10 +246,24 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
   if (event.httpMethod === 'POST') {
     // The conversation comes from the PATH for the same reason the read does - it is what the
     // session policy is scoped to. Only the task id is body content now.
-    let body: { taskId?: string } = {};
+    let body: { taskId?: string; run?: boolean } = {};
     try { body = JSON.parse(event.body || '{}'); } catch { /* handled below */ }
-    const { taskId } = body;
+    const { taskId, run } = body;
     if (!taskId) return respond(event, 400, { error: 'taskId is required' });
+    // THE TASK'S WHOLE RUN (ADR-067 WT27): each live task the run opened is cancelled as the task cancel below cancels one.
+    if (run === true) {
+      if (!channelId) return respond(event, 400, { error: 'a channelId path segment is required' });
+      if (!APP_INSTANCE_ARN) return respond(event, 503, { error: 'This deployment cannot resolve a conversation id' });
+      const runChannelArn = `${APP_INSTANCE_ARN}/channel/${channelId}`;
+      for (const arn of arns) {
+        const out = await ask<{ cancelled?: number }>(arn, 'adminCancelRun', { taskId, channelArn: runChannelArn, by: actor });
+        if ((out?.cancelled ?? 0) > 0) {
+          console.log('[admin-tasks][audit] operator cancelled a run', { taskId, channelArn: runChannelArn, cancelled: out!.cancelled, actor });
+          return respond(event, 200, { cancelled: out!.cancelled });
+        }
+      }
+      return respond(event, 404, { error: 'That task belongs to no run with live work in that conversation' });
+    }
     if (!channelId) return respond(event, 400, { error: 'a channelId path segment is required' });
     if (!APP_INSTANCE_ARN) {
       console.error('[AdminTasks] APP_INSTANCE_ARN is unset; cannot resolve a channel id');

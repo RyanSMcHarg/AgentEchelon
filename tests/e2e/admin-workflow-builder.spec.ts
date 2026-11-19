@@ -61,7 +61,7 @@ test.afterEach(async () => {
 
 async function openAssistant(page: Page, profile: string): Promise<void> {
   await page.goto('/?admin=profiles');
-  await expect(page.locator('h3:has-text("Assistants")')).toBeVisible({ timeout: 20000 });
+  await expect(page.locator('h2:has-text("Assistants")')).toBeVisible({ timeout: 20000 });
   await expect(page.locator('.admin-tab-loading')).toHaveCount(0, { timeout: 20000 });
   await page.locator('.admin-content table').first().locator('tbody tr', { hasText: profile }).first().click();
   await expect(page.locator('.admin-breadcrumb')).toBeVisible({ timeout: 10000 });
@@ -162,7 +162,7 @@ test('a workflow made on the canvas keeps where its steps were put, validates an
 
   // ── VALIDATE on the server: the draft the builder saved is valid.
   await page.getByRole('button', { name: /^Validate$/i }).click();
-  await expect(page.getByText(/Draft is valid/i)).toBeVisible({ timeout: 30000 });
+  await expect(page.getByText(/Passes Validate/)).toBeVisible({ timeout: 30000 });
 
   // ── RESTORE, asserted: the workflow removed (its layout goes with it), nothing left changed, and the draft activated.
   await openWorkflow(page);
@@ -172,7 +172,7 @@ test('a workflow made on the canvas keeps where its steps were put, validates an
   await expect(page.getByTestId('assistant-draft')).toBeVisible();
   await expect(page.getByTestId('assistant-nav-workflows-changed')).toHaveCount(0, { timeout: 30000 });
   await page.getByRole('button', { name: /^Validate$/i }).click();
-  await expect(page.getByText(/Draft is valid/i)).toBeVisible({ timeout: 30000 });
+  await expect(page.getByText(/Passes Validate/)).toBeVisible({ timeout: 30000 });
   await page.getByRole('button', { name: /Activate draft/i }).click();
   await expect(page.getByTestId('new-version')).toBeVisible({ timeout: 60000 });
   startedDraftOf = '';

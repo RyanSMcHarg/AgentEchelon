@@ -17,7 +17,7 @@ import {
   type EventWorkflow,
   type PromptWelcomeStep,
 } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
-import type { WelcomeOpeningStep } from '../../../../../../backend/lambda/src/lib/welcome-orientation.ts';
+import { openingTextOf, type WelcomeOpeningStep, type WelcomeOrientation } from '../../../../../../backend/lambda/src/lib/welcome-orientation.ts';
 
 /** A template a step may name, with the source in use and the family it comes from. */
 export interface WelcomePromptOption {
@@ -41,6 +41,17 @@ export function promptPreview(source: string): string {
 }
 
 export type Workflows = Record<string, EventWorkflow>;
+
+/**
+ * THE PLATFORM'S WELCOME, HOLDING THE WORDS THE CLASSIFICATION GREETS WITH TODAY, so the edit form opens on them. It
+ * reaches the draft only when a person changes something: until then the classification's setting keeps speaking.
+ */
+export function welcomeHolding(builtIn: EventWorkflow, orientation: WelcomeOrientation): EventWorkflow {
+  const key = Object.keys(builtIn.states).find((k) => builtIn.states[k].opening);
+  if (!key) return builtIn;
+  const opening = { text: openingTextOf(orientation) };
+  return { ...builtIn, states: { ...builtIn.states, [key]: { ...builtIn.states[key], opening } } };
+}
 
 /** The name of the version's own welcome for a kind of room ('' for every room no other welcome names), or undefined. */
 export function welcomeNameFor(workflows: Workflows, type: string): string | undefined {
@@ -131,4 +142,42 @@ export function withWelcome(
   const next = { ...workflows, [name]: wf };
   if (isPlatformDefault(wf)) delete next[name];
   return next;
+}
+
+/**
+ * HOW A WELCOME GREETS, AS ITS EDIT FORM OFFERS IT (ADR-067 stage 1): a template opening alone, an opening and one
+ * prompt turn, or a workflow of its own steps. Read from the welcome's own plan (`welcomePlan`), so the form preselects
+ * what the router runs.
+ */
+export type WelcomeMode = 'template' | 'prompt' | 'workflow';
+
+export function welcomeModeOf(wf: EventWorkflow | undefined): WelcomeMode {
+  if (!wf) return 'template';
+  const plan = welcomePlan(wf);
+  if (plan.runs) return 'workflow';
+  return plan.prompt ? 'prompt' : 'template';
+}
+
+/** The kind of room a welcome is for: the type it names, or '' for every room no other welcome names. */
+export const welcomeTypeOf = (wf: EventWorkflow | undefined): string => wf?.types?.[0] ?? '';
+
+/**
+ * THE WORKFLOWS WITH ONE WELCOME SET TO A MODE. Template keeps the opening and drops everything after it; Prompt keeps
+ * the opening and adds or keeps one prompt turn; Workflow leaves the welcome as it is. A welcome's steps beyond its
+ * opening are not written into the workflows that run by Template or Prompt: the edit form keeps them in the draft's
+ * `keptWelcomeWorkflow`, so switching back to Workflow restores them.
+ */
+export function withWelcomeMode(workflows: Workflows, name: string, mode: WelcomeMode, promptTemplate: string): Workflows {
+  const wf = workflows[name];
+  if (!wf || mode === 'workflow') return workflows;
+  const type = welcomeTypeOf(wf);
+  const plan = welcomePlan(wf);
+  const opening = plan.opening ?? {};
+  const minimal: EventWorkflow = {
+    on: 'assistant-joined', ...(wf.types?.length ? { types: wf.types } : {}), initial: 'opening',
+    states: { opening: { opening, onSuccess: 'done', onFailure: 'done' }, done: { disposition: 'success' } },
+  };
+  const base = { ...workflows, [name]: minimal };
+  if (mode === 'template') return withWelcome(base, type, { prompt: null });
+  return withWelcome(base, type, { prompt: plan.prompt ?? { template: promptTemplate } });
 }

@@ -60,6 +60,7 @@ import { UTILITY_MODEL_ID, utilityModelArns } from '../config/model-strategy';
 import { AgentGuardrails } from '../constructs/bedrock-guardrails';
 import { deidentifyGuardrailPolicy } from '../config/deidentify-guardrail';
 import { alertEmitterWiring, RES_PREFIX, modelArnsForClassification, SSM_ROOT } from './agent-classification-common';
+import { BOUNDARY_REFUSAL_METRIC, BOUNDARY_REFUSAL_NAMESPACE } from '../../lambda/src/lib/access-denial';
 
 /**
  * How DocumentIngestion's asynchronous invocations (the S3 notifications on `rag/`) are retried. A failed invocation
@@ -68,6 +69,15 @@ import { alertEmitterWiring, RES_PREFIX, modelArnsForClassification, SSM_ROOT } 
  * retries are safe because an ingest is idempotent on the object's ETag (`document-ingestion.ts`).
  */
 export const DOCUMENT_INGESTION_RETRY = { retryAttempts: 2, maxEventAgeHours: 6, dlqRetentionDays: 14 } as const;
+
+/**
+ * How the archival function's Kinesis batches are retried. A failed batch is retried three times, split in half
+ * on each failure; what still fails is recorded in the archival dead-letter queue, kept for fourteen days (the
+ * longest SQS keeps a message, and longer than the seven days the message-analytics table keeps a turn's
+ * telemetry), and its alarm fires. The record is the batch's stream position; the stream itself keeps the
+ * records for twenty-four hours, which is the window `scripts/redrive-archival-dlq.mjs` can re-run them in.
+ */
+export const ARCHIVAL_RETRY = { retryAttempts: 3, dlqRetentionDays: 14 } as const;
 
 /**
  * esbuild commandHooks for a DB Lambda's asset. Copies:
@@ -156,6 +166,11 @@ export interface ArchiveStackAuroraProps extends cdk.StackProps {
    */
   attachmentsBucketArn?: string;
   /**
+   * The company bucket ARN, from the Conversations stack. The RAG corpus is the company's knowledge, kept under its
+   * `rag/` prefix there with no expiry; DocumentIngestion embeds what lands under it and removes what leaves it.
+   */
+  companyBucketArn: string;
+  /**
    * Cost sleep mode (docs/SPEC-COST-SLEEP-MODE.md). When true, this stack also
    * provisions the deployment-state table, the idle checker + EventBridge rule,
    * the public state route, and the SNS notification topic. The admin sleep and wake routes are the
@@ -173,10 +188,17 @@ export interface ArchiveStackAuroraProps extends cdk.StackProps {
   sleepRecipients?: Array<{ email: string; name?: string }>;
 }
 
+
+/** The analytics projection's Aurora Serverless v2 maximum capacity, read by the cluster and by the alarm that says it is held there. */
+const ANALYTICS_DB_MAX_ACU = 4;
+
 export class ArchiveStackAurora extends cdk.Stack implements IArchiveStackOutputs {
   // IArchiveStackOutputs implementation
   public readonly archiveBucketArn: string;
   public readonly archiveBucketName: string;
+  public readonly conversationArchiveBucketName: string;
+  public readonly conversationArchiveBucketArn: string;
+  public readonly archiveKeyArn: string;
   public readonly analyticsMode = 'aurora' as const;
   /** The client-events route and, with sleep mode, the paused-deployment probe, on `PersonApi`. */
   public readonly routes: RouteSpec[] = [];
@@ -214,6 +236,11 @@ export class ArchiveStackAurora extends cdk.Stack implements IArchiveStackOutput
   public readonly dbSubnets: ec2.SubnetSelection;
   /** The connection settings every function that talks to the database is given. */
   public readonly dbEnvironment: Record<string, string>;
+  /**
+   * The clean copy's detector, for a function in a stack that consumes this one (the golden nomination de-identifies a
+   * task's recorded tool calls with it, ADR-066 decision 7). A reference, so the consuming stack deploys after this one.
+   */
+  public readonly deidentifyGuardrail: { id: string; version: string; arn: string };
   /** The `rds-db:connect` resources: the cluster's users, and the proxy's when it exists. */
   public readonly dbConnectResources: string[];
   /** The bootstrap that creates the IAM-auth database users. A function connecting as them deploys after it. */
@@ -404,7 +431,7 @@ export class ArchiveStackAurora extends cdk.Stack implements IArchiveStackOutput
       securityGroups: [dbSecurityGroup],
 
       serverlessV2MinCapacity: 0.5,
-      serverlessV2MaxCapacity: 4,
+      serverlessV2MaxCapacity: ANALYTICS_DB_MAX_ACU,
 
       writer: rds.ClusterInstance.serverlessV2('writer', {
         enablePerformanceInsights: true,
@@ -490,7 +517,7 @@ export class ArchiveStackAurora extends cdk.Stack implements IArchiveStackOutput
     // in Aurora mode. Reuses this stack's ArchiveKey; names come from shared constants so
     // the admin-conversations IAM resolves to it unchanged.
     // See docs/guides/developer/MESSAGE-FLOW.md section 9.
-    new ConversationArchive(this, 'ConversationEventArchive', {
+    const conversationArchive = new ConversationArchive(this, 'ConversationEventArchive', {
       messageStream,
       encryptionKey: archiveKey,
     });
@@ -524,8 +551,12 @@ export class ArchiveStackAurora extends cdk.Stack implements IArchiveStackOutput
       bucketKeyEnabled: true,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       enforceSSL: true, // deny non-TLS access (aws:SecureTransport)
+      // ONE FAMILY, NAMED (tenet D15): the copies of delivered documents a grading run reads. The company
+      // corpus the RAG pipeline ingests lives in the company bucket, which expires nothing.
       lifecycleRules: [
         {
+          id: 'ExpireDeliveredDocuments',
+          prefix: 'delivered-documents/',
           transitions: [
             {
               storageClass: s3.StorageClass.INFREQUENT_ACCESS,
@@ -539,6 +570,10 @@ export class ArchiveStackAurora extends cdk.Stack implements IArchiveStackOutput
 
     this.archiveBucketName = archiveBucket.bucketName;
     this.archiveBucketArn = archiveBucket.bucketArn;
+    // The system of record is the conversation archive's bucket, not the Aurora plane's documents bucket above.
+    this.conversationArchiveBucketName = conversationArchive.archiveBucket.bucketName;
+    this.conversationArchiveBucketArn = conversationArchive.archiveBucket.bucketArn;
+    this.archiveKeyArn = archiveKey.keyArn;
 
     // =====================================================
     // Schema Init Custom Resource
@@ -892,14 +927,27 @@ export class ArchiveStackAurora extends cdk.Stack implements IArchiveStackOutput
 
     archivalLambda.node.addDependency(iamAuthSetup);
 
-    // Add Kinesis event source
+    // A BATCH THE PROJECTION COULD NOT TAKE IS KEPT, NOT SKIPPED. A failed batch is retried
+    // (ARCHIVAL_RETRY.retryAttempts), halved each time so a bad record is isolated from good ones; the
+    // part that still fails after the last retry is recorded in this queue as its stream position (shard
+    // and sequence-number range), and its alarm reaches the admin channel. The queue keeps the record for
+    // fourteen days, past the seven the turn's out-of-band telemetry is kept for, so a failure is still
+    // on record after everything it described has expired. `scripts/redrive-archival-dlq.mjs` reads the
+    // range back from the stream and re-runs it through this function; the archival writes are
+    // idempotent, so a re-run lands on the rows a partial run already wrote.
+    const archivalDlq = new sqs.Queue(this, 'ArchivalDeadLetterQueue', {
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
+      retentionPeriod: cdk.Duration.days(ARCHIVAL_RETRY.dlqRetentionDays),
+    });
     archivalLambda.addEventSource(
       new lambdaEventSources.KinesisEventSource(messageStream, {
         startingPosition: lambda.StartingPosition.LATEST,
         batchSize: 100,
         maxBatchingWindow: cdk.Duration.seconds(5),
-        retryAttempts: 3,
+        retryAttempts: ARCHIVAL_RETRY.retryAttempts,
         bisectBatchOnError: true,
+        onFailure: new lambdaEventSources.SqsDlq(archivalDlq),
       })
     );
 
@@ -1200,14 +1248,15 @@ export class ArchiveStackAurora extends cdk.Stack implements IArchiveStackOutput
     // =====================================================
     // Document Ingestion Lambda (VPC-attached, S3-triggered) — RAG
     // proof-point. Triggers on PutObject under the `rag/` prefix of
-    // the archive bucket; chunks the file, embeds via Titan v2,
+    // the COMPANY bucket; chunks the file, embeds via Titan v2,
     // writes to the `embeddings` table.
     //
     // ADR-001 + ADR-002: Aurora pgvector @ 1024-dim is the KB backing.
-    // The archive bucket already exists (it backs Kinesis archival);
-    // adding `rag/` as a corpus prefix avoids provisioning another
-    // bucket. Lifecycle rules already block-public-access + encrypt.
+    // The corpus is the company's knowledge, so it lives with the rest of
+    // it in the company bucket (Conversations stack), which expires
+    // nothing, and never in the archive, whose families expire by name.
     // =====================================================
+    const corpusBucket = s3.Bucket.fromBucketArn(this, 'CorpusBucket', props.companyBucketArn);
     const documentIngestionLambdaSg = new ec2.SecurityGroup(
       this,
       'DocumentIngestionLambdaSg',
@@ -1246,14 +1295,16 @@ export class ArchiveStackAurora extends cdk.Stack implements IArchiveStackOutput
             statements: [
               new iam.PolicyStatement({
                 actions: ['s3:GetObject'],
-                // Scoped to the rag/ prefix only — the ingestion Lambda
-                // has no business reading conversation archives.
-                resources: [`${archiveBucket.bucketArn}/rag/*`],
+                // Scoped to the rag/ prefix only: the company bucket's other
+                // families are read by the turn, never by ingestion.
+                resources: [`${props.companyBucketArn}/rag/*`],
               }),
-              // SSE-KMS archive: reading an object needs decrypt on the customer CMK.
+              // A removal event is settled by the key's current object (HEAD), and S3 answers a missing key
+              // 404 only to a principal that may list the bucket; without it a withdrawn document reads 403
+              // and is never purged. Key names only; no object body.
               new iam.PolicyStatement({
-                actions: ['kms:Decrypt'],
-                resources: [archiveKey.keyArn],
+                actions: ['s3:ListBucket'],
+                resources: [props.companyBucketArn],
               }),
             ],
           }),
@@ -1282,6 +1333,8 @@ export class ArchiveStackAurora extends cdk.Stack implements IArchiveStackOutput
         environment: {
           ...dbEnvironment,
           DRIFT_EMBEDDING_MODEL_ID: 'amazon.titan-embed-text-v2:0',
+          // The one bucket whose events are the corpus; a record from any other is refused.
+          CORPUS_BUCKET: corpusBucket.bucketName,
         },
         bundling: {
           externalModules: ['@aws-sdk/*'],
@@ -1300,11 +1353,13 @@ export class ArchiveStackAurora extends cdk.Stack implements IArchiveStackOutput
     // race with the bucket's eventbridge configuration; the L1
     // BucketNotification flows directly to Lambda invoke.
     // AND REMOVED: a document deleted from the corpus takes its chunks with it (document-ingestion.ts).
-    archiveBucket.addObjectRemovedNotification(
+    // The bucket is imported, so CDK writes these with its notifications custom resource, which leaves any
+    // notification another stack configured on the bucket in place.
+    corpusBucket.addObjectRemovedNotification(
       new s3n.LambdaDestination(documentIngestionLambda),
       { prefix: 'rag/' },
     );
-    archiveBucket.addObjectCreatedNotification(
+    corpusBucket.addObjectCreatedNotification(
       new s3n.LambdaDestination(documentIngestionLambda),
       { prefix: 'rag/' },
     );
@@ -1504,6 +1559,7 @@ export class ArchiveStackAurora extends cdk.Stack implements IArchiveStackOutput
     const deidentifyGuardrail = new AgentGuardrails(this, 'DeidentifyGuardrail', {
       policy: deidentifyGuardrailPolicy(`${RES_PREFIX}-deidentify`),
     });
+    this.deidentifyGuardrail = { id: deidentifyGuardrail.guardrailId, version: deidentifyGuardrail.guardrailVersion, arn: deidentifyGuardrail.guardrailArn };
     const cleanCopyAlert = alertEmitterWiring(this);
     const cleanCopyFn = new lambdaNodeJs.NodejsFunction(this, 'CleanCopyBatchFunction', {
       entry: path.join(__dirname, '../../lambda/src/clean-copy-batch.ts'),
@@ -1608,6 +1664,112 @@ export class ArchiveStackAurora extends cdk.Stack implements IArchiveStackOutput
     cleanCopyNeverStarted.node.addDependency(cleanCopyFirstRun);
     cleanCopyNeverStarted.addAlarmAction(new cloudwatchActions.SnsAction(cleanCopyAlarmTopic));
     cleanCopyNeverStarted.addOkAction(new cloudwatchActions.SnsAction(cleanCopyAlarmTopic));
+
+    // AN ARCHIVAL BATCH THAT EXHAUSTED ITS RETRIES IS AN ALARM IN THE ADMIN CHANNEL, through the same
+    // notifier. Its records are not in the projection, so every analytics figure over that window is
+    // narrower than the traffic until the batch is re-run. The alarm stays raised while the queue holds a
+    // record and clears when the redrive (or a discard) empties it.
+    const archivalFailureTopic = new sns.Topic(this, 'ArchivalFailureAlarmTopic', {
+      displayName: 'Archival: batch not projected',
+    });
+    archivalFailureTopic.addSubscription(new snsSubs.LambdaSubscription(alarmNotifierFn));
+    const archivalDlqAlarm = new cloudwatch.Alarm(this, 'ArchivalDeadLetterAlarm', {
+      alarmName: `${this.stackName}-archival-batch-failed`,
+      alarmDescription:
+        'A batch of conversation events was not written to the Aurora projection after every retry; its stream '
+        + 'position is kept in the archival dead-letter queue. The archive in S3 still holds the events. Re-run it '
+        + 'within 24 hours of the failure with `node scripts/redrive-archival-dlq.mjs` from backend/. See '
+        + 'docs/guides/admin/AURORA-MODE-GUIDE.md, "Archival failures".',
+      // Every record in the queue, including one a redrive holds in flight, so the alarm clears only when a
+      // batch is removed, never while it is being read.
+      metric: new cloudwatch.MathExpression({
+        expression: 'visible + inflight',
+        usingMetrics: {
+          visible: archivalDlq.metricApproximateNumberOfMessagesVisible({ period: cdk.Duration.minutes(5), statistic: 'Maximum' }),
+          inflight: archivalDlq.metricApproximateNumberOfMessagesNotVisible({ period: cdk.Duration.minutes(5), statistic: 'Maximum' }),
+        },
+        period: cdk.Duration.minutes(5),
+      }),
+      threshold: 0,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      evaluationPeriods: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    archivalDlqAlarm.addAlarmAction(new cloudwatchActions.SnsAction(archivalFailureTopic));
+    archivalDlqAlarm.addOkAction(new cloudwatchActions.SnsAction(archivalFailureTopic));
+
+    // A PROJECTION HELD AT ITS MAXIMUM IS AN ALARM IN THE ADMIN CHANNEL, through the same notifier. Every console
+    // read, the archival writer and the golden and classifier runs share this cluster, so a sustained 100% CPU or a
+    // capacity pinned at its maximum queues them all: the console's analytics reads time out at the gateway (503)
+    // while every figure still looks merely slow. Fifteen minutes, so a burst a scale-up absorbs does not raise it.
+    const analyticsDbTopic = new sns.Topic(this, 'AnalyticsDbSaturatedAlarmTopic', {
+      displayName: 'Analytics projection: at its maximum',
+    });
+    analyticsDbTopic.addSubscription(new snsSubs.LambdaSubscription(alarmNotifierFn));
+    const SATURATED_FOR = { period: cdk.Duration.minutes(5), evaluationPeriods: 3, datapointsToAlarm: 3 };
+    const saturationAlarms = [
+      new cloudwatch.Alarm(this, 'AnalyticsDbCpuSaturatedAlarm', {
+        alarmName: `${this.stackName}-analytics-db-cpu-saturated`,
+        alarmDescription:
+          'The analytics projection has run at 90% CPU or more for 15 minutes, so console analytics reads, the archival '
+          + 'writer and golden or classifier runs queue behind it and time out. Look at the top SQL in Performance '
+          + 'Insights for the cluster; a query missing an index is the usual cause. See docs/guides/admin/AURORA-MODE-GUIDE.md.',
+        // THE AVERAGE, NOT THE MAXIMUM. At its minimum capacity the cluster reads 100% for the seconds a burst takes
+        // before it scales, so a five-minute Maximum breaches on ordinary e2e traffic averaging 10%.
+        // Saturation is the sustained case, and the average is what holds at 100% when readers queue.
+        metric: dbCluster.metricCPUUtilization({ period: SATURATED_FOR.period, statistic: 'Average' }),
+        threshold: 90,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: SATURATED_FOR.evaluationPeriods,
+        datapointsToAlarm: SATURATED_FOR.datapointsToAlarm,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, 'AnalyticsDbAtCapacityAlarm', {
+        alarmName: `${this.stackName}-analytics-db-at-capacity`,
+        alarmDescription:
+          `The analytics projection has held its maximum Aurora capacity (${ANALYTICS_DB_MAX_ACU} ACU) for 15 minutes, so `
+          + 'it cannot scale further and its readers queue. Find the load in Performance Insights before raising the '
+          + 'maximum. See docs/guides/admin/AURORA-MODE-GUIDE.md.',
+        metric: dbCluster.metric('ServerlessDatabaseCapacity', { period: SATURATED_FOR.period, statistic: 'Minimum' }),
+        threshold: ANALYTICS_DB_MAX_ACU,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: SATURATED_FOR.evaluationPeriods,
+        datapointsToAlarm: SATURATED_FOR.datapointsToAlarm,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    ];
+    for (const alarm of saturationAlarms) {
+      alarm.addAlarmAction(new cloudwatchActions.SnsAction(analyticsDbTopic));
+      alarm.addOkAction(new cloudwatchActions.SnsAction(analyticsDbTopic));
+    }
+
+    // AN ASSISTANT REFUSED BY A CONVERSATION'S CLASSIFICATION IS AN ALARM IN THE ADMIN CHANNEL (ADR-045), through the same
+    // notifier. The router records each refusal under one metric with the assistant as its dimension
+    // (`recordClassificationBoundaryRefusal`, access-denial.ts); assistants are data, so the alarm sums every assistant's
+    // series with a Metrics Insights query rather than naming one. One refusal is enough: an assistant reaching a room
+    // its classification does not grant is a misassignment or a probe, and either is an operator's to look at.
+    const boundaryRefusalTopic = new sns.Topic(this, 'BoundaryRefusalAlarmTopic', {
+      displayName: 'An assistant was refused by a conversation classification',
+    });
+    boundaryRefusalTopic.addSubscription(new snsSubs.LambdaSubscription(alarmNotifierFn));
+    const boundaryRefusalAlarm = new cloudwatch.Alarm(this, 'AssistantRefusedByClassificationAlarm', {
+      alarmName: `${this.stackName}-assistant-refused-by-classification`,
+      alarmDescription:
+        'An assistant was refused by a conversation\'s classification boundary in the last 5 minutes. The router\'s '
+        + '[SecurityEvent] log line names the assistant and the conversation. See docs/design/decisions/045-a-refusal-from-the-classification-boundary-ends-the-turn.md.',
+      metric: new cloudwatch.MathExpression({
+        expression: `SELECT SUM(${BOUNDARY_REFUSAL_METRIC}) FROM SCHEMA("${BOUNDARY_REFUSAL_NAMESPACE}", Assistant)`,
+        period: cdk.Duration.minutes(5),
+        label: 'Refusals across every assistant',
+      }),
+      threshold: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      evaluationPeriods: 1,
+      datapointsToAlarm: 1,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    boundaryRefusalAlarm.addAlarmAction(new cloudwatchActions.SnsAction(boundaryRefusalTopic));
+    boundaryRefusalAlarm.addOkAction(new cloudwatchActions.SnsAction(boundaryRefusalTopic));
 
     this.routes.push({
       api: 'person', method: 'POST', path: '/events', handler: clientEventsFn, capability: 'core', throttle: ARCHIVE_ROUTE_THROTTLE,

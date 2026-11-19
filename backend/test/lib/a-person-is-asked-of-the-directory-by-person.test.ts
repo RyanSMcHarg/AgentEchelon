@@ -230,6 +230,28 @@ describe('groupsFor and personsInGroup', () => {
     expect(bounded).not.toContain('premium');
   });
 
+  it('is null for a person of a pool whose issuer clears them some other way: a fixed set and a translation', async () => {
+    const identities = { [person(PAT)]: [{ issuer: iss(PARTNER), subject: 'p' }] };
+    // The partner pool is a cognito pool, and its issuer declares a fixed set: its groups are nobody's clearance.
+    expect(await build({ home: {}, partner: { p: user('p', {}) }, identities }).directory.clearedByGroups(person(PAT))).toBeNull();
+    const translated = testDirectory({
+      appInstanceArn: APP,
+      issuers: [{
+        issuer: poolIssuer('federated', PARTNER, { kind: 'cognito-federated', clearance: { groups: { map: { eng: 'premium' }, claim: 'groups' } as never, classifications: ['premium'] } }),
+        client: pool({}).client,
+        groups: { name: 't', groupsFor: async () => { throw new Error('a translation reads no pool groups'); } },
+      }],
+      identities: { resolve: async () => person(PAT), subjectsOf: async () => [{ issuer: 'federated', subject: 'p' }] },
+    });
+    expect(await translated.clearedByGroups(person(PAT))).toBeNull();
+  });
+
+  it('holds a groups issuer to its groups: a person with none is cleared for nothing, not for what the token says', async () => {
+    const none: ClearanceSource = { name: 'test', groupsFor: async () => [] };
+    const identities = { [person(ALICE)]: [{ issuer: iss(HOME), subject: 's' }] };
+    expect(await build({ home: {}, clearance: none, identities }).directory.clearedByGroups(person(ALICE))).toEqual([]);
+  });
+
   it('lists a group\'s enabled members as people; a disabled one is out and an unminted one undetermined', async () => {
     const { directory } = build({
       home: { a: user('a', {}), b: user('b', {}, false), c: user('c', {}) },

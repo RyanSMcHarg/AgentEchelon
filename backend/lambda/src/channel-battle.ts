@@ -34,11 +34,8 @@
  */
 
 import {
-  ChimeSDKMessagingClient,
   CreateChannelMembershipCommand,
   DeleteChannelMembershipCommand,
-  DescribeChannelCommand,
-  DescribeChannelMembershipCommand,
   ListChannelModeratorsCommand,
   ListTagsForResourceCommand,
   ChannelMessageType,
@@ -55,8 +52,8 @@ import {
 import { SSMClient } from '@aws-sdk/client-ssm';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { parseJsonBody, callerPersonId } from './lib/auth.js';
+import { callerReachesConversation, refusalAnswer, type ConversationAccess } from './lib/conversation-access.js';
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
-import { readChannelClassificationTag } from './lib/channel-classification.js';
 import { resolveActiveBattleExperimentForClassification, battleSidesOf, type Experiment as ManagedExperiment } from './lib/experiment-manager.js';
 import { noticeLine } from './lib/assistant-notice.js';
 import { endBattle } from './lib/battle-end.js';
@@ -68,11 +65,10 @@ import { challengerBotArnOf, type ChannelBattleConfig } from './lib/battle-state
 import { userArnFor } from './lib/person-arn.js';
 import { responder, originsFrom, DEV_ORIGIN } from './lib/http-response.js';
 import { chimeMessagingClient } from './lib/chime/clients.js';
-import { parseChannelMetadata } from './lib/chime/channel-meta.js';
 import { loadProfileRegistry } from '../../lib/profile-registry';
 
 const messagingClient = chimeMessagingClient({});
-/** One tag read per conversation: the classification gate and the room's primary read the same tags. */
+/** The room's primary reads its tags through this memo, one read per conversation per container. */
 const tagReader = memoizedTagReader(messagingClient);
 const ssmClient = new SSMClient({});
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -150,41 +146,26 @@ function isValidChannelArn(channelArn: string): boolean {
   return /^[a-zA-Z0-9-]+$/.test(channelId);
 }
 
-interface ChannelMetadata {
-  /** Member-writable metadata: never read for a decision (the gate reads the classification tag). */
-  modelTier?: string;
-  createdBy?: string;
-  modelId?: string;
-  modelName?: string;
-}
-
-async function readChannelMetadata(channelArn: string, botArn: string): Promise<ChannelMetadata | null> {
-  try {
-    const channel = await messagingClient.send(
-      new DescribeChannelCommand({ ChannelArn: channelArn, ChimeBearer: botArn }),
-    );
-    const meta = parseChannelMetadata(channel.Channel?.Metadata);
-    if (!meta) console.warn('[channel-battle] the channel Metadata is not a JSON object');
-    return (meta as ChannelMetadata | undefined) ?? null;
-  } catch (err) {
-    console.warn('[channel-battle] DescribeChannel failed:', err);
-    return null;
-  }
-}
-
-// The battle classification gate keys on the IMMUTABLE `classification` tag, NOT `metadata.modelTier`.
-// Metadata is mutable via the owner rename cap (chime:UpdateChannel), so trusting it would let
-// a moderator rewrite the classification to open premium battles on a channel not cleared for them.
-// The tag cannot be changed by UpdateChannel.
-//
-// IT NO LONGER FAILS CLOSED TO THE FLOOR, AND IT CANNOT (ADR-045 decision 2). The old guarantee was
-// "a missing or unreadable tag denies the battle rather than opening it", and it rested entirely on
-// the floor classification not being battle-eligible. Every conversational classification is
-// battle-eligible as of 2026-09-17, so substituting the floor would now OPEN a duel on a tag nobody
-// could read - the safety property inverted the moment that config changed, silently, in a different
-// file. An unreadable tag is `undefined` here and the caller refuses.
-async function resolveChannelClassification(channelArn: string): Promise<string | undefined> {
-  return readChannelClassificationTag(tagReader as unknown as ChimeSDKMessagingClient, channelArn, '[channel-battle]');
+/**
+ * THE CALLER'S OWN BOUNDARY IN FRONT OF EVERY BATTLE ROUTE: a current member of the conversation, proven
+ * with their own AppInstanceUser as bearer, and cleared for its classification (`lib/conversation-access.ts`).
+ * Anything that cannot be answered, an unresolved caller or an unset app instance included, is a refusal.
+ *
+ * The classification it answers with is the IMMUTABLE `classification` tag, never `metadata.modelTier`,
+ * which a moderator can rewrite (chime:UpdateChannel) to open battles on a channel not cleared for them.
+ * An unreadable tag is refused, never read as a floor: every conversational classification is
+ * battle-eligible (ADR-045 decision 2), so a floor would open a duel on a tag nobody could read.
+ *
+ * This role reads tags only on conversations that carry a classification (`anyClassificationTagged` in
+ * `battle-stack.ts`), so a denied tag read means the conversation carries none
+ * (`tagGrantCoversClassifiedOnly`). The classification is remembered by the check's own cache.
+ */
+async function callerReach(event: APIGatewayProxyEvent, channelArn: string): Promise<ConversationAccess> {
+  return callerReachesConversation(event, channelArn, {
+    appInstanceArn: APP_INSTANCE_ARN,
+    client: messagingClient,
+    tagGrantCoversClassifiedOnly: true,
+  });
 }
 
 interface Experiment extends LegacyBattleBinding {
@@ -226,6 +207,7 @@ async function loadExperiment(experimentId: string): Promise<Experiment | null> 
  * of channels they're a member of). On any AWS error we fail CLOSED —
  * deny the action rather than allow it on a transient failure.
  */
+// Read with ListChannelModerators, the action this function's role holds (`personModeratesChannel` asks DescribeChannelModerator).
 async function callerIsModerator(channelArn: string, callerArn: string): Promise<boolean> {
   if (!callerArn) return false;
   try {
@@ -385,22 +367,14 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
   }
   const callerArn = userArnFor(APP_INSTANCE_ARN, callerSub);
 
-  // Channel access + moderator check. Read metadata as the CALLER (a member):
-  // no shared bot is a channel member, so the per-classification bot can't DescribeChannel.
-  const meta = await readChannelMetadata(channelArn, callerArn);
-  if (!meta) {
-    return respond(404, { error: 'Channel not found or inaccessible' }, origin);
+  // A member cleared for the conversation, before anything about it is decided; its classification is the
+  // tag that check read.
+  const access = await callerReach(event, channelArn);
+  if (!access.ok) {
+    const refused = refusalAnswer(access);
+    return respond(refused.statusCode, refused.body, origin);
   }
-  // Access confirmed above (caller could DescribeChannel). Classification comes from the tag.
-  const channelClassification = await resolveChannelClassification(channelArn);
-  if (!channelClassification) {
-    // Unreadable is not a classification, and with every classification now battle-eligible there is
-    // no safe value to stand in for one. Refuse the enable rather than guess which room this is.
-    return respond(403, {
-      error: 'Battle Mode cannot be enabled: this conversation\'s classification could not be read',
-      code: 'CLASSIFICATION_UNREADABLE',
-    }, origin);
-  }
+  const channelClassification = access.classification;
   // CAPABILITY AND POLICY, IN THAT ORDER (ADR-049). This read `battleEligible` off the assistant
   // profile, which was `true` for basic while basic's stack wires no battle plumbing at all - so an
   // enable here succeeded and the duel had no grants to run with. `canRunBattle` refuses unless the
@@ -619,24 +593,16 @@ async function handleDisable(event: APIGatewayProxyEvent, origin?: string): Prom
   }
   const callerArn = userArnFor(APP_INSTANCE_ARN, callerSub);
 
-  // Read metadata as the CALLER (a member); no shared bot is a channel member.
-  // Then resolve the channel's per-classification bot for the bot-attributed delete +
-  // announcement.
-  const meta = await readChannelMetadata(channelArn, callerArn);
-  if (!meta) {
-    return respond(404, { error: 'Channel not found or inaccessible' }, origin);
+  // A member cleared for the conversation, before anything is torn down. DISABLE REFUSES AN UNREADABLE
+  // TAG TOO: the bot ARN is resolved FROM the classification, so an unreadable tag would pick some other
+  // classification's assistant to act as, posting the leaving message and deleting the membership as an
+  // identity that was never in this room.
+  const access = await callerReach(event, channelArn);
+  if (!access.ok) {
+    const refused = refusalAnswer(access);
+    return respond(refused.statusCode, refused.body, origin);
   }
-  const disableClassification = await resolveChannelClassification(channelArn);
-  if (!disableClassification) {
-    // DISABLE REFUSES TOO, and that is worth a sentence because the instinct is to let a teardown
-    // through. The bot ARN is resolved FROM the classification, so an unreadable tag would pick some
-    // other classification's assistant to act as - posting the leaving message and deleting the
-    // membership as an identity that was never in this room.
-    return respond(403, {
-      error: 'Battle Mode cannot be changed: this conversation\'s classification could not be read',
-      code: 'CLASSIFICATION_UNREADABLE',
-    }, origin);
-  }
+  const disableClassification = access.classification;
   const botArn = await resolvePrimaryBotArn(channelArn, disableClassification);
   // See handleEnable — live moderator list.
   if (!(await callerIsModerator(channelArn, callerArn))) {
@@ -717,48 +683,37 @@ async function handleGet(event: APIGatewayProxyEvent, origin?: string): Promise<
     return respond(500, { error: 'CHANNEL_BATTLE_CONFIG_TABLE not configured' }, origin);
   }
 
-  // Verify the caller is a channel member before disclosing battle config
-  // (enabled flag, experimentId, challenger) — otherwise any signed-in user
-  // could read any channel's config just by knowing the ARN.
-  const callerSub = await callerPersonId(event);
-  if (callerSub && APP_INSTANCE_ARN) {
-    const callerUserArn = userArnFor(APP_INSTANCE_ARN, callerSub);
-    try {
-      await messagingClient.send(new DescribeChannelMembershipCommand({
-        ChannelArn: channelArn,
-        MemberArn: callerUserArn,
-        ChimeBearer: callerUserArn,
-      }));
-    } catch (membershipErr) {
-      console.warn('[channel-battle] config GET denied — caller not a member', {
-        callerSub, channelArn, err: (membershipErr as Error).name,
-      });
-      return respond(403, {
-        error: 'Caller is not a member of the channel',
-        code: 'NOT_A_MEMBER',
-      }, origin);
-    }
+  // A member cleared for the conversation before any battle config is disclosed (enabled flag,
+  // experimentId, challenger): a signed-in caller who merely knows the ARN learns nothing about it.
+  // The route is on PersonApi behind the edge authorizer, so every caller is a person; one resolving to nobody is refused.
+  const access = await callerReach(event, channelArn);
+  // A PROVEN MEMBER WHOSE CONVERSATION'S CLASSIFICATION IS NOT KNOWN is answered, not refused: one with no
+  // recognized classification, or one whose tag read failed just now. This endpoint answers several
+  // capability questions for the composer, and refusing them all would blank it. Every capability that
+  // depends on the classification reads as absent, which is the direction the enable gate takes. A
+  // non-member, an uncleared member and an outage before membership was proven are refused.
+  const degraded = !access.ok && access.memberProven
+    && (access.code === 'CLASSIFICATION_UNREADABLE' || access.code === 'UNAVAILABLE');
+  if (!access.ok && !degraded) {
+    const refused = refusalAnswer(access);
+    return respond(refused.statusCode, refused.body, origin);
   }
 
   // Whether this conversation MAY battle at all, from the same per-profile flag the enable path gates
   // on. Returned so the UI can hide the Battle surfaces on capability rather than on a hardcoded
   // `modelTier === 'premium'` — which read mutable channel metadata and ignored `battleEligible`
-  // entirely, so marking a non-premium profile eligible left the toggle invisible.
-  // A READ, SO AN UNREADABLE TAG REPORTS "NOT ELIGIBLE" RATHER THAN REFUSING THE WHOLE RESPONSE.
-  // This endpoint answers several capability questions at once for the composer; failing all of them
-  // because one could not be resolved would blank the UI. Reporting the capability as absent hides
-  // the Battle surfaces, which is the same direction the gate takes and costs a person a toggle
-  // rather than a working conversation.
-  const statusClassification = await resolveChannelClassification(channelArn);
+  // entirely, so marking a non-premium profile eligible left the toggle invisible. The classification
+  // is the immutable tag the access check read.
+  const statusClassification = access.ok ? access.classification : undefined;
   // The SAME question the enable path asks, so the composer never offers a toggle the enable would
-  // refuse. Reporting it as absent when the classification is unreadable is unchanged.
+  // refuse.
   const battleEligible = await canRunBattle(statusClassification);
   /**
    * Whether the assistant here can READ a file the user attaches (attachment-in).
    *
    * WHY IT RIDES THIS RESPONSE. The composer needs a per-conversation capability answer, and this is
-   * already the endpoint that has one: it is MEMBER-gated rather than admin- or moderator-gated, and
-   * it resolves the classification from the IMMUTABLE TAG (`resolveChannelClassification`) rather
+   * already the endpoint that has one: it is gated on a cleared member rather than an admin or moderator, and
+   * it resolves the classification from the IMMUTABLE TAG (`callerReach`) rather
    * than from `metadata.modelTier`, which members can write. The alternative was for the client to
    * decide from the tier name it holds - which is that mutable metadata, and would have put a
    * capability rule in one client for a boundary IAM enforces.
@@ -774,6 +729,11 @@ async function handleGet(event: APIGatewayProxyEvent, origin?: string): Promise<
   const attachmentsReadable = statusClassification
     ? profiles.requireProfileFor(statusClassification).attachmentsReadable === true
     : false;
+  // The battle config is disclosed only to a member proven cleared. A degraded answer cannot tell an
+  // uncleared member from a cleared one, so it carries the capabilities alone, each read as absent.
+  if (degraded) {
+    return respond(200, { enabled: false, channelArn, battleEligible, attachmentsReadable }, origin);
+  }
 
   const result = await ddb.send(
     new GetCommand({ TableName: CHANNEL_BATTLE_CONFIG_TABLE, Key: { channelArn } }),

@@ -123,7 +123,7 @@ Personas are defined in [PERSONAS.md](../../../overview/PERSONAS.md) and are not
 
 **OPEN:** directory privacy on the eligible-user list - who may see whom, whether existing members and unapproved accounts are excluded, and how the listing pages for a large pool.
 
-**OPEN:** which bearer authorizes the membership write on an ordinary conversation. The design assumes the assistant that owns the conversation is a moderator of it, which holds for conversations that assistant created and is unverified for a pre-existing one it was merely added to. If it does not hold, the write needs an admin `AppInstanceUser` bearer instead, and that choice has to be made and recorded before build rather than discovered as an authorization error.
+**OPEN:** which bearer authorizes the membership write on an ordinary conversation. The design assumes the assistant that owns the conversation is a moderator of it, which holds for conversations that assistant created and is not established for a pre-existing one it was added to. If it does not hold, the write needs an admin `AppInstanceUser` bearer instead, and that choice has to be made and recorded before build rather than discovered as an authorization error.
 
 **Any declared issuer is eligible (FR20).** An entry naming another issuer resolves through `Identities` and that issuer's `ClearanceSource` like any other. The clearance lookup this design reuses already does so: `resolveMemberClearance` in `backend/lambda/src/membership-audit.ts` asks `Directory.clearanceOf`, which finds the person's subjects through `Identities` and asks each issuer's clearance source. **NOT BUILT:** the add path that would call it.
 

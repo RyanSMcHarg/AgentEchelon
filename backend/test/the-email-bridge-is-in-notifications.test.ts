@@ -51,6 +51,22 @@ function bridgeStatements(t: Template): any[] {
 }
 const actionsOf = (s: any): string[] => [].concat(s.Action);
 
+describe('the share rechecks the sharer\'s clearance live (DESIGN-REVOCATION-WINDOWS R4)', () => {
+  it('carries the flag and the read of the person\'s current groups', () => {
+    const t = synth();
+    const [id, fn] = Object.entries(t.findResources('AWS::Lambda::Function'))
+      .find(([logicalId]) => logicalId.startsWith('ShareConversationFunction')) as [string, any];
+    expect(id).toBeTruthy();
+    expect(fn.Properties.Environment.Variables.LIVE_CLEARANCE).toBe('directory');
+    expect(fn.Properties.Environment.Variables.IDENTITIES_TABLE).toBeTruthy();
+    const role = JSON.stringify(fn.Properties.Role);
+    const statements = (Object.values(t.findResources('AWS::IAM::Policy')) as any[])
+      .filter((p) => role.includes(p.Properties.Roles[0].Ref))
+      .flatMap((p) => p.Properties.PolicyDocument.Statement);
+    expect(statements.some((s) => actionsOf(s).includes('cognito-idp:AdminListGroupsForUser'))).toBe(true);
+  });
+});
+
 describe('the email bridge', () => {
   const t = synth();
 

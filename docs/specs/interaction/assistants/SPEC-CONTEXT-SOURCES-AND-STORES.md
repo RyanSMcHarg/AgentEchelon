@@ -174,9 +174,9 @@ Personas are defined in [PERSONAS.md](../../../overview/PERSONAS.md) and are not
 
 Section numbers here are cited from source comments and are stable. Each subsection names a store, its content, who reads it, the guard, and the direction its guard fails in.
 
-### 1. Amazon S3, the attachments bucket
+### 1. Amazon S3: the company, profile and attachments buckets
 
-One bucket, five prefixes, and they do not share a guard. The prefix is the boundary, so the key layout **is** the security model.
+Three buckets, one owner each, and their prefixes do not share a guard. The company bucket holds `context/` (1.1, 1.2), `platform-knowledge/` (1.3) and, in Aurora mode, the RAG corpus `rag/` (1.5); the profile bucket holds profile bodies (1.4), intent packs and templates; the attachments bucket holds what conversations produce (1.6). Within a bucket the prefix is the boundary, so the key layout **is** the security model.
 
 #### 1.1 `context/{classification}/*` - curated business documents
 
@@ -220,7 +220,7 @@ One bucket, five prefixes, and they do not share a guard. The prefix is the boun
 
 #### 1.5 `rag/{sourceType}/{classification}/…` - RAG ingestion input
 
-**Content.** Source documents destined for the vector store. Two corpora ship: the company documents written by the demo seed, and the platform corpus written by the knowledge generator.
+**Content.** Source documents destined for the vector store, kept in the company bucket, which expires nothing. Two corpora ship: the company documents written by the demo seed, and the platform corpus written by the knowledge generator.
 
 **Read by.** Nothing at turn time. An S3 `PutObject` event drives `backend/lambda/src/analytics-aurora/document-ingestion.ts`, which chunks, embeds and writes to the database. **The key path is where a chunk's classification is asserted**: the segment after the source type. Content whose path carries no recognized classification is stamped at the conversational classification the fewest holders reach, derived by counting reach from the declared grants rather than read off a rank, so adding a classification tightens this default instead of silently leaving untagged content readable at a classification the fewest holders reach.
 
@@ -242,11 +242,11 @@ The versioned profile definition: model bundle, tool allowlist, guardrail select
 
 **Guard.** IAM on the parameter path, and a single-writer rule: the profile writer's role (`manage-profiles.ts`) owns the namespace, because a definition and its body are one artifact and a second writer to either is a second source of truth.
 
-**Failure direction.** Fails closed to the compiled-in seed profile when a definition is absent or unreadable.
+**Failure direction.** Serves the compiled-in seed profile only when no version is active. A version that exists and cannot be read is read again while the failure is transient, then answered by the last version the container read for the profile; with none, the turn fails with `ProfileVersionUnreadableError` and the person gets the degraded reply. The seed never stands in for a version.
 
 #### 2.2 `${SSM_ROOT}/assistant/{classification}/assistant-intent-pack` and `-system-prompt`
 
-The per-deployment intent taxonomy and system prompt, read by `backend/lambda/src/lib/intent-pack.ts`. These are per CLASSIFICATION rather than per profile. The system prompt sits against the same 4,096-character boundary that drove 1.4. The intent pack does not: its parameter holds a pointer to a content-addressed body at `classification-packs/{classification}/{sha256}/intentPack` in the attachments bucket (`backend/lambda/src/lib/profile-bodies.ts`), and an inline pack in the parameter still reads.
+The per-deployment intent taxonomy and system prompt, read by `backend/lambda/src/lib/intent-pack.ts`. These are per CLASSIFICATION rather than per profile. The system prompt sits against the same 4,096-character boundary that drove 1.4. The intent pack does not: its parameter holds a pointer to a content-addressed body at `classification-packs/{classification}/{sha256}/intentPack` in the profile bucket (`backend/lambda/src/lib/profile-bodies.ts`), and an inline pack in the parameter still reads.
 
 **Guard.** IAM on the parameter path, and on the pack body's prefix, which names the classification: its own functions read it and no other classification's do, and only its deploy-time writer puts a body there. The reader refuses a pointer outside its own classification's prefix and a body whose hash is not its id. The parameter is written by the deploy context, by the seeder or by hand, so it is deploy-time configuration rather than a runtime write path.
 
@@ -375,10 +375,10 @@ The per-deployment intent taxonomy and system prompt, read by `backend/lambda/sr
 | Company documents | S3 `context/{cls}/` | Curated business documents | IAM prefix grant | Infrastructure | Withholds |
 | Context digest | S3 `context/{cls}/_digest.json` | Summary of the above | IAM prefix grant | Infrastructure | Withholds |
 | Platform self-knowledge | S3 `platform-knowledge/{cls}/` | Product documentation | IAM prefix grant, plus content discipline | Infrastructure for scope, content discipline for pollution | Withholds; leaks if the corpus is polluted |
-| Persona and intent pack | S3 `profiles/…` | Behavior prose | Write exclusivity plus read prefix | Infrastructure | Falls back to the seed |
+| Persona and intent pack | S3 `profiles/…` | Behavior prose | Write exclusivity plus read prefix | Infrastructure | The version is unreadable: the last version read serves, else the turn degrades; never the seed |
 | RAG source documents | S3 `rag/{type}/{cls}/` | Ingestion input | Key path asserts the classification | Ingest-time only | Serves a mislabel faithfully |
 | Attachments | S3 `uploads/`, `generated-docs/` | Uploaded and generated files | IAM plus the credential vend | Infrastructure | Withholds |
-| Profile definition | SSM | Configuration | IAM path plus single writer | Infrastructure | Falls back to the seed |
+| Profile definition | SSM | Configuration | IAM path plus single writer | Infrastructure | The seed serves only where no version is active; an unreadable version serves the last version read, else the turn degrades |
 | Deployment intent pack | SSM | Taxonomy, system prompt | IAM path | Infrastructure | Falls back to the platform default pack |
 | Source catalog | SSM `…/context-sources` | Selectable source declarations | IAM path plus the exact-ARN grant published with it | Infrastructure | Withholds, per source |
 | Host grounding | DynamoDB channel context | Participant and domain context | Table IAM, no user principal | Infrastructure | Soft null |
@@ -425,7 +425,7 @@ Today the retrieved chunk text lives in the `embeddings` row itself and is retur
 
 #### 8.3 Meetings and operations telemetry
 
-One narrow path exists and the rest does not (FR18). `backend/lambda/src/lib/deployment-health.ts` reads this deployment's own CloudWatch Lambda metrics - invocations, errors, throttles and average duration - for a bounded window, and this deployment's own CloudWatch alarms in `ALARM` or `INSUFFICIENT_DATA` (name, state, reason and since when, capped at 20 and 10, labeled as data rather than instructions), exposed as a tool in the Converse loop. The alarm read is `DescribeAlarms` granted on this deployment's alarm ARNs rather than `*` (`deploymentAlarmNamePrefixes` in `agent-classification-common.ts`). CloudWatch authorizes a listing call against `alarm:*` and a call that names its alarms against each alarm's ARN, so the tool asks by name only (`AlarmNames`, 100 per call), and the names come from the deployment: every stack publishes the alarms it declares under `<SSM root>/alarms/` (`publishAlarmNames`, `lib/constructs/alarm-names.ts`), which the ops session reads (`RoleObservabilityAlarmNames`). A published name with no alarm behind it is skipped, and a refused or failed read is reported as unavailable beside the metrics, never as no alarms.
+One narrow path exists and the rest does not (FR18). `backend/lambda/src/lib/deployment-health.ts` reads this deployment's own CloudWatch Lambda metrics - invocations, errors, throttles and average duration - for a bounded window, and this deployment's own CloudWatch alarms in `ALARM` or `INSUFFICIENT_DATA` (name, state, reason and since when, capped at 20 and 10, labeled as data rather than instructions), exposed as a tool in the Converse loop. Where the conversation watches an alarm (an incident an alarm opened, or an incident watch), the tool also reads that one alarm by name, in whatever state it is now, `OK` included (SPEC-WORKFLOWS-AND-TASKS WT120). The alarm read is `DescribeAlarms` granted on the account's alarm ARNs (`alarm:*`), to an observability role alone (owner, 2026-11-07): an incident is opened by whichever alarm its team attached, which need not be this deployment's. The grant therefore also admits a listing call, so not listing is the tool's own rule rather than IAM's: it asks by name only (`AlarmNames`, 100 per call), and the names come from the deployment and the conversation's own context row: every stack publishes the alarms it declares under `<SSM root>/alarms/` (`publishAlarmNames`, `lib/constructs/alarm-names.ts`), which the ops session reads (`RoleObservabilityAlarmNames`). A published name with no alarm behind it is skipped, and a refused or failed read is reported as unavailable beside the metrics, never as no alarms.
 
 **Evidence (development deployment, 2026-10-28).** A temporary role holding exactly `cloudwatch:DescribeAlarms` on `arn:aws:cloudwatch:us-east-1:<account>:alarm:AgentEchelonAssistants-*` and `...:alarm:AgentEchelon-*` (deleted afterwards). `aws cloudwatch describe-alarms --alarm-name-prefix AgentEchelonAssistants-`, the same with `--state-value`, and `describe-alarms` with no filter were each refused: `not authorized to perform cloudwatch:DescribeAlarms on resource: arn:aws:cloudwatch:us-east-1:<account>:alarm:*`. `aws cloudwatch describe-alarms --alarm-names AgentEchelonAssistants-premium-context-source-failure-rate AgentEchelonAssistants-premium-typed-conversation-events-undelivered` was allowed and returned both alarms, each in state `OK`. A listing call is therefore authorized against `alarm:*` and a named call against each alarm's ARN, which is why the tool never lists. It runs **under the assumed assistant identity and never under the ambient Lambda role**, with no fallback: one shared runtime serves every role a classification declares, and that runtime's own role holds no observability grant, so requiring the assistant identity is what keeps the per-role boundary honest rather than decorative. `tests/e2e/an-assistant-boundary-refuses-cloudwatch.spec.ts` is the deny-test: the grant admits the role whose boundary declares it, refuses the classification's primary assistant and an untagged session, and grants reads and never a write.
 

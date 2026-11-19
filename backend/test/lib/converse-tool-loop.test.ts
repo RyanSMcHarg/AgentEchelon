@@ -305,16 +305,19 @@ describe('invokeBedrock output guardrail parity (ADR-011)', () => {
     expect(r.response).toBe('clean answer');
   });
 
-  it('fails OPEN (keeps the original reply) when ApplyGuardrail throws — never drops a reply', async () => {
-    mockBedrockSend.mockImplementation((cmd: { __cmd?: string }) =>
-      cmd.__cmd === 'ApplyGuardrail'
-        ? Promise.reject(new Error('guardrail outage'))
-        : Promise.resolve(endTurn('important answer', 10, 5)),
-    );
+  it('withholds the reply when the OUTPUT guardrail throws: unchecked words never reach the person', async () => {
+    mockBedrockSend.mockImplementation((cmd: { __cmd?: string; input?: { source?: string } }) => {
+      if (cmd.__cmd === 'ApplyGuardrail' && cmd.input?.source === 'OUTPUT') return Promise.reject(new Error('guardrail outage'));
+      if (cmd.__cmd === 'ApplyGuardrail') return Promise.resolve({ action: 'NONE' });
+      return Promise.resolve(endTurn('important answer', 10, 5));
+    });
+    const err = jest.spyOn(console, 'error').mockImplementation(() => {});
 
     const r = await invokeBedrock('sys', [{ role: 'user', content: 'hi' }], config, undefined, false);
+    err.mockRestore();
 
-    expect(r.response).toBe('important answer');
+    expect(r.response).not.toContain('important answer');
+    expect(r.response).toBe('I could not run my safety check just now, so I have not sent a reply. Please try again in a moment.');
   });
 
   it('falls back to the original text when INTERVENED but the masked output is empty', async () => {
@@ -398,16 +401,21 @@ describe('invokeBedrock input guardrail (prompt-injection, source=INPUT)', () =>
     expect(mockBedrockSend).toHaveBeenCalledTimes(1); // blocked before Converse
   });
 
-  it('allows the turn (fail OPEN) when the INPUT guardrail throws', async () => {
+  it('blocks the turn before the model when the INPUT guardrail throws: an unscored input never reaches it', async () => {
     mockBedrockSend.mockImplementation((cmd: { __cmd?: string; input?: { source?: string } }) => {
       if (cmd.__cmd === 'ApplyGuardrail' && cmd.input?.source === 'INPUT') return Promise.reject(new Error('guardrail outage'));
       if (cmd.__cmd === 'ApplyGuardrail') return Promise.resolve({ action: 'NONE' });
       return Promise.resolve(endTurn('normal answer', 10, 5));
     });
+    const err = jest.spyOn(console, 'error').mockImplementation(() => {});
 
     const r = await invokeBedrock('sys', [{ role: 'user', content: 'hi' }], config, undefined, false);
+    err.mockRestore();
 
-    expect(r.response).toBe('normal answer');
+    expect(r.inputGuardBlocked).toBe(true);
+    // Told to try again, never to rephrase: nothing about what they wrote was judged.
+    expect(r.response).toBe('I could not run my safety check just now, so I have not sent a reply. Please try again in a moment.');
+    expect(mockBedrockSend).toHaveBeenCalledTimes(1); // no Converse call
   });
 
   it('proceeds to the model when the INPUT guardrail does not intervene', async () => {

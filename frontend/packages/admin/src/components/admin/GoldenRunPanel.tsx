@@ -35,9 +35,18 @@ interface Props {
   canRun: boolean;
   /** Activate the draft past the gate's refusal; the tab owns the write and what the page shows after it. */
   onActivatePastGate?: (confirm: PastGateConfirmation) => Promise<PastGateOutcome>;
+  /** Told what each reading of the gate says for this draft: whether Activate would pass it. */
+  onOutcome?: (proceed: boolean) => void;
 }
 
-export default function GoldenRunPanel({ profileName, draftConfigId, canRun, onActivatePastGate }: Props): React.ReactElement | null {
+/** Each intent whose walks did not exercise steps of its workflow, with those steps, from the run's walk entries. */
+export function runStepsNotWalked(entries: ReadonlyArray<{ intent: string; runSteps?: string[] }> | undefined): Array<{ intent: string; steps: string[] }> {
+  const by = new Map<string, Set<string>>();
+  for (const e of entries ?? []) for (const s of e.runSteps ?? []) by.set(e.intent, (by.get(e.intent) ?? new Set()).add(s));
+  return [...by.entries()].map(([intent, steps]) => ({ intent, steps: [...steps] }));
+}
+
+export default function GoldenRunPanel({ profileName, draftConfigId, canRun, onActivatePastGate, onOutcome }: Props): React.ReactElement | null {
   const { t } = useTranslation();
   const can = useCan();
   const [confirming, setConfirming] = useState(false);
@@ -78,6 +87,12 @@ export default function GoldenRunPanel({ profileName, draftConfigId, canRun, onA
   // A confirmation belongs to a refusal: once the gate no longer refuses, it closes rather than waiting to reopen on a
   // later refusal with an old reason in it.
   const refusing = !!reading?.outcome && !reading.outcome.proceed;
+  // Each reading is handed up, so a refusal Activate gave earlier is cleared once the gate reads as passing.
+  const proceeds = reading?.outcome ? reading.outcome.proceed : undefined;
+  useEffect(() => {
+    if (proceeds !== undefined) onOutcome?.(proceeds);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [proceeds, reading]);
   useEffect(() => {
     if (!refusing) {
       setConfirming(false);
@@ -142,6 +157,9 @@ export default function GoldenRunPanel({ profileName, draftConfigId, canRun, onA
   // The channel said the run failed while its row still reads running: it ended without recording it (a timeout).
   const runEndedUnrecorded = run?.status === 'running' && endedFailed === run.runId;
   const runError = run?.error === 'deadline' ? t('admin.assistantPage.golden.deadline') : run?.error ?? '';
+  // WHAT A RUN ANSWERS: the entries that used no tool, where the read counts them; else every entry, as at most.
+  const answered = gate?.answeredEntries;
+  const k = run?.k ?? 3;
   const failureLine = (f: GoldenFailure) => t('admin.assistantPage.golden.failure', {
     entry: f.entryId.slice(0, 8),
     attempt: f.attempt,
@@ -218,6 +236,12 @@ export default function GoldenRunPanel({ profileName, draftConfigId, canRun, onA
               {run.result.refused
                 ? <ul data-testid="golden-run-failures">{run.result.failures.map((f) => <li key={`${f.entryId}-${f.attempt}`}>{failureLine(f)}</li>)}</ul>
                 : <p>{t(run.result.regressionExercised === 0 ? 'admin.assistantPage.golden.unmeasured' : 'admin.assistantPage.golden.passed')}</p>}
+              {/* THE RUN AROUND A WALKED TASK IS NOT WALKED (ADR-067): its steps are named, so a pass says what it did not cover. */}
+              {runStepsNotWalked(run.result.walks?.entries).map(({ intent, steps }) => (
+                <p key={intent} className="admin-field-hint" data-testid={`golden-run-steps-not-walked-${intent}`}>
+                  {t('admin.assistantPage.golden.runStepsNotWalked', { intent, steps: steps.join(', ') })}
+                </p>
+              ))}
               {run.result.readyToPromote.length > 0 && (
                 <p>{t('admin.assistantPage.golden.readyToPromote', { entries: run.result.readyToPromote.map((id) => id.slice(0, 8)).join(', ') })}</p>
               )}
@@ -226,14 +250,23 @@ export default function GoldenRunPanel({ profileName, draftConfigId, canRun, onA
           <div className="admin-config-actions">
             {offerRun && (
               <button type="button" className="btn-secondary" disabled={busy} onClick={() => { void start(); }} data-testid="golden-run-start">
-                {t('admin.assistantPage.golden.run', { count: gate.entries, k: run?.k ?? 3 })}
+                {answered !== undefined
+                  ? t('admin.assistantPage.golden.run', { count: answered, k })
+                  : t('admin.assistantPage.golden.runUpTo', { count: gate.entries, k })}
               </button>
             )}
             <button type="button" className="btn-secondary" disabled={busy} onClick={() => { void read(); }}>
               {t('admin.assistantPage.golden.checkAgain')}
             </button>
           </div>
-          {offerRun && <p className="admin-field-hint">{t('admin.assistantPage.golden.cost', { answers: gate.entries * 3 * 2 })}</p>}
+          {offerRun && (
+            <p className="admin-field-hint" data-testid="golden-run-cost">
+              {answered !== undefined
+                ? t('admin.assistantPage.golden.cost', { answers: answered * k * 2 })
+                : t('admin.assistantPage.golden.costUpTo', { answers: gate.entries * k * 2 })}
+              {answered !== undefined && answered < gate.entries ? ` ${t('admin.assistantPage.golden.setAside', { count: gate.entries - answered })}` : ''}
+            </p>
+          )}
         </>
       )}
       {refusal && offerPastGate && !confirming && (
@@ -245,7 +278,7 @@ export default function GoldenRunPanel({ profileName, draftConfigId, canRun, onA
       )}
       {refusal && offerPastGate && confirming && (
         <section className="admin-golden-past-gate" aria-labelledby="golden-past-gate-title" data-testid="golden-past-gate">
-          <h4 id="golden-past-gate-title">{t('admin.assistantPage.golden.pastGate.title')}</h4>
+          <h3 id="golden-past-gate-title">{t('admin.assistantPage.golden.pastGate.title')}</h3>
           <p>{t(`admin.assistantPage.golden.refusal.${refusal.code}`, refusal.params ?? {})}</p>
           {(refusal.failures ?? []).length > 0 && <ul>{(refusal.failures ?? []).map((f) => <li key={`${f.entryId}-${f.attempt}`}>{failureLine(f)}</li>)}</ul>}
           <p className="admin-field-hint">{t('admin.assistantPage.golden.pastGate.explain')}</p>

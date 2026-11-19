@@ -72,6 +72,8 @@ export interface VariableSource {
   insertAs: MessageValueType;
   /** Its one source (tenet D7), for the console and for a reviewer. */
   origin: string;
+  /** A `ctx:` field: what the deployment's catalog says it holds. */
+  description?: string;
 }
 
 /**
@@ -228,6 +230,16 @@ export const EVENT_FIELDS: readonly EventFieldDeclaration[] = Object.freeze([
     origin: "the verified opening request, resolved to an AppInstanceUser (the router's handleConversationOpened)",
   },
   {
+    event: 'conversation-opened', field: 'openedBy', type: 'enum', computedByPlatform: true, describesPerson: false,
+    values: ['workflow', 'event'],
+    origin: "what opened the conversation, as its creator names it: a workflow's open step, or an event an opener declared (the router's handleConversationOpened)",
+  },
+  {
+    event: 'conversation-opened', field: 'customerImpact', type: 'enum', computedByPlatform: true, describesPerson: false,
+    values: ['impacted', 'not_impacted'],
+    origin: "the customer impact a card of the opening run recorded (the customer_impact machine's ending), carried by its open step (the router's handleConversationOpened)",
+  },
+  {
     event: 'person-joined', field: 'person', type: 'person-list', computedByPlatform: true, describesPerson: true,
     origin: "the person the adding path names, verified a member by a live read (the router's handlePersonJoined)",
   },
@@ -249,6 +261,16 @@ export const EVENT_FIELDS: readonly EventFieldDeclaration[] = Object.freeze([
     event: 'alarm-state-changed', field: 'alarmState', type: 'enum', computedByPlatform: true, describesPerson: false,
     values: ['ALARM', 'OK', 'INSUFFICIENT_DATA'],
     origin: "the alarm's state as CloudWatch reports it when the router reads it (the router's handleAlarmStateChanged)",
+  },
+  // A CONVERSATION'S MEETING (the `meetings` capability): its link, and once it ended how long it ran, each from the
+  // meeting's own record as the router reads it before anything runs.
+  {
+    event: 'meeting-started', field: 'meetingLink', type: 'string', computedByPlatform: true, describesPerson: false,
+    origin: "the meeting window's link for the conversation, built by the router (handleMeetingLifecycle)",
+  },
+  {
+    event: 'meeting-ended', field: 'meetingDuration', type: 'string', computedByPlatform: true, describesPerson: false,
+    origin: "how long the meeting ran, from its start to the service's end event (the router's handleMeetingLifecycle)",
   },
 ]);
 
@@ -310,6 +332,7 @@ function catalogSources(catalog: readonly PublishedContextSource[]): Record<stri
         source, type, trust: fieldTrust(entry, f), describesPerson, availability,
         insertAs: type === 'string' ? 'longText' : 'text',
         origin: `the ${entry.key} context source (${entry.title})`,
+        ...(f.description ? { description: f.description } : {}),
       };
     }
   }
@@ -612,7 +635,9 @@ export function versionVariablesErrors(raw: unknown, table: SourceTable): string
 
 /** Each variable's name to the source it names, the map `sourceLookup` reads a version's names through. */
 export function versionVariableSources(variables: Readonly<Record<string, VersionVariable>> | undefined): Record<string, string> {
-  return Object.fromEntries(Object.entries(variables ?? {}).map(([name, v]) => [name, v.source]));
+  return Object.fromEntries(Object.entries(variables && typeof variables === 'object' && !Array.isArray(variables) ? variables : {})
+    .filter(([, v]) => !!v && typeof v === 'object' && typeof (v as { source?: unknown }).source === 'string')
+    .map(([name, v]) => [name, v.source]));
 }
 
 /** The lookup a version's conditions and templates read through: a variable by its name, else a source. */
@@ -806,7 +831,7 @@ export function whenErrors(when: unknown, lookup: SourceLookup, opts: WhenValida
         errors.push(`${at}"${key}" exists only at ${src.events.join(', ')}, not at ${opts.event}`);
       }
       if (src.describesPerson && opts.selects === 'room') {
-        errors.push(`${at}"${key}" describes a person, so it selects only a message addressed to that person, never one the room reads`);
+        errors.push(`${at}"${key}" describes a person, so it selects only a message addressed to that person, never one the whole conversation reads`);
       }
       const raw = clause[key];
       if (isScalar(raw)) {
@@ -888,7 +913,7 @@ export function insertionErrors(use: InsertionUse, lookup: SourceLookup): string
       }
       if (src.describesPerson && use.audience === 'room' && !(mention && src.mentionable)) {
         errors.push(`{{${field}}} in "${section}" binds "${binding}", which describes a person and reaches only that person; `
-          + 'a message the room reads may name a member only through a mention');
+          + 'a message the whole conversation reads may name a member only through a mention');
       }
       if (src.source === 'person:clearance' && section.startsWith('email.')) {
         errors.push(`{{${field}}}: a person's clearance never reaches an email, so it cannot be in "${section}"`);
@@ -1189,4 +1214,57 @@ export function insertValue(
   const checked = cleanMessageValue(src.insertAs, src.trust === 'member' ? text.replace(DELIMITER, '') : text, name);
   if ('refused' in checked) return held(name, 'refused-by-type');
   return checked.value || undefined;
+}
+
+/**
+ * THE VARIABLES A ROUTER RESOLVES, AND THE VALUES IT HOLDS (ADR-060): the version's variables over the platform's sources,
+ * read as the least-permitting catalog would admit them (`withUnreadCatalog`), with the two values every router holds -
+ * the conversation's classification and its type. A source with no value here is said from its variable's fallback.
+ * The router resolves every welcome and message through this, and the console's welcome preview calls it too, so the
+ * preview shows what the room reads.
+ */
+export function routerHeldVariables(
+  variables: Readonly<Record<string, VersionVariable>> | undefined,
+  held: { classification?: string; conversationType?: string } = {},
+): { lookup: SourceLookup; variables?: Readonly<Record<string, VersionVariable>>; values: Record<string, VariableValue | undefined> } {
+  return {
+    lookup: withUnreadCatalog(versionLookup(buildSourceTable({ catalog: [] }), variables), variables),
+    ...(variables ? { variables } : {}),
+    values: {
+      ...(held.classification ? { 'conversation:classification': held.classification } : {}),
+      ...(held.conversationType ? { 'conversation:type': held.conversationType } : {}),
+    },
+  };
+}
+
+/**
+ * WHAT A ROUTER HOLDS AT AN EVENT (`routerGate`): the conversation's classification and type, the event's own fields
+ * (checked against the workflow's event by validation), the participant roles, and a person's onboarding and clearance
+ * only where the event settles the person (the join's subject, the person who joined, the invitee). A condition on any
+ * other source never holds there, so the console offers none.
+ */
+export function routerHoldsAt(source: string, event: string): boolean {
+  if (source === 'conversation:classification' || source === 'conversation:type') return true;
+  if (/^(event|invitation):/.test(source)) return true;
+  if (source === 'participant:role' || source.startsWith('participantRole:')) return true;
+  if (source === 'person:onboarded' || source === 'person:clearance') {
+    return ['assistant-joined', 'person-joined', 'invitation-sent', 'invitation-unredeemed'].includes(event);
+  }
+  return false;
+}
+
+/**
+ * WHAT A PROCESSOR TURN HOLDS (`turnValues`): the conversation's classification, type and language, the person's
+ * clearance, preferred language, reply preferences and display name on a person's turn, and the fields of the context
+ * sources the version reads. A routing rule or a template field on any other source never has a value there.
+ */
+export function processorTurnHolds(source: string): boolean {
+  return ['conversation:classification', 'conversation:type', 'signal:userLanguage', 'person:clearance', 'person:preferredLanguage', 'person:displayName'].includes(source)
+    || /^(pref|ctx):/.test(source);
+}
+
+/** The context source a `ctx:<source>.<field>` names, or undefined for any other source. */
+export function contextSourceOf(source: string): string | undefined {
+  const m = /^ctx:([^.\s]+)\.[^.\s]+$/.exec(source);
+  return m ? m[1] : undefined;
 }

@@ -1,3 +1,5 @@
+// The conversation's type allows what these cases do; the refusal is `a-type-that-turns-a-capability-off-is-refused`.
+jest.mock('../lambda/src/lib/type-capability', () => ({ ...jest.requireActual('../lambda/src/lib/type-capability'), typeAllows: jest.fn(async () => ({ ok: true })) }));
 import { edgeContext } from './helpers/edge-context';
 /**
  * POST /tasks - a person opens a work item.
@@ -19,8 +21,15 @@ const mockSsmSend = jest.fn();
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn(() => ({ send: mockChimeSend })),
   DescribeChannelCommand: jest.fn((input: unknown) => ({ __type: 'DescribeChannel', input })),
+  DescribeChannelMembershipCommand: jest.fn((input: unknown) => ({ __type: 'DescribeChannelMembership', input })),
   ListTagsForResourceCommand: jest.fn((input: unknown) => ({ __type: 'ListTags', input })),
 }), { virtual: true });
+// The caller is cleared for the premium conversation (`lib/conversation-access.ts`); an uncleared caller's
+// refusal is proven in `lib/a-person-route-reaches-only-a-conversation-its-caller-reaches.test.ts`.
+jest.mock('../lambda/src/lib/auth', () => ({
+  ...jest.requireActual('../lambda/src/lib/auth'),
+  callerHolderToken: () => 'premium',
+}));
 
 jest.mock('@aws-sdk/client-lambda', () => ({
   LambdaClient: jest.fn(() => ({ send: mockLambdaSend })),
@@ -54,6 +63,9 @@ const post = (body: unknown, sub = 'user-a') => handler({
 function chimeAnswers(opts: { member?: boolean; archived?: boolean; classification?: string; days?: number } = {}) {
   const { member = true, archived = false, classification = 'premium', days = 270 } = opts;
   mockChimeSend.mockImplementation((cmd: { __type: string }) => {
+    if (cmd.__type === 'DescribeChannelMembership') {
+      return member ? Promise.resolve({}) : Promise.reject(Object.assign(new Error('not a member'), { name: 'NotFoundException' }));
+    }
     if (cmd.__type === 'DescribeChannel') {
       return member
         ? Promise.resolve({ Channel: { ExpirationSettings: { ExpirationDays: days } } })
@@ -131,9 +143,12 @@ describe('a person opens a work item', () => {
   });
 
   it('refuses an untagged conversation rather than opening an item no turn could read', async () => {
+    // Nobody can be shown to be cleared for a conversation with no classification, so the caller's own
+    // boundary refuses it before anything else is read.
+    // Its own conversation: a classification read once is remembered for the conversation's life.
     chimeAnswers({ classification: '' });
-    const res = await post({ channelArn: CHANNEL, taskType: 'action_item' });
-    expect([res.statusCode, JSON.parse(res.body).code]).toEqual([409, 'CONVERSATION_UNCLASSIFIED']);
+    const res = await post({ channelArn: `${APP}/channel/conv-untagged`, taskType: 'action_item' });
+    expect([res.statusCode, JSON.parse(res.body).code]).toEqual([403, 'CLASSIFICATION_UNREADABLE']);
     expect(mockLambdaSend).not.toHaveBeenCalled();
   });
 
@@ -152,11 +167,11 @@ describe('a person opens a work item', () => {
   });
 
   it('refuses when the tag read FAILS, rather than treating unknown as open', async () => {
-    mockChimeSend.mockImplementation((cmd: { __type: string }) => (cmd.__type === 'DescribeChannel'
+    mockChimeSend.mockImplementation((cmd: { __type: string }) => (cmd.__type !== 'ListTags'
       ? Promise.resolve({ Channel: {} })
       : Promise.reject(new Error('ThrottlingException'))));
-    const res = await post({ channelArn: CHANNEL, taskType: 'action_item' });
-    expect([res.statusCode, JSON.parse(res.body).code]).toEqual([503, 'CHANNEL_STATE_UNREADABLE']);
+    const res = await post({ channelArn: `${APP}/channel/conv-unreadable`, taskType: 'action_item' });
+    expect([res.statusCode, JSON.parse(res.body).code]).toEqual([503, 'UNAVAILABLE']);
     expect(mockLambdaSend).not.toHaveBeenCalled();
   });
 

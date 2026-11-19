@@ -93,7 +93,7 @@ The sign-in screen offers a button for each redirect issuer in `issuers` in `bac
 
 An issuer returns the tab to `<origin>/callback`. On CloudFront that path is served by the SPA error mapping (403 and 404 answer `/index.html` with 200, `backend/lib/constructs/frontend-distribution.ts`), and the Vite dev server serves it the same way. The pool's web client registers `<origin>/callback` for both interface origins plus `http://localhost:5173/callback`, and the dedicated admin client `http://localhost:5174/callback` plus the admin origin. A foreign issuer registers the same URI on its own client.
 
-The deployment's pool has a managed login domain, which the redirect sign-in and an in-pool provider's button go through (`ManagedLoginDomain`, output `UserPoolDomainUrl`, in `backend/lib/stacks/identity-stack.ts`). **NOT VERIFIED:** a live redirect sign-in on a deployed origin. [`IDENTITY-PROVIDER-GUIDE.md`](IDENTITY-PROVIDER-GUIDE.md#step-2-sign-in-in-the-frontend) has the flow, its checks and what each issuer must provide.
+The deployment's pool has a managed login domain, which the redirect sign-in and an in-pool provider's button go through (`ManagedLoginDomain`, output `UserPoolDomainUrl`, in `backend/lib/stacks/identity-stack.ts`). [`IDENTITY-PROVIDER-GUIDE.md`](IDENTITY-PROVIDER-GUIDE.md#step-2-sign-in-in-the-frontend) has the flow, its checks, what each issuer must provide, and what of it is proven.
 
 ## Local vs. CloudFront
 

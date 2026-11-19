@@ -75,7 +75,7 @@ import {
   TOKEN_REFRESH_FAILURE_MESSAGE,
 } from './AuthProvider';
 import { ExchangeRefusedError } from '../services/credentialExchange';
-import { endSessionEpoch } from '../services/sessionEpoch';
+import { endSessionEpoch, onSessionEnd } from '../services/sessionEpoch';
 
 const REFRESH_INTERVAL_MS = 50 * 60 * 1000;
 
@@ -391,6 +391,20 @@ describe('signing out while a refresh is already in flight', () => {
 
     expect(localStorage.getItem('idToken')).toBeTruthy();
     expect(auth.current()?.isAuthenticated).toBe(true);
+  });
+});
+
+describe('how a session ends', () => {
+  it('a sign-out says it was signed out, so what every window shares is let go only then', async () => {
+    seedSession(idTokenExpiringIn(3600));
+    const auth = mountAuth();
+    await waitFor(() => expect(auth.current()?.isAuthenticated).toBe(true));
+    const heard: string[] = [];
+    const stop = onSessionEnd((reason) => { heard.push(reason); });
+    send.mockResolvedValue({});
+    await act(async () => { await auth.current()!.logout(); });
+    stop();
+    expect(heard).toEqual(['signed-out']);
   });
 });
 

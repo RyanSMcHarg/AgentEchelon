@@ -2,7 +2,7 @@
  * WHERE DOCUMENT TEMPLATES LIVE, and how a version becomes the one in use (SPEC-DOCUMENT-TEMPLATES FR2, FR7).
  *
  * A template's body is stored at `templates/<classification>/<name>/<sha256>.md` in the deployment's
- * attachments bucket, the same store the classification's intent pack uses (`profile-bodies.ts`). The key
+ * profile bucket, the same store the classification's intent pack uses (`profile-bodies.ts`). The key
  * is content-addressed and written with `If-None-Match: *`, so a body is never overwritten: a changed
  * template is a new object beside the old one.
  *
@@ -19,7 +19,8 @@
  * are the operator's own credentials through `scripts/template.mjs`, the same operator-side path that seeds a
  * classification's pack; the deploy's writer of the platform's shipped document templates
  * (`lib/constructs/default-template-writer.ts`), scoped to the names it writes and create-only; and the
- * console's writer of an assistant's own family (`manage-message-templates.ts`). No turn role writes a
+ * console's writer of an assistant's own family (`manage-message-templates.ts`), which on a team route writes on a
+ * session IAM binds to the route's assistant (`team-scoped-writer.ts`). No turn role writes a
  * template. The reader's own key and hash checks are the second layer (tenet P4): a body is read only from
  * its own family's key and only when its bytes hash to the id the key names.
  */
@@ -27,6 +28,7 @@ import { S3Client, GetObjectCommand, PutObjectCommand, ListObjectsV2Command } fr
 import { SSMClient, GetParameterCommand, PutParameterCommand } from '@aws-sdk/client-ssm';
 import { BOUNDED_REQUEST_HANDLER } from './bounded-request-handler.js';
 import { sessionClient } from './assistant-session.js';
+import { writesAsTeam } from './team-scoped-writer.js';
 import { bodyBucket, contentIdOf } from './profile-bodies.js';
 import {
   parseTemplate,
@@ -157,10 +159,13 @@ export function templatePointerValue(pointer: TemplatePointer): string {
 
 function resolved(deps: TemplateStoreDeps | undefined) {
   const region = process.env.AWS_REGION || 'us-east-1';
+  const config = { region, requestHandler: BOUNDED_REQUEST_HANDLER };
   return {
-    s3: deps?.s3 ?? sessionClient(S3Client, { region, requestHandler: BOUNDED_REQUEST_HANDLER }),
-    ssm: deps?.ssm ?? sessionClient(SSMClient, { region, requestHandler: BOUNDED_REQUEST_HANDLER }),
-    bucket: deps?.bucket ?? (process.env.TEMPLATE_BUCKET || bodyBucket() || process.env.ATTACHMENTS_BUCKET),
+    // On a team route a write goes out on the route's team writer session, which writes its own assistant's family alone.
+    s3: deps?.s3 ?? writesAsTeam(sessionClient(S3Client, config), 's3', (credentials) => new S3Client({ ...config, credentials })),
+    ssm: deps?.ssm ?? writesAsTeam(sessionClient(SSMClient, config), 'ssm', (credentials) => new SSMClient({ ...config, credentials })),
+    // The profile bucket, under `templates/`: a template is part of what an assistant is.
+    bucket: deps?.bucket ?? (process.env.TEMPLATE_BUCKET || bodyBucket()),
     ssmRoot: deps?.ssmRoot ?? (process.env.SSM_ROOT || '/agent-echelon'),
     now: deps?.now ?? Date.now,
   };
@@ -184,7 +189,7 @@ export async function putTemplate(
   const key = templateKey(classification, template.name, contentHash, opts.owner);
   const d = resolved(deps);
   if (opts.dryRun) return { name: template.name, contentHash, key, written: false };
-  if (!d.bucket) throw new TemplateReferenceError(template.name, 'no template bucket configured (TEMPLATE_BUCKET, PROFILE_BODY_BUCKET or ATTACHMENTS_BUCKET).');
+  if (!d.bucket) throw new TemplateReferenceError(template.name, 'no template bucket configured (TEMPLATE_BUCKET, else PROFILE_BODY_BUCKET).');
   try {
     await d.s3.send(new PutObjectCommand({
       Bucket: d.bucket, Key: key, Body: source, ContentType: 'text/markdown; charset=utf-8', IfNoneMatch: '*',

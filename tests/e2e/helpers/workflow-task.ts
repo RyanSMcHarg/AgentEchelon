@@ -9,6 +9,7 @@ import { channelArnFor } from './battle-state-backend';
 import { idTokenFor, personArnOf } from './person';
 import { aws } from './aws';
 import { adminUrl, personUrl } from './api-urls';
+import { replacingDraft, draftIdOf } from './profile-draft';
 import { trackConversation } from './watchdog/current';
 import { untilRoomChanges } from './watchdog/wire-wait';
 
@@ -16,29 +17,37 @@ export const PROFILE = 'advisor';
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** The active version now, to roll back to. */
-export async function activeVersionOf(admin: unknown): Promise<number | undefined> {
+export async function activeVersionOf(admin: unknown): Promise<number> {
   const listing = await signedCall(adminUrl('assistant-admin', '/admin/profiles'), admin as never);
-  return (listing.body?.profiles ?? []).find((p: any) => p.profileName === PROFILE)?.activeVersion ?? undefined;
+  const version = (listing.body?.profiles ?? []).find((p: any) => p.profileName === PROFILE)?.activeVersion ?? undefined;
+  // A run that changes the deployed assistant starts only with a version to return it to.
+  expect(version, `${PROFILE} has no active version to return to; the run would leave its own version active`).toBeDefined();
+  return version as number;
 }
 
 /** Create a version, patch its event workflows, validate and return the validation body (errors and warnings). */
 export async function draftWith(admin: unknown, eventWorkflows: Record<string, unknown>, extra: Record<string, unknown> = {}): Promise<any> {
-  const created = await signedCall(adminUrl('assistant-admin', '/admin/profiles/version'), admin as never, 'POST', { profileName: PROFILE });
+  const created = await replacingDraft((b) => signedCall(adminUrl('assistant-admin', '/admin/profiles/version'), admin as never, 'POST', b), { profileName: PROFILE });
   expect(created.status, JSON.stringify(created.body).slice(0, 400)).toBe(200);
-  const edited = await signedCall(adminUrl('assistant-admin', '/admin/profiles/draft'), admin as never, 'POST', { profileName: PROFILE, patch: { eventWorkflows, ...extra } });
+  const edited = await signedCall(adminUrl('assistant-admin', '/admin/profiles/draft'), admin as never, 'POST', { profileName: PROFILE, patch: { eventWorkflows, ...extra }, configId: draftIdOf(created) });
   if (edited.status !== 200) return { errors: [JSON.stringify(edited.body)] };
   const valid = await signedCall(adminUrl('assistant-admin', '/admin/profiles/validate'), admin as never, 'POST', { profileName: PROFILE });
   return valid.body ?? {};
 }
 
 export async function activate(admin: unknown): Promise<void> {
-  const activated = await signedCall(adminUrl('assistant-admin', '/admin/profiles/activate'), admin as never, 'POST', { profileName: PROFILE });
+  // The draft as it stands: the one this run started and edited (`draftWith`).
+  const listing = await signedCall(adminUrl('assistant-admin', '/admin/profiles'), admin as never);
+  const configId = (listing.body?.profiles ?? []).find((p: any) => p.profileName === PROFILE)?.draftConfigId;
+  const activated = await signedCall(adminUrl('assistant-admin', '/admin/profiles/activate'), admin as never, 'POST', { profileName: PROFILE, configId });
   expect(activated.status, JSON.stringify(activated.body).slice(0, 400)).toBe(200);
 }
 
 export async function rollBack(admin: unknown, version: number | undefined): Promise<void> {
   if (version === undefined) return;
-  await signedCall(adminUrl('assistant-admin', '/admin/profiles/rollback'), admin as never, 'POST', { profileName: PROFILE, version }).catch(() => undefined);
+  const back = await signedCall(adminUrl('assistant-admin', '/admin/profiles/rollback'), admin as never, 'POST', { profileName: PROFILE, version }).catch((err) => ({ status: 0, body: { error: (err as Error).message } }));
+  // The run's own version is never left serving: a rollback that did not land fails the run.
+  expect(back.status, `${PROFILE} was not rolled back to version ${version}: ${JSON.stringify(back.body ?? {}).slice(0, 300)}`).toBe(200);
 }
 
 /** A new conversation as the premium test user, created the way the chat client creates one. */

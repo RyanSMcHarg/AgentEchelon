@@ -119,6 +119,12 @@ describe('what a version may name (FR22, FR24)', () => {
       expect(await eventWorkflowTemplateErrors({ eventWorkflows: { welcome: promptWelcome('welcome-greeting') } } as any, assistant, deps)).toEqual([]);
     });
 
+    it('a task step update naming a template nobody wrote is refused at that step', async () => {
+      const body = { intentPack: { machines: { brief: { initial: 'a', states: { a: { transitions: [], notice: { to: 'room', template: 'nobody-wrote-this' } } } } } } };
+      const errors = await eventWorkflowTemplateErrors(body as any, assistant, deps);
+      expect(errors).toEqual([expect.stringMatching(/^intentPack.machines.brief.states.a.notice names "nobody-wrote-this", which is not a message template/)]);
+    });
+
     it('an unknown template is refused at the step that names it', async () => {
       const errors = await eventWorkflowTemplateErrors({ eventWorkflows: { 'welcome-ops': promptWelcome('nobody-wrote-this', undefined, ['ops']) } } as any, assistant, deps);
       expect(errors).toEqual([expect.stringMatching(/^eventWorkflows\.welcome-ops\.states\.prompt\.prompt\.template names "nobody-wrote-this", which is not a prompt template/)]);
@@ -270,8 +276,11 @@ describe('where the router and processor run it', () => {
 
   it('a welcome said by the reply waits on nothing new: its workflow comes from the profile read that composed the opening', () => {
     const load = between(router, 'async function loadWelcomeFor(', 'async function loadWelcomeOrientation(');
-    // One profile read, the one the opening always made, and the welcome selected from it without another.
-    expect(load.match(/await /g)).toHaveLength(2);
+    // One profile read, the one the opening always made, and the welcome selected from it without another. The other two
+    // are the deployment's copy (`loadWelcomeOrientation`, cached per container), read once on either path: under the
+    // opening's own fields, or alone.
+    expect(load.match(/await /g)).toHaveLength(3);
+    expect(load.match(/await loadWelcomeOrientation\(\)/g)).toHaveLength(2);
     // The served version: the active one, with the experiment arm read beside it rather than after it.
     expect(load).toMatch(/served = await servedWelcomeVersion\(profileName, channelArn\);/);
     expect(router).toMatch(/await Promise\.all\(\[resolveActiveProfile\(profileName, \{ ssm: ssmClient, ssmRoot: SSM_ROOT \}\), armRead\]\)/);
@@ -289,7 +298,7 @@ describe('where the router and processor run it', () => {
   });
 
   it('a prompt welcome\'s one added wait is the dispatch: the processor ARN and the asynchronous invoke', () => {
-    const dispatch = between(router, 'async function dispatchWelcomePrompt(', ' * RUN AN EVENT WORKFLOW AS ONE ASSISTANT');
+    const dispatch = between(router, 'async function dispatchWelcomePrompt(', '\n}\n');
     expect(dispatch.match(/await /g)).toHaveLength(1);
     expect(dispatch).not.toMatch(/evaluateAbuseGate|resolveChannelSize|resolveActiveProfile/);
     const lib = fs.readFileSync(path.join(__dirname, '..', '..', 'lambda', 'src', 'lib', 'welcome-prompt-turn.ts'), 'utf8');

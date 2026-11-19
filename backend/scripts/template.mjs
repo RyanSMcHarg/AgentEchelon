@@ -18,12 +18,12 @@
  * the template its messages are said from before the classification's (ADR-062 decision 3). Without it, the
  * classification's own family.
  *
- * A body is stored at `templates/<classification>/<name>/<sha256>.md` in the attachments bucket, created
+ * A body is stored at `templates/<classification>/<name>/<sha256>.md` in the profile bucket, created
  * once and never overwritten. The active version is the SSM parameter
  * `<ssmRoot>/assistant/<classification>/templates/<name>`; activation and rollback rewrite only it, so
  * the next delivery uses the new version with no deploy.
  *
- * The bucket is `--bucket <name>`, else TEMPLATE_BUCKET, else the `AttachmentsBucketName` output of this
+ * The bucket is `--bucket <name>`, else TEMPLATE_BUCKET, else the `ProfileBucketName` output of this
  * instance's Conversations stack. `check` reads the classification's deployed intent pack unless
  * `--pack` names a local one.
  *
@@ -67,8 +67,8 @@ async function resolveBucket() {
   const stack = `${resolveStackPrefix(process.env)}Conversations`;
   const cfn = new CloudFormationClient({ region: REGION });
   const resp = await cfn.send(new DescribeStacksCommand({ StackName: stack }));
-  const out = resp.Stacks?.[0]?.Outputs?.find((o) => o.OutputKey === 'AttachmentsBucketName')?.OutputValue;
-  if (!out) throw new Error(`${stack} has no AttachmentsBucketName output; pass --bucket <name>.`);
+  const out = resp.Stacks?.[0]?.Outputs?.find((o) => o.OutputKey === 'ProfileBucketName')?.OutputValue;
+  if (!out) throw new Error(`${stack} has no ProfileBucketName output; pass --bucket <name>.`);
   return out;
 }
 

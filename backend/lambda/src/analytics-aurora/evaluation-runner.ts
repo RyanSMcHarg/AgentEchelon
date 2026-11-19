@@ -29,6 +29,7 @@ import {
 import { S3Client } from '@aws-sdk/client-s3';
 import { query, ensureSchema } from './db-client.js';
 import { updateJoinSql } from './update-events.js';
+import { IS_A_DRIFT_OFFER } from './drift-offers.js';
 import { runToolPass } from './tool-judge.js';
 import { stripMessageMarkers } from '../lib/message-markers.js';
 import { renderPrompt } from '../lib/render-prompt.js';
@@ -355,7 +356,7 @@ async function getUnscoredExchanges(limit: number): Promise<UnscoredExchange[]> 
   const res = await query<UnscoredExchange>(
     `SELECT e.id,
             -- WHY this row was taken, carried to the write so the score can state its population.
-            CASE WHEN e.intent_confidence = 'low' OR hf.message_id IS NOT NULL OR ${HAS_SAFETY_FINDING_SQL}
+            CASE WHEN e.intent_confidence = 'low' OR hf.message_id IS NOT NULL OR e.paired_by = 'platform' OR ${HAS_SAFETY_FINDING_SQL}
                  THEN 'always' ELSE 'sampled' END AS sample_stratum,
             e.channel_arn,
             e.assistant,
@@ -363,7 +364,7 @@ async function getUnscoredExchanges(limit: number): Promise<UnscoredExchange[]> 
             e.intent,
             e.task_id,
             e.created_at,
-            COALESCE(mu.updated_content, mu.content) AS user_message,
+            COALESCE(mu.updated_content, mu.content, ma_upd.metadata->>'stepAsk', ma.metadata->>'stepAsk') AS user_message,
             COALESCE(ma.updated_content, ma.content) AS agent_response,
             -- THE TURN'S ANALYTICS LIVE ON THE UPDATE ROW, NOT THE CREATE ROW. The assistant posts a
             -- placeholder first and rewrites it once the reply is ready, so everything the turn
@@ -375,7 +376,8 @@ async function getUnscoredExchanges(limit: number): Promise<UnscoredExchange[]> 
             -- value. Same latest-update join the archival SQL uses.
             COALESCE(ma.metadata, '{}'::jsonb) || COALESCE(ma_upd.metadata, '{}'::jsonb) AS agent_metadata
        FROM exchanges e
-       JOIN messages mu ON e.user_message_id = mu.id
+       -- A TURN THE PLATFORM STARTED HAS NO PERSON'S MESSAGE (migration 106): it is judged against what its step asked.
+       LEFT JOIN messages mu ON e.user_message_id = mu.id
        JOIN messages ma ON e.agent_message_id = ma.id
        -- THE LATEST UPDATE (migration 084): every update is its own row, and the reply graded is the
        -- message as it stands, the same text COALESCE(ma.updated_content, ...) reads above.
@@ -386,7 +388,7 @@ async function getUnscoredExchanges(limit: number): Promise<UnscoredExchange[]> 
        LEFT JOIN human_flag hf ON hf.channel_arn = ma.channel_arn
                               AND hf.message_id = ma.message_id
       WHERE er.id IS NULL
-        AND mu.content IS NOT NULL
+        AND COALESCE(mu.content, ma_upd.metadata->>'stepAsk', ma.metadata->>'stepAsk') IS NOT NULL
         AND COALESCE(ma.updated_content, ma.content) IS NOT NULL
         -- ── STRATIFIED, AND THE DRAW IS DETERMINISTIC ────────────────────────────────────────────
         --
@@ -401,6 +403,9 @@ async function getUnscoredExchanges(limit: number): Promise<UnscoredExchange[]> 
         AND (
           e.intent_confidence = 'low'
           OR hf.message_id IS NOT NULL
+          -- A TURN THE PLATFORM STARTED IS ALWAYS JUDGED (FR43, owner 2026-11-17): a workflow step runs the same way every
+          -- time, so one unsampled step is a step whose quality is never read at all.
+          OR e.paired_by = 'platform'
           OR ${HAS_SAFETY_FINDING_SQL}
           OR ('x' || substr(md5(e.id::text), 1, 8))::bit(32)::bigint % 100 < $2
         )
@@ -1140,10 +1145,11 @@ async function getFlowsToScore(limit: number): Promise<TaskFlow[]> {
 
 async function getTaskExchanges(taskId: string): Promise<PriorTurn[]> {
   const res = await query<PriorTurn>(
-    `SELECT COALESCE(mu.updated_content, mu.content) AS user_message,
+    `SELECT COALESCE(mu.updated_content, mu.content, ma.metadata->>'stepAsk') AS user_message,
             COALESCE(ma.updated_content, ma.content) AS agent_response
        FROM exchanges e
-       JOIN messages mu ON e.user_message_id = mu.id
+       -- A TURN THE PLATFORM STARTED HAS NO PERSON'S MESSAGE (migration 106): it is judged against what its step asked.
+       LEFT JOIN messages mu ON e.user_message_id = mu.id
        JOIN messages ma ON e.agent_message_id = ma.id
       WHERE e.task_id = $1
       ORDER BY e.created_at ASC`,
@@ -1247,6 +1253,36 @@ async function sweepStaleFlows(): Promise<{ swept: number }> {
     });
   }
   return { swept: result.rows.length };
+}
+
+/**
+ * Pass D0: close the flows whose duel ended, as abandoned work.
+ *
+ * WHEN A DUEL ENDS ITS SIDES' TASKS END WITH IT, and the side's own message says so: the router's edit that takes the
+ * side's waiting marker down states its task `cancelled` with the ending `battle-ended` (`declareDuelEnded`). That
+ * edit is archived like every other, so the fact is read here from the message that declared it, never from a copy.
+ * A flow the judge left `in_progress` is then closed as `abandoned`, with its reason, rather than read as running
+ * work until the stale sweep below calls it inactive. Like that sweep it calls no model and invents no score.
+ */
+export const DUEL_ENDED_FLOWS_SQL = `UPDATE intent_flows f
+        SET status = 'abandoned',
+            outcome = 'abandoned - battle ended',
+            outcome_details = COALESCE(f.outcome_details, '{}'::jsonb)
+              || jsonb_build_object('closedBy', 'battle-ended')
+      WHERE f.status = 'in_progress'
+        AND f.task_id IN (
+          SELECT COALESCE(m.metadata->'analytics'->'activeTask'->>'taskId', m.metadata->'activeTask'->>'taskId')
+            FROM messages m
+           WHERE COALESCE(m.metadata->'analytics'->>'taskEnding', m.metadata->>'taskEnding') = 'battle-ended'
+             AND COALESCE(m.last_updated_at, m.created_at) > NOW() - ($1 || ' days')::interval
+        )
+      RETURNING f.id`;
+const DUEL_ENDED_LOOKBACK_DAYS = 14;
+
+async function closeDuelEndedFlows(): Promise<{ closed: number }> {
+  const result = await query<{ id: string }>(DUEL_ENDED_FLOWS_SQL, [String(DUEL_ENDED_LOOKBACK_DAYS)]);
+  if (result.rows.length > 0) console.log('[evaluation-runner] closed the flows of ended duels', { closed: result.rows.length });
+  return { closed: result.rows.length };
 }
 
 async function upsertFlow(flow: TaskFlow, turns: PriorTurn[], s: FlowScore): Promise<void> {
@@ -1394,6 +1430,8 @@ async function getUnjudgedDriftOffers(limit: number): Promise<DriftOfferRow[]> {
              LIMIT 1
           ) cs ON TRUE
       WHERE d.source = 'live'
+        -- ONLY AN OFFER IS JUDGED: a change nobody was asked about has no offer to be right or wrong (migration 101).
+        AND ${IS_A_DRIFT_OFFER('d')}
         AND d.evaluated_at IS NULL
         AND m.content IS NOT NULL
       ORDER BY d.occurred_at DESC
@@ -1592,6 +1630,13 @@ export async function handler(
       return { scored: 0, errors: 1 };
     });
 
+    // Pass D0: an ended duel's flows are abandoned work, named for why. BEFORE the stale sweep, so a duel's flow is
+    // closed with its own reason rather than as inactivity.
+    const duelFlows = await closeDuelEndedFlows().catch((err) => {
+      console.error('Duel-ended flow pass error:', err);
+      return { closed: 0 };
+    });
+
     // Pass D: close flows that stopped rather than finished. AFTER Pass B, so a flow that gained a
     // turn this run is re-scored first and is not stale by the time the sweep reads it.
     const sweep = await sweepStaleFlows().catch((err) => {
@@ -1599,7 +1644,7 @@ export async function handler(
       return { swept: 0 };
     });
 
-    console.log(`Evaluation complete: exchanges ${scored} (errors ${errors.length}, image-skipped ${imageSkipped}); documents ${documentsScored} (skipped ${documentsSkipped}, errors ${documentErrors}, stopped after ${DOCUMENT_MAX_ATTEMPTS} attempts ${documentsExhausted}); flows ${flows.scored} (errors ${flows.errors}); drift offers ${driftOffers.scored} (errors ${driftOffers.errors}); stale flows closed ${sweep.swept}.`);
+    console.log(`Evaluation complete: exchanges ${scored} (errors ${errors.length}, image-skipped ${imageSkipped}); documents ${documentsScored} (skipped ${documentsSkipped}, errors ${documentErrors}, stopped after ${DOCUMENT_MAX_ATTEMPTS} attempts ${documentsExhausted}); flows ${flows.scored} (errors ${flows.errors}); drift offers ${driftOffers.scored} (errors ${driftOffers.errors}); stale flows closed ${sweep.swept}; ended-duel flows closed ${duelFlows.closed}.`);
     if (errors.length) console.warn('Eval errors:', errors.slice(0, 5));
     return {
       statusCode: 200,
@@ -1680,12 +1725,13 @@ async function getPendingDocuments(limit: number): Promise<PendingDocument[]> {
             e.intent,
             e.task_id,
             e.created_at,
-            COALESCE(mu.updated_content, mu.content) AS user_message,
+            COALESCE(mu.updated_content, mu.content, ma_upd.metadata->>'stepAsk', ma.metadata->>'stepAsk') AS user_message,
             COALESCE(ma.updated_content, ma.content) AS agent_response,
             COALESCE(ma.metadata, '{}'::jsonb) || COALESCE(ma_upd.metadata, '{}'::jsonb) AS agent_metadata,
             COALESCE(ga.attempts, 0) AS document_attempts
        FROM exchanges e
-       JOIN messages mu ON e.user_message_id = mu.id
+       -- A TURN THE PLATFORM STARTED HAS NO PERSON'S MESSAGE (migration 106): it is judged against what its step asked.
+       LEFT JOIN messages mu ON e.user_message_id = mu.id
        JOIN messages ma ON e.agent_message_id = ma.id
        ${updateJoinSql({ alias: 'ma_upd', create: 'ma', pick: 'latest' })}
        -- The reply's row, most recent first: the document states the population its exchange was drawn from.

@@ -71,7 +71,7 @@ const MembershipAuditTab: React.FC = () => {
   return (
     <div className="admin-tab">
       <div className="admin-tab-header">
-        <h3>{translate('admin.membershipAudit.membershipAudit')}</h3>
+        <h2>{translate('admin.membershipAudit.membershipAudit')}</h2>
         <div role="group" aria-label={translate('admin.membershipAudit.enforcementMode')} className="admin-filter-group">
           <button className="admin-filter-btn" aria-pressed={!enforce} disabled={busy === 'enforce'} onClick={() => toggleEnforce(false)}>
             Report only

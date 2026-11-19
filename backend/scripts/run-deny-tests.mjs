@@ -3,6 +3,7 @@
  * Run named deny-tests one after another and report each one's verdict, a crash included.
  *
  *   AWS_PROFILE=<profile> AE_INSTANCE_NAME=<instance> node scripts/run-deny-tests.mjs invitations bearer-pin
+ *   ... node scripts/run-deny-tests.mjs --record admin-capabilities   # also keep each verdict in the release record
  *
  * A name is the part after `deny-test-` (`invitations` runs `scripts/deny-test-invitations.mjs`). Each runs
  * as its own process with this one's environment and output, in order, never in parallel: they create and
@@ -22,7 +23,10 @@ const require = createRequire(import.meta.url);
 const { verdictOf, runExitCode } = require('./lib/deny-test-verdict.cjs');
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const names = process.argv.slice(2);
+// `--record` keeps each verdict in this commit's release record (`lib/release-records.mjs`), so the release
+// report can show the refusals held on the deployment rather than in review (DESIGN-RELEASE-EVIDENCE section 7).
+const RECORD = process.argv.includes('--record');
+const names = process.argv.slice(2).filter((a) => a !== '--record');
 if (!names.length) {
   const available = fs.readdirSync(HERE).filter((f) => /^deny-test-.+\.mjs$/.test(f)).map((f) => f.slice('deny-test-'.length, -'.mjs'.length));
   console.error(`usage: node scripts/run-deny-tests.mjs <name> [<name> ...]\navailable: ${available.join(' ')}`);
@@ -53,5 +57,14 @@ for (const v of verdicts) {
       : v.kind === 'gap' ? 'GAP: a refusal or control did not hold'
         : 'SETUP ERROR: it could not run its checks';
   console.log(`  ${v.name.padEnd(44)} ${detail}`);
+}
+if (RECORD) {
+  const { gitState } = await import('./lib/deployed-commit.mjs');
+  const { appendRecords } = await import('./lib/release-records.mjs');
+  const state = gitState(path.join(HERE, '..'));
+  appendRecords(state.head, 'deny', verdicts.map((v) => ({
+    name: v.name.replace(/^deny-test-/, '').replace(/\.mjs$/, ''), kind: v.kind, code: v.code ?? null, dirty: state.dirty,
+  })));
+  console.log(`\nrecorded for ${state.head.slice(0, 8)}${state.dirty ? ' (uncommitted changes: a release report will refuse it)' : ''}`);
 }
 process.exitCode = runExitCode(verdicts);

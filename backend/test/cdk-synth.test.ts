@@ -27,7 +27,7 @@ describe('CDK Synthesis', () => {
 
   /**
    * IDENTITY AND EVERY CONVERSATIONAL MEMBER CLASSIFICATION'S OWN STACK, as bin builds them. A person's vend roles
-   * are Identity's (the one-conversation role and the admin plane's chat identity) and each classification
+   * are Identity's (the `restricted` role and the admin plane's chat identity) and each classification
    * stack's own (`ExchangeRole`, `lib/constructs/exchange-role.ts`), and so are the clearance groups. Built once.
    */
   type VendRole = { token: string; id: string; template: Template };
@@ -39,6 +39,8 @@ describe('CDK Synthesis', () => {
     const conversational = defaultProfileRegistry.memberClassificationValues().filter((c) => defaultProfileRegistry.isConversational(c));
     const stacks = conversational.map((c) => assistantsOf(c)(app, `TestAssistantsVend-${c}`, {
       env, appInstanceArn: chime.appInstanceArn, attachmentsBucketName: 'test-bucket', attachmentsBucketArn: 'arn:aws:s3:::test-bucket',
+      companyBucketName: 'test-company-bucket', companyBucketArn: 'arn:aws:s3:::test-company-bucket',
+      profileBucketName: 'test-profile-bucket', profileBucketArn: 'arn:aws:s3:::test-profile-bucket',
       credentialExchangeRoleArn: identityStack.credentialExchangeRoleArn,
     } as never));
     const identity = Template.fromStack(identityStack);
@@ -245,7 +247,7 @@ describe('CDK Synthesis', () => {
     it('should synthesize the Aurora archive stack', async () => {
       const { ArchiveStackAurora } = await import('../lib/stacks/archive-stack-aurora');
       const app = new cdk.App();
-      const stack = new ArchiveStackAurora(app, 'TestArchiveAurora', {
+      const stack = new ArchiveStackAurora(app, 'TestArchiveAurora', { companyBucketArn: 'arn:aws:s3:::test-company-bucket',
         env,
         appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
         messageStream: testMessageStream(app),
@@ -282,7 +284,7 @@ describe('CDK Synthesis', () => {
     it('does not create an RDS Proxy by default (avoids the 8-ACU minimum)', async () => {
       const { ArchiveStackAurora } = await import('../lib/stacks/archive-stack-aurora');
       const app = new cdk.App();
-      const stack = new ArchiveStackAurora(app, 'TestAuroraNoProxy', {
+      const stack = new ArchiveStackAurora(app, 'TestAuroraNoProxy', { companyBucketArn: 'arn:aws:s3:::test-company-bucket',
         env,
         appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
         messageStream: testMessageStream(app),
@@ -295,7 +297,7 @@ describe('CDK Synthesis', () => {
     it('creates an RDS Proxy when enableRdsProxy=true', async () => {
       const { ArchiveStackAurora } = await import('../lib/stacks/archive-stack-aurora');
       const app = new cdk.App();
-      const stack = new ArchiveStackAurora(app, 'TestAuroraProxy', {
+      const stack = new ArchiveStackAurora(app, 'TestAuroraProxy', { companyBucketArn: 'arn:aws:s3:::test-company-bucket',
         env,
         appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
         messageStream: testMessageStream(app),
@@ -309,7 +311,7 @@ describe('CDK Synthesis', () => {
     it('should create Aurora with IAM authentication enabled', async () => {
       const { ArchiveStackAurora } = await import('../lib/stacks/archive-stack-aurora');
       const app = new cdk.App();
-      const stack = new ArchiveStackAurora(app, 'TestArchiveAurora', {
+      const stack = new ArchiveStackAurora(app, 'TestArchiveAurora', { companyBucketArn: 'arn:aws:s3:::test-company-bucket',
         env,
         appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
         messageStream: testMessageStream(app),
@@ -326,7 +328,7 @@ describe('CDK Synthesis', () => {
     it('should create VPC with no NAT gateways', async () => {
       const { ArchiveStackAurora } = await import('../lib/stacks/archive-stack-aurora');
       const app = new cdk.App();
-      const stack = new ArchiveStackAurora(app, 'TestArchiveAurora', {
+      const stack = new ArchiveStackAurora(app, 'TestArchiveAurora', { companyBucketArn: 'arn:aws:s3:::test-company-bucket',
         env,
         appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
         messageStream: testMessageStream(app),
@@ -340,7 +342,7 @@ describe('CDK Synthesis', () => {
     it('should create VPC endpoints for Kinesis, S3, SecretsManager, and Bedrock', async () => {
       const { ArchiveStackAurora } = await import('../lib/stacks/archive-stack-aurora');
       const app = new cdk.App();
-      const stack = new ArchiveStackAurora(app, 'TestArchiveAurora', {
+      const stack = new ArchiveStackAurora(app, 'TestArchiveAurora', { companyBucketArn: 'arn:aws:s3:::test-company-bucket',
         env,
         appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
         messageStream: testMessageStream(app),
@@ -396,7 +398,7 @@ describe('CDK Synthesis', () => {
           '../lib/stacks/archive-stack-aurora'
         );
         const app = new cdk.App({ context: vpcContext });
-        return new ArchiveStackAurora(app, id, {
+        return new ArchiveStackAurora(app, id, { companyBucketArn: 'arn:aws:s3:::test-company-bucket',
           env,
           appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
           messageStream: testMessageStream(app),
@@ -429,7 +431,7 @@ describe('CDK Synthesis', () => {
         const app = new cdk.App();
         expect(
           () =>
-            new ArchiveStackAurora(app, 'TestAuroraBadEp', {
+            new ArchiveStackAurora(app, 'TestAuroraBadEp', { companyBucketArn: 'arn:aws:s3:::test-company-bucket',
               env,
               appInstanceArn:
                 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
@@ -710,7 +712,8 @@ describe('CDK Synthesis', () => {
         for (const f of FORBIDDEN) expect(acts).not.toContain(f);
         // Positive lock: the owner-rename cap must be present on every chat role (roles
         // are pinned to the caller's own ${sub}; Chime's moderator check is the real gate).
-        expect(acts).toContain('chime:UpdateChannel');
+        if (role === 'restricted') expect(acts).not.toContain('chime:UpdateChannel');
+        else expect(acts).toContain('chime:UpdateChannel');
       }
 
       // Two-plane admin identity (docs/SPEC-ADMIN-IDENTITY.md): the moderation
@@ -778,7 +781,7 @@ describe('CDK Synthesis', () => {
         return tagging[0].Condition ?? {};
       };
 
-      // Every vended classification's role, the one-conversation role, and the admin PLANE role (the admin
+      // Every vended classification's role, the `restricted` role, and the admin PLANE role (the admin
       // backend's), which carries its own literal role rather than a classification's. An outside
       // classification no signed-in issuer reaches (the guest) has no role: its people are vended on the
       // guest-session role.
@@ -813,6 +816,10 @@ describe('CDK Synthesis', () => {
       appInstanceArn,
       attachmentsBucketName: 'agent-echelon-attachments-test',
       attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
+      companyBucketName: 'agent-echelon-company-test',
+      companyBucketArn: 'arn:aws:s3:::agent-echelon-company-test',
+      profileBucketName: 'agent-echelon-profile-test',
+      profileBucketArn: 'arn:aws:s3:::agent-echelon-profile-test',
     };
 
     /**
@@ -1140,6 +1147,26 @@ describe('CDK Synthesis', () => {
         expect(props.OKActions?.length).toBeGreaterThan(0);
       });
 
+      it('alarms on the first withheld turn when the guardrail cannot be applied, and on recovery', () => {
+        // A guardrail that cannot be applied withholds every turn it guards, so one occurrence is the signal.
+        const alarms = alerting().findResources('AWS::CloudWatch::Alarm');
+        const alarm = Object.values(alarms).find(
+          (a) => String((a.Properties as { AlarmName?: string }).AlarmName || '').includes('guardrail-unavailable'),
+        );
+        expect(alarm).toBeDefined();
+        const props = alarm!.Properties as {
+          Namespace?: string; MetricName?: string; Threshold?: number; ComparisonOperator?: string;
+          Dimensions?: Array<{ Name: string; Value: string }>; AlarmActions?: unknown[]; OKActions?: unknown[];
+        };
+        expect(props.Namespace).toBe('AgentEchelon/Guardrail');
+        expect(props.MetricName).toBe('GuardrailUnavailable');
+        expect(props.Threshold).toBe(0);
+        expect(props.ComparisonOperator).toBe('GreaterThanThreshold');
+        expect(props.Dimensions).toEqual([{ Name: 'Classification', Value: 'standard' }]);
+        expect(props.AlarmActions?.length).toBeGreaterThan(0);
+        expect(props.OKActions?.length).toBeGreaterThan(0);
+      });
+
       it('routes the alarm to the notifier, which raises an ae.alert rather than mailing a list', () => {
         // SNS is the transport between CloudWatch and the notifier; the notifier raises the alert on
         // the default bus, and the admin backend posts it into the admin conversation, which fans out
@@ -1328,6 +1355,10 @@ describe('CDK Synthesis', () => {
       appInstanceArn,
       attachmentsBucketName: 'agent-echelon-attachments-test',
       attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
+      companyBucketName: 'agent-echelon-company-test',
+      companyBucketArn: 'arn:aws:s3:::agent-echelon-company-test',
+      profileBucketName: 'agent-echelon-profile-test',
+      profileBucketArn: 'arn:aws:s3:::agent-echelon-profile-test',
     };
 
     /** The archive in Aurora mode with live drift: the stack builds its own turn data plane in the archive's VPC
@@ -1505,6 +1536,17 @@ describe('CDK Synthesis', () => {
       const policies = JSON.stringify(template.findResources('AWS::IAM::Policy'));
       expect(policies).not.toContain('rds-db:connect');
       expect(policies).not.toContain('chime:CreateChannel');
+    });
+
+    it('a meeting\'s conversation type has a creator only where meetings are declared (absent means off)', () => {
+      const creatorOf = (capabilities?: string[]) => {
+        const app = new cdk.App();
+        const stack = assistantsOf('basic')(app, 'AgentEchelonAssistants-basic', { ...classificationBaseProps, ...(capabilities ? { capabilities } : {}) });
+        return Object.keys(Template.fromStack(stack).findResources('AWS::IAM::Role')).filter((id) => id.startsWith('TypedConversationFromEvent'));
+      };
+      expect(creatorOf()).toHaveLength(0);
+      expect(creatorOf(['chat', 'admin'])).toHaveLength(0);
+      expect(creatorOf(['chat', 'meetings'])).toHaveLength(1);
     });
   });
 
@@ -1741,6 +1783,10 @@ describe('CDK Synthesis', () => {
       appInstanceArn,
       attachmentsBucketName: 'agent-echelon-attachments-test',
       attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
+      companyBucketName: 'agent-echelon-company-test',
+      companyBucketArn: 'arn:aws:s3:::agent-echelon-company-test',
+      profileBucketName: 'agent-echelon-profile-test',
+      profileBucketArn: 'arn:aws:s3:::agent-echelon-profile-test',
     };
 
     // Pull every IAM policy statement out of the synthesized template.
@@ -1954,6 +2000,10 @@ describe('CDK Synthesis', () => {
       appInstanceArn,
       attachmentsBucketName: 'agent-echelon-attachments-test',
       attachmentsBucketArn: bucketArn,
+      companyBucketName: 'agent-echelon-company-test',
+      companyBucketArn: 'arn:aws:s3:::agent-echelon-company-test',
+      profileBucketName: 'agent-echelon-profile-test',
+      profileBucketArn: 'arn:aws:s3:::agent-echelon-profile-test',
     };
 
     // Every IAM statement in the synthesized template (inline role policies + AWS::IAM::Policy).

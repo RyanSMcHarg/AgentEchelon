@@ -227,9 +227,11 @@ test.describe('a classification is denied a model it does not declare (ADR-054)'
     test.skip(defaultProfileRegistry.selectsModel('basic', 'opus'), 'basic selects opus on this deployment, so there is nothing to refuse');
     const basicPrimary = 'concierge';
     try {
-      const valid = await draftModels(session.admin, { byIntent: { report_generation: { primary: 'haiku', steps: { generating: { primary: 'opus' } } } } }, {}, basicPrimary);
+      // An intent basic classifies, with a workflow of steps: basic offers no report, so a `report_generation` route is
+      // refused as unreachable before its step is read, and that refusal is not the one this test is about.
+      const valid = await draftModels(session.admin, { byIntent: { guided_troubleshooting: { primary: 'haiku', steps: { diagnosing: { primary: 'opus' } } } } }, {}, basicPrimary);
       const errors: string[] = valid.errors ?? [];
-      expect(errors.join(' '), JSON.stringify(valid).slice(0, 600)).toContain("models.byIntent['report_generation'].steps['generating'].primary");
+      expect(errors.join(' '), JSON.stringify(valid).slice(0, 600)).toContain("models.byIntent['guided_troubleshooting'].steps['diagnosing'].primary");
     } finally {
       await discardDraft(session.admin, basicPrimary);
     }

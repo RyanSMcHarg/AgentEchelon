@@ -55,7 +55,7 @@ const ModelsTab: React.FC<ModelsTabProps> = ({ data, effectivenessData, isLoadin
   return (
     <div className="admin-tab">
       <div className="admin-section">
-        <h3>{t('admin.models.modelUsage')}</h3>
+        <h2>{t('admin.models.modelUsage')}</h2>
         <DataTable
           columns={[
             { key: 'model_name', label: 'Model', render: (v) => modelDisplayName(v as string) || '—' },
@@ -69,7 +69,7 @@ const ModelsTab: React.FC<ModelsTabProps> = ({ data, effectivenessData, isLoadin
       </div>
 
       <div className="admin-section">
-        <h3>{t('admin.models.intentXModelEffectiveness')}</h3>
+        <h2>{t('admin.models.intentXModelEffectiveness')}</h2>
         <DataTable
           columns={[
             { key: 'model_name', label: 'Model', render: (v) => modelDisplayName(v as string) || '—' },
@@ -97,7 +97,7 @@ const ModelsTab: React.FC<ModelsTabProps> = ({ data, effectivenessData, isLoadin
       </div>
 
       <div className="admin-section">
-        <h3>{t('admin.models.userFeedback')}</h3>
+        <h2>{t('admin.models.userFeedback')}</h2>
         {feedbackError && (
           <p className="admin-error" role="alert">
             {feedbackError.message ?? t('admin.models.couldNotReadFeedback')}{' '}

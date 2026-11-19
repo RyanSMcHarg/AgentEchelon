@@ -9,7 +9,6 @@ describe('computeAlerts', () => {
       ],
       latency: [{ delivery_option: 'DIRECT', assistant_turn_count: 100, avg_ttff_ms: 600, p95_total_ms: 8000 }],
       modelEffectiveness: [{ model: 'haiku', avg_score: 88 }],
-      flagged: [],
       errorRate: [{ error_count: 0, total_count: 1000 }],
     });
     expect(alerts).toEqual([]);
@@ -60,7 +59,8 @@ describe('computeAlerts', () => {
     const alerts = computeAlerts({
       // A warn-tier latency + an error-tier runtime alert; error must sort first.
       latency: [{ delivery_option: 'DIRECT', assistant_turn_count: 10, avg_ttff_ms: 1500, p95_total_ms: 9000 }], // 1.5s -> warn
-      flagged: [{ classification: 'error_response' }, { classification: 'poor' }, { classification: 'error_response' }],
+      // Two intents' counts sum; the replies themselves are never read here.
+      intentEffectiveness: [{ intent: 'a', error_response_count: '1' }, { intent: 'b', error_response_count: 1 }],
     });
     expect(alerts[0].severity).toBe('error');
     const err = alerts.find((a) => a.id === 'r-error-responses');

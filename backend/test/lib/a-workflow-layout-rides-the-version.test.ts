@@ -11,13 +11,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { getModelCatalog } from '../../lib/config/model-strategy';
-import { PLATFORM_EVENT_WORKFLOWS, type EventWorkflow } from '../../lambda/src/lib/event-workflow';
+import { SHIPPED_EVENT_WORKFLOWS, type EventWorkflow } from '../../lambda/src/lib/event-workflow';
 import {
   activateDraft, activateExistingVersion, createDraft, editDraft, getDraft, isKnownProfile, ProfileValidationError, validateDraft,
 } from '../../lambda/src/lib/profile-lifecycle';
 import { __clearActiveProfileCache, bodyFrom, definitionParamName, resolveActiveProfile, type ProfileDefinition } from '../../lambda/src/lib/active-profile';
 import { exportManifest, importManifest } from '../../lambda/src/lib/profile-manifest';
-import { canonicalLayout, contentIdOf, layoutKey, offloadBodies } from '../../lambda/src/lib/profile-bodies';
+import { canonicalLayout, contentIdOf, keptWelcomeKey, layoutKey, offloadBodies } from '../../lambda/src/lib/profile-bodies';
 import { layoutFor, workflowLayoutErrors, MAX_LAYOUT_COORDINATE } from '../../lambda/src/lib/workflow-layout';
 import { fakeSsmStore } from '../helpers/fake-ssm-store';
 
@@ -48,7 +48,16 @@ const NAME = 'ops-premium';
 const CATALOG = getModelCatalog('us-east-1', '123456789012');
 const BUCKET = 'ae-attachments';
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
-const OWN: EventWorkflow = clone(PLATFORM_EVENT_WORKFLOWS['ops-room']);
+// THE OPS CONVERSATION'S OWN PATH (the one an event opens), small enough to sit inline where no body store is configured.
+const OWN: EventWorkflow = (() => {
+  const wf = clone(SHIPPED_EVENT_WORKFLOWS['ops-room']) as EventWorkflow & { states: Record<string, any> };
+  const kept = ['opening', 'greet-lead', 'first-look', 'tell-absent', 'tell-unavailable', 'done'];
+  for (const k of Object.keys(wf.states)) if (!kept.includes(k)) delete wf.states[k];
+  wf.states.opening.onSuccess = 'greet-lead'; wf.states.opening.onFailure = 'greet-lead';
+  wf.states['first-look'].onSuccess = 'done';
+  for (const k of ['tell-absent', 'tell-unavailable']) { wf.states[k].onSuccess = 'done'; wf.states[k].onFailure = 'done'; }
+  return wf;
+})();
 const WORKFLOWS = { 'ops-mine': OWN };
 const AT = { 'ops-mine': { opening: { x: 40, y: 120 }, 'greet-lead': { x: 40, y: 260 }, 'first-look': { x: 360, y: 260 }, done: { x: 40, y: 400 } } };
 const MOVED = { 'ops-mine': { ...AT['ops-mine'], 'first-look': { x: 600, y: 300 } } };
@@ -147,7 +156,7 @@ describe('the layout is a body of the version, never inline', () => {
     const stored = latest(store, draftName);
     mockS3Objects.set(`${BUCKET}/${stored.layoutRef!.key}`, canonicalLayout(MOVED));
     expect((await getDraft(client, ROOT, NAME))!.layout).toBeUndefined();
-    mockS3Objects.clear();
+    mockS3Objects.delete(`${BUCKET}/${stored.layoutRef!.key}`);
     expect((await getDraft(client, ROOT, NAME))!.layout).toBeUndefined();
   });
 });
@@ -235,5 +244,88 @@ describe('no grant of its own', () => {
     expect(layoutKey('a', 'b', 'c')).toMatch(/^profiles\//);
     const construct = fs.readFileSync(path.join(__dirname, '..', '..', 'lib', 'constructs', 'admin-assistant-administration.ts'), 'utf8');
     expect(construct).not.toMatch(/layout/i);
+  });
+});
+
+describe('an intent\'s machine is placed the same way, under its own key', () => {
+  const MACHINE = { initial: 'plan', states: { plan: { transitions: ['visit'] }, visit: { transitions: ['done'] }, done: { transitions: [], terminal: 'success' as const } } };
+  const PACK = { extends: 'default' as const, intents: [], machines: { site_visit: MACHINE } };
+  const POINTS = { 'machine:site_visit': { plan: { x: 40, y: 40 }, visit: { x: 40, y: 200 }, done: { x: 300, y: 360 } } };
+
+  it('a draft edit that saves a machine with its points keeps both, beside the event workflows\' points', async () => {
+    const { client } = await draftWithLayout();
+    await editDraft(client, ROOT, NAME, { intentPack: PACK, layout: { ...AT, ...POINTS } } as never, 'admin');
+    expect((await getDraft(client, ROOT, NAME))!.layout).toEqual({ ...AT, ...POINTS });
+  });
+
+  it('a state the machine no longer has loses its point, and a machine the pack no longer declares loses its entry', async () => {
+    const { client } = await draftWithLayout();
+    await editDraft(client, ROOT, NAME, { intentPack: PACK, layout: { ...AT, ...POINTS } } as never, 'admin');
+    const shorter = { initial: 'plan', states: { plan: { transitions: ['done'] }, done: { transitions: [], terminal: 'success' as const } } };
+    await editDraft(client, ROOT, NAME, { intentPack: { ...PACK, machines: { site_visit: shorter } } } as never, 'admin');
+    const { visit: _gone, ...rest } = POINTS['machine:site_visit'];
+    expect((await getDraft(client, ROOT, NAME))!.layout).toEqual({ ...AT, 'machine:site_visit': rest });
+    await editDraft(client, ROOT, NAME, { intentPack: null } as never, 'admin');
+    expect((await getDraft(client, ROOT, NAME))!.layout).toEqual(AT);
+  });
+
+  it('a caller that does not pass the machines (the event workflow builder) keeps their points as they are', () => {
+    expect(layoutFor({ ...AT, ...POINTS }, WORKFLOWS)).toEqual({ ...AT, ...POINTS });
+    expect(layoutFor({ ...AT, ...POINTS }, WORKFLOWS, null)).toEqual(AT);
+  });
+
+  it('a machine entry is capped on its own, apart from the event workflows', () => {
+    const many = Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`machine:m${i}`, { a: { x: 1, y: 1 } }]));
+    expect(workflowLayoutErrors(many)).toEqual(['layout places at most 16 machines']);
+    expect(workflowLayoutErrors({ 'machine:m': Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`s${i}`, { x: 1, y: 1 }])) })).toEqual([]);
+  });
+});
+
+describe('a kept welcome rides the version on the layout\'s terms (ADR-067 G40)', () => {
+  const KEPT: EventWorkflow = clone(SHIPPED_EVENT_WORKFLOWS.welcome);
+
+  it('a draft edit stores it under its own key, changes no configId, and never puts it in what runs', async () => {
+    const { client, store } = await draftWithLayout();
+    const before = latest(store, draftName).configId;
+    await editDraft(client, ROOT, NAME, { keptWelcomeWorkflow: KEPT } as never, 'admin');
+    const stored = latest(store, draftName);
+    expect(stored.configId).toBe(before);
+    expect(stored.keptWelcomeWorkflow).toBeUndefined();
+    expect(stored.keptWelcomeWorkflowRef!.key).toMatch(new RegExp(`^profiles/${NAME}/${stored.configId}/kept-welcome/[0-9a-f]{64}$`));
+    expect(stored.keptWelcomeWorkflowRef!.key.startsWith(keptWelcomeKey(NAME, stored.configId, ''))).toBe(true);
+    const draft = (await getDraft(client, ROOT, NAME))!;
+    expect(draft.keptWelcomeWorkflow).toEqual(KEPT);
+    expect(Object.keys(draft.eventWorkflows ?? {})).toEqual(['ops-mine']);
+    expect(bodyFrom(draft as never)).not.toHaveProperty('keptWelcomeWorkflow');
+  });
+
+  it('is kept through an edit that does not name it, by activation and into the next draft, and null clears it', async () => {
+    const { client } = await draftWithLayout();
+    await editDraft(client, ROOT, NAME, { keptWelcomeWorkflow: KEPT } as never, 'admin');
+    await editDraft(client, ROOT, NAME, { displayName: 'Ops' } as never, 'admin');
+    expect((await getDraft(client, ROOT, NAME))!.keptWelcomeWorkflow).toEqual(KEPT);
+    await activateDraft(client, ROOT, NAME, CATALOG, 'admin');
+    await createDraft(client, ROOT, NAME, 'admin');
+    expect((await getDraft(client, ROOT, NAME))!.keptWelcomeWorkflow).toEqual(KEPT);
+    await editDraft(client, ROOT, NAME, { keptWelcomeWorkflow: null } as never, 'admin');
+    expect((await getDraft(client, ROOT, NAME))!.keptWelcomeWorkflow).toBeUndefined();
+  });
+
+  it('only a welcome may be kept, checked for its shape', async () => {
+    const { client } = await draftWithLayout();
+    const err = await editDraft(client, ROOT, NAME, { keptWelcomeWorkflow: OWN } as never, 'admin').catch((e) => e);
+    expect(err).toBeInstanceOf(ProfileValidationError);
+    expect(JSON.stringify(err.errors)).toContain("keptWelcomeWorkflow is a welcome, so it starts on 'assistant-joined'");
+  });
+
+  it('export carries it beside the body, and import lands it on the target\'s draft', async () => {
+    const { client } = await draftWithLayout();
+    await editDraft(client, ROOT, NAME, { keptWelcomeWorkflow: KEPT } as never, 'admin');
+    const manifest = await exportManifest(client, ROOT, NAME, 'draft');
+    expect(manifest.keptWelcomeWorkflow).toEqual(KEPT);
+    expect((manifest.body as unknown as Record<string, unknown>).keptWelcomeWorkflow).toBeUndefined();
+    const target = fakeSsmStore();
+    await importManifest(target.client, ROOT, manifest, importOpts as never);
+    expect((await getDraft(target.client, ROOT, NAME))!.keptWelcomeWorkflow).toEqual(KEPT);
   });
 });

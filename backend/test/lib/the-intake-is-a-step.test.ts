@@ -16,7 +16,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import {
-  PLATFORM_EVENT_WORKFLOWS,
+  SHIPPED_EVENT_WORKFLOWS,
   eventWorkflowErrors,
   runEventWorkflow,
   type EventRunContext,
@@ -64,7 +64,7 @@ describe('where an intake may be offered', () => {
   it('is a step of its own kind, and never the opening of an arrival', () => {
     const both = withIntake('person-joined', 'joined');
     (both.states.intake as Record<string, unknown>).send = { to: 'room', template: 'x' };
-    expect(eventWorkflowErrors('b', both).join()).toMatch(/exactly one of a send, an agent step, an action, an opening, a prompt, a task, or a terminal disposition/);
+    expect(eventWorkflowErrors('b', both).join()).toMatch(/exactly one of a send, an agent step, an action, an opening, a prompt, a task, a wait, an open, or a terminal disposition/);
     expect(eventWorkflowErrors('f', withIntake('person-joined', 'joined', 'intake')).join()).toMatch(/initial must be a send/);
   });
 });
@@ -111,7 +111,7 @@ describe('running the step', () => {
 
 describe('the welcome and the router', () => {
   it('the platform welcome offers the intake to the subject after greeting them', () => {
-    const wf = PLATFORM_EVENT_WORKFLOWS['opening-and-subject'];
+    const wf = SHIPPED_EVENT_WORKFLOWS['opening-and-subject'];
     expect(wf.states['greet-subject'].onSuccess).toBe('intake');
     expect(wf.states.intake).toEqual({ action: { tool: 'start_intake', to: 'subject' }, onSuccess: 'done', onFailure: 'done' });
     expect(eventWorkflowErrors('opening-and-subject', wf)).toEqual([]);

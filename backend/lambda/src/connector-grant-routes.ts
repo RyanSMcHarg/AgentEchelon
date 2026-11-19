@@ -12,7 +12,7 @@
  * grant; a revocation the vendor does not confirm is kept as `revoke-failed` for the sweep, and the answer
  * says so (202).
  *
- * A one-conversation person is refused, as on every route that does not admit them. No first-party client
+ * No first-party client
  * calls these routes yet: the linking screen is **NOT BUILT**.
  */
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';

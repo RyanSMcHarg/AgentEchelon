@@ -133,6 +133,15 @@ describe('the reader', () => {
     expect(JSON.parse(puts()[0].Item.detail).filter).toMatchObject({ days: 90 });
   });
 
+  it('serves a reader that is not a person as the IAM principal that signed its request', async () => {
+    const arn = 'arn:aws:sts::111122223333:assumed-role/App-AdminRole-def/ops-automation';
+    const item = { id: 'r', event: 'analytics_content_read', at: '2026-11-12T10:00:00.000Z', actorPersonId: 'iam#' + arn, actorKind: 'iam', actorPrincipalArn: arn, outcome: 'granted', capabilities: [], detail: '{}' };
+    mockDocSend.mockImplementation(async (c: { __type: string }) => (c.__type === 'Query' ? { Items: [item] } : {}));
+    const handler = load();
+    const res = await handler(get(CONSOLE(LEGAL), { days: '1' }));
+    expect(JSON.parse(res.body).records[0]).toMatchObject({ actor: 'iam#' + arn, actorKind: 'iam', actorPrincipalArn: arn });
+  });
+
   it('serves nothing when the read cannot be recorded', async () => {
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
     mockDocSend.mockRejectedValue(new Error('down'));

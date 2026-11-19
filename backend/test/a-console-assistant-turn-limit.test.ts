@@ -51,7 +51,7 @@ function signed(kind: 'team' | 'admin', path: string, body: unknown): APIGateway
     path,
     headers: { origin: 'http://localhost:5173' },
     body: JSON.stringify(body),
-    requestContext: { identity: { userArn: `arn:aws:sts::1:assumed-role/ae-${kind}-console/${session}` } },
+    requestContext: { identity: { userArn: `arn:aws:sts::1:assumed-role/agent-echelon-${kind}-console/${session}` } },
   } as unknown as APIGatewayProxyEvent;
 }
 

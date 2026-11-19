@@ -73,7 +73,7 @@ import { DynamoDBDocumentClient, UpdateCommand, GetCommand, DeleteCommand } from
 import {
   recordOverflowDrop, recordQueued, recordTakeover, recordAwaitedAnswer,
 } from './turn-queue-metrics.js';
-import type { PendingStopDecision } from './stop-evaluation.js';
+import type { PendingStopDecision, StopEvaluationDispatch } from './stop-evaluation.js';
 import { BOUNDED_REQUEST_HANDLER } from './bounded-request-handler.js';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
@@ -1300,6 +1300,69 @@ export async function rememberStopDecision(args: {
   } catch (err: any) {
     console.warn('[turn-lock] could not record the stop decision:', err?.message);
     return false;
+  }
+}
+
+/**
+ * THE QUESTION AFTER A STOP WAITS FOR THE ACKNOWLEDGEMENT TO BE RELEASED.
+ *
+ * The router posts the acknowledgement before the question turn, but the order of the two sends is not the order the
+ * room sees: each message is released by its own channel-flow invocation, and Amazon Chime SDK stamps a message when it
+ * is released, so an acknowledgement whose flow pass runs slower than the question's placeholder would show AFTER the
+ * question it promised (a placeholder can be stamped 2.2 s before the acknowledgement sent ahead of it).
+ *
+ * So the dispatch is recorded here, keyed to the acknowledgement's message id, and the channel flow sends it when it
+ * releases that acknowledgement (`takeStopEvaluation`). The release is the event that makes the order true; nothing
+ * waits or polls for it.
+ */
+export async function deferStopEvaluation(args: {
+  channelArn: string;
+  responderId: string;
+  acknowledgementId: string;
+  dispatch: StopEvaluationDispatch;
+}): Promise<boolean> {
+  if (!turnStopEnabled()) return false;
+  const { channelArn, responderId, acknowledgementId, dispatch } = args;
+  if (!channelArn || !responderId || !acknowledgementId) return false;
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: TABLE,
+      Key: { pk: lockKey(channelArn, responderId) },
+      UpdateExpression: 'SET stopEvaluation = :e',
+      ExpressionAttributeValues: { ':e': { acknowledgementId, dispatch, deferredAt: new Date().toISOString() } },
+    }));
+    return true;
+  } catch (err: any) {
+    console.warn('[turn-lock] could not defer the stop evaluation:', err?.message);
+    return false;
+  }
+}
+
+/**
+ * The deferred evaluation for this acknowledgement, removed as it is read, or undefined.
+ *
+ * ONCE, because the flow sees the same message again whenever it is updated: the conditional remove is what makes the
+ * second sighting take nothing. A record for a different acknowledgement (a later stop) is left alone.
+ */
+export async function takeStopEvaluation(args: {
+  channelArn: string;
+  responderId: string;
+  acknowledgementId: string;
+}): Promise<StopEvaluationDispatch | undefined> {
+  if (!turnStopEnabled()) return undefined;
+  try {
+    const res = await ddb.send(new UpdateCommand({
+      TableName: TABLE,
+      Key: { pk: lockKey(args.channelArn, args.responderId) },
+      UpdateExpression: 'REMOVE stopEvaluation',
+      ConditionExpression: 'stopEvaluation.acknowledgementId = :a',
+      ExpressionAttributeValues: { ':a': args.acknowledgementId },
+      ReturnValues: 'ALL_OLD',
+    }));
+    return (res.Attributes?.stopEvaluation as { dispatch?: StopEvaluationDispatch } | undefined)?.dispatch;
+  } catch (err: any) {
+    if (err?.name === 'ConditionalCheckFailedException') return undefined;
+    throw err;
   }
 }
 

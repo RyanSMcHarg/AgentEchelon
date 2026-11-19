@@ -1,13 +1,13 @@
 /**
  * AN AREA'S UNSAVED EDIT IS ITS OWN PART OF THE DRAFT, LAID OVER THE LATEST SAVE.
  *
- * What it proves: two areas that share a body field (the welcome and the event workflows share `eventWorkflows`; the
- * models and the routing rules share `models`) each keep only their own part of it, so saving one never carries back
+ * What it proves: the workflows area owns every workflow, the welcome included, so an edit to a welcome is saved with it;
+ * two areas that share a body field (the models and the routing rules share `models`) each keep only their own part of it, so saving one never carries back
  * the other's older value; one patch for several areas keeps every area's edit; the draft the controls start from is
  * the saved draft with the area's edit over it; and only areas holding an edit are listed.
  */
 import { describe, it, expect } from 'vitest';
-import { combinedPatch, draftWith, rebase, unsavedAreas } from './unsavedAreas';
+import { combinedPatch, draftWith, rebase, rebaseOnto, unsavedAreas } from './unsavedAreas';
 import type { ProfileDefinitionBody } from '../../services/profileService';
 
 const welcome = (text: string) => ({
@@ -23,17 +23,11 @@ const SAVED: ProfileDefinitionBody = {
 };
 
 describe('one area of a shared field', () => {
-  it('keeps the welcome edit and takes the event workflows from the latest draft', () => {
-    // The welcome edit was made while `chase` waited 1; a save of the events since made it wait 2.
-    const edit = { eventWorkflows: { hello: welcome('Hello there.'), chase: chase(1) } };
-    const latest = { ...SAVED, eventWorkflows: { hello: welcome('Hi.'), chase: chase(2) } };
-    expect(rebase('welcome', latest, edit).eventWorkflows).toEqual({ hello: welcome('Hello there.'), chase: chase(2) });
-  });
-
-  it('keeps the events edit and takes the welcomes from the latest draft, and a removed workflow stays removed', () => {
-    const edit = { eventWorkflows: { hello: welcome('Hi.') } };
+  it('keeps the workflows edit whole, the welcome in it included, and a removed workflow stays removed', () => {
+    // The builder edits every workflow, so a welcome edited there is saved with the rest rather than taken from the draft.
+    const edit = { eventWorkflows: { hello: welcome('Hello there.') } };
     const latest = { ...SAVED, eventWorkflows: { hello: welcome('Newer.'), chase: chase(1) } };
-    expect(rebase('events', latest, edit).eventWorkflows).toEqual({ hello: welcome('Newer.') });
+    expect(rebase('events', latest, edit).eventWorkflows).toEqual({ hello: welcome('Hello there.') });
   });
 
   it('keeps the models edit and takes the routing rules from the latest draft, and the other way round', () => {
@@ -50,12 +44,11 @@ describe('one area of a shared field', () => {
 });
 
 describe('several areas in one patch', () => {
-  it('keeps both the welcome and the events edits, and a field the result removes is sent as null', () => {
+  it('keeps the workflows and the identity edits, and a field the result removes is sent as null', () => {
     const patch = combinedPatch(SAVED, {
-      welcome: { eventWorkflows: { hello: welcome('Hello there.'), chase: chase(1) } },
-      events: { eventWorkflows: { hello: welcome('Hi.') } },
+      events: { eventWorkflows: { hello: welcome('Hello there.') } },
       identity: { persona: null },
-    }, ['welcome', 'events', 'identity']);
+    }, ['events', 'identity']);
     expect(patch).toEqual({ eventWorkflows: { hello: welcome('Hello there.') }, persona: null });
   });
 
@@ -71,7 +64,50 @@ describe('what the controls start from', () => {
   });
 
   it('lists only the areas holding an edit', () => {
-    expect(unsavedAreas({ identity: { persona: 'x' }, welcome: {} })).toEqual(['identity']);
+    expect(unsavedAreas({ identity: { persona: 'x' }, events: {} })).toEqual(['identity']);
     expect(unsavedAreas({ identity: { persona: 'x' }, abilities: { tools: [] } }, ['abilities', 'models'])).toEqual(['abilities']);
+  });
+});
+
+describe('carrying unsaved edits onto a draft saved elsewhere since', () => {
+  const nudge = (n: number) => ({ on: 'invitation-unredeemed' as const, initial: 'nudge', states: { nudge: { disposition: 'success' as const, wait: n } } }) as never;
+
+  it("keeps the workflows this person changed and takes every other workflow from the newer draft", () => {
+    // Started from SAVED: this person edited the welcome and removed the chase; the other writer added a nudge.
+    const edit = { eventWorkflows: { hello: welcome('Mine.') } };
+    const newer = { ...SAVED, eventWorkflows: { hello: welcome('Hi.'), chase: chase(1), nudge: nudge(2) } };
+    const { unsaved, overlaps } = rebaseOnto({ events: edit }, SAVED, newer);
+    expect(unsaved.events?.eventWorkflows).toEqual({ hello: welcome('Mine.'), nudge: nudge(2) });
+    expect(overlaps).toEqual([]);
+  });
+
+  it('names a workflow both changed, and keeps this person\'s version of it', () => {
+    const edit = { eventWorkflows: { hello: welcome('Mine.'), chase: chase(1) } };
+    const newer = { ...SAVED, eventWorkflows: { hello: welcome('Theirs.'), chase: chase(1) } };
+    const { unsaved, overlaps } = rebaseOnto({ events: edit }, SAVED, newer);
+    expect(unsaved.events?.eventWorkflows).toEqual({ hello: welcome('Mine.'), chase: chase(1) });
+    expect(overlaps).toEqual([{ area: 'events', fields: ['eventWorkflows.hello'] }]);
+  });
+
+  it('names a field of another area the newer draft also changed, and keeps the edit for the person to decide', () => {
+    const before = { ...SAVED, persona: 'Old.' };
+    const newer = { ...SAVED, persona: 'Theirs.' };
+    const { unsaved, overlaps } = rebaseOnto({ identity: { persona: 'Mine.' } }, before, newer);
+    expect(unsaved.identity).toEqual({ persona: 'Mine.' });
+    expect(overlaps).toEqual([{ area: 'identity', fields: ['persona'] }]);
+  });
+
+  it('names nothing where the newer draft left the field alone', () => {
+    const newer = { ...SAVED, tools: ['search_context'] };
+    const { unsaved, overlaps } = rebaseOnto({ identity: { persona: 'Mine.' } }, SAVED, newer);
+    expect(unsaved.identity).toEqual({ persona: 'Mine.' });
+    expect(overlaps).toEqual([]);
+  });
+
+  it('drops an edit that says nothing the newer draft does not already say', () => {
+    const newer = { ...SAVED, persona: 'Same.' };
+    const { unsaved, overlaps } = rebaseOnto({ identity: { persona: 'Same.' } }, SAVED, newer);
+    expect(unsaved).toEqual({});
+    expect(overlaps).toEqual([]);
   });
 });

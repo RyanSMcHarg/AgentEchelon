@@ -76,8 +76,11 @@ export interface AssistantAdvertisement {
   assistant: string;
   /** The name a person calls it, for copy that names who to ask. */
   displayName: string;
-  /** What it recognizes, as `(key, person-facing line)` pairs in declaration order. */
-  intents: Array<{ key: string; summary: string }>;
+  /**
+   * What it recognizes, as `(key, person-facing line)` pairs in declaration order. `multiStep` marks an intent that
+   * opens a task of the assistant's own machine, which a workflow step may give to the role it holds (ADR-067 WT78).
+   */
+  intents: Array<{ key: string; summary: string; multiStep?: true }>;
   /** The authored limit line: what it does NOT reach. Absent when the profile carries none. */
   boundary?: string;
 }
@@ -105,7 +108,9 @@ export function projectAdvertisement(input: {
   // introduction uses, so one definition of "advertised" serves both consumers. `extends` is ignored on
   // purpose: an inherited intent is not this assistant's to advertise.
   const declared = (input.pack?.intents ?? []) as IntentPack['intents'];
-  const intents = advertisedIntents({ intents: declared } as IntentPack);
+  const multi = new Set(declared.filter((d) => d.delivery === 'TASK_MULTI_STEP').map((d) => d.key));
+  const intents = advertisedIntents({ intents: declared } as IntentPack)
+    .map((i) => (multi.has(i.key) ? { ...i, multiStep: true as const } : i));
   const boundary = input.boundary?.trim() || undefined;
   return {
     assistant: input.assistant,

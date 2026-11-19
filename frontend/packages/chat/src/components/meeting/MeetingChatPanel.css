@@ -1,0 +1,114 @@
+/*
+ * THE IN-MEETING CHAT PANEL (MeetingChatPanel.tsx), sized as the sibling project's meeting sidebar: 380px beside the
+ * video, and no more than 45% of a mid-width window. Closed, the stage takes the whole width. On a phone-width screen the
+ * roster and the chat are each a pane of their own, the whole window wide (`meetingPanes.ts`). Every color is a
+ * design-system token with its light value as the fallback.
+ */
+/* THE RIGHT COLUMN (MeetingChatPanel): the roster at its top, then the chat panel with its own header. Its width is the
+   viewer's, set from the splitter (280px to 640px, 380px at first). */
+.ae-meeting-side {
+  width: var(--ae-meeting-side-width, 380px);
+  flex: none;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-0, #FFFFFF);
+}
+.ae-meeting-side[hidden] { display: none; }
+.ae-meeting-side-roster {
+  flex: 0 1 auto;
+  max-height: 40%;
+  overflow: auto;
+  border-bottom: 1px solid var(--divider-strong, #8F8F99);
+}
+/* With the chat closed, the roster takes the column. */
+.ae-meeting-side-roster:has(+ .ae-meeting-chat[hidden]) { max-height: none; flex: 1 1 auto; border-bottom: none; }
+.ae-meeting-side .ae-meeting-chat.ae-meeting-chat--panel { width: auto; height: auto; flex: 1 1 auto; min-height: 0; border-left: none; border-top: none; }
+.ae-meeting-chat.ae-meeting-chat--panel[hidden] { display: none; }
+
+/* THE SPLITTER between the video and the column: a thin line with a wide hit area, focusable and moved by the arrows. */
+.ae-meeting-splitter {
+  flex: none;
+  width: 8px;
+  margin: 0 -4px;
+  position: relative;
+  z-index: 2;
+  cursor: col-resize;
+  touch-action: none;
+  background: transparent;
+}
+.ae-meeting-splitter::before {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0; left: 50%;
+  width: 1px;
+  background: var(--divider-strong, #8F8F99);
+}
+.ae-meeting-splitter:hover::before, .ae-meeting-splitter:focus-visible::before { width: 3px; margin-left: -1px; background: var(--focus-ring, #7C3AED); }
+.ae-meeting-splitter:focus-visible { outline: none; }
+
+@media (max-width: 1024px) {
+  .ae-meeting-side { width: min(var(--ae-meeting-side-width, 300px), 45vw); }
+}
+/* A PANE ON A PHONE-WIDTH SCREEN: the roster or the chat takes the whole window between the header and the tab bar, with
+   no splitter. The video's pane does the same while it is the one shown, so closing the chat gives the video the window. */
+.ae-meeting-side.ae-meeting-side--pane { width: auto; flex: 1 1 auto; min-width: 0; }
+.ae-meeting-side-roster[hidden] { display: none; }
+.ae-meeting-side--pane .ae-meeting-side-roster { max-height: none; flex: 1 1 auto; border-bottom: none; }
+
+.ae-meeting-chat-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px 8px 16px;
+  border-bottom: 1px solid var(--divider-strong, #8F8F99);
+  background: var(--surface-50, #FAFAFA);
+  flex: none;
+}
+.ae-meeting-chat-panel-heading { display: grid; min-width: 0; }
+.ae-meeting-chat-panel-conversation {
+  font-size: 12px; color: var(--text-secondary, #71717A); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ae-meeting-chat-panel-header h2 { margin: 0; font-size: 15px; font-weight: 600; color: var(--text-primary, #09090B); }
+.ae-meeting-chat-panel-close {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--control-border-strong, #71717A);
+  border-radius: 6px;
+  background: var(--btn-secondary-bg, #FFFFFF);
+  color: var(--text-primary, #09090B);
+  cursor: pointer;
+}
+.ae-meeting-chat-panel-close:hover { background: var(--surface-200, #E4E4E7); color: var(--text-primary, #09090B); }
+.ae-meeting-chat-panel-close:focus-visible { outline: 2px solid var(--focus-ring, #14B8A6); outline-offset: 2px; }
+.ae-meeting-chat-panel-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.ae-meeting-chat-panel-body > * { flex: 1; min-height: 0; }
+
+/* The header's Chat button and the count of what arrived while the panel was closed. */
+.ae-meeting-chat-toggle { position: relative; display: inline-flex; align-items: center; gap: 6px; }
+.ae-meeting-chat-unread {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--danger-fill, #B91C1C);
+  color: #FFFFFF;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+}
+
+/* On the icon toggle, the count sits on its corner, so the button keeps its size. */
+.ae-mc-btn--icon .ae-meeting-chat-unread { position: absolute; top: -6px; right: -6px; }
+
+/* A phone-width screen: no splitter, 16px gutters, and a 44px close. */
+@media (max-width: 640px), (max-height: 480px) and (orientation: landscape) {
+  .ae-meeting-splitter { display: none; }
+  .ae-meeting-chat-panel-header { padding: 8px 16px; }
+  .ae-meeting-chat-panel-close { width: 44px; height: 44px; }
+}

@@ -2,6 +2,8 @@ import type { IntentCoverage } from '../../../../../backend/lambda/src/lib/golde
 import i18n from '@ae/shared/i18n';
 import type { PublishedVariables, VersionVariable, When } from '../../../../../backend/lambda/src/lib/variables.ts';
 import type { MessageEntry } from '../../../../../backend/lambda/src/lib/message-template.ts';
+import type { WelcomeOrientation } from '../../../../../backend/lambda/src/lib/welcome-orientation.ts';
+import type { TaskStateMachine } from '../../../../../backend/lambda/src/lib/task-state-machines.ts';
 import { consoleCredentials, sigv4GetJson, sigv4PostJson } from './sigv4Fetch';
 import { teamAssistant } from './teamScope';
 import { adminApiConfigured, adminUrl } from './adminApi';
@@ -80,6 +82,8 @@ export interface CatalogIntent {
   machine?: string;
   /** What a turn of the intent hands over; `image` makes its card offer an image model. */
   needs?: string;
+  /** The tools a turn of the intent is offered, within the version's allowlist. Absent means all of it. */
+  tools?: string[];
 }
 
 /** One step of a task machine, as the catalog serves it (`MachineStep` in `classification-catalog.ts`). */
@@ -106,21 +110,36 @@ export interface ClassificationCatalog {
   classification: string;
   models: { text: string[]; image: string[]; default?: string };
   guardrails?: Array<{ key: string; guardrailId: string }>;
-  contextSources?: Array<{ key: string; description?: string }>;
+  /** `type` and `prefix` decide which roles can read a source (`context-source-reach.ts`). */
+  contextSources?: Array<{ key: string; title?: string; description?: string; type?: string; prefix?: string }>;
+  /** The deployment declares the `notifications` capability, so a workflow can offer email. */
+  emailConfigured?: boolean;
   templates?: Array<{ name: string; active: string }>;
   /** `required`: a platform workflow every assistant has (the turn queue's), which no selection removes. */
   workflows?: Array<{ key: string; source: 'platform' | 'classification'; required: boolean; initial: string; states: string[]; steps?: MachineStep[] }>;
   packIntents?: string[];
+  /** Where the pack comes from: the classification's own parameter, or the platform's default pack it serves when none is set. */
+  packSource?: 'classification' | 'platform';
   /** The pack's intents with what each is for, and the machine a multi-step intent runs. */
   intents?: CatalogIntent[];
+  /** The classification's pack as stored, when it sets one: what a version copies as its own when it first edits a machine. */
+  storedPack?: { intents: unknown[]; machines?: Record<string, TaskStateMachine>; extends?: 'default' };
   /** The platform intents every assistant answers, each with whether it answers through the `general` route unrouted. */
   platformIntents?: Array<{ key: string; answersThroughGeneral: boolean }>;
   topology?: { processorTimeout: number; memorySize: number; reservedConcurrency?: number; maxTokens?: number };
   retrievalReach: string[];
-  /** The bucket the context prefixes are keys in (the deployment's attachments bucket). */
+  /** The bucket the context prefixes are keys in (the deployment's company bucket). */
   contextBucket?: string;
   roles: Record<string, { contextPrefixes: string[] }>;
   budgets?: { userHourly?: number; globalHourly?: number };
+  /** The deployment's welcome orientation for the classification: what the primary opens with when its version sets no opening. */
+  welcomeOrientation?: WelcomeOrientation;
+  /** The classification's primary assistant, the only one the deployment's orientation applies to. */
+  primaryAssistant?: string;
+  /** The deployment's onboarding intake for the classification: what the primary asks a person it has not met where its version sets none. */
+  onboardingIntake?: { greeting?: string; questions: string[] };
+  /** The deployment-wide lines a message is said from where no stored template fits, by template name. */
+  deploymentLines?: Record<string, string>;
   /** Every variable source the classification publishes, with its type, trust and whether it may decide (ADR-060). */
   variables?: PublishedVariables;
 }
@@ -175,10 +194,15 @@ export interface ProfileDefinitionBody {
   messages?: Record<string, MessageEntry>;
   /** The event workflows this version declares (ADR-061 decision 1), by name. */
   eventWorkflows?: Record<string, import('../../../../../backend/lambda/src/lib/event-workflow.ts').EventWorkflow>;
+  /** The processes this version owns (SPEC-PROCESSES P1), by name: a label, the workflows each links and its metrics. */
+  processes?: Record<string, import('../../../../../backend/lambda/src/lib/event-workflow.ts').VersionProcess>;
+  /** What a person's request runs, by intent (ADR-067 decision 1). */
+  intentWorkflows?: Record<string, import('../../../../../backend/lambda/src/lib/intent-workflow.ts').IntentWorkflow>;
   /** The variables this version names, each a source and a fallback (ADR-060 decision 1). */
   variables?: Record<string, VersionVariable>;
   /** The fields below are shown read-only on the page, each with its edit path. */
-  intentPack?: { intents?: Array<{ key: string; description?: string }>; [k: string]: unknown };
+  /** As stored: `extends: 'default'` inherits the platform intents, and an entry naming one overrides only what it says. */
+  intentPack?: { extends?: 'default'; intents?: Array<{ key: string; description?: string }>; [k: string]: unknown };
   workflows?: string[];
   /** Per workflow, when its confirmed step is put to the person (ADR-064 decision G). */
   confirmBrief?: Record<string, 'always' | 'when-incomplete'>;
@@ -197,6 +221,8 @@ export interface ProfileManifestTyped {
   provenance?: { instanceId?: string; sourceProfileName?: string; sourceVersion?: number | string; exportedConfigId?: string };
   /** Where the console draws each workflow step (ADR-061 decision 7): beside the body, never part of it. */
   layout?: WorkflowLayout;
+  /** A welcome workflow the console keeps while the welcome says a template or a prompt (ADR-067 G40): beside the body, never run. */
+  keptWelcomeWorkflow?: import('../../../../../backend/lambda/src/lib/event-workflow.ts').EventWorkflow;
   contentHash?: string;
   signature?: string;
 }
@@ -212,6 +238,8 @@ export interface ProfileVersionSummary {
   promotedFrom?: { profileName: string; version: number; experimentId: string };
   /** A version an administrator activated past the golden gate: the refusal passed, who, when and why (ADR-065). */
   activatedPastGate?: { code: string; params: Record<string, string | number>; reason: string; actor: string; at: string; runId?: string };
+  /** A version stored with the retired `welcome` (W1): the server refuses a rollback to it until the migration runs. */
+  retiredWelcome?: true;
 }
 
 /** Live, instance-bound infra identifiers for a profile's assistant (server-resolved) — for AWS deep links.
@@ -304,9 +332,15 @@ export interface ProfileListing {
   versions: ProfileVersionSummary[];
   hasDraft: boolean;
   draftConfigId?: string;
+  /** The active version New version cloned into the draft, when the draft records one. */
+  draftBasedOnVersion?: number;
+  /** The assistant and version an imported or copied draft came from, when the draft records them. */
+  draftCreatedFrom?: { profileName?: string; version?: number };
   resolved?: ResolvedInfra;
   /** The name people see beside its messages, when the listing could read it. */
   displayName?: string;
+  /** The name a version that sets none inherits: the one the identity is provisioned with (its directory entry's). */
+  provisionedDisplayName?: string;
   /** The classification the assistant answers in, and its role there. */
   classification?: string;
   role?: string;
@@ -328,6 +362,8 @@ export interface ProfileListing {
   deployedClassifierMode?: 'keyword' | 'llm';
   /** The active version's event workflows: each by name, the event that starts it and its rooms. Absent while none is active. */
   activeEventWorkflows?: Array<{ name: string; on: string; types?: string[] }>;
+  /** The tasks the active version gives to an assistant role (WT78), by workflow, step, role and the intent it names. */
+  activeRoleTasks?: Array<{ workflow: string; step: string; role: string; machine: string }>;
   /** Whether the active version declares an onboarding intake. */
   activeOnboarding?: boolean;
 }
@@ -351,6 +387,8 @@ export interface ToolDescriptor {
   /** The RUNTIME precondition that must also hold for the tool to be offered, even when a profile
    *  allows it - so the console can explain "enabled, but only active when X". */
   requires: string;
+  /** The assistant roles it is offered to, where that is its precondition; absent: every role. */
+  roles?: string[];
 }
 
 export type ProfileManifest = Record<string, unknown>;
@@ -441,11 +479,15 @@ export async function listProfiles(): Promise<ProfileListing[]> {
   return (await listProfilesAndTools()).profiles;
 }
 
-export async function createProfileVersion(profileName: string): Promise<{ profileName: string; draftConfigId: string }> {
+/**
+ * START A NEW VERSION (a draft cloned from the active version). A draft that exists is replaced only when
+ * `replaceConfigId` names it; otherwise the server refuses `409 DRAFT_EXISTS` with the configId of the draft there.
+ */
+export async function createProfileVersion(profileName: string, replaceConfigId?: string): Promise<{ profileName: string; draftConfigId: string }> {
   return post({
     admin: () => adminUrl('assistant-admin', '/admin/profiles/version'),
     team: (a) => adminUrl('assistant-admin', `/admin/assistants/${a}/profiles/version`),
-  }, { profileName });
+  }, { profileName, ...(replaceConfigId ? { replaceConfigId } : {}) });
 }
 
 /**
@@ -457,13 +499,20 @@ export async function createProfileVersion(profileName: string): Promise<{ profi
 export type ProfileDraftPatch = { [K in keyof ProfileDefinitionBody]?: ProfileDefinitionBody[K] | null } & {
   /** The canvas layout (ADR-061 decision 7): saved with the draft as its own body, never part of what the version does. */
   layout?: WorkflowLayout | null;
+  /** The kept welcome (ADR-067 G40): saved with the draft as its own body, never run; `null` clears it. */
+  keptWelcomeWorkflow?: import('../../../../../backend/lambda/src/lib/event-workflow.ts').EventWorkflow | null;
 };
 
-export async function editProfileDraft(profileName: string, patch: ProfileDraftPatch): Promise<{ profileName: string; draftConfigId: string }> {
+/**
+ * Edit the draft this console is showing, named by its configId. The server merges the patch only while that is still
+ * the stored draft: a draft saved since is refused `409 DRAFT_CHANGED`, and an edit naming none while one exists is
+ * `409 CONFIG_ID_REQUIRED`. With no draft and no configId, the edit starts one from the active version.
+ */
+export async function editProfileDraft(profileName: string, patch: ProfileDraftPatch, configId: string | null | undefined): Promise<{ profileName: string; draftConfigId: string }> {
   return post({
     admin: () => adminUrl('assistant-admin', '/admin/profiles/draft'),
     team: (a) => adminUrl('assistant-admin', `/admin/assistants/${a}/profiles/draft`),
-  }, { profileName, patch });
+  }, { profileName, patch, ...(configId ? { configId } : {}) });
 }
 
 /**
@@ -494,7 +543,7 @@ export async function previewWorkflowRun(
   profileName: string,
   workflow: string,
   definition: import('../../../../../backend/lambda/src/lib/event-workflow.ts').EventWorkflow,
-  sample: { values?: Record<string, string | boolean | string[]>; outcomes?: Record<string, 'success' | 'failure' | 'deadline'> } = {},
+  sample: { values?: Record<string, string | boolean | string[]>; outcomes?: Record<string, 'success' | 'failure' | 'deadline' | 'absent'> } = {},
 ): Promise<WorkflowPreview> {
   return post({
     admin: () => adminUrl('assistant-admin', '/admin/profiles/preview-run'),
@@ -519,7 +568,17 @@ export interface GoldenResult {
   readyToPromote: string[];
   pairedDifference: { mean: number; ci: [number | null, number | null]; entries: number } | null;
   minimumDetectable: number | null;
-  notExercised: Array<{ entryId: string; reason: 'tools' }>;
+  /** `tools`: a text entry whose answer used a tool; `step` or `tool`: a walk stopped at the step or tool named (ADR-066). */
+  notExercised: Array<{ entryId: string; reason: 'tools' | 'step' | 'tool'; step?: string; tool?: string }>;
+  /** The walks of multi-step entries (ADR-066 decision 7); absent when the run walked none. */
+  walks?: {
+    walked: number;
+    passed: number;
+    failed: number;
+    notExercised: number;
+    entries: Array<{ entryId: string; intent: string; outcome: 'passed' | 'failed' | 'not-exercised'; reason?: string; step?: string; tool?: string; runSteps?: string[] }>;
+    byIntent: Array<{ intent: string; walked: number; passed: number; failed: number; notExercised: number }>;
+  };
   regressionExercised: number;
   entries: number;
   k: number;
@@ -534,6 +593,8 @@ export interface GoldenGateReading {
   gate?: {
     entries: number;
     regressionEntries: number;
+    /** Live entries a run answers (those that used no tool); absent where the read did not count them. */
+    answeredEntries?: number;
     uncoveredRegression?: number;
     /** Per intent of the draft's pack (ADR-065 decision 6). */
     coverage?: IntentCoverage[];
@@ -655,7 +716,11 @@ export async function retireGoldenUpload(profileName: string, uploadId: string, 
  */
 export type IdentityRenameOutcome = 'applied' | 'unchanged' | 'unsupported' | 'failed';
 
-export async function activateProfileDraft(profileName: string): Promise<{
+/**
+ * Activate the draft this console is showing, named by the configId it was reviewed as. A draft saved since is refused
+ * `409 DRAFT_CHANGED` (with the configId there now) and nothing serving changes; no draft is `404 NO_DRAFT`.
+ */
+export async function activateProfileDraft(profileName: string, configId: string): Promise<{
   profileName: string;
   version?: number;
   identityRename?: IdentityRenameOutcome;
@@ -664,7 +729,7 @@ export async function activateProfileDraft(profileName: string): Promise<{
   return post({
     admin: () => adminUrl('assistant-admin', '/admin/profiles/activate'),
     team: (a) => adminUrl('assistant-admin', `/admin/assistants/${a}/profiles/activate`),
-  }, { profileName });
+  }, { profileName, configId });
 }
 
 /** What an administrator confirms to activate a draft past the golden gate (ADR-065 decision 5). */
@@ -757,10 +822,65 @@ export async function exportProfile(profileName: string, version?: number | 'dra
   return r.manifest;
 }
 
-export async function importProfile(manifest: ProfileManifest, targetProfileName?: string): Promise<{ imported: string; configId: string; landedAs: string }> {
+/**
+ * Import a manifest as the target's draft. A draft that exists is replaced only when `replaceConfigId` names it (the
+ * draft the preview warned about); otherwise the server refuses `409 DRAFT_EXISTS` and writes nothing.
+ */
+export async function importProfile(manifest: ProfileManifest, targetProfileName?: string, replaceConfigId?: string): Promise<{ imported: string; configId: string; landedAs: string }> {
   return post({
     admin: () => adminUrl('assistant-admin', '/admin/profiles/import'),
     team: (a) => adminUrl('assistant-admin', `/admin/assistants/${a}/profiles/import`),
-  }, { manifest, targetProfileName });
+  }, { manifest, targetProfileName, ...(replaceConfigId ? { replaceConfigId } : {}) });
+}
+
+/**
+ * A PROCESS AS ITS OWN MANIFEST (SPEC-PROCESSES P13): one `processes` entry and what its workflows need of a deployment, as
+ * `process-manifest.ts` writes it. The console reads it only to show where it came from and to send it back.
+ */
+export interface ProcessManifest {
+  schemaVersion: number;
+  kind: 'process';
+  ownerProfileName: string;
+  processName: string;
+  process: { label: string; description?: string; workflows: string[]; metrics?: unknown[] };
+  requires: Record<string, unknown>;
+  provenance?: Record<string, unknown>;
+  contentHash: string;
+  signature?: string;
+}
+
+/** One refusal of a process import, export or activation: its code and the names of what is missing, said from the locale bundle. */
+export interface ProcessRefusal {
+  code: string;
+  workflow?: string;
+  type?: string;
+  role?: string;
+  intent?: string;
+  assistant?: string;
+  template?: string;
+  machine?: string;
+  classification?: string;
+  process?: string;
+}
+
+/** Export one process of the active version, or of the draft, as its own manifest. */
+export async function exportProcess(profileName: string, processName: string, draft?: boolean): Promise<ProcessManifest> {
+  const r = await post<{ manifest: ProcessManifest }>({
+    admin: () => adminUrl('assistant-admin', '/admin/profiles/process-export'),
+    team: (a) => adminUrl('assistant-admin', `/admin/assistants/${a}/profiles/process-export`),
+  }, { profileName, processName, ...(draft ? { draft: true } : {}) });
+  return r.manifest;
+}
+
+/**
+ * Import a process manifest into its owner's draft, never the active version: the assistant `profileName` names (the page's),
+ * else the manifest's owner. A draft that exists is added to only when `replaceConfigId` names it (`409 DRAFT_EXISTS`). A
+ * deployment that lacks what the process needs answers `422` with `refusals`, and nothing is written.
+ */
+export async function importProcess(manifest: ProcessManifest, replaceConfigId?: string, profileName?: string): Promise<{ imported: string; profileName: string; configId: string; landedAs: string }> {
+  return post({
+    admin: () => adminUrl('assistant-admin', '/admin/profiles/process-import'),
+    team: (a) => adminUrl('assistant-admin', `/admin/assistants/${a}/profiles/process-import`),
+  }, { manifest, profileName: profileName || manifest.ownerProfileName, ...(replaceConfigId ? { replaceConfigId } : {}) });
 }
 

@@ -42,6 +42,7 @@
  */
 
 import { parseNotifyDirective, fanOutChannelNotification, mentionedMemberIds } from './channel-notify.js';
+import { addressesTheRoom } from './flow-bypass.js';
 import { emitEmfMetric } from './emf-metrics.js';
 import type { MessageStreamEvent } from './message-stream-event.js';
 import { decodeContent } from './chime/history.js';
@@ -100,7 +101,7 @@ export type NotifySkipReason =
 
 export type NotifyDecision =
   | { notify: false; reason: NotifySkipReason }
-  | { notify: true; channelArn: string; senderArn: string; messageText: string; personSent: boolean;
+  | { notify: true; channelArn: string; senderArn: string; messageText: string; personSent: boolean; privateMessage: boolean;
       directive: NonNullable<ReturnType<typeof parseNotifyDirective>> };
 
 /**
@@ -128,18 +129,17 @@ export function decideNotify(event: MessageStreamEvent): NotifyDecision {
   // carries is already the text a reader with no unwrapper can read.
   const messageText = decodeContent(p.Content || '');
 
-  // A PERSON'S MESSAGE MAY EMAIL ONLY THE PEOPLE IT MENTIONS. Their Metadata is
-  // theirs to write, so a hand-crafted `notify` must not reach the room: it needs a delimited mention
-  // to address anyone, and the fan-out then emails only mentioned members (`channel-notify.ts`). An
+  // A PERSON'S MESSAGE EMAILS ONLY WHO IT ADDRESSES. Their Metadata is theirs to write, so it needs a delimited mention or
+  // `@all` or `@humans` to address anyone, and the fan-out reaches only those members (`channel-notify.ts`). An
   // assistant's message is written by the platform and keeps every shape it had. Checked before the
   // directive parse, because it rejects most of the people's traffic for less.
   const personSent = !senderArn.includes('/bot/');
-  if (personSent && !mentionedMemberIds(messageText).length) return { notify: false, reason: 'person-mentions-no-one' };
+  if (personSent && !mentionedMemberIds(messageText).length && !addressesTheRoom(messageText)) return { notify: false, reason: 'person-mentions-no-one' };
 
   const directive = parseNotifyDirective(p.Metadata);
   if (!directive) return { notify: false, reason: 'no-directive' };
 
-  return { notify: true, channelArn: p.ChannelArn, senderArn, messageText, personSent, directive };
+  return { notify: true, channelArn: p.ChannelArn, senderArn, messageText, personSent, privateMessage: [p.Target, p.Targets].some((t) => Array.isArray(t) && t.length > 0), directive };
 }
 
 /**
@@ -169,6 +169,7 @@ export async function notifyOnDelivery(event: MessageStreamEvent): Promise<void>
       bearerArn: decision.senderArn,
       senderArn: decision.senderArn,
       personSent: decision.personSent,
+      privateMessage: decision.privateMessage,
       messageText: decision.messageText,
       directive: decision.directive,
     });

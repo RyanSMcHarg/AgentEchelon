@@ -61,8 +61,8 @@ export const ExperimentSettings: React.FC<{
   const { t } = useTranslation();
   return (
     <section className="admin-section" data-testid="experiment-settings" aria-labelledby="experiment-settings-title">
-      <h4 id="experiment-settings-title">{t('admin.experiments.settings.title')}</h4>
-      <h5>{t('admin.experiments.settings.split')}</h5>
+      <h3 id="experiment-settings-title">{t('admin.experiments.settings.title')}</h3>
+      <h4>{t('admin.experiments.settings.split')}</h4>
       <dl className="admin-config-list" data-testid="experiment-split">
         {(experiment.variants ?? []).map((v) => {
           const role = versionRoleOf(experiment, v.variantId);
@@ -81,7 +81,7 @@ export const ExperimentSettings: React.FC<{
       </dl>
       {experiment.battleEnabled && (
         <>
-          <h5>{t('admin.battle.mode')}</h5>
+          <h4>{t('admin.battle.mode')}</h4>
           <dl className="admin-config-list" data-testid="experiment-battle">
             <dt>{t('admin.experiments.battleChallenger')}</dt>
             <dd>{experiment.challengerAssistant ? <code>{experiment.challengerAssistant}</code> : '—'}</dd>

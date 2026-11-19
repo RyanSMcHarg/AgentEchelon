@@ -35,6 +35,66 @@
   border-radius: var(--radius-md);
 }
 
+/* A staged file that was not kept on this device: its name and the two ways on. */
+.message-input-reattach {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* A small text action inside a notice. */
+.message-input-inline-action {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-size: var(--text-sm);
+  color: var(--accent-500);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* Messages waiting in this device's outbox, on the same tokens as the notices above. */
+.message-input-queued {
+  list-style: none;
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.message-input-queued-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  background: var(--surface-100);
+  border: 1px dashed var(--surface-200);
+  border-radius: var(--radius-md);
+}
+
+.message-input-queued-item--failed {
+  border-style: solid;
+}
+
+.message-input-queued-text {
+  flex: 1 1 12rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+
+.message-input-queued-state {
+  font-style: italic;
+}
+
 .message-input-form {
   display: flex;
   align-items: flex-end;

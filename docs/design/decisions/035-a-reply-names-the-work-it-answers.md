@@ -45,14 +45,14 @@ This is for anyone with several items open with an assistant, on whatever channe
 | A reference a person could type | None. Task ids are UUIDs, shown only to the model |
 | Routing a group message | Since ADR-034 the channel flow resolves every `@` token from message text and dispatches the turn itself, so a group conversation is routed from content the flow provably receives |
 
-### How the non-web channels work, measured in this repository and in communication-hub
+### How the non-web channels carry a reply
 
 | Channel | Inbound reply | What it can carry | Reference implementation |
 |---|---|---|---|
-| **Email** | Built in communication-hub, designed here (SPEC-NOTIFICATION-BRIDGE). SES receipt, a signed token in `Message-ID` and a body footer, quoted text stripped, posted as the person through an assumed role when the token verifies | Plain text into the channel, plus the token's lookup row: conversation, person, and one `taskId` | The lookup row is keyed per conversation and person, so every new email overwrites its `taskId`. A token binds a reply to the conversation, not reliably to an item |
-| **SMS** | Not built in either repository. communication-hub has a design for a keyword set (YES, CONFIRM, DECLINE, STOP) and "the most recently active conversation" when a person has several | Plain text only; a single business sender number, no per-conversation or per-item numbering | None |
-| **Voice** | Built in communication-hub: inbound calls, fixed keypad menus, voicemail transcribed and posted by a bot | Transcribed speech and keypad digits | No notion of choosing an item |
-| **Admin commands (communication-hub)** | `accept meeting <id>` accepts a full id or an 8-character prefix; with no id it acts on the single pending request or lists them when several are pending | Text | The closest existing precedent: a short typed reference, the single case implicit, and a list when ambiguous |
+| **Email** | Designed here (SPEC-NOTIFICATION-BRIDGE): SES receipt, a signed token in `Message-ID` and a body footer, quoted text stripped, posted as the person through an assumed role when the token verifies | Plain text into the channel, plus the token's lookup row: conversation, person, and one `taskId` | The lookup row is keyed per conversation and person, so every new email overwrites its `taskId`. A token binds a reply to the conversation, not reliably to an item |
+| **SMS** | Not built. The usual shape is a keyword set (YES, CONFIRM, DECLINE, STOP) and "the most recently active conversation" when a person has several | Plain text only; a single business sender number, no per-conversation or per-item numbering | None |
+| **Voice** | Not built. The usual shape: inbound calls, fixed keypad menus, voicemail transcribed and posted by a bot | Transcribed speech and keypad digits | No notion of choosing an item |
+| **Typed admin commands** | A command such as `accept <id>` accepts a full id or an 8-character prefix; with no id it acts on the single pending request or lists them when several are pending | Text | The closest existing precedent: a short typed reference, the single case implicit, and a list when ambiguous |
 
 ## Options
 
@@ -68,7 +68,7 @@ This is for anyone with several items open with an assistant, on whatever channe
 
 **F. A sender number or address per item.** Does not scale, costs per number, and breaks the identity model where the conversation's own number identifies the conversation.
 
-**A per-thread token (communication-hub's email model) is not an option on its own.** It identifies the conversation, and its one `taskId` is overwritten by the next message, so it is a transport detail that a reference rides inside rather than a way to name an item.
+**A per-thread email token is not an option on its own.** It identifies the conversation, and its one `taskId` is overwritten by the next message, so it is a transport detail that a reference rides inside rather than a way to name an item.
 
 ## Decision
 

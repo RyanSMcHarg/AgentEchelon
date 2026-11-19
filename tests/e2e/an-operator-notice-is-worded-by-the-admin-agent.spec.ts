@@ -25,7 +25,7 @@ import { guardBackendErrors } from './helpers/turn-guards';
 import { pollFor } from './helpers/task-backend';
 import { awsv, awsvText } from './helpers/aws';
 import { SSM_ROOT, STACK_PREFIX, physicalIdsInClassificationStacks } from './helpers/stack-prefix';
-import { attachmentsBucket } from './helpers/delivered-template';
+import { profileBucket } from './helpers/delivered-template';
 import { assistantTemplatePointer, putAssistantTemplate, readPointer, restorePointer } from './helpers/template-pointer';
 import { roomMessagesSeenBy, type RoomMessage } from './helpers/event-run-messages';
 import { ADMIN_NOTICE_ASSISTANT, ADMIN_NOTICE_CLASSIFICATION, shippedAdminNotices } from '../../backend/lambda/src/lib/admin-notice-templates';
@@ -73,7 +73,7 @@ test.describe.serial('an operator notice is worded by the admin assistant (notif
     serviceAdmin = ssmValue(`${SSM_ROOT}/app-instance-admin-arn`);
     expect(agentBot, 'the admin channel is enabled, so the admin agent\'s bot ARN must be published').toContain('/bot/');
     expect(serviceAdmin, `${SSM_ROOT}/app-instance-admin-arn is not published`).toContain('/user/');
-    expect(attachmentsBucket(), 'the Conversations stack publishes no AttachmentsBucketName, where templates are stored').toBeTruthy();
+    expect(profileBucket(), 'the Conversations stack publishes no ProfileBucketName, where templates are stored').toBeTruthy();
 
     // AN ALARM NOTIFIER'S TOPIC: every classification stack subscribes the one notifier to its own alarm topics.
     try {

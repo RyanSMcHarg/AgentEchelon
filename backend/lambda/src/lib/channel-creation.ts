@@ -15,6 +15,8 @@
  * one message into the PARENT, carrying a durable link to the child in message Metadata.
  */
 
+import { TEAM_ROOM_TAG, teamRoomChannelId } from './event-triggers.js';
+import { withTurnDeclarationLine } from './turn-declaration.js';
 import { templateLine } from './message-lines.js';
 import { conversationNameFor, conversationNameText, PLACEHOLDER_TITLE } from './conversation-name.js';
 import { primaryTagFor } from './conversation-primary.js';
@@ -33,20 +35,23 @@ import {
   ChannelMessageType,
   ChannelMessagePersistenceType,
 } from '@aws-sdk/client-chime-sdk-messaging';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import {
   CONVERSATION_TYPES,
   DEFAULT_CONVERSATION_TYPE,
   GUEST_VISITOR_TYPE,
   classificationAllowedForType,
   getConversationTypeConfig,
+  meetingSettingsOf,
   membershipSourceStamp,
+  relationOf,
   type ExpirationCriterion,
 } from '../../../lib/config/conversation-types.js';
 import {
   putChannelContext,
   getChannelContext,
   seedChannelContext,
+  recordChildConversation,
   type ChannelContextPatch,
 } from './channel-context-client.js';
 import type { ResolvedAgent } from './default-agents.js';
@@ -104,6 +109,11 @@ export function useChannelCreationMessagingClient(client: ChimeSDKMessagingClien
 const conversationClient = sessionClient(ChimeSDKMessagingClient, { requestHandler: BOUNDED_REQUEST_HANDLER });
 
 export interface CreateConversationFromDriftInput {
+  /**
+   * THE TYPE THE MOVED SUBJECT OPENS AS, the move step's own (WT90): a type with drift off is how a
+   * workflow stops a child drifting again. Absent: an ordinary conversation.
+   */
+  typeKey?: string;
   /**
    * Whether creation posts the link to the new conversation in the parent. True by default. The
    * conversation split passes false: the processor that asked for the split posts the link itself, as
@@ -174,6 +184,8 @@ export interface CreateConversationFromDriftInput {
  */
 export interface CreateConversationFromEventInput {
   appInstanceArn: string;
+  /** This is its type's one team room, so its id and tag follow the convention (`lib/event-triggers.ts`). */
+  teamRoom?: boolean;
   /** The assistant the conversation is created FOR. Never the `CreateChannel` bearer: it is added as a
    *  member and moderator after the flow is attached. */
   botArn: string;
@@ -249,6 +261,8 @@ export interface CreateConversationFromEventInput {
    * context row with the rest, so the router runs `alarm-state-changed` here.
    */
   watchedAlarm?: string;
+  /** The keys the opening event names for the conversation to watch (DESIGN-EVENT-TARGETS section 3), each `<kind>#<id>`. */
+  watchedRefs?: string[];
 }
 
 export interface CreateConversationFromDriftResult {
@@ -457,6 +471,14 @@ export async function createConversationFromDrift(
   if (!profiles.isConversational(input.modelTier)) {
     throw new Error(`a conversation cannot be created at classification "${input.modelTier}"`);
   }
+  // THE TYPE A MOVE OPENS AS (a workflow's move step) MUST PERMIT THIS CLASSIFICATION, as every other creator requires.
+  if (input.typeKey && !classificationAllowedForType(input.typeKey, input.modelTier)) {
+    throw new Error(`conversation type "${input.typeKey}" does not permit classification "${input.modelTier}"`);
+  }
+  // A ROOM WHOSE MEMBERS COME FROM A GROUP IS THE GROUP'S, whatever a stored version declares: a move carries the room's people.
+  if (input.typeKey && membershipSourceStamp(input.typeKey)) {
+    throw new Error(`conversation type "${input.typeKey}" takes its members from its source, so a subject cannot move into one`);
+  }
   const title = sanitizeTitle(input.topicLabel);
   const priorSubject = sanitizeTriggerContext(input.topicLabel);
   return createConversationCore({
@@ -468,7 +490,7 @@ export async function createConversationFromDrift(
     // AN ORDINARY CONVERSATION, SPLIT FROM ONE. The classification is the input above; the type is never
     // derived from it. Only an ordinary conversation can drift (`ops` declares drift off), so its split
     // is ordinary too.
-    typeKey: DEFAULT_CONVERSATION_TYPE,
+    typeKey: input.typeKey && CONVERSATION_TYPES[input.typeKey] ? input.typeKey : DEFAULT_CONVERSATION_TYPE,
     channelId: newDriftChannelId(),
     title,
     modelId: input.modelId,
@@ -504,7 +526,7 @@ export async function createConversationFromDrift(
       // which is the only reason the quote was ever truncated - and, being member-writable, Metadata
       // made it editable by the very person it quotes.
     },
-    ...(input.postParentLink === false ? {} : { parentMessage: (created: CreateConversationResult) => topicMovedLink(title, created.channelArn, input.copy) }),
+    ...(input.postParentLink === false ? {} : { parentMessage: (created: CreateConversationResult) => topicMovedLink(title, created.channelArn, input.copy, input.originatingMessageId) }),
   });
 }
 
@@ -521,9 +543,15 @@ export function topicMovedLink(
   title: string,
   childChannelArn: string,
   copy?: { topicMoved?: string },
+  /**
+   * The person's message whose subject moved, on a drift move. Declared on the link so the history and summary
+   * here leave the moved exchange out (`lib/moved-subject.ts`). A split names none: its subjects stay here too.
+   */
+  movedMessageId?: string,
 ): { content: string; metadata: Record<string, unknown> } {
+  const line = templateLine('topic-moved', { copy }, { values: { title } });
   return {
-    content: templateLine('topic-moved', { copy }, { values: { title } }),
+    content: movedMessageId ? withTurnDeclarationLine(line, { kind: 'drift', moves: movedMessageId }) : line,
     metadata: { driftRedirect: { childChannelArn, label: title } },
   };
 }
@@ -876,7 +904,9 @@ export async function createConversationFromEvent(
     typeKey: input.typeKey,
     // NOT `conv-drift-...`. The drift id is member-visible in every client that shows a conversation id,
     // and an `ops` conversation branded a drift child is a thing an audience reads on screen.
-    channelId: newTypedChannelId(input.typeKey),
+    // A TEAM ROOM'S ID IS ITS NAME, the same every time, and its tag says what it is: the room is found by its ARN, with no table.
+    channelId: input.teamRoom ? teamRoomChannelId(input.typeKey, input.classification) : newTypedChannelId(input.typeKey),
+    ...(input.teamRoom ? { createOrGet: true, tagExtras: [{ Key: TEAM_ROOM_TAG, Value: input.typeKey }] } : {}),
     title: conversationNameText(input.name) || sanitizeTitle(input.topicLabel),
     modelId: input.modelId,
     modelName: input.modelName,
@@ -919,6 +949,7 @@ export async function createConversationFromEvent(
     contextExtras: {
       ...(input.participantRoles && Object.keys(input.participantRoles).length ? { participantRoles: input.participantRoles } : {}),
       ...(input.watchedAlarm ? { watchedAlarm: input.watchedAlarm } : {}),
+      ...(input.watchedRefs?.length ? { watchedRefs: input.watchedRefs } : {}),
       ...(sanitizeTriggerContext(input.topicLabel)
         ? (input.parentChannelArn
           ? { priorSubject: sanitizeTriggerContext(input.topicLabel) }
@@ -943,6 +974,11 @@ export async function createConversationFromEvent(
     // in the sense that an event concerned it, which the context row's `parentRef` carries as a link.
     metadataExtras: {
       ...(input.parentChannelArn ? { parentChannelArn: input.parentChannelArn } : {}),
+      // A MEETING'S CONVERSATION NAMES ITS ROOM, as a display hint for the client's conversation list, which lists
+      // it with its room's meetings rather than among ordinary conversations. Rewriting it moves only where the
+      // conversation is listed: the meeting's room is the context row's server-only `meetingOf`.
+      ...(input.parentChannelArn && meetingSettingsOf(input.typeKey)
+        ? { meetingOf: input.parentChannelArn.split('/').pop() } : {}),
     },
     // NO PARENT MESSAGE. The caller posts the notification, and a creator that also posted would put two
     // bot messages in the concerned conversation, one of them describing something that did not happen.
@@ -953,12 +989,19 @@ export async function createConversationFromEvent(
  * THE CHANNEL ID OF A HOST'S CONTEXT CONVERSATION: deterministic from the classification and the host's
  * context, so the same context always names the same channel (create-or-get), and charset-safe for an
  * Amazon Chime SDK ChannelId (`[A-Za-z0-9_-]`, at most 64). Classification-scoped, so a deployment that
- * changes the classification its oneChannel issuers name creates fresh channels carrying the new
+ * changes the `contextClassification` its issuers name creates fresh channels carrying the new
  * classification's tag rather than re-opening ones its assistant cannot act in.
  */
 export function contextChannelId(classification: string, contextType: string, contextId: string): string {
-  return `ctx-${classification}-${contextType}-${contextId}`.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 64);
+  // A DIGEST OF THE CONTEXT'S PARTS, so two contexts never share a channel: a readable prefix alone folds `-` and every other
+  // separator together and is cut at the length limit.
+  const digest = createHash('sha256').update(JSON.stringify([classification, contextType, contextId])).digest('hex').slice(0, CONTEXT_ID_DIGEST_LENGTH);
+  return `${`ctx-${classification}-${contextType}-${contextId}`.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, CHANNEL_ID_MAX - CONTEXT_ID_DIGEST_LENGTH - 1)}-${digest}`;
 }
+
+/** An Amazon Chime SDK ChannelId's limit, and how much of a context channel's id is its digest. */
+const CHANNEL_ID_MAX = 64;
+const CONTEXT_ID_DIGEST_LENGTH = 16;
 
 export interface CreateConversationForContextInput {
   appInstanceArn: string;
@@ -966,7 +1009,7 @@ export interface CreateConversationForContextInput {
   botArn: string;
   /** The person, as the AppInstanceUser the credential exchange resolved them to. */
   userArn: string;
-  /** The context classification the registry's oneChannel issuers name, never the request's. */
+  /** The registry's `contextClassification`, never the request's. */
   classification: Classification;
   /** DETERMINISTIC from the host's context, so a repeat call names the same channel (create-or-get). */
   channelId: string;
@@ -981,32 +1024,26 @@ export interface CreateConversationForContextInput {
   channelFlowArn?: string;
   /** The service admin, so no assistant is a member before the flow is attached. */
   creatorBearerArn?: string;
-  /**
-   * Whether the person is made a moderator. True for the host user opening their own conversation;
-   * false for a member the host enrolls (`membershipHandler` in `conversation-management.ts`), who is
-   * never handed a moderator role.
-   */
-  openerModerator?: boolean;
-  /** Records how long each step took. Optional. */
-  timer?: PhaseTimer;
 }
 
 /**
- * A HOST APP OPENS A CONTEXT-BOUND CONVERSATION FOR ITS OWN USER. The fourth origin.
+ * A HOST APP OPENS A CONTEXT-BOUND CONVERSATION FOR ITS OWN USER, through its membership function
+ * (`membershipHandler` in `conversation-management.ts`). The fourth origin.
  *
  * It creates the way every other origin does: the service admin creates, the flow is attached, the
  * assistant and the person are added, and the admin leaves.
  *
  * WHAT LEGITIMATELY DIFFERS, and nothing else does: the channel id is deterministic from the host's
  * context (`contextChannelId`), so creation is create-or-get and a `ConflictException` is returned to
- * the caller to decide who may re-open the existing conversation; the context binding goes in Metadata
- * and the host's grounding in the context row; and the classification is the one the trusted-issuer
- * registry's oneChannel issuers name, never the request's.
+ * the caller, which joins the person to the existing conversation; the person the host enrolls is a
+ * member and never a moderator; the context binding goes in Metadata and the host's grounding in the
+ * context row; and the classification is the trusted-issuer registry's `contextClassification`,
+ * never the request's.
  */
 export async function createConversationForContext(
   input: CreateConversationForContextInput,
 ): Promise<CreateConversationResult> {
-  // The same backstop every origin has. The registry refuses a oneChannel classification that is not
+  // The same backstop every origin has. The registry refuses a `contextClassification` that is not
   // conversational at synth.
   if (!profiles.isConversational(input.classification)) {
     throw new Error(`a conversation cannot be created at classification "${input.classification}"`);
@@ -1029,8 +1066,7 @@ export async function createConversationForContext(
     additionalMemberArns: [],
     agents: [],
     creatorBearerArn: input.creatorBearerArn,
-    openerModerator: input.openerModerator,
-    timer: input.timer,
+    openerModerator: false,
     contextExtras: input.contextExtras,
     metadataExtras: input.metadataExtras,
     tagExtras: input.tagExtras,
@@ -1089,33 +1125,45 @@ export async function createConversationForBriefing(
 }
 
 /**
- * COMPLETE AN EXISTING CONTEXT CONVERSATION, idempotently: its flow, its context row, then its members.
+ * THE ROOM CARRIES THE DEPLOYMENT'S CHANNEL FLOW: a room with none takes it before any member is added, and a failure adds
+ * nobody. A room carrying another flow is logged and left as it is. `known` is the flow a read in this request already
+ * found, or undefined to read it here.
+ */
+async function ensureChannelFlow(channelArn: string, channelFlowArn: string, ChimeBearer: string, known?: string | null): Promise<void> {
+  const attached = known !== undefined
+    ? known
+    : (await messagingClient.send(new DescribeChannelCommand({ ChannelArn: channelArn, ChimeBearer }))).Channel?.ChannelFlowArn;
+  if (!attached) {
+    console.warn('[channel-creation] an existing conversation has no channel flow; attaching it before any member is added', { channelArn });
+    await messagingClient.send(new AssociateChannelFlowCommand({ ChannelArn: channelArn, ChannelFlowArn: channelFlowArn, ChimeBearer }));
+  } else if (attached !== channelFlowArn) {
+    console.error('[channel-creation] an existing conversation carries a different channel flow; left as it is', { channelArn, attached, expected: channelFlowArn });
+  }
+}
+
+/**
+ * COMPLETE A BOUND VISITOR'S CONTINUATION, idempotently: its flow, its context row, then its members.
  *
- * A re-open reaches a conversation whose first creation may have stopped part way, in the order creation
- * runs: the channel created and the flow never attached (`AssociateChannelFlow` failed, which is logged and
- * not fatal for this origin, or the creation died between the two calls), the context row unwritten, the
- * assistant or the person not yet added. The retry's `CreateChannel` answers `ConflictException`, so this
- * is the only code that ever sees that room again, and it finishes it in the order creation would have:
+ * A retried bind reaches a continuation whose first creation may have stopped part way, and its `CreateChannel`
+ * answers `ConflictException`, so this is the only code that sees that room again. It finishes it in the order
+ * creation runs:
  *
- *   1. THE FLOW, BEFORE ANY MEMBER. Read from the channel (`DescribeChannel`) and associated when missing.
- *      Adding the assistant to a room with no flow is the defect creation's ordering exists to prevent:
- *      its welcome, and every message after, would bypass the flow. A flow that cannot be read or attached
- *      throws, so no member is added to an unflowed room.
+ *   1. THE CHANNEL FLOW, where it is missing, before any member can post.
  *   2. THE CONTEXT ROW, where it is missing (`seedChannelContext` writes only absent fields, so a complete
  *      row is unchanged). Before the assistant joins, because its welcome reads the participants.
- *   3. THE ASSISTANT AND THE OPENER. Each add tolerates `ConflictException`, the already-there answer.
+ *   3. THE ASSISTANT AND THE PERSON, each a member and a moderator. Each add tolerates `ConflictException`, the
+ *      already-there answer.
  *
  * The caller has already decided this person may re-open it; this function decides nothing. The bearer is
- * the service admin: an AppInstanceAdmin may describe, associate and add in any channel of the instance
- * without being in it, so the assistant is never the identity acting here.
+ * the service admin: an AppInstanceAdmin may add in any channel of the instance without being in it, so the
+ * assistant is never the identity acting here.
  */
-export async function reseatContextOpener(input: {
+export async function completeBoundContinuation(input: {
   channelArn: string;
   botArn: string;
   userArn: string;
   bearerArn: string;
-  /** The deployment's channel flow, attached when the room has none. */
-  channelFlowArn?: string;
+  channelFlowArn: string;
 }): Promise<void> {
   const tolerateConflict = async (send: () => Promise<unknown>) => {
     try {
@@ -1124,22 +1172,7 @@ export async function reseatContextOpener(input: {
       if ((err as { name?: string }).name !== 'ConflictException') throw err;
     }
   };
-  if (input.channelFlowArn) {
-    const described = await messagingClient.send(new DescribeChannelCommand({ ChannelArn: input.channelArn, ChimeBearer: input.bearerArn }));
-    const attached = described.Channel?.ChannelFlowArn;
-    if (!attached) {
-      console.warn('[channel-creation] a re-opened context conversation has no channel flow; attaching it before any member is added', {
-        channelArn: input.channelArn,
-      });
-      await messagingClient.send(new AssociateChannelFlowCommand({
-        ChannelArn: input.channelArn, ChannelFlowArn: input.channelFlowArn, ChimeBearer: input.bearerArn,
-      }));
-    } else if (attached !== input.channelFlowArn) {
-      console.error('[channel-creation] a re-opened context conversation carries a different channel flow; left as it is', {
-        channelArn: input.channelArn, attached, expected: input.channelFlowArn,
-      });
-    }
-  }
+  await ensureChannelFlow(input.channelArn, input.channelFlowArn, input.bearerArn);
   await seedChannelContext(input.channelArn, sharedContextFields(DEFAULT_CONVERSATION_TYPE, [subFromUserArn(input.userArn)]));
   for (const arn of [input.botArn, input.userArn]) {
     await tolerateConflict(() => messagingClient.send(new CreateChannelMembershipCommand({
@@ -1152,18 +1185,90 @@ export async function reseatContextOpener(input: {
 }
 
 /**
- * ENROL A PERSON THE HOST ADDS IN AN EXISTING CONTEXT CONVERSATION, idempotently: the room's assistant,
- * then the person, each as a DEFAULT member and never a moderator. The bearer is the service admin: an
- * AppInstanceAdmin may add members to any channel of the instance without being in it, so no assistant
- * is the identity acting here. The room's flow was attached when it was created. The caller has already
- * checked the room is of its own classification; this function decides nothing.
+ * COMPLETE AN EXISTING TEAM ROOM, idempotently (SPEC-WORKFLOWS-AND-TASKS WT121): its flow, then its primary assistant as a
+ * moderator, its lead as a moderator, the people and assistants its type names, and its role moderators. A team room's id is
+ * fixed and it is created once, so a creation that stopped part way is only ever seen again through `ConflictException`,
+ * and this is what finishes it, in the order creation runs. Each add tolerates `ConflictException`, the already-there answer.
+ *
+ * The context row is not written here: creation writes it straight after `CreateChannel`, before any step that can fail.
+ * The bearer is the service admin, which may describe, associate and add in any channel of the instance without being in it.
+ * An assistant that cannot be added fails the completion, as it fails a creation; a person who cannot be added is logged.
+ */
+export async function completeTeamRoom(input: {
+  channelArn: string;
+  primaryBotArn: string;
+  /** Empty when the room's lead role has no single holder: everyone else is still added. */
+  leadArn: string;
+  memberArns: string[];
+  agentBotArns: string[];
+  roleModerators: string[];
+  bearerArn: string;
+  channelFlowArn?: string;
+}): Promise<void> {
+  const tolerateConflict = async (send: () => Promise<unknown>) => {
+    try {
+      await send();
+    } catch (err) {
+      if ((err as { name?: string }).name !== 'ConflictException') throw err;
+    }
+  };
+  const ChimeBearer = input.bearerArn;
+  if (input.channelFlowArn) await ensureChannelFlow(input.channelArn, input.channelFlowArn, ChimeBearer);
+  // THE LEAD MAY BE NONE: a room completed while its on-call role has no single holder (a handover) gets everyone else, and its
+  // lead joins through the membership reconcile once the role has one again.
+  for (const arn of [input.primaryBotArn, input.leadArn].filter(Boolean)) {
+    await tolerateConflict(() => messagingClient.send(new CreateChannelMembershipCommand({ ChannelArn: input.channelArn, MemberArn: arn, Type: 'DEFAULT', ChimeBearer })));
+    await tolerateConflict(() => messagingClient.send(new CreateChannelModeratorCommand({ ChannelArn: input.channelArn, ChannelModeratorArn: arn, ChimeBearer })));
+  }
+  for (const arn of input.memberArns) {
+    if (!arn || arn === input.leadArn) continue;
+    await tolerateConflict(() => messagingClient.send(new CreateChannelMembershipCommand({ ChannelArn: input.channelArn, MemberArn: arn, Type: 'DEFAULT', ChimeBearer })))
+      .catch((err) => console.error('[channel-creation] could not carry a member into the team room', { channelArn: input.channelArn, memberArn: arn, message: (err as Error)?.message }));
+  }
+  for (const arn of input.roleModerators) {
+    if (!arn || arn === input.leadArn) continue;
+    await setParticipantRoleModerator({ channelArn: input.channelArn, personArn: arn, bearerArn: ChimeBearer, moderator: true }).catch((err) => {
+      console.error('[channel-creation] could not make a participant role\'s holder a moderator of the team room', { channelArn: input.channelArn, message: (err as Error)?.message });
+    });
+  }
+  for (const arn of input.agentBotArns) {
+    if (!arn || arn === input.primaryBotArn) continue;
+    await tolerateConflict(() => messagingClient.send(new CreateChannelMembershipCommand({ ChannelArn: input.channelArn, MemberArn: arn, Type: 'DEFAULT', ChimeBearer })));
+  }
+}
+
+/** Whether a channel stands, as the service admin reads it. A channel never created reads as refused, so both mean no. */
+export async function channelStands(channelArn: string, bearerArn: string): Promise<boolean> {
+  try {
+    await messagingClient.send(new DescribeChannelCommand({ ChannelArn: channelArn, ChimeBearer: bearerArn }));
+    return true;
+  } catch (err) {
+    const name = (err as { name?: string }).name;
+    if (name === 'NotFoundException' || name === 'ForbiddenException') return false;
+    throw err;
+  }
+}
+
+/**
+ * ENROL A PERSON THE HOST ADDS IN AN EXISTING CONTEXT CONVERSATION, idempotently: the room's flow where it has none (so a
+ * creation that stopped before its flow is finished here), then the room's assistant and the person, each as a DEFAULT
+ * member and never a moderator. The bearer is the service admin: an AppInstanceAdmin may add members to any channel of
+ * the instance without being in it, so no assistant is the identity acting here. The caller has already checked the room
+ * is of its own classification; this function decides nothing. Answers whether this add made the person a member, as
+ * opposed to finding them one already (`ConflictException`).
  */
 export async function addContextMember(input: {
   channelArn: string;
   botArn: string;
   userArn: string;
   bearerArn: string;
-}): Promise<void> {
+  /** The deployment's channel flow. A room with none takes it before any member is added; a failure adds nobody. */
+  channelFlowArn?: string;
+  /** The flow a read in this request found on the room (null: none), so it is not read again. */
+  attachedFlowArn?: string | null;
+}): Promise<boolean> {
+  if (input.channelFlowArn) await ensureChannelFlow(input.channelArn, input.channelFlowArn, input.bearerArn, input.attachedFlowArn);
+  let joined = true;
   for (const arn of [input.botArn, input.userArn]) {
     try {
       await messagingClient.send(new CreateChannelMembershipCommand({
@@ -1171,8 +1276,10 @@ export async function addContextMember(input: {
       }));
     } catch (err) {
       if ((err as { name?: string }).name !== 'ConflictException') throw err;
+      if (arn === input.userArn) joined = false;
     }
   }
+  return joined;
 }
 
 /**
@@ -1317,8 +1424,8 @@ async function requireOriginClassification(originChannelArn: string, classificat
 
 /**
  * THE CONTEXT EVERY NEW CONVERSATION'S ROW CARRIES, whatever its origin: who is in it, its type, when it
- * began, and its enforced membership source. One definition, so a re-open that finishes a half-created
- * room (`reseatContextOpener`) writes exactly what creation would have.
+ * began, and its enforced membership source. One definition, so a retried bind that finishes a half-created
+ * room (`completeBoundContinuation`) writes exactly what creation would have.
  */
 function sharedContextFields(typeKey: string, humanSubs: string[]): ChannelContextPatch {
   return {
@@ -1551,8 +1658,8 @@ async function createConversationCore(core: CoreInput): Promise<CreateConversati
   // the assistant becomes a member, and every message created before this association bypasses the flow
   // entirely, including the welcome. The service admin is the only member until this has run.
   //
-  // BEST-EFFORT FOR A DRIFT CONVERSATION AND FATAL FOR AN EVENT-INITIATED ONE, which is a real
-  // difference in what the two conversations are for rather than inconsistency.
+  // BEST-EFFORT FOR A DRIFT CONVERSATION AND FATAL FOR AN EVENT-INITIATED OR CONTEXT ONE, which is a real
+  // difference in what the conversations are for rather than inconsistency.
   //
   // A drift conversation has the person who asked for it sitting in it. Without a flow it is a room they
   // can still type in, and they will say so. An event-initiated conversation of type `ops` exists so a
@@ -1576,7 +1683,7 @@ async function createConversationCore(core: CoreInput): Promise<CreateConversati
     } catch (err) {
       // ERROR, NOT WARN, AND IT NAMES THE RESOURCES (2026-09-22).
       //
-      // The conversation still works, so this stays non-fatal - but what it comes up WITHOUT is the
+      // A drift conversation still works, so this stays non-fatal for it - but what it comes up WITHOUT is the
       // channel flow, which means no addressing, no marker stripping, no private-address enforcement
       // and no duplicate-placeholder claim, in a room that otherwise looks fine. That is not a warning.
       //
@@ -1596,6 +1703,12 @@ async function createConversationCore(core: CoreInput): Promise<CreateConversati
         err: (err as { name?: string })?.name ?? err,
       });
       if (core.origin === 'event') throw err;
+      // A CONTEXT ROOM IS REFUSED TOO, and nobody joins a room the flow cannot reach. Its id is deterministic, so the host's
+      // retry reaches `addContextMember`, which attaches the flow first; the service admin leaves now, since no later step will.
+      if (core.origin === 'context') {
+        await timed(timer, 'adminLeaves', () => adminLeaves(channelArn, creatorBearer));
+        throw err;
+      }
     }
   }
 
@@ -1779,6 +1892,12 @@ async function createConversationCore(core: CoreInput): Promise<CreateConversati
     //    (`lib/membership-reconcile.ts`). A call that fails while the other is in flight is tried once more
     //    on its own, so a conflict between the two can cost a round trip but never leaves the admin behind.
     await timed(timer, 'adminLeaves', () => adminLeaves(channelArn, creatorBearer));
+  }
+
+  // A `thread` CHILD IS LISTED ON ITS PARENT (DESIGN-WORKFLOWS-AND-TASKS section 6, rule 1), on the server-only row, so
+  // the parent's turns can read how it is going. A `move` child is not: the subject left, and only the links remain.
+  if (input.parentChannelArn && relationOf(core.typeKey) === 'thread') {
+    await recordChildConversation(input.parentChannelArn, { channelId, typeKey: core.typeKey, openedAt: new Date().toISOString() });
   }
 
   const created: CreateConversationResult = { channelArn, channelId };

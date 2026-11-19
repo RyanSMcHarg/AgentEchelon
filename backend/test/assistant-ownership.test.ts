@@ -78,6 +78,11 @@ jest.mock('@aws-sdk/client-ssm', () => ({
 }));
 
 process.env.SSM_ROOT = '/ae';
+// This instance's console roles, as the stack names them (`adminAuthEnv`).
+process.env.ADMIN_IAM_ENFORCEMENT = 'true';
+process.env.ADMIN_CONSOLE_ROLE_NAME = 'x-admin-console';
+process.env.TEAM_CONSOLE_ROLE_NAME = 'x-team-console';
+process.env.ADMIN_PLANE_ROLE_NAME = 'x-admin-plane';
 process.env.APP_INSTANCE_ARN = 'arn:aws:chime:us-east-1:1:app-instance/a';
 process.env.USER_POOL_ID = 'us-east-1_pool';
 
@@ -226,6 +231,17 @@ describe('a team member assigning ownership', () => {
 
   it('refuses a body naming another assistant than the route', async () => {
     expect(await call(teamEvent('ops-premium', { assistant: 'analyst', team: 'ops', reason: 'r' }))).toEqual({ status: 403, code: 'ASSISTANT_MISMATCH' });
+  });
+
+  it("DENY: another instance's console sessions are refused here, whatever grant admitted them, and nothing is read or assigned", async () => {
+    for (const role of ['other-admin-console', 'other-team-console']) {
+      for (const method of ['GET', 'POST']) {
+        const e = { ...apiEvent(method, { assistant: 'analyst', team: 'ops', reason: 'r' }), requestContext: { identity: { userArn: `arn:aws:sts::1:assumed-role/${role}/console-${SUB}` } } } as unknown as APIGatewayProxyEvent;
+        const res = await call(e);
+        expect(res.status).toBe(403);
+      }
+    }
+    expect(owner(ANALYST)).toBeNull();
   });
 
   it('is refused on the admin route, which lists every owner and assigns any team', async () => {

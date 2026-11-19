@@ -91,7 +91,7 @@ describe('MessageInput - replying to a duel side', () => {
     render(<MessageInput />);
     await send('Yes, that is exactly it. Go ahead.');
 
-    expect(sendMessage).toHaveBeenCalledWith('Yes, that is exactly it. Go ahead.', undefined, { targetArn: ATLAS });
+    expect(sendMessage).toHaveBeenCalledWith('Yes, that is exactly it. Go ahead.', undefined, { targetArn: ATLAS }, expect.objectContaining({ conversationArn: expect.any(String) }));
     expect(clearReplyingToSides).toHaveBeenCalled();
   });
 
@@ -118,8 +118,8 @@ describe('MessageInput - replying to a duel side', () => {
     expect(textarea().placeholder).toBe('conversation.placeholderBattleReplyBoth');
     await send('Audience is the leadership team.', 2);
 
-    expect(sendMessage).toHaveBeenNthCalledWith(1, 'Audience is the leadership team.', undefined, { targetArn: ATLAS });
-    expect(sendMessage).toHaveBeenNthCalledWith(2, 'Audience is the leadership team.', undefined, { targetArn: PIXEL });
+    expect(sendMessage).toHaveBeenNthCalledWith(1, 'Audience is the leadership team.', undefined, { targetArn: ATLAS }, expect.anything());
+    expect(sendMessage).toHaveBeenNthCalledWith(2, 'Audience is the leadership team.', undefined, { targetArn: PIXEL }, expect.anything());
   });
 
   it('a side waiting is not a reply mode: without a choice the send is an ordinary message', async () => {

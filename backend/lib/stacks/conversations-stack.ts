@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import { sharedOrigins, adminOrigin, invitationLandingFor } from '../config/app-origins';
+import { adminSessionRoleEnv } from '../constructs/admin-role-grants';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNodeJs from 'aws-cdk-lib/aws-lambda-nodejs';
@@ -22,18 +23,23 @@ import {
   adminPlaneMembershipStatements, ownInstanceFunctions, STACK_PREFIX, CAPABILITY_RESOURCES, INSTANCE_NAME, membershipAsServiceAdminStatements,
   modelArnsForClassification,
   EVERY_CLASSIFICATION, neverAnOutsideConversation, memberRoutersByNameStatements, routerByNameEnvironment,
-  ownInstanceMemberConversationFunctions,
+  ownInstanceMemberConversationFunctions, anyClassificationTagged, meetingRowReadConditions,
 } from './agent-classification-common';
 import { getModelCatalog, type Classification } from '../config/model-strategy';
 import { guestSettingsOf } from '../config/issuers';
-import { bindTargetCreatorsOnly, conversationCreatorInvoke, memberCreatorsOnly, CONVERSATION_CREATOR_PARAM_ROOT } from '../constructs/conversation-creator';
+import { bindTargetCreatorsOnly, conversationCreatorInvoke, memberCreatorsOnly, CONVERSATION_CREATOR_PARAM_ROOT, typedCreatorName } from '../constructs/conversation-creator';
 import { APPROVAL_QUEUE_ATTRIBUTE, REGISTRATIONS_AWAITING_APPROVAL } from '../../lambda/src/lib/upgrade';
 import { grantIssuerRegistry, issuersOf } from '../constructs/trusted-issuers';
 import { grantServerEventAppend } from '../constructs/server-event-writer';
-import { grantAccountStateRead, grantDirectoryRead } from '../constructs/directory-access';
+import { grantAccountStateRead, grantDirectoryRead, grantLiveClearance } from '../constructs/directory-access';
 import type { RouteSource, RouteSpec, RouteThrottle } from '../constructs/http-api';
 import { grantTokenKinds } from '../constructs/token-store';
-import { claimTargetOf, GUEST_VISITOR_TYPE, upgradePathsOf } from '../config/conversation-types';
+import { dashboardPagesReadStatement } from '../constructs/dashboard-distribution';
+import { DASHBOARDS_FAMILY } from '../../lambda/src/lib/dashboard-keys';
+import { TRANSCRIPTS_FAMILY } from '../../lambda/src/lib/meeting-transcript';
+import { RECORDINGS_FAMILY } from '../../lambda/src/lib/meeting-recording';
+import { meetingRecordingsSinkStatements } from '../constructs/meeting-recordings';
+import { claimTargetOf, GUEST_VISITOR_TYPE, MAX_CONVERSATION_TTL_DAYS, upgradePathsOf } from '../config/conversation-types';
 import { INVITATIONS_BY_CHANNEL, INVITATION_CHANNEL_ATTRIBUTE } from '../../lambda/src/lib/invitations';
 import { CLASSIFICATION_PACK_PREFIX } from '../../lambda/src/lib/profile-bodies';
 
@@ -64,6 +70,10 @@ export interface ConversationsStackProps extends cdk.StackProps {
   credentialExchangeFunctionArn?: string;
   /** The classifications the `invitation-link` issuer declares (Identity), when the registry declares one. */
   invitationLinkReach?: string[];
+  /** The `dashboard-pages` capability is declared: CloudFront may read dashboard pages from the attachments bucket. */
+  dashboardPages?: boolean;
+  /** The `meetings` capability is declared: the media pipelines service may write a meeting's recording to the attachments bucket. */
+  meetings?: boolean;
   /**
    * Whether `notifications` is declared: the invitation and guest-upgrade functions are told the `TransactionalMail`
    * function's fixed name, which sends their emails. Absent, they send none, and each answers with its unsent path.
@@ -96,8 +106,18 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
   public readonly routes: RouteSpec[] = [];
   /** The archive, removal and leave handler; the admin console's archive route reaches it too. */
   public readonly conversationManagementFunction: lambda.IFunction;
-  /** The attachments bucket: user uploads, assistant deliverables, and profile bodies under `profiles/*`. */
+  /**
+   * THREE BUCKETS, ONE OWNER EACH. The attachments bucket holds what conversations produce: a member's upload
+   * (`attachments/`), an assistant's deliverable (`generated-docs/`) and a generated image (`battle-images/`).
+   */
   public readonly attachmentsBucket: s3.Bucket;
+  /** The company bucket: the company corpus (`context/`) and the platform's self-knowledge (`platform-knowledge/`). */
+  public readonly companyBucket: s3.Bucket;
+  /**
+   * The profile bucket: what an assistant is. Profile bodies (`profiles/`), intent packs (`classification-packs/`)
+   * and message and document templates (`templates/`).
+   */
+  public readonly profileBucket: s3.Bucket;
   public readonly presignedUrlFunction: lambda.Function;
   /**
    * UserFeedback (thumbs) table. Exposed so the Aurora archive can read it for the per-variant thumbs
@@ -160,6 +180,16 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
       indexName: 'channelArn-updatedAt-index',
       partitionKey: { name: 'channelArn', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'updatedAt', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    // THE OPEN WORK OF THE CONVERSATIONS A CONVERSATION'S WORKFLOW OPENED, BY MACHINE (WT122): a team conversation reads every
+    // open incident it opened in one query, each held in its own conversation. SPARSE: only a task a `conversation-opened` run opens in a
+    // conversation a workflow opened carries `openedFrom`, so no other task is indexed.
+    agentTasksTable.addGlobalSecondaryIndex({
+      indexName: 'openedFrom-taskType-index',
+      partitionKey: { name: 'openedFrom', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'taskType', type: dynamodb.AttributeType.STRING },
       projectionType: dynamodb.ProjectionType.ALL,
     });
 
@@ -527,18 +557,25 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
           id: 'DeleteOldVersions',
           noncurrentVersionExpiration: cdk.Duration.days(30),
         },
-        {
-          id: 'DeleteOldAttachments',
-          expiration: cdk.Duration.days(90), // Keep attachments for 90 days
-        },
-        // A golden-set upload's entries, before they are de-identified, are handed over here and removed once read; this
-        // removes any the import did not, and their versions, within a day (ADR-065 decision 7).
-        {
-          id: 'ExpireGoldenUploads',
-          prefix: 'golden-uploads/',
-          expiration: cdk.Duration.days(1),
-          noncurrentVersionExpiration: cdk.Duration.days(1),
-        },
+        // NINETY DAYS FOR WHAT A CONVERSATION PRODUCES: a member's upload, an assistant's delivered document and a
+        // generated image, one rule per family (tenet D15).
+        { id: 'DeleteOldAttachments', prefix: 'attachments/', expiration: cdk.Duration.days(90) },
+        { id: 'DeleteOldGeneratedDocs', prefix: 'generated-docs/', expiration: cdk.Duration.days(90) },
+        { id: 'DeleteOldGeneratedImages', prefix: 'battle-images/', expiration: cdk.Duration.days(90) },
+        // A CONVERSATION'S DASHBOARD (DESIGN-CONVERSATION-DASHBOARDS section 3): thirty days after its last write, as an ops
+        // conversation expires thirty days after its last message, and a superseded version after one.
+        { id: 'DeleteOldDashboards', prefix: DASHBOARDS_FAMILY, expiration: cdk.Duration.days(30), noncurrentVersionExpiration: cdk.Duration.days(1) },
+        // THE `meetings` CAPABILITY'S ATTACH POINT: its families' expiry, where it is declared.
+        // A MEETING'S TRANSCRIPT (SPEC-ASSISTANT-MEETINGS FR28) LIVES AS LONG AS ITS CONVERSATION: the conversation expires
+        // the platform's longest after its last message, which is at the meeting's end, so the transcript expires that long
+        // after it is written. No setting of its own.
+        // A MEETING'S AUDIO AND VIDEO RECORDING (SPEC-ASSISTANT-MEETINGS FR70) LIVES AS LONG AS ITS CONVERSATION, as its
+        // transcript does. The capture chunks beneath it are deleted once their recording is written
+        // (`meeting-recording-events.ts`), and this expiry removes any a delete missed.
+        ...(props.meetings ? [
+          { id: 'DeleteOldTranscripts', prefix: TRANSCRIPTS_FAMILY, expiration: cdk.Duration.days(MAX_CONVERSATION_TTL_DAYS) },
+          { id: 'DeleteOldRecordings', prefix: RECORDINGS_FAMILY, expiration: cdk.Duration.days(MAX_CONVERSATION_TTL_DAYS) },
+        ] : []),
       ],
       cors: [
         {
@@ -553,6 +590,32 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
         },
       ],
     });
+
+    // WHAT THE PLATFORM SERVES FROM IS KEPT APART FROM WHAT CONVERSATIONS PRODUCE. Neither bucket carries an expiry:
+    // a profile version's persona and pack are read on every turn for as long as it is active or can be rolled back
+    // to, and the company corpus is read until its owner replaces it. Versioned, so a replaced object is recoverable
+    // for 30 days. No CORS: no browser reads either one directly.
+    const servedFrom = (id: string, rules: s3.LifecycleRule[] = []): s3.Bucket => new s3.Bucket(this, id, {
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      enforceSSL: true,
+      versioned: true,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      autoDeleteObjects: false,
+      lifecycleRules: [{ id: 'DeleteOldVersions', noncurrentVersionExpiration: cdk.Duration.days(30) }, ...rules],
+    });
+    this.companyBucket = servedFrom('CompanyBucket');
+    // A GOLDEN-SET UPLOAD BELONGS TO THE ASSISTANT IT EVALUATES. Its entries, before they are de-identified, are handed
+    // over under `golden-uploads/` and removed once read; this rule removes any the import did not, and their versions,
+    // within a day (ADR-065 decision 7). The one expiring family in this bucket, and it names its prefix (tenet D15).
+    this.profileBucket = servedFrom('ProfileBucket', [{
+      id: 'ExpireGoldenUploads',
+      prefix: 'golden-uploads/',
+      expiration: cdk.Duration.days(1),
+      noncurrentVersionExpiration: cdk.Duration.days(1),
+    }]);
+    new cdk.CfnOutput(this, 'CompanyBucketName', { value: this.companyBucket.bucketName, description: 'S3 bucket for the company corpus and the platform self-knowledge' });
+    new cdk.CfnOutput(this, 'ProfileBucketName', { value: this.profileBucket.bucketName, description: 'S3 bucket for assistant profile bodies, intent packs and templates' });
 
     // Published for offboarding (Identity), which deploys before this stack and resolves it at runtime,
     // and for the admin credential exchange's attachment reads. Every stack that deploys after this one takes the bucket by reference.
@@ -575,20 +638,82 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
       timeout: cdk.Duration.seconds(10),
       environment: {
         BUCKET_NAME: this.attachmentsBucket.bucketName,
-        EXPIRATION_SECONDS: '3600', // 1 hour
+        // FIVE MINUTES: a signed URL cannot be revoked, so a person removed from the conversation keeps
+        // what was already signed for them until it expires, and no longer.
+        EXPIRATION_SECONDS: '300',
         ALLOWED_ORIGIN: this.node.tryGetContext('appUrl') || 'http://localhost:5173',
+        // The conversation type the creator recorded, which says whether attachments are on (`lib/type-capability.ts`).
+        CHANNEL_CONTEXT_TABLE: channelContextTable.tableName,
       },
     });
+    this.presignedUrlFunction.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:GetItem'],
+      resources: [channelContextTable.tableArn],
+    }));
 
-    // Grant Lambda permissions to generate presigned URLs
-    this.attachmentsBucket.grantReadWrite(this.presignedUrlFunction);
+    // THE PRESIGNER SIGNS ONLY THE KEY FAMILIES IT SERVES: a person's upload under `attachments/`, and a
+    // download from `attachments/`, `generated-docs/`, `battle-images/` or a meeting's transcript (`transcripts/`). A URL carries the signer's
+    // permissions, so the role holds these and nothing else in the bucket.
+    this.presignedUrlFunction.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['s3:PutObject'],
+      resources: [this.attachmentsBucket.arnForObjects('attachments/*')],
+    }));
+    this.presignedUrlFunction.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['s3:GetObject'],
+      resources: ['attachments/*', 'generated-docs/*', 'battle-images/*'].map((p) => this.attachmentsBucket.arnForObjects(p)),
+    }));
+    // A meeting's transcript and recording are signed only where the `meetings` capability is declared.
+    if (props.meetings) {
+      this.presignedUrlFunction.addToRolePolicy(new iam.PolicyStatement({
+        sid: 'MeetingFilesSignedForMembers',
+        actions: ['s3:GetObject'],
+        resources: [`${TRANSCRIPTS_FAMILY}*/*.md`, `${RECORDINGS_FAMILY}*/media/composited-video/*.mp4`].map((p) => this.attachmentsBucket.arnForObjects(p)),
+      }));
+    }
+    // ITS OWN CHECK BEFORE IT SIGNS (`lib/conversation-access.ts`): the caller's membership, looked up
+    // with the caller as bearer, and the conversation's classification tag. Reads only.
+    this.presignedUrlFunction.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['chime:DescribeChannelMembership'],
+      resources: [`${props.appInstanceArn}/channel/*`, `${props.appInstanceArn}/user/*`],
+    }));
+    this.presignedUrlFunction.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['chime:ListTagsForResource'],
+      resources: [`${props.appInstanceArn}/channel/*`],
+    }));
+    // A MEETING WHOSE RECORD NAMES NO HOST is hosted by the parent conversation's moderators (`meeting-host.ts` `hostedMeetingLive`): whether
+    // the caller moderates it, asked with the caller as bearer. Reads only, where the `meetings` capability is declared.
+    if (props.meetings) {
+      this.presignedUrlFunction.addToRolePolicy(new iam.PolicyStatement({
+        sid: 'MeetingHostModeratorRead',
+        actions: ['chime:DescribeChannelModerator'],
+        resources: [`${props.appInstanceArn}/channel/*`, `${props.appInstanceArn}/user/*`],
+      }));
+    }
     // Who called is the edge authorizer's context, read through the registry (callerPersonId).
     grantIssuerRegistry(this.presignedUrlFunction, props.selfPoolId);
+    // The live clearance recheck of the shared conversation check (DESIGN-REVOCATION-WINDOWS R4).
+    grantLiveClearance(this.presignedUrlFunction, { appInstanceArn: props.appInstanceArn, userPoolId: props.selfPoolId });
     this.presignedUrlFunction.addEnvironment('APP_INSTANCE_ARN', props.appInstanceArn);
     this.routes.push({
       api: 'person', method: 'POST', path: '/presigned-url', handler: this.presignedUrlFunction, capability: 'core',
       throttle: { rate: 25, burst: 50 },
     });
+
+    // THE `dashboard-pages` CAPABILITY'S ATTACH POINT (DESIGN-CONVERSATION-DASHBOARDS section 4): where it is declared, CloudFront
+    // may read a conversation's dashboard page, and only pages, for any distribution of this account. The bucket's stack
+    // deploys before the capability's, so the condition cannot name the one distribution.
+    if (props.dashboardPages) this.attachmentsBucket.addToResourcePolicy(dashboardPagesReadStatement(this.attachmentsBucket, this.account));
+    // THE `meetings` CAPABILITY'S ATTACH POINT (SPEC-ASSISTANT-MEETINGS FR70): where it is declared, the Amazon Chime SDK media
+    // pipelines service may write a meeting's capture and its recording under `recordings/`, and nothing else in the bucket.
+    if (props.meetings) {
+      for (const st of meetingRecordingsSinkStatements(this.attachmentsBucket, this.account, this.partition)) this.attachmentsBucket.addToResourcePolicy(st);
+    }
+    // THE BUCKET'S OBJECT EVENTS GO TO THE ACCOUNT'S DEFAULT BUS where the `meetings` capability is declared, so a
+    // recording's written file is an event its finish is driven by (`meeting-recording-events.ts`) rather than something
+    // polled for. A native property of the bucket: no notification custom resource. A deployment without meetings sends none.
+    if (props.meetings) {
+      (this.attachmentsBucket.node.defaultChild as s3.CfnBucket).addPropertyOverride('NotificationConfiguration.EventBridgeConfiguration.EventBridgeEnabled', true);
+    }
 
     new cdk.CfnOutput(this, 'AttachmentsBucketName', {
       value: this.attachmentsBucket.bucketName,
@@ -670,9 +795,7 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
 
     // EVERY ROUTE BELOW IS A PERSON ROUTE, behind the edge authorizer on `PersonApi`, so no anonymous
     // caller can create channels, impersonate a userArn (taken from the request body), or burn Bedrock
-    // spend via the welcome generator. A person whose issuer declares the one-conversation session reaches
-    // only `ONE_CHANNEL_ROUTES` there, and is refused again by every handler that does not admit them
-    // (`callerPerson`, lib/auth.ts): two layers (tenet D3).
+    // spend via the welcome generator.
 
     // ── GET /tasks/mine — the open work items this user owns, across every conversation ──────────
     //
@@ -691,34 +814,48 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
       memorySize: 256,
       environment: {
         USER_TASKS_TABLE: userTasksTable.tableName,
+        // The conversation type the creator recorded, which says whether tasks are on (`lib/type-capability.ts`).
+        CHANNEL_CONTEXT_TABLE: channelContextTable.tableName,
         ALLOWED_ORIGIN: appUrl,
         SSM_ROOT,
         // POST /tasks composes the caller's AppInstanceUser ARN from their person id (callerPersonId) and
         // proves membership as that bearer, so it needs the instance it is composing against.
         APP_INSTANCE_ARN: props.appInstanceArn,
         // Where a classification's intent-pack body lives when its parameter holds a pointer.
-        PROFILE_BODY_BUCKET: this.attachmentsBucket.bucketName,
+        PROFILE_BODY_BUCKET: this.profileBucket.bucketName,
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
     userTasksTable.grantReadData(userTasksApiFn);
+    userTasksApiFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:GetItem'], resources: [channelContextTable.tableArn] }));
     // Who called is the edge authorizer's context, read through the registry (callerPersonId).
     grantIssuerRegistry(userTasksApiFn, props.selfPoolId);
+    // The live clearance recheck of the shared conversation check (DESIGN-REVOCATION-WINDOWS R4).
+    grantLiveClearance(userTasksApiFn, { appInstanceArn: props.appInstanceArn, userPoolId: props.selfPoolId });
 
     // ── WHAT THE WRITE HALF NEEDS, AND NOTHING MORE ─────────────────────────────────────────────
     //
     // `DescribeChannel` is the membership proof and is called with the CALLER as `ChimeBearer`, so the
     // grant covers `/user/*` as well as `/channel/*` for the same reason `turnStateApiFn`'s does: a
     // bearer this role may not act as cannot be used, so a channel the caller is not on cannot be
-    // described. `ListTagsForResource` reads the authoritative `archived` tag; the Metadata mirror of
+    // described. `DescribeChannelMembership`, bearing the caller, and `ListTagsForResource` are the shared
+    // check (`lib/conversation-access.ts`): membership and clearance against the `classification` tag.
+    // `ListTagsForResource` also reads the authoritative `archived` tag; the Metadata mirror of
     // it is explicitly non-authoritative and a live refusal may not rest on an archived copy.
     //
     // NO DIRECT TASK-TABLE WRITE. The row is written by the task service, which is the second
     // enforcement layer task access carries (tenet D3). Granting this function the table would make
     // that boundary a suggestion.
     userTasksApiFn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['chime:DescribeChannel', 'chime:ListTagsForResource'],
+      actions: ['chime:DescribeChannel', 'chime:DescribeChannelMembership', 'chime:ListTagsForResource'],
       resources: [`${props.appInstanceArn}/channel/*`, `${props.appInstanceArn}/user/*`],
+    }));
+    // THE LIST'S MEMBERSHIP IS ONE READ (`listReach`): `/tasks/mine` lists the caller's own memberships, bearing the
+    // caller, rather than one membership lookup per conversation that holds their work. The bearer and the user read
+    // are the caller, so the read returns only the caller's memberships.
+    userTasksApiFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['chime:ListChannelMembershipsForAppInstanceUser'],
+      resources: [props.appInstanceArn, `${props.appInstanceArn}/user/*`],
     }));
 
     // ── THE PER-CLASSIFICATION TASK SERVICE, READ BY NAME AT RUNTIME ────────────────────────────
@@ -756,10 +893,10 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
       ],
     }));
     // And the pack bodies those parameters point at. Read-only, on the pack key family and nothing else
-    // in the bucket; every classification's, for the same reason the parameter read is.
+    // in the profile bucket; every classification's, for the same reason the parameter read is.
     userTasksApiFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['s3:GetObject'],
-      resources: [this.attachmentsBucket.arnForObjects(`${CLASSIFICATION_PACK_PREFIX}/*`)],
+      resources: [this.profileBucket.arnForObjects(`${CLASSIFICATION_PACK_PREFIX}/*`)],
     }));
 
     // What is waiting in a conversation, for the client to RENDER rather than reconstruct (ADR-033).
@@ -792,12 +929,28 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
     turnStateTable.grantReadData(turnStateApiFn);
     // Who called is the edge authorizer's context, read through the registry (callerPersonId).
     grantIssuerRegistry(turnStateApiFn, props.selfPoolId);
+    // The live clearance recheck of the shared conversation check (DESIGN-REVOCATION-WINDOWS R4).
+    grantLiveClearance(turnStateApiFn, { appInstanceArn: props.appInstanceArn, userPoolId: props.selfPoolId });
     // Membership and per-message visibility are decided by Amazon Chime SDK, AS THE CALLER: the
-    // handler passes the caller's own bearer, so a non-member's describe fails and a targeted message
-    // they are not on cannot be fetched. That is why this grant is on `/user/*` rather than a bot.
+    // handler passes the caller's own bearer, so a non-member's membership lookup fails and a targeted
+    // message they are not on cannot be fetched. That is why this grant is on `/user/*` rather than a bot.
+    // Two legs of one action (tenet D12): the conversation must carry a classification, and the bearer leg
+    // names the people, whose AppInstanceUsers carry no classification tag to condition on.
     turnStateApiFn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['chime:DescribeChannel', 'chime:GetChannelMessage'],
-      resources: [`${props.appInstanceArn}/channel/*`, `${props.appInstanceArn}/user/*`],
+      sid: 'ReadInAClassifiedConversation',
+      actions: ['chime:DescribeChannelMembership', 'chime:GetChannelMessage'],
+      resources: [`${props.appInstanceArn}/channel/*`],
+      conditions: anyClassificationTagged(),
+    }));
+    turnStateApiFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadAsTheCaller',
+      actions: ['chime:DescribeChannelMembership', 'chime:GetChannelMessage'],
+      resources: [`${props.appInstanceArn}/user/*`],
+    }));
+    // The conversation's `classification` tag, which the caller's clearance must reach (`lib/conversation-access.ts`).
+    turnStateApiFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['chime:ListTagsForResource'],
+      resources: [`${props.appInstanceArn}/channel/*`],
     }));
 
     // POST /tasks - a person opens a work item in a conversation they are a member of. Authorized at the
@@ -844,9 +997,9 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
     // instance's `Instance` tag and the tag the caller is bounded to (`conversationCreatorInvoke`), so
     // declaring a classification changes nothing in this stack.
     //
-    // THE CONTEXT CLASSIFICATION: the one the trusted-issuer registry's oneChannel issuers name
-    // (lib/config/issuers.ts), at which a host's context conversations are created. Its creator also
-    // serves the context request, and its role also holds the re-open reads below.
+    // THE CONTEXT CLASSIFICATION: the one the trusted-issuer registry's `contextClassification` names
+    // (lib/config/issuers.ts), at which a host's context conversations are created, by the host's
+    // membership function below, whose role holds these reads.
     const contextClassification = issuersOf(this).contextClassification();
     /** Reads and refreshes, bearing the service admin, of a channel of the context classification only. */
     const contextChannelReads = (sid: string, actions: string[]): iam.PolicyStatement[] => (contextClassification ? [
@@ -949,6 +1102,7 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
       // THE ONE EMAIL, the account's sign-in link, as the transactional `claim` kind, sent by `Notifications`.
       nameTransactionalMail(upgradeFn, props.transactionalMail);
       this.guestUpgradeFunction = upgradeFn;
+      grantLiveClearance(upgradeFn, { appInstanceArn: props.appInstanceArn, userPoolId: props.selfPoolId });
       grantIssuerRegistry(upgradeFn, props.selfPoolId);
       // THE FUNNEL'S PATH B STAGES (B12): a claim issued, and a claim redeemed.
       grantServerEventAppend(upgradeFn, 'UpgradeFunnel');
@@ -1019,10 +1173,11 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
         actions: ['lambda:InvokeFunction'],
         resources: [minter],
       }));
-      // MEMBERSHIP AS THE CALLER, and the conversation's tags.
+      // MEMBERSHIP AS THE CALLER, and the conversation's tags: `DescribeChannel` for an inviter, and the shared check
+      // (`lib/conversation-access.ts`, `DescribeChannelMembership` bearing the caller) for a member listing or revoking.
       invitationsFn.addToRolePolicy(new iam.PolicyStatement({
         sid: 'TheInvitersMembership',
-        actions: ['chime:DescribeChannel', 'chime:ListTagsForResource'],
+        actions: ['chime:DescribeChannel', 'chime:DescribeChannelMembership', 'chime:ListTagsForResource'],
         resources: [`${props.appInstanceArn}/channel/*`, `${props.appInstanceArn}/user/*`],
       }));
       for (const st of membershipAsServiceAdminStatements('InviteeMembership', props.appInstanceArn, EVERY_CLASSIFICATION, conversationServiceAdminArn,
@@ -1035,6 +1190,8 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
         resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${INSTANCE_SSM.appInstanceAdminArn}`],
       }));
       grantIssuerRegistry(invitationsFn, props.selfPoolId);
+      // The live clearance recheck of the shared conversation check (DESIGN-REVOCATION-WINDOWS R4).
+      grantLiveClearance(invitationsFn, { appInstanceArn: props.appInstanceArn, userPoolId: props.selfPoolId });
       // THE ONE EMAIL, as the transactional `invitation` kind, sent by `Notifications`.
       nameTransactionalMail(invitationsFn, props.transactionalMail);
       // `invitation-sent` IS NAMED TO THE ROUTER of the conversation's classification (ADR-061 decision 1), found by
@@ -1053,7 +1210,7 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
     // ── PROPOSALS (ADR-061 decision 8, rule 8): THE APPLY ENDPOINT ─────────────────────────────────────────────
     //
     // A person applies or declines a proposal an agent step addressed to them (`proposals-api.ts`). It reads and
-    // consumes `proposal#*` records alone, proves the caller's membership as the caller (`DescribeChannel` bearing
+    // consumes `proposal#*` records alone, proves the caller's membership and clearance (`lib/conversation-access.ts`, bearing
     // them), reads the conversation's tags and its participant-role holdings, and performs the act holding grants the
     // assistant does not: the invitations function's reminder, and a member classification's typed creator, found by
     // its fixed name and bounded by its `audience` tag to this instance's member conversations, naming no list. Each grant is
@@ -1071,22 +1228,35 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
           TOKENS_TABLE: tokensTable.tableName,
           CHANNEL_CONTEXT_TABLE: channelContextTable.tableName,
           ALLOWED_ORIGIN: appUrl,
-          TYPED_CREATOR_NAME_PATTERN: `${STACK_PREFIX}Assistants-{classification}-TypedCreator`,
+          TYPED_CREATOR_NAME_PATTERN: typedCreatorName('{classification}'),
           ...(this.invitationsFunction ? { INVITATIONS_FUNCTION: this.invitationsFunction.functionName } : {}),
         },
       });
       grantTokenKinds(tokensTable, proposalsFn.role!, ['proposal'], ['dynamodb:GetItem', 'dynamodb:UpdateItem']);
+      // The live clearance recheck of the shared conversation check (DESIGN-REVOCATION-WINDOWS R4).
+      grantLiveClearance(proposalsFn, { appInstanceArn: props.appInstanceArn, userPoolId: props.selfPoolId });
       proposalsFn.addToRolePolicy(new iam.PolicyStatement({
         sid: 'ReadTheParticipantRoleHoldings',
         actions: ['dynamodb:GetItem'],
         resources: [channelContextTable.tableArn],
-        conditions: { 'ForAllValues:StringEquals': { 'dynamodb:Attributes': ['channelArn', 'conversationType', 'participantRoles'] } },
+        // An `add_to_meeting` proposal reads, again, the meeting it adds to: which room it is of, that room's meeting, and
+        // whether it runs and who hosts it (`lib/meeting-invites.ts`).
+        conditions: meetingRowReadConditions(props.appInstanceArn),
       }));
       proposalsFn.addToRolePolicy(new iam.PolicyStatement({
         sid: 'TheDecidersMembership',
-        actions: ['chime:DescribeChannel', 'chime:ListTagsForResource'],
+        actions: ['chime:DescribeChannelMembership', 'chime:ListTagsForResource'],
         resources: [`${props.appInstanceArn}/channel/*`, `${props.appInstanceArn}/user/*`],
       }));
+      // A moderator of the meeting's room or its own conversation may add people to it, asked bearing them, where the
+      // `meetings` capability is declared.
+      if (props.meetings) {
+        proposalsFn.addToRolePolicy(new iam.PolicyStatement({
+          sid: 'MeetingDecidersModeration',
+          actions: ['chime:DescribeChannelModerator'],
+          resources: [`${props.appInstanceArn}/channel/*`, `${props.appInstanceArn}/user/*`],
+        }));
+      }
       if (this.invitationsFunction) {
         proposalsFn.addToRolePolicy(new iam.PolicyStatement({
           sid: 'SendAConfirmedReminder',
@@ -1097,7 +1267,7 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
       proposalsFn.addToRolePolicy(new iam.PolicyStatement({
         sid: 'OpenAConfirmedConversation',
         actions: ['lambda:InvokeFunction'],
-        resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Assistants-*-TypedCreator`],
+        resources: [`arn:${this.partition}:lambda:${this.region}:${this.account}:function:${typedCreatorName('*')}`],
         conditions: ownInstanceMemberConversationFunctions(),
       }));
       this.routes.push(
@@ -1112,7 +1282,7 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
     }
 
     // THE API: it authenticates the person, applies the reach gate, the admin-plane refusal and the TTL
-    // limit, and invokes the requested classification's creator. It holds no Amazon Chime SDK grant.
+    // limit, and invokes the requested classification's creator. It holds no Amazon Chime SDK grant on a conversation.
     // EVERY MEMBERS CLASSIFICATION'S CREATOR, and never an outside one's: a person never opens a visitor's
     // conversation, and only guest start may ask the guest creator for one. A guest-only deployment has no
     // member creator, so the API holds no invoke and opens no conversation.
@@ -1157,9 +1327,9 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
       role: createConversationApiRole,
     });
 
-    // Who called is the edge authorizer's context, read through the registry (callerPersonId). Every issuer
-    // reaches it, the one-conversation ones included: it is one of `ONE_CHANNEL_ROUTES`.
+    // Who called is the edge authorizer's context, read through the registry (callerPersonId).
     grantIssuerRegistry(createConversationFunction, props.selfPoolId);
+    grantLiveClearance(createConversationFunction, { appInstanceArn: props.appInstanceArn, userPoolId: props.selfPoolId });
     this.routes.push({
       api: 'person', method: 'POST', path: '/create-conversation', handler: createConversationFunction, capability: 'core',
       throttle: CONVERSATION_THROTTLE,
@@ -1219,6 +1389,13 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
             // is `outside` or absent, so an add granted here later is still refused there by IAM, under the
             // handler, while the removals and the archive keep working on every conversation.
             ...neverAnOutsideConversation('ConversationManagementAdds', props.appInstanceArn, [...CONVERSATION_MANAGEMENT_ADDS]),
+            // THE CALLER'S OWN MEMBERSHIP, bearing the caller, before archive or remove acts for them as the
+            // service admin (`lib/conversation-access.ts`). A read, and only of a membership.
+            new iam.PolicyStatement({
+              actions: ['chime:DescribeChannelMembership'],
+              resources: [`${props.appInstanceArn}/channel/*`, `${props.appInstanceArn}/user/*`],
+              effect: iam.Effect.ALLOW,
+            }),
             // Read the classification tag before anything is decided: a read of the channel's tags,
             // which takes no bearer, on any channel so an untagged one is reported rather than denied.
             new iam.PolicyStatement({
@@ -1270,6 +1447,12 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
       ],
     });
     conversationActionsTable.grantWriteData(conversationMgmtRole);
+    // AN ENDED MEETING'S CONVERSATION IS ARCHIVED on its router's word, once its own row says it is a meeting's
+    // conversation whose last meeting has ended (`archiveEndedMeetingConversation`). A read of that row only.
+    // Where the `meetings` capability is declared.
+    if (props.meetings) {
+      conversationMgmtRole.addToPolicy(new iam.PolicyStatement({ sid: 'ReadAMeetingConversationsRecord', actions: ['dynamodb:GetItem'], resources: [channelContextTable.tableArn] }));
+    }
 
     const conversationMgmtFn = new lambdaNodeJs.NodejsFunction(this, 'ConversationManagementFunction', {
       entry: './lambda/src/conversation-management.ts',
@@ -1282,9 +1465,12 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
         APP_INSTANCE_ARN: props.appInstanceArn,
         ADMIN_ARN_PARAM: INSTANCE_SSM.appInstanceAdminArn,
         AUDIT_TABLE: conversationActionsTable.tableName,
+        CHANNEL_CONTEXT_TABLE: channelContextTable.tableName,
         ...managementNotices.env,
-        // The admin console calls this function too, to archive from the console (admin API, IAM).
+        // The admin console calls this function too, to archive from the console (admin API, IAM), and only
+        // this instance's admin console session is admitted there (`isAdminConsoleSession`).
         ALLOWED_ORIGIN: [...new Set([appUrl, adminOrigin(this)])].join(','),
+        ...adminSessionRoleEnv(),
       },
       bundling: { minify: false, forceDockerBundling: false, externalModules: ['@aws-sdk/*'] },
     });
@@ -1297,6 +1483,8 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
 
     // Who called is the edge authorizer's context, read through the registry (callerPersonId).
     grantIssuerRegistry(conversationMgmtFn, props.selfPoolId);
+    // The live clearance recheck of the shared conversation check (DESIGN-REVOCATION-WINDOWS R4).
+    grantLiveClearance(conversationMgmtFn, { appInstanceArn: props.appInstanceArn, userPoolId: props.selfPoolId });
     this.conversationManagementFunction = conversationMgmtFn;
     for (const action of ['archive', 'remove-member', 'leave']) {
       this.routes.push({
@@ -1314,7 +1502,7 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
     // DEFAULT member (never a moderator) and the room's primary greets them; REMOVE evicts. The person is
     // named by issuer and subject and resolved through the trusted-issuer registry and Identities.
     //
-    // Stood up when the registry declares a oneChannel issuer, whose context classification it serves.
+    // Stood up when the registry declares a `contextClassification`, which it serves.
     if (contextClassification) {
       const membershipRole = new iam.Role(this, 'ConversationMembershipRole', {
         assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
@@ -1359,8 +1547,9 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
           iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
         ],
       });
-      // Add writes the private host grounding to the server-only store, never channel Metadata.
-      channelContextTable.grant(membershipRole, 'dynamodb:UpdateItem');
+      // Add writes the private host grounding to the server-only store, never channel Metadata, and reads the
+      // row's member list so a re-add replaces a person's entry.
+      channelContextTable.grant(membershipRole, 'dynamodb:UpdateItem', 'dynamodb:GetItem');
       const membershipFn = new lambdaNodeJs.NodejsFunction(this, 'ConversationMembershipFunction', {
         entry: './lambda/src/conversation-management.ts',
         handler: 'membershipHandler',
@@ -1465,6 +1654,11 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
               actions: ['chime:DescribeChannelMembership'],
               resources: [`${props.appInstanceArn}/*`],
             }),
+            // The conversation's `classification` tag, which the voter's clearance must reach (`lib/conversation-access.ts`).
+            new iam.PolicyStatement({
+              actions: ['chime:ListTagsForResource'],
+              resources: [`${props.appInstanceArn}/channel/*`],
+            }),
           ],
         }),
       },
@@ -1491,6 +1685,8 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
 
     // Who called is the edge authorizer's context, read through the registry (callerPersonId).
     grantIssuerRegistry(feedbackFn, props.selfPoolId);
+    // The live clearance recheck of the shared conversation check (DESIGN-REVOCATION-WINDOWS R4).
+    grantLiveClearance(feedbackFn, { appInstanceArn: props.appInstanceArn, userPoolId: props.selfPoolId });
     // POST is person-level: any signed-in person submits feedback. The summary an administrator reads is
     // the `AdminServices` stack's (`view-analytics`), on `AdminApi`.
     this.routes.push({

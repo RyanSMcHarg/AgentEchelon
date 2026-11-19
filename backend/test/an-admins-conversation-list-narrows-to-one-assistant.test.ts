@@ -57,7 +57,7 @@ const list = (assistant?: string): APIGatewayProxyEvent => ({
   headers: { origin: 'http://localhost:5173' },
   pathParameters: null,
   queryStringParameters: { limit: '25', offset: '0', ...(assistant !== undefined ? { assistant } : {}) },
-  requestContext: { identity: { userArn: 'arn:aws:sts::1:assumed-role/ae-admin-console/console-sub' } },
+  requestContext: { identity: { userArn: 'arn:aws:sts::1:assumed-role/agent-echelon-admin-console/console-sub' } },
 } as unknown as APIGatewayProxyEvent);
 const body = (res: { body: string }) => JSON.parse(res.body);
 

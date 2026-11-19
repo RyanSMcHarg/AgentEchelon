@@ -63,7 +63,7 @@ const manifest = {
     modelKey: 'opus',
     models: { default: 'opus', classifier: 'sonnet' },
     intentPack: { intents: [{ key: 'account_review' }, { key: 'pricing' }] },
-    welcome: { title: 'Hello' },
+    eventWorkflows: { welcome: { on: 'assistant-joined' } },
     persona: 'You advise.',
   },
 };
@@ -105,16 +105,16 @@ describe('the steps', () => {
   it('lists every step and marks the current one', () => {
     renderFlow();
     const steps = within(screen.getByRole('list', { name: 'Steps' })).getAllByRole('listitem');
-    expect(steps.map((s) => s.textContent)).toEqual(['Classification and name', 'Starting point and models', 'Behavioral', 'Workflows', 'Scope and models', 'Tools and context', 'Review and activate']);
+    expect(steps.map((s) => s.textContent)).toEqual(['Classification and name', 'Starting point and models', 'Behavioral', 'Purview', 'Workflows', 'Templates', 'Tools and context', 'Security', 'Review and activate']);
     expect(steps[0]).toHaveAttribute('aria-current', 'step');
-    expect(screen.getByTestId('create-step-heading')).toHaveTextContent('Step 1 of 7: Classification and name');
+    expect(screen.getByTestId('create-step-heading')).toHaveTextContent('Step 1 of 9: Classification and name');
   });
 
   it('keeps the introduction to the wizard behind a ? control', () => {
     renderFlow();
-    expect(screen.queryByText(/built in the background with a first draft/)).toBeNull();
+    expect(screen.queryByText(/You finish the draft and activate it after/)).toBeNull();
     fireEvent.click(screen.getByTestId('create-help'));
-    expect(screen.getByTestId('create-help-panel')).toHaveTextContent('built in the background with a first draft');
+    expect(screen.getByTestId('create-help-panel')).toHaveTextContent('You finish the draft and activate it after');
     expect(screen.getByTestId('create-help')).toHaveAttribute('aria-expanded', 'true');
   });
 
@@ -131,8 +131,7 @@ describe('the steps', () => {
     expect(screen.queryByTestId('create-deploy-step')).toBeNull();
     fireEvent.click(screen.getByTestId('create-deploy-help'));
     const step = screen.getByTestId('create-deploy-step');
-    expect(step).toHaveTextContent('one classification for its whole life');
-    expect(step).toHaveTextContent('tools, context, tags and IAM role');
+    expect(step).toHaveTextContent('Adding a new one takes a deploy');
     expect(within(step).getByRole('link', { name: /Adding a classification/ })).toHaveAttribute('href', DOC_SECTIONS.addClassification);
     expect(within(step).getByRole('link', { name: /Adding a role/ })).toHaveAttribute('href', DOC_SECTIONS.addRole);
     // It is not a field: nothing in it takes input.
@@ -251,7 +250,7 @@ describe('the starting point', () => {
     upload(JSON.stringify(manifest));
     await waitFor(() => expect(screen.getByTestId('create-start-source')).toHaveTextContent('advisor v4'));
     expect(screen.getByTestId('create-start-intents')).toHaveTextContent('account_review, pricing');
-    expect(screen.getByText(/Checked against premium when you create the assistant/)).toBeTruthy();
+    expect(screen.getByText(/Checked against premium; anything it can't use is refused/)).toBeTruthy();
     expect(screen.getByTestId('create-models-from-file')).toBeTruthy();
     expect(select('Default model').value).toBe('opus');
     expect(select('Classifier model').value).toBe('sonnet');
@@ -263,6 +262,30 @@ describe('the starting point', () => {
     expect(request.descriptor).toEqual({ modelKey: 'opus', classifierMode: 'llm', classifierModelKey: 'sonnet' });
     // The name was decided in the first step, so the name chosen there is the one sent, whatever the file names.
     expect(request.displayName).toBe('Advisor2');
+  });
+
+  it("says the welcome is the file's own when the file holds an assistant-joined workflow", async () => {
+    renderFlow();
+    toCan();
+    startWith(/Upload a profile file/);
+    upload(JSON.stringify(manifest));
+    await waitFor(() => expect(screen.getByTestId('create-start-contents')).toHaveTextContent("The file's own"));
+    expect(screen.queryByTestId('create-start-retired-welcome')).toBeNull();
+  });
+
+  it('says a file carrying the old-style welcome must move it into eventWorkflows, and does not create from it', async () => {
+    renderFlow();
+    toCan();
+    startWith(/Upload a profile file/);
+    const { eventWorkflows: _wf, ...body } = manifest.body;
+    upload(JSON.stringify({ ...manifest, body: { ...body, welcome: { title: 'Hello' } } }));
+    const said = await screen.findByTestId('create-start-retired-welcome');
+    expect(said).toHaveTextContent('old-style welcome');
+    expect(said).toHaveTextContent('Move it into eventWorkflows');
+    // The welcome row says the refusal, not that the welcome is the file's own.
+    expect(said.closest('dd')).not.toHaveTextContent("The file's own");
+    chooseFirstModel();
+    expect(createButton()).toBeDisabled();
   });
 
   it('does not fill in a model from a file that the classification does not select', async () => {
@@ -327,8 +350,8 @@ describe('creating', () => {
     chooseFirstModel();
     fireEvent.click(createButton());
     const building = await screen.findByTestId('create-building');
-    expect(building).toHaveTextContent('finance-advisor is being built');
-    expect(screen.getByTestId('create-step-heading')).toHaveTextContent('Step 3 of 7: Behavioral');
+    expect(building).toHaveTextContent('Building finance-advisor');
+    expect(screen.getByTestId('create-step-heading')).toHaveTextContent('Step 3 of 9: Behavioral');
     expect(onCheckBuild).not.toHaveBeenCalled();
     fireEvent.click(screen.getByTestId('create-check-build'));
     expect(onCheckBuild).toHaveBeenCalledTimes(1);

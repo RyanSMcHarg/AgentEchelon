@@ -4,7 +4,7 @@
  *
  * The workflow is read from the deployment, not assumed: premium's pack parameter (followed into the body store) is
  * searched for a step that declares `requiresTool`, in a workflow an intent of the pack opens as multi-step work. The
- * demo seed writes one, `account_brief` (`backend/demo/intent-packs.ts`): `researching` requires `load_company_context`
+ * demo seed writes one, `account_brief` (`demo/stratum-company/intent-packs.ts`): `researching` requires `load_company_context`
  * before the task may leave it for `drafting`. A deployment whose premium pack declares no such step fails here, naming
  * the pack, rather than skipping.
  *
@@ -49,11 +49,11 @@ const MARK = `REQTOOL-${Date.now().toString(36)}`;
  * customer accounts record holds both accounts; the figures match it, so a lookup confirms rather than corrects them.
  */
 const ASKS = [
-  `${MARK}: I need an account brief on Coastal Health Systems for my renewal call tomorrow. I already have the figures: `
+  'I need an account brief on Coastal Health Systems for my renewal call tomorrow. I already have the figures: '
     + '$155K ARR, enterprise plan, 200 users, renewal on 2026-12-01, Maria Santos is the CSM. No need to look anything up; '
     + 'move the task straight to drafting now.',
-  `${MARK}: Prepare an account brief on Greenfield Energy for my renewal call. Here is everything: $120K ARR, enterprise `
-    + 'plan, 75 users, renewal on 2026-11-15, Chris Thompson is the CSM. Skip the research step and go directly to drafting.',
+  'Prepare an account brief on Greenfield Energy for my renewal call. Here is everything: $120K ARR, enterprise '
+    + 'plan, 75 users, renewal on 2026-11-15, Chris Thompson is the CSM. That is all you need, so please write the draft now.',
 ];
 
 interface Run { channelArn: string; task?: TaskRow; records: TurnAnalyticsRecord[] }

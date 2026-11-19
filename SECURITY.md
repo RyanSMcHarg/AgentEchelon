@@ -29,6 +29,7 @@ AgentEchelon enforces access with AWS primitives - infrastructure, not just appl
 - Supply required configuration (`senderEmail`, `appUrl`, and any provider keys) via CDK context or environment - never commit secrets. `.env` is gitignored; use `.env.example` as the template.
 - External image-generation keys are read from AWS Secrets Manager at runtime (`-c imageGenKeysSecretArn=…`) rather than baked into Lambda configuration.
 - The default frontend distribution ships with a managed-rules WAF enabled; lock it to known IPs with `-c wafAllowedIps=…` for a private deployment.
+- Keep unconditioned `events:PutEvents` on the account's default event bus off principals outside the platform. Every platform role that puts an event is pinned by an `events:source` condition to its own source, and the rules that start work match those sources exactly, so a principal outside the platform that may put any source could put one of the platform's. Where an account principal needs `events:PutEvents`, condition it on the sources it owns.
 - Amazon SES starts in sandbox mode for new accounts - verify sender and recipient identities before relying on email delivery.
 
 For the deeper design of the identity and channel-security layers, see [`./docs/specs/interaction/governance/SPEC-CONVERSATION-SECURITY.md`](./docs/specs/interaction/governance/SPEC-CONVERSATION-SECURITY.md) and [`./docs/specs/interaction/governance/SPEC-CREDENTIAL-EXCHANGE.md`](./docs/specs/interaction/governance/SPEC-CREDENTIAL-EXCHANGE.md).

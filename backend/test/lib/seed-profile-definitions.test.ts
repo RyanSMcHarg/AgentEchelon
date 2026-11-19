@@ -80,6 +80,16 @@ describe('seed-profile-definitions P0', () => {
     expect(params.get(`${SSM_ROOT}/assistant/ops-premium/definition`)!.labels.has('active')).toBe(true);
   });
 
+  it('seeds nothing for an assistant named in except, whose first version is imported instead', async () => {
+    // The demo seed passes ['ops-premium']: the ops assistant's version is imported from its shipped manifest when it
+    // is created, so a seed rerun never overwrites what the import (or a team's edit since) activated.
+    const { client, params } = fakeSsmStore();
+    const results = await seedAllProfileDefinitions(client, SSM_ROOT, {}, undefined, {}, {}, {}, {}, ['ops-premium']);
+    expect(results.map((r) => r.profileName)).not.toContain('ops-premium');
+    expect(results.map((r) => r.profileName)).toContain('advisor');
+    expect(params.has(`${SSM_ROOT}/assistant/ops-premium/definition`)).toBe(false);
+  });
+
   it('round-trips: after seeding, resolveActiveProfile serves the byte-identical compiled seed', async () => {
     const { client } = fakeSsmStore();
     await seedAllProfileDefinitions(client, SSM_ROOT);
@@ -119,7 +129,7 @@ describe('seed-profile-definitions P0', () => {
 
   it('keeps user-profile off the welcome: its catalog entry waits for a settled identity', () => {
     const entry = contextSourceCatalog({
-      classification: 'basic', attachmentsBucketArn: 'arn:aws:s3:::b', attachmentsBucketName: 'b',
+      classification: 'basic', companyBucketArn: 'arn:aws:s3:::b', companyBucketName: 'b',
       userProfileTableArn: 'arn:aws:dynamodb:us-east-1:1:table/p', userProfileTableName: 'p',
       region: 'us-east-1', account: '1',
     }).find((e) => e.key === 'user-profile');

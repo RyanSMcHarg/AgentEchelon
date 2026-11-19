@@ -22,15 +22,11 @@ const Header: React.FC<HeaderProps> = ({ onHome, onOpenSettings }) => {
         <div className="header-left">
           <button type="button" className="header-brand" onClick={onHome} aria-label={t('header.home')}>
             <svg viewBox="0 0 32 32" fill="none" aria-hidden="true" className="header-mark">
+              {/* The AgentEchelon mark, as public/brand-mark.svg draws it: three ascending bars in a stepped formation. */}
               <rect x="2.5" y="2.5" width="27" height="27" rx="7.5" stroke="currentColor" strokeWidth="2" />
-              <path
-                d="M10 23 C 10 18, 22 19, 21 14 C 20.4 11, 16 11.4, 16 8.6"
-                stroke="#b4532a"
-                strokeWidth="2.3"
-                strokeLinecap="round"
-                strokeDasharray="0 4.3"
-              />
-              <circle cx="16" cy="7.9" r="2.4" fill="#b4532a" />
+              <rect x="8" y="19" width="4" height="6" rx="1.2" fill="#818cf8" />
+              <rect x="14" y="14" width="4" height="11" rx="1.2" fill="#a5b4fc" />
+              <rect x="20" y="9" width="4" height="16" rx="1.2" fill="#e0e7ff" />
             </svg>
             <span className="header-title">{t('app.brandName')}</span>
           </button>

@@ -72,7 +72,7 @@ test.describe('Admin console navigation', () => {
     await page.goto('/?admin=latency');
     await expect(page.locator('.admin-subtab-btn.active')).toHaveText(/Overview/i, { timeout: 15000 });
     await expect(page.locator('.admin-subtab-btn', { hasText: 'Latency' })).toHaveCount(0);
-    await expect(page.locator('h3:has-text("Response Latency")')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('h2:has-text("Response Latency")')).toBeVisible({ timeout: 15000 });
   });
 
   // (Removed) "Back from the first admin tab returns to the app" tested the OLD

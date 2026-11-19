@@ -152,3 +152,92 @@ describe('requireAdmin — Cognito modes', () => {
     expect('statusCode' in denied && denied.statusCode).toBe(403);
   });
 });
+
+/**
+ * AN ADMIN ROUTE ADMITS ONLY THIS INSTANCE'S ADMINISTRATORS (tenet D3, the second layer behind the gateway).
+ *
+ * The gateway refuses a principal without `execute-api:Invoke` on the route. Behind it, a console or admin-plane
+ * session is admitted only on this instance's own roles, by name, and a team session only on a team route, so a
+ * grant that reaches further than it should (another instance's session in the same account, a team session on
+ * an administrator's route) is still refused here.
+ */
+describe('admin auth: only this instance\'s administrators', () => {
+  const ENFORCED = { ADMIN_AUTH_MODE: 'ae-cognito', ADMIN_IAM_ENFORCEMENT: 'true' };
+  const PERSON = '0192f0e0-0000-7000-8000-0000000000a1';
+  const signedOn = (role: string, session: string, at = '/admin/conversations') => ({
+    ...eventWith(null, { userArn: `arn:aws:sts::111:assumed-role/${role}/${session}` }),
+    path: at,
+    resource: at,
+  }) as unknown as APIGatewayProxyEvent;
+
+  test('this instance\'s admin console session and admin plane are admitted', async () => {
+    const auth = loadAuth(ENFORCED);
+    for (const ev of [signedOn('agent-echelon-admin-console', `console-${PERSON}`), signedOn('agent-echelon-admin-plane', `archive-${PERSON}`)]) {
+      expect(auth.trustedIamAdminPrincipal(ev)).toBe('admin');
+      expect(auth.callerIsAdmin(ev)).toBe(true);
+      expect('claims' in await auth.requireAdmin(ev)).toBe(true);
+    }
+    expect(auth.isAdminConsoleSession(signedOn('agent-echelon-admin-console', `console-${PERSON}`))).toBe(true);
+  });
+
+  test.each([
+    ['another instance\'s admin console session', 'acme-admin-console', `console-${PERSON}`],
+    ['another instance\'s admin plane', 'acme-admin-plane', `archive-${PERSON}`],
+    ['another instance\'s team console session', 'acme-team-console', `console-${PERSON}@standard`],
+    ['a person\'s chat credential', 'agent-echelon-exchange-premium', PERSON],
+    ['another instance\'s person credential', 'acme-exchange-admin', PERSON],
+  ])('%s is refused', async (_label, role, session) => {
+    const auth = loadAuth(ENFORCED);
+    const ev = signedOn(role, session);
+    expect(auth.trustedIamAdminPrincipal(ev)).toBeNull();
+    expect(auth.callerIsAdmin(ev)).toBe(false);
+    expect(auth.callerCanReadArchive(ev)).toBe(false);
+    expect(auth.callerCanManageProfiles(ev)).toBe(false);
+    expect(auth.callerCanManageAssistants(ev)).toBe(false);
+    expect(auth.callerCanSeeUserIdentity(ev)).toBe(false);
+    expect(auth.isAdminConsoleSession(ev)).toBe(false);
+    // Refused: 403 when the session names a person who is not an admin here, 401 when it names nobody.
+    const guard = await auth.requireAdmin(ev);
+    expect('statusCode' in guard && [401, 403].includes(guard.statusCode)).toBe(true);
+  });
+
+  test('another instance\'s session is refused in service mode too', () => {
+    const auth = loadAuth({ ADMIN_AUTH_MODE: 'service' });
+    expect(auth.callerIsAdmin(signedOn('acme-admin-console', `console-${PERSON}`))).toBe(false);
+    expect(auth.callerIsAdmin(signedOn('agent-echelon-admin-console', `console-${PERSON}`))).toBe(true);
+  });
+
+  test('a team console session is refused on an administrator\'s route, and admitted on its team route', async () => {
+    const auth = loadAuth(ENFORCED);
+    const team = `console-${PERSON}@standard`;
+    for (const route of ['/admin/conversations', '/admin/tasks/channel/{channelId}', '/admin/templates/save', '/admin/profiles/activate']) {
+      const ev = signedOn('agent-echelon-team-console', team, route);
+      expect([route, auth.trustedIamAdminPrincipal(ev)]).toEqual([route, null]);
+      expect([route, auth.callerIsAdmin(ev)]).toEqual([route, false]);
+      const guard = await auth.requireAdmin(ev);
+      expect([route, 'statusCode' in guard && guard.statusCode]).toEqual([route, 403]);
+    }
+    for (const route of ['/admin/assistants/{assistant}/profiles', '/query/analytics/assistants/{assistant}/query', '/admin/teams/{team}/roster']) {
+      expect([route, auth.trustedIamAdminPrincipal(signedOn('agent-echelon-team-console', team, route))]).toEqual([route, 'team']);
+    }
+    // The matched route decides, not a path segment that happens to read like one.
+    const channelNamedAssistants = {
+      ...signedOn('agent-echelon-team-console', team, '/admin/conversations/assistants/messages'),
+      resource: '/admin/conversations/{channelId}/messages',
+    } as unknown as APIGatewayProxyEvent;
+    expect(auth.trustedIamAdminPrincipal(channelNamedAssistants)).toBeNull();
+  });
+
+  test('a handler not told this instance\'s roles admits none of its sessions', () => {
+    const auth = loadAuth({ ...ENFORCED, ADMIN_CONSOLE_ROLE_NAME: undefined, TEAM_CONSOLE_ROLE_NAME: undefined, ADMIN_PLANE_ROLE_NAME: undefined });
+    expect(auth.callerIsAdmin(signedOn('agent-echelon-admin-console', `console-${PERSON}`))).toBe(false);
+    expect(auth.callerIsAdmin(signedOn('agent-echelon-admin-plane', `archive-${PERSON}`))).toBe(false);
+    expect(auth.isAdminConsoleSession(signedOn('agent-echelon-admin-console', `console-${PERSON}`))).toBe(false);
+  });
+
+  test('an operator\'s own signed credential, which no instance mints, is admitted', () => {
+    const auth = loadAuth(ENFORCED);
+    expect(auth.callerIsAdmin(eventWith(null, { userArn: 'arn:aws:iam::111:user/operator' }))).toBe(true);
+    expect(auth.callerIsAdmin(signedOn('AWSReservedSSO_AdministratorAccess_0123', 'operator@example.com'))).toBe(true);
+  });
+});

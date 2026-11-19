@@ -30,6 +30,7 @@ import { signedAnalyticsPost } from './helpers/signed-analytics';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 import { SSM_ROOT } from './helpers/stack-prefix';
 import { ADMIN_API_URL, adminUrl, profileActionUrl } from './helpers/api-urls';
+import { replacingDraft, draftIdOf } from './helpers/profile-draft';
 
 guardConsoleErrors();
 
@@ -144,7 +145,8 @@ test.describe.serial('portable profiles — set up, improve, export, import, pro
     expect(exportedManifest, 'needs the exported manifest').toBeTruthy();
 
     // The target is named, as every import must: the manifest's own name never decides where it lands.
-    const imported = await api(idToken, '/import', { manifest: exportedManifest, targetProfileName: PROFILE });
+    // A draft an earlier run left is replaced by naming it (SPEC-PORTABLE-PROFILES FR19).
+    const imported = await replacingDraft((b) => api(idToken, '/import', b), { manifest: exportedManifest, targetProfileName: PROFILE });
     expect(JSON.stringify(imported), 'import rejected the manifest this deployment just exported')
       .not.toMatch(/__error/);
     expect(imported.imported, 'import names the profile it landed').toBe(PROFILE);
@@ -160,14 +162,14 @@ test.describe.serial('portable profiles — set up, improve, export, import, pro
   test('a draft EDIT persists and validates (improving a profile)', async () => {
     test.setTimeout(180_000);
     // Fresh draft from the active version, then a small, legal edit.
-    const versioned = await api(idToken, '/version', { profileName: PROFILE });
+    const versioned = await replacingDraft((b) => api(idToken, '/version', b), { profileName: PROFILE });
     expect(JSON.stringify(versioned)).not.toMatch(/__error/);
     expect(versioned.draftConfigId, 'the fresh draft names its configId').toBeTruthy();
 
     // THE EDIT IS PROVEN KEPT BY THE DRAFT'S OWN ID. `configId` hashes what a version says, so a kept
     // edit to a body key changes it, and a key the body does not hold (`description`) leaves it as it was:
     // a patch the API dropped would pass every other check here.
-    const ignored = await api(idToken, '/draft', { profileName: PROFILE, patch: { description: `ignored ${Date.now()}` } });
+    const ignored = await api(idToken, '/draft', { profileName: PROFILE, patch: { description: `ignored ${Date.now()}` }, configId: versioned.draftConfigId });
     expect(ignored.draftConfigId, 'a key that is not part of a version changes nothing').toBe(versioned.draftConfigId);
 
     // The persona addendum is a short, free-text body key, so a unique marker is always a change. (What the assistant
@@ -176,6 +178,7 @@ test.describe.serial('portable profiles — set up, improve, export, import, pro
     const edited = await api(idToken, '/draft', {
       profileName: PROFILE,
       patch: { systemPromptAddendum: marker },
+      configId: ignored.draftConfigId,
     });
     // A refusal arrives either as a transport error or as a 4xx body naming its `error`.
     expect(JSON.stringify(edited), 'the draft edit was refused').not.toMatch(/__error/);
@@ -197,8 +200,8 @@ test.describe.serial('portable profiles — set up, improve, export, import, pro
     // Activate a CLONE of the active definition, not the edited draft above: this proves the pointer
     // moves without changing a single byte of what the assistant says. `/version` re-clones active,
     // discarding the probe edit.
-    await api(idToken, '/version', { profileName: PROFILE });
-    const activated = await api(idToken, '/activate', { profileName: PROFILE });
+    const clone = await replacingDraft((b) => api(idToken, '/version', b), { profileName: PROFILE });
+    const activated = await api(idToken, '/activate', { profileName: PROFILE, configId: draftIdOf(clone) });
     expect(JSON.stringify(activated), 'activation was refused for a clone of the active version')
       .not.toMatch(/__error/);
     expect(typeof activated.version, 'activate reports the new version number').toBe('number');
@@ -231,7 +234,7 @@ test.describe.serial('portable profiles — set up, improve, export, import, pro
     // gates suite uses, for the same reason: a cleanup that swallowed its own error is how a test
     // definition gets left behind where a later legitimate activation trips over it.
     if (!idToken) return;
-    await api(idToken, '/version', { profileName: PROFILE });
+    await replacingDraft((b) => api(idToken, '/version', b), { profileName: PROFILE });
     const check = await api(idToken, '/validate', { profileName: PROFILE });
     expect(
       check.valid,

@@ -71,7 +71,7 @@ describe('the router is invoked by its declared sources alone (deny tests)', () 
     expect(permissionsOf(standard).filter((p) => p.Properties!.Principal === 'events.amazonaws.com')).toHaveLength(0);
   });
 
-  it('DENY: within its stack, only the router itself, the processor and the scheduler role may invoke the router', () => {
+  it('DENY: within its stack, only the router itself, the processor, the scheduler role and the event-trigger relay may invoke the router', () => {
     for (const r of [premium, standard]) {
       const router = routerOf(r);
       const invokers = new Set<string>();
@@ -81,7 +81,7 @@ describe('the router is invoked by its declared sources alone (deny tests)', () 
         if (!text(statement.Resource).includes(router)) continue;
         for (const role of roles) invokers.add(role.replace(/[0-9A-F]{8}$/, ''));
       }
-      for (const role of invokers) expect(role).toMatch(/^(AgentHandlerRole|ProcessorRole|AsyncProcessorRole|EventDeadlineSchedulerRole)/);
+      for (const role of invokers) expect(role).toMatch(/^(AgentHandlerRole|ProcessorRole|AsyncProcessorRole|EventDeadlineSchedulerRole|EventTriggerRelayServiceRole)/);
     }
   });
 
@@ -113,5 +113,103 @@ describe('the router is invoked by its declared sources alone (deny tests)', () 
     }
     expect(routerReads(standard)).toHaveLength(0);
     expect(ruleOf(standard)).toBeUndefined();
+  });
+});
+
+describe('with meetings declared, the router is still invoked by its declared sources alone (deny tests)', () => {
+  const synth = (classification: string): Record<string, Resource> => {
+    const app = new cdk.App();
+    const stack = assistantsOf(classification)(app, `AgentEchelonAssistants-${classification}`, { ...CLASSIFICATION_TEST_PROPS, capabilities: ['chat', 'meetings'] } as never);
+    return (Template.fromStack(stack).toJSON() as { Resources: Record<string, Resource> }).Resources;
+  };
+  const premium = synth('premium');
+  const standard = synth('standard');
+  const routerOf = (r: Record<string, Resource>) => Object.keys(r).find((id) => r[id].Type === 'AWS::Lambda::Function' && /^AgentHandler[0-9A-F]{8}$/.test(id))!;
+  const rulesOf = (r: Record<string, Resource>) => Object.keys(r).filter((id) => r[id].Type === 'AWS::Events::Rule' && /^(IncidentWatchAlarmChanges|MeetingLifecycle|MeetingAttended)/.test(id));
+  const permissionsOf = (r: Record<string, Resource>) => Object.values(r)
+    .filter((x) => x.Type === 'AWS::Lambda::Permission' && text(x.Properties?.FunctionName).includes(routerOf(r)));
+
+  it('DENY: an EventBridge principal reaches the router only through the incident-watch, meeting lifecycle and meeting attended rules, each by its own ARN', () => {
+    for (const r of [premium, standard]) {
+      const rules = rulesOf(r);
+      const events = permissionsOf(r).filter((p) => p.Properties!.Principal === 'events.amazonaws.com');
+      expect(events.length).toBe(rules.length);
+      for (const p of events) expect(rules.map((id) => ({ 'Fn::GetAtt': [id, 'Arn'] }))).toContainEqual(p.Properties!.SourceArn);
+      for (const p of permissionsOf(r)) expect(['lexv2.amazonaws.com', 'lex.amazonaws.com', 'events.amazonaws.com']).toContain(String(p.Properties!.Principal));
+    }
+    expect(rulesOf(standard).filter((id) => id.startsWith('MeetingLifecycle'))).toHaveLength(1);
+  });
+
+  it('the meeting lifecycle rule matches this instance\'s events for its own classification and hands the router four fields', () => {
+    const id = rulesOf(standard).find((x) => x.startsWith('MeetingLifecycle'))!;
+    const rule = standard[id].Properties!;
+    expect(rule.EventPattern.detail.classification).toEqual(['standard']);
+    expect(rule.EventBusName).toBeUndefined();
+    expect(rule.Targets).toHaveLength(1);
+    expect(text(rule.Targets[0].Arn)).toContain(routerOf(standard));
+    // A person's attendance is not handed over here: it has its own rule, which carries the person.
+    expect(rule.EventPattern.detail.event).toEqual([{ 'anything-but': ['person-attended'] }]);
+  });
+
+  it("the meeting attended rule matches this classification's person-attended events alone, and reaches its router", () => {
+    const id = rulesOf(standard).find((x) => x.startsWith('MeetingAttended'))!;
+    const rule = standard[id].Properties!;
+    expect(rule.EventPattern.detail).toEqual({ instance: [expect.any(String)], classification: ['standard'], event: ['person-attended'] });
+    expect(text(rule.Targets[0].Arn)).toContain(routerOf(standard));
+    expect(text(rule.Targets[0].InputTransformer)).toContain('$.detail.personId');
+  });
+
+  it('DENY: the router may read a meeting\'s state and nothing else of Amazon Chime SDK meetings, so an end is confirmed by the service', () => {
+    const reads = statementsWithRoles(standard)
+      .filter(({ roles, statement }) => roles.some((role) => /^AgentHandlerRole/.test(role)) && list(statement.Action).some((a) => /^chime:.*Meeting/.test(String(a))));
+    expect(reads).toHaveLength(1);
+    expect(list(reads[0].statement.Action)).toEqual(['chime:GetMeeting']);
+    expect(text(reads[0].statement.Resource)).toMatch(/:meeting\/\*/);
+  });
+
+  it('the router invokes the meeting entries by ARNs in the stack\'s own partition', () => {
+    const invokes = statementsWithRoles(standard)
+      .filter(({ roles, statement }) => roles.some((role) => /^AgentHandlerRole/.test(role)) && ['StartThisConversationsMeeting', 'ReadThisConversationsMeetingSummary'].includes(String(statement.Sid)));
+    expect(invokes).toHaveLength(2);
+    for (const { statement } of invokes) {
+      expect(text(statement.Resource)).not.toContain('arn:aws:lambda');
+      expect(text(statement.Resource)).toContain('AWS::Partition');
+    }
+  });
+
+  it('the router archives an ended meeting\'s conversation through the conversation management function alone', () => {
+    const invokes = statementsWithRoles(standard)
+      .filter(({ roles, statement }) => roles.some((role) => /^AgentHandlerRole/.test(role)) && statement.Sid === 'ArchiveAnEndedMeetingsConversation');
+    expect(invokes).toHaveLength(1);
+    expect(list(invokes[0].statement.Action)).toEqual(['lambda:InvokeFunction']);
+    expect(text(invokes[0].statement.Resource)).toContain("conversationmanagementfunctionarn");
+  });
+
+  it('DENY: a turn reads and lists meeting transcripts of its own classification only', () => {
+    const reads = statementsWithRoles(standard).filter(({ statement }) => ['ReadItsOwnTranscripts', 'ListItsOwnTranscripts'].includes(String(statement.Sid)));
+    expect(reads.map((r) => r.statement.Sid).sort()).toEqual(['ListItsOwnTranscripts', 'ReadItsOwnTranscripts']);
+    const get = reads.find((r) => r.statement.Sid === 'ReadItsOwnTranscripts')!.statement;
+    expect(list(get.Action)).toEqual(['s3:GetObject']);
+    expect(text(get.Resource)).toContain('/transcripts/standard/*');
+    const listing = reads.find((r) => r.statement.Sid === 'ListItsOwnTranscripts')!.statement;
+    expect(listing.Condition).toEqual({ StringLike: { 's3:prefix': ['transcripts/standard/*'] } });
+    // Without meetings no turn reads a transcript.
+    expect(statementsWithRoles(synthAssistants('standard')).filter(({ statement }) => statement.Sid === 'ReadItsOwnTranscripts')).toHaveLength(0);
+  });
+
+  it('DENY: the meeting creator reads a room\'s membership only in this classification\'s conversations, bearing the service admin', () => {
+    const reads = statementsWithRoles(standard)
+      .filter(({ roles, statement }) => roles.some((role) => /^TypedConversationFromEventRole/.test(role)) && list(statement.Action).includes('chime:DescribeChannelMembership'));
+    expect(reads.map((r) => r.statement.Sid).sort()).toEqual(['EventCreateReadRoomMembership', 'EventCreateReadRoomMembershipAsServiceAdmin']);
+    const channel = reads.find((r) => r.statement.Sid === 'EventCreateReadRoomMembership')!.statement;
+    expect(channel.Condition).toEqual({ StringEquals: { 'aws:ResourceTag/classification': 'standard' } });
+    // The parent conversation's people and moderators, read under the same condition: its meeting's conversation takes its people.
+    expect(list(channel.Action).sort()).toEqual(['chime:DescribeChannelMembership', 'chime:ListChannelMemberships', 'chime:ListChannelModerators']);
+    const bearer = reads.find((r) => r.statement.Sid === 'EventCreateReadRoomMembershipAsServiceAdmin')!.statement;
+    expect(text(bearer.Resource)).toMatch(/\/user\/[^*"]+-admin/);
+    // Without meetings the creator holds no such read.
+    const without = statementsWithRoles(synthAssistants('standard'))
+      .filter(({ statement }) => list(statement.Action).includes('chime:DescribeChannelMembership') && /^EventCreateReadRoomMembership/.test(String(statement.Sid)));
+    expect(without).toHaveLength(0);
   });
 });

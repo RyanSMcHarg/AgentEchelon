@@ -86,6 +86,13 @@ let announcedDisabled = false;
  */
 export const TURN_PATH_FAMILIES = ['AgentHandler', 'AsyncProcessor', 'DataPlaneLambda', 'ChannelFlowProcessor'];
 
+/**
+ * FAMILIES WATCHED WHERE THE DEPLOYMENT HAS THEM: a capability's own functions, which swallow a failed AWS call into a
+ * warning and carry on (a meeting whose transcription the service refused still starts). Absent where the capability is
+ * not declared, so a missing one is not a warning; present, an error there fails the run like the turn path's.
+ */
+export const CAPABILITY_FAMILIES = ['Meetings-'];
+
 function handlerLogGroups(): string[] {
   if (cachedGroups) return cachedGroups;
 
@@ -99,7 +106,7 @@ function handlerLogGroups(): string[] {
   );
 
   const all = out.split(/\s+/).filter((g) => g.length > 0);
-  cachedGroups = all.filter((g) => TURN_PATH_FAMILIES.some((f) => g.includes(f)));
+  cachedGroups = all.filter((g) => [...TURN_PATH_FAMILIES, ...CAPABILITY_FAMILIES].some((f) => g.includes(f)));
 
   // A guard that checks nothing must not pass quietly - that is the failure mode above.
   if (cachedGroups.length === 0) {
@@ -187,7 +194,7 @@ async function scanBackendErrors(sinceEpochMs: number, allowed: Pattern[] = []):
       // JSON gives one discrete string per message, so an exclusion matches the whole line.
       const { stdout } = await execAsync(
         `aws logs filter-log-events --log-group-name "${group}" --start-time ${sinceEpochMs} `
-          + `--filter-pattern "?ERROR ?Exception ?AccessDenied ?Denied" `
+          + `--filter-pattern "?ERROR ?Exception ?AccessDenied ?AccessDeniedException ?Denied" `
           + `--query "events[].message" --output json ${AWS_PROFILE ? `--profile ${AWS_PROFILE}` : ''}`,
         { env: { ...process.env, MSYS_NO_PATHCONV: '1', PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
           maxBuffer: 8 * 1024 * 1024 },

@@ -18,6 +18,7 @@
 const mockMessagingSend = jest.fn();
 const mockSsmSend = jest.fn();
 const mockPutChannelContext = jest.fn();
+const mockRecordChild = jest.fn();
 const mockGetChannelContext = jest.fn();
 
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
@@ -46,6 +47,7 @@ jest.mock('@aws-sdk/client-ssm', () => ({
 jest.mock('../../lambda/src/lib/channel-context-client', () => ({
   putChannelContext: (...a: unknown[]) => mockPutChannelContext(...a),
   getChannelContext: (...a: unknown[]) => mockGetChannelContext(...a),
+  recordChildConversation: (...a: unknown[]) => mockRecordChild(...a),
 }));
 
 import { createConversationFromEvent } from '../../lambda/src/lib/channel-creation';
@@ -108,6 +110,23 @@ describe('the type constrains the classification rather than supplying it', () =
     await expect(create({ classification: 'standard' })).rejects.toThrow(/does not permit/);
     expect(mockMessagingSend).not.toHaveBeenCalled();
     expect(mockPutChannelContext).not.toHaveBeenCalled();
+  });
+
+  it('DENY: a move refuses a type whose members come from a group, whatever a stored version declared, BEFORE a channel exists', async () => {
+    const { createConversationFromDrift } = jest.requireActual('../../lambda/src/lib/channel-creation') as typeof import('../../lambda/src/lib/channel-creation');
+    const refused = createConversationFromDrift({
+      appInstanceArn: 'arn:aws:chime:us-east-1:111:app-instance/i',
+      botArn: 'arn:aws:chime:us-east-1:111:app-instance/i/bot/b',
+      userArn: 'arn:aws:chime:us-east-1:111:app-instance/i/user/u',
+      modelTier: 'premium',
+      modelId: 'm',
+      topicLabel: 'a subject',
+      typeKey: 'ops',
+      parentChannelArn: 'arn:aws:chime:us-east-1:111:app-instance/i/channel/parent',
+      originatingMessageId: 'm1',
+    } as never);
+    await expect(refused).rejects.toThrow(/takes its members from its source/);
+    expect(mockMessagingSend).not.toHaveBeenCalled();
   });
 
   it('refuses a type the registry does not declare', async () => {
@@ -199,6 +218,14 @@ describe('the conversation gets the TYPE\'S policy, not the classification\'s', 
     await create({ parentChannelArn: undefined });
     expect(writtenContext().priorSubject).toBeUndefined();
     expect(writtenContext().topic).toBe('error rate above threshold');
+  });
+
+  it('lists an incident on the conversation it was opened from, because ops is a thread', async () => {
+    await create();
+    expect(mockRecordChild).toHaveBeenCalledWith(CONCERNED, expect.objectContaining({ typeKey: 'ops', channelId: expect.any(String) }));
+    mockRecordChild.mockClear();
+    await create({ parentChannelArn: undefined });
+    expect(mockRecordChild).not.toHaveBeenCalled();
   });
 
   it('carries the label alone when the event supplied no issue line', async () => {

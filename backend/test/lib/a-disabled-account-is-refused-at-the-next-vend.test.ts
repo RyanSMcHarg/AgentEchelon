@@ -132,7 +132,7 @@ describe('the roles that ask hold the pool reads on exactly the registry\'s Cogn
   const HOST_POOL = 'us-east-1_HostPool';
   const context = { issuers: [
     { id: 'deployment', kind: 'cognito-pool', pool: 'self', clearance: { groups: true, classifications: ['basic', 'standard', 'premium', 'admin'] }, admin: true },
-    { id: 'host', kind: 'cognito-pool', pool: HOST_POOL, clearance: { oneChannel: 'basic', classifications: ['basic'] } },
+    { id: 'host', kind: 'cognito-pool', pool: HOST_POOL, clearance: { fixed: ['basic'], classifications: ['basic'] }, contextClassification: 'basic' },
   ] };
   const asking = (t: ReturnType<typeof identityTemplate>, rolePrefix: string) => (Object.entries(t.findResources('AWS::IAM::Policy')) as Array<[string, any]>)
     .filter(([, p]) => JSON.stringify(p.Properties.Roles).includes(rolePrefix))

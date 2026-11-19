@@ -51,10 +51,11 @@ export const CHANNEL_NAME_MAX_UNITS = 256;
 export type ConversationNameValues = Partial<Record<ConversationNameField, string>>;
 
 /**
- * The kinds of room the platform names by default: `opened` for a room an event or the platform opens, the others for
- * the room each creator opens. Each is a section `label.<kind>` of the `conversation-name` template.
+ * The kinds of room the platform names by default: `opened` for a room an event or the platform opens, `meeting` for a
+ * meeting's own conversation (named for its room, given as `label`), the others for the room each creator opens. Each
+ * is a section `label.<kind>` of the `conversation-name` template.
  */
-export type ConversationNameKind = 'opened' | 'visitor' | 'customer' | 'briefing' | 'adminNotifications';
+export type ConversationNameKind = 'opened' | 'visitor' | 'customer' | 'briefing' | 'adminNotifications' | 'meeting';
 
 /** The text split into what a reader sees as single characters, so a cut never splits a surrogate pair or a mark. */
 function graphemesOf(s: string): string[] {
@@ -130,7 +131,15 @@ function alarmName(values: ConversationNameValues, words: VersionWords): string 
 
 /** A type's key as a reader sees it: `ops-team` is "Ops Team". The words are the builder's own key, in Title Case. */
 export function typeDisplayName(typeKey: string): string {
-  return typeKey.split(/[-_\s]+/).filter(Boolean).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+  return identifierWords(typeKey);
+}
+
+/**
+ * AN IDENTIFIER AS A READER SEES IT, where a room is named from one (a CloudWatch alarm's name): its words, split at
+ * hyphens, underscores and spaces, each starting upper case. `AgentEchelon-demo-incident` is "AgentEchelon Demo Incident".
+ */
+export function identifierWords(id: string): string {
+  return id.split(/[-_\s]+/).filter(Boolean).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 }
 
 /** A room an event opened, by its type: `label.opened` for its name, `label.openedSubject` for what it is about. '' with no type. */
@@ -198,13 +207,4 @@ export function namingSeed(message: string | undefined | null): string | null {
 /** Today's date as the platform writes one into a name: ISO, so it reads the same in every language. */
 export function nameDate(now: Date = new Date()): string {
   return now.toISOString().slice(0, 10);
-}
-
-/**
- * THE NAME A REOPENED CONTEXT ROOM CARRIES: the host's current title while the room still carries the title it was last
- * named from (or none), and otherwise the name it has, which a person or its primary assistant gave it.
- */
-export function contextRoomName(current: string | undefined, namedFrom: string | undefined, title: string): string {
-  if (!current) return title;
-  return namedFrom !== undefined && current === namedFrom ? title : current;
 }

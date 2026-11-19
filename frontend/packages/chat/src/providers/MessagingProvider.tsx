@@ -1,3 +1,4 @@
+import { TARGET_MISMATCH_LOG, receivedTargetMismatch } from '../utils/targetIntegrity';
 import { createContext, useContext, useState, useEffect, useRef, useCallback, type ReactNode } from 'react';
 import {
   DefaultMessagingSession,
@@ -7,12 +8,20 @@ import {
   type MessagingSession,
 } from 'amazon-chime-sdk-js';
 import { useAwsClient } from './AwsClientProvider';
-import { useAuth } from '@ae/shared';
+import { isAssistantArn, useAuth } from '@ae/shared';
+import { onSessionEnd } from '@ae/shared/services/sessionEpoch.ts';
 import { chimeService } from '../services/chimeService';
 import { markResponseReceived, markPlaceholderShown } from '../services/messageLatencyTracker';
 import { liftTurnStateFields } from '../services/turnStateFields';
 import { proposalFromMetadata } from '../services/proposalService';
 import { taskCardFromMetadata } from '../services/taskCardService';
+import { dashboardFromMetadata } from '../services/dashboardService';
+import { MAX_RING_SECONDS, arrivingRingEndsAt, isRingOff, nextRing, parseRing, steadyNow } from '../services/meetingRing';
+import { claimMeetingRing, isRingSettled, onRingSettledElsewhere, ringOver, settleRingOnce, unlessInMeeting } from '../services/meetingPresence';
+import { conversationIdOf, meetingWindowRequest } from '../utils/meetingWindow';
+import { reportRingOutcome } from '../services/meetingEventReporter';
+import type { RingOutcome } from '../services/meetingEventNames';
+import { isMeetingEnabled, meetingCardFromMetadata, meetingService } from '../services/meetingService';
 import { trackEvent } from '@ae/shared';
 import {
   parseMessageContent,
@@ -52,8 +61,9 @@ export interface ChannelCallbacks {
   onMembershipChange?: (channelArn: string) => void;
   /** Fires on UPDATE_CHANNEL events — primarily when the bot renames a
    *  channel after deriving a title from the first user message. The
-   *  subscriber receives the new channel `Name`. */
-  onChannelUpdate?: (channelArn: string, channelName: string) => void;
+   *  subscriber receives the new channel `Name`, and the channel's `Metadata`
+   *  as the event carries it (the archive's `archived` display mirror rides it). */
+  onChannelUpdate?: (channelArn: string, channelName: string, metadata?: string) => void;
 }
 
 /** Cross-channel bookkeeping that is not about rendering: unread state, and surfacing a channel the
@@ -63,6 +73,38 @@ export interface GlobalMessageListener {
   /** Fires on CREATE_CHANNEL_MEMBERSHIP in ANY channel, including one the sidebar does not know
    *  about yet — without it a newly-joined channel never appears until a reload. */
   onAddedToChannel?: (channelArn: string) => void;
+  /** Fires when a channel the viewer is in is deleted (DELETE_CHANNEL), or the viewer's own membership is
+   *  removed (DELETE_CHANNEL_MEMBERSHIP naming them): the conversation is no longer theirs to show. */
+  onRemovedFromChannel?: (channelArn: string) => void;
+}
+
+/** A meeting ringing for the viewer: which conversation, and when the ring stops (`meetingRing.ts`). */
+export interface IncomingRing {
+  channelArn: string;
+  /** Epoch milliseconds. */
+  endsAt: number;
+}
+
+/** The last ring or ring-off this window heard, in any window kind: which conversation, and when (epoch milliseconds). */
+export interface RingHeard {
+  channelArn: string;
+  at: number;
+}
+
+/**
+ * MEETING NEWS PUSHED OVER THE MESSAGING CONNECTION (`meetingNews`): the platform's started or ended card, from an
+ * assistant, in the conversation it was posted in (the meeting's own, or the conversation it was started from), with the card's
+ * own word on the meeting; or this person removed from a conversation.
+ */
+export interface MeetingNews extends RingHeard {
+  /** Its place among the news this window heard, counting from one: a reader applies every piece after the last it applied. */
+  seq?: number;
+  /** The card: which meeting, started or ended, its own conversation and the conversation it was started from. */
+  card?: { event: 'meeting-started' | 'meeting-ended'; meetingId: string; conversationId?: string; roomConversationId?: string; ringUntil?: number };
+  /** The card's send time, on the server's clock. */
+  sentAt?: number;
+  /** This person was removed from the conversation. */
+  removed?: true;
 }
 
 interface MessagingContextType {
@@ -70,7 +112,7 @@ interface MessagingContextType {
   /**
    * Incremented each time a messaging session STARTS - the first connect and every reconnect.
    *
-   * The same contract as communication-hub's `MessagingProvider.sessionVersion`: anything that holds
+   * THE SESSION CONTRACT: anything that holds
    * data the session would have pushed lists this as a dependency and re-reads when it changes,
    * because a message posted while no session was running is never pushed again.
    */
@@ -78,6 +120,41 @@ interface MessagingContextType {
   /** Register the single channel-event handler. Pass null to clear it. */
   setChannelListener: (callbacks: ChannelCallbacks | null) => void;
   setGlobalListener: (listener: GlobalMessageListener | null) => void;
+  /** The meeting ringing for the viewer now, or null. */
+  incomingRing: IncomingRing | null;
+  /**
+   * The last ring or ring-off heard for any conversation, in the app and in a meeting window alike (which shows no ring):
+   * a meeting started or ended there, so whatever shows that conversation's meeting reads it again.
+   */
+  ringHeard: RingHeard | null;
+  /**
+   * When a ring or a ring-off was last heard for a conversation, by its id (0 for never). Every ring is kept, so two heard
+   * for different conversations in one render are both read, where `ringHeard` holds only the last.
+   */
+  ringHeardAt?: (conversationId: string) => number;
+  /**
+   * THE LAST MEETING NEWS PUSHED FOR ANY CONVERSATION, in any window kind: the platform's started or ended card arriving
+   * in any conversation the person is in, carrying the card, or this person removed from a conversation. Whatever lists
+   * the person's meetings applies it directly, so a meeting started anywhere shows at once, with no read and no timer.
+   */
+  meetingNews: MeetingNews | null;
+  /**
+   * EVERY PIECE OF MEETING NEWS AFTER `seq`, oldest first: news that lands in one render is all here, where
+   * `meetingNews` holds only the last of it. A reader keeps the `seq` of the last piece it applied.
+   */
+  meetingNewsAfter?: (seq: number) => MeetingNews[];
+  /** Stop the ring: the viewer answered or declined it, or its time is up. */
+  dismissRing: (outcome?: 'ringAnswered' | 'ringDismissed') => void;
+  /**
+   * A RING THE VIEWER MISSED, for what is left of it: a status read on load or on reconnect found the meeting started inside
+   * its ring's window. A ring this app already showed for the conversation, answered or not, does not ring again.
+   */
+  ringLate: (channelArn: string, endsAt: number) => void;
+  /**
+   * A server time (a message's creation time) on this device's clock, by the shortest delivery this connection has seen,
+   * so a message's time and a time this app read compare whatever the two clocks say.
+   */
+  localTimeOf: (serverTime: number) => number;
 }
 
 const MessagingContext = createContext<MessagingContextType | undefined>(undefined);
@@ -152,6 +229,9 @@ function correlationIdOf(rawContent: string | undefined): string | undefined {
   return /<!--corr:([A-Za-z0-9._-]{1,64})-->/.exec(decoded)?.[1];
 }
 
+/** How much meeting news a window keeps for its readers: far more than ever lands in one render. */
+const NEWS_KEPT = 50;
+
 export function MessagingProvider({ children }: { children: ReactNode }) {
   const { isInitialized, userArn } = useAwsClient();
   const { refreshCredentials } = useAuth();
@@ -160,6 +240,34 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
   const sessionRef = useRef<MessagingSession | null>(null);
   const channelListenerRef = useRef<ChannelCallbacks | null>(null);
   const globalListenerRef = useRef<GlobalMessageListener | null>(null);
+  const [incomingRing, setIncomingRing] = useState<IncomingRing | null>(null);
+  const [ringHeard, setRingHeard] = useState<RingHeard | null>(null);
+  const [meetingNews, setMeetingNews] = useState<MeetingNews | null>(null);
+  /** The news this window heard, newest last, the most recent `NEWS_KEPT` of it, numbered as it arrived. */
+  const newsLogRef = useRef<MeetingNews[]>([]);
+  const newsSeqRef = useRef(0);
+  /** When a ring or ring-off was last heard, by conversation id. */
+  const ringsHeardRef = useRef<Map<string, number>>(new Map());
+  const pushNews = useCallback((news: Omit<MeetingNews, 'seq'>) => {
+    newsSeqRef.current += 1;
+    const numbered: MeetingNews = { ...news, seq: newsSeqRef.current };
+    newsLogRef.current = [...newsLogRef.current, numbered].slice(-NEWS_KEPT);
+    setMeetingNews(numbered);
+  }, []);
+  const meetingNewsAfter = useCallback((seq: number) => newsLogRef.current.filter((n) => (n.seq ?? 0) > seq), []);
+  const ringHeardAt = useCallback((conversationId: string) => ringsHeardRef.current.get(conversationId) ?? 0, []);
+  /** When the last ring this app showed for each conversation stops, so a late ring never repeats one already shown. */
+  const ringsShownRef = useRef<Map<string, number>>(new Map());
+  /**
+   * RINGS ARE FOR THE APP, NOT A MEETING WINDOW: a meeting window shows no ring, so it neither takes one nor reports one.
+   * Read once, as the app reads whether it is a meeting window.
+   */
+  const [takesRings] = useState(() => meetingWindowRequest() === null);
+  /**
+   * The shortest delivery this connection has seen, arrival minus send time: it carries the difference between this
+   * clock and the server's, so a ring's lateness is read without trusting either clock against the other.
+   */
+  const fastestDeliveryRef = useRef(Infinity);
   const isConnectingRef = useRef(false);
   const hiddenAtRef = useRef<number | null>(null);
   const lastMessageTimeRef = useRef<number>(Date.now());
@@ -179,7 +287,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
   const forceReconnectRef = useRef<(() => Promise<void>) | null>(null);
 
   // Parse a Chime message payload into our Message type
-  const parseMessagePayload = useCallback((payload: Record<string, unknown>): Message | null => {
+  const parseMessagePayload = useCallback((payload: Record<string, unknown>, isUpdate = false): Message | null => {
     if (!payload) return null;
 
     let content = payload.Content as string | undefined;
@@ -211,7 +319,9 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     let metadata: Record<string, unknown> = {};
     try {
       if (payload.Metadata) {
-        metadata = JSON.parse(payload.Metadata as string);
+        // An object or nothing: Metadata is member-writable, and `null` or a bare string parses without being one.
+        const parsed: unknown = JSON.parse(payload.Metadata as string);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) metadata = parsed as Record<string, unknown>;
       }
     } catch {
       // Ignore metadata parse errors
@@ -231,15 +341,22 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     const metadataTask = parseActiveTaskFromMetadata(metadata);
     const currentUserArn = chimeService.getUserArn();
     const targets = payload.Target as Array<{ MemberArn?: string }> | undefined;
-    // Belt-and-suspenders: Chime's WebSocket CREATE event doesn't reliably
-    // echo the Target field to the recipient, so the channel-flow processor
-    // also stamps `targetedSender` into the metadata for the sticky-target
-    // auto-set. Either signal is sufficient.
-    const targetedToUser =
-      (!!currentUserArn && Array.isArray(targets)
-        && targets.some((t) => t?.MemberArn === currentUserArn))
-      || (typeof metadata.targetedSender === 'string'
-        && metadata.targetedSender === currentUserArn);
+    // TARGETED TO THIS PERSON IS THE `Target` AMAZON CHIME SDK SET: the service sets and enforces it, and the history path
+    // (`chimeService.listMessages`) reads the same field. AN ASSISTANT'S PRIVATE REPLY that first arrives as its rewrite,
+    // which may carry no `Target`, is read by the recipient the platform stamped on it (`targetedSender`): the sender is
+    // service-stamped as an assistant, so its Metadata is the platform's. A person's Metadata never says who a message is for.
+    const senderIsAssistant = isAssistantArn(senderArn);
+    const targetedToUser = !!currentUserArn && ((Array.isArray(targets) && targets.some((t) => t?.MemberArn === currentUserArn))
+      || (senderIsAssistant && !Array.isArray(targets) && metadata.targetedSender === currentUserArn));
+    const targetArns = Array.isArray(targets) ? targets.map((t) => t?.MemberArn).filter((a): a is string => !!a) : [];
+    // THE TARGET AND THE MESSAGE'S OWN WORDS MUST AGREE (`targetIntegrity.ts`). A rewrite's event is compared only where it
+    // carries a `Target` to compare with; a created message always is.
+    const targetMismatch = !isUpdate || 'Target' in payload
+      ? receivedTargetMismatch({ text: decoded, metadata, targetArns, senderIsAssistant })
+      : undefined;
+    if (targetMismatch) {
+      console.error(`${TARGET_MISMATCH_LOG} a received message disagrees with its Target`, { messageId: payload.MessageId, channelArn: payload.ChannelArn, mismatch: targetMismatch });
+    }
 
     return {
       id: (payload.MessageId as string) || `msg-${Date.now()}`,
@@ -258,10 +375,15 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       assignmentMode: typeof metadata.assignmentMode === 'string' ? metadata.assignmentMode : undefined,
       feedback: parseMessageFeedbackFromMetadata(metadata),
       targetedToUser: targetedToUser || undefined,
+      ...(targetArns.length ? { targetArns } : {}),
+      ...(targetMismatch ? { targetMismatch } : {}),
       // A proposal addressed to this person (ADR-061 decision 8), lifted as the history load lifts it.
       proposal: proposalFromMetadata(metadata),
       // A task a workflow assigned this person (ADR-063), lifted as the history load lifts it.
       taskCard: taskCardFromMetadata(metadata),
+      // A meeting's started or ended card, by the function the history load uses too, only from an assistant.
+      meetingCard: meetingCardFromMetadata(metadata, senderArn),
+      dashboard: dashboardFromMetadata(metadata, senderArn),
       // The answer's phase and the queue's depth and stage, lifted by the SAME function the history
       // load uses (`liftTurnStateFields`), so a reload shows exactly what the live event showed.
       ...liftTurnStateFields(metadata),
@@ -373,6 +495,46 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
             headers?.['x-amz-chime-channel-arn'];
           if (!channelArn) return;
 
+          // A MEETING'S RING (`meetingRing.ts`): a control message, which is never a message of the conversation. It rings
+          // the viewer for what is left of its length, and goes no further: no unread mark, no view. ONE RING KEY, THE MEETING:
+          // it sounds in the meeting's own conversation, so a second ring for it changes nothing, and a ring-off for it (the
+          // end's, to everyone, or one addressed to this person because they took the meeting elsewhere) stops it here and
+          // keeps a ring that arrives after it from sounding. ONE TAB RINGS: the first tab of this browser to hear a meeting's
+          // ring claims it (`claimMeetingRing`), and the others show nothing.
+          // A RING COUNTS ONLY FROM AN ASSISTANT: the platform sends it as the parent conversation's assistant, so a member's control
+          // message rings nobody and stops nothing.
+          const sentAt = typeof payload.CreatedTimestamp === 'string' ? Date.parse(payload.CreatedTimestamp) : NaN;
+          if (Number.isFinite(sentAt)) fastestDeliveryRef.current = Math.min(fastestDeliveryRef.current, steadyNow() - sentAt);
+          if (eventType === 'CREATE_CHANNEL_MESSAGE' && payload.Type === 'CONTROL') {
+            const senderArn = (payload.Sender as Record<string, string> | undefined)?.Arn || '';
+            const ringOff = isRingOff(payload.Content);
+            const seconds = parseRing(payload.Content);
+            if (!isAssistantArn(senderArn) || (!ringOff && seconds === null)) return;
+            // Every window hears that the meeting started or ended, the meeting window included, so what it shows before
+            // joining is read again (`useConversationMeeting`).
+            const heardAt = Date.now();
+            ringsHeardRef.current.set(conversationIdOf(channelArn), heardAt);
+            setRingHeard({ channelArn, at: heardAt });
+            if (!takesRings) return;
+            if (ringOff) {
+              setIncomingRing((r) => (r && r.channelArn === channelArn ? null : r));
+              // ITS RING IS OVER for this person: a ring of this meeting that arrives after the ring-off sounds nowhere.
+              ringsShownRef.current.set(channelArn, Date.now() + MAX_RING_SECONDS * 1000);
+              ringOver(channelArn, Date.now(), MAX_RING_SECONDS);
+              return;
+            }
+            if (seconds !== null && !isRingSettled(channelArn) && (ringsShownRef.current.get(channelArn) ?? 0) <= Date.now()) {
+              const endsAt = arrivingRingEndsAt(seconds, payload.CreatedTimestamp as string | undefined, fastestDeliveryRef.current, Date.now(), steadyNow());
+              // A person already in this meeting, in a window of this browser (their own start included), hears no ring.
+              if (endsAt > Date.now()) unlessInMeeting(conversationIdOf(channelArn), () => {
+                if (!claimMeetingRing(conversationIdOf(channelArn))) return;
+                ringsShownRef.current.set(channelArn, endsAt);
+                setIncomingRing((r) => nextRing(r, { channelArn, endsAt }));
+              });
+            }
+            return;
+          }
+
           // Global listener fires first — regardless of whether a per-channel
           // subscription exists. Used for unread-state tracking across all
           // channels the user is in.
@@ -385,6 +547,22 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
             }
           }
 
+          // MEETING NEWS IN ANY CONVERSATION: the platform's started or ended card from an assistant, wherever it lands (the
+          // meeting's own conversation, which everyone in the parent conversation is a member of, and the parent), carrying the card itself;
+          // and this person removed from a conversation. A card's rewrite (its summary) is not news.
+          if (eventType === 'CREATE_CHANNEL_MESSAGE') {
+            const sender = (payload.Sender as Record<string, string> | undefined)?.Arn || '';
+            let meta: Record<string, unknown> = {};
+            try { meta = typeof payload.Metadata === 'string' ? JSON.parse(payload.Metadata) as Record<string, unknown> : {}; } catch { meta = {}; }
+            try {
+              const card = meetingCardFromMetadata(meta, sender);
+              if (card) pushNews({ channelArn, at: Date.now(), card, ...(Number.isFinite(sentAt) ? { sentAt } : {}) });
+            } catch { /* never in the way of the message itself */ }
+          } else if (eventType === 'DELETE_CHANNEL_MEMBERSHIP'
+            && !!userArn && (payload.Member as { Arn?: string } | undefined)?.Arn === userArn) {
+            pushNews({ channelArn, at: Date.now(), removed: true });
+          }
+
           // Global membership hook — fires BEFORE the per-channel bail below, so a membership in a
           // channel we are not yet subscribed to (a channel we were just added to, e.g. a drift-spawned
           // conversation) still reaches the app and can be surfaced in the sidebar.
@@ -393,6 +571,19 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
               globalListenerRef.current?.onAddedToChannel?.(channelArn);
             } catch (err) {
               console.warn('Global membership listener threw:', err);
+            }
+          }
+
+          // A CONVERSATION THAT IS GONE, OR NO LONGER THE VIEWER'S, LEAVES THE CLIENT AT ONCE. Deleted anywhere
+          // (another client, the console, a reset), or the viewer removed from it: either way it must not stay
+          // open or listed until a reload. Another member leaving is an ordinary membership change, below.
+          const removedMember = (payload.Member as { Arn?: string } | undefined)?.Arn;
+          if (eventType === 'DELETE_CHANNEL'
+            || (eventType === 'DELETE_CHANNEL_MEMBERSHIP' && !!userArn && removedMember === userArn)) {
+            try {
+              globalListenerRef.current?.onRemovedFromChannel?.(channelArn);
+            } catch (err) {
+              console.warn('Global removal listener threw:', err);
             }
           }
 
@@ -453,7 +644,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
               break;
             }
             case 'UPDATE_CHANNEL_MESSAGE': {
-              const msg = parseMessagePayload(payload);
+              const msg = parseMessagePayload(payload, true);
               if (msg) {
                 // The async-processor's update is when the real bot reply
                 // arrives. markResponseReceived is idempotent (the pending
@@ -490,7 +681,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
               // title derive) updates the channel's Name or Metadata.
               // The payload places the new name at `payload.Name`.
               const newName = (payload.Name as string | undefined) || '';
-              if (newName) callbacks.onChannelUpdate?.(channelArn, newName);
+              if (newName) callbacks.onChannelUpdate?.(channelArn, newName, payload.Metadata as string | undefined);
               break;
             }
           }
@@ -503,7 +694,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     } finally {
       isConnectingRef.current = false;
     }
-  }, [isInitialized, userArn, parseMessagePayload]);
+  }, [isInitialized, userArn, parseMessagePayload, takesRings]);
 
   // Force reconnect — stops existing session, refreshes credentials
   // (CRITICAL on visibility-stale paths: tokens cached by AwsClientProvider
@@ -620,8 +811,62 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     globalListenerRef.current = listener;
   }, []);
 
+  // WHAT HAPPENED TO A RING THIS APP SHOWED is reported once, for the meeting's analytics: answered with Join, dismissed,
+  // or left to run out. A ring stopped because the meeting ended is nobody's answer and is not reported.
+  const reportRing = useCallback((ring: IncomingRing | null, outcome: RingOutcome) => {
+    if (ring && isMeetingEnabled()) reportRingOutcome(ring.channelArn, outcome, (arn, events) => meetingService.reportEvents(arn, null, events));
+  }, []);
+  // The ring showing now, read by the handlers below so a report is made outside a state update, which React may repeat.
+  const incomingRingRef = useRef<IncomingRing | null>(null);
+  incomingRingRef.current = incomingRing;
+  // ONE OUTCOME PER RING across this person's tabs (`settleRingOnce`): the tab that settles it first reports it, and the
+  // others stop showing it.
+  const dismissRing = useCallback((outcome?: 'ringAnswered' | 'ringDismissed') => {
+    const ring = incomingRingRef.current;
+    if (ring) settleRingOnce(ring.channelArn, ring.endsAt, () => { if (outcome) reportRing(ring, outcome); });
+    setIncomingRing(null);
+  }, [reportRing]);
+  useEffect(() => onRingSettledElsewhere(({ channelArn, until }) => {
+    ringsShownRef.current.set(channelArn, Math.max(until, ringsShownRef.current.get(channelArn) ?? 0));
+    setIncomingRing((r) => (r && r.channelArn === channelArn ? null : r));
+  }), []);
+  const ringLate = useCallback((channelArn: string, endsAt: number) => {
+    const now = Date.now();
+    if (!takesRings || endsAt <= now || (ringsShownRef.current.get(channelArn) ?? 0) > now || isRingSettled(channelArn, now)) return;
+    if (!claimMeetingRing(conversationIdOf(channelArn), now)) return;
+    ringsShownRef.current.set(channelArn, endsAt);
+    setIncomingRing((r) => nextRing(r, { channelArn, endsAt }));
+  }, [takesRings]);
+  const localTimeOf = useCallback((serverTime: number) => {
+    const offset = fastestDeliveryRef.current;
+    // The offset is on the steady clock; the answer is said on the wall clock, where the times it is compared with are.
+    return Number.isFinite(offset) ? serverTime + offset + (Date.now() - steadyNow()) : serverTime;
+  }, []);
+  // A SESSION THAT ENDS TAKES ITS RINGS AND ITS MEETING NEWS WITH IT: the next person to sign in on this tab hears no ring
+  // meant for, and sees none of the meetings of, the person who was.
+  useEffect(() => onSessionEnd(() => {
+    incomingRingRef.current = null;
+    setIncomingRing(null);
+    setRingHeard(null);
+    setMeetingNews(null);
+    newsLogRef.current = [];
+    ringsHeardRef.current = new Map();
+    ringsShownRef.current = new Map();
+  }), []);
+
+  // THE RING STOPS ON ITS OWN when its time is up.
+  useEffect(() => {
+    if (!incomingRing) return undefined;
+    const timer = setTimeout(() => {
+      if (incomingRingRef.current !== incomingRing) return;
+      settleRingOnce(incomingRing.channelArn, incomingRing.endsAt, () => reportRing(incomingRing, 'ringTimedOut'));
+      setIncomingRing(null);
+    }, Math.max(0, incomingRing.endsAt - Date.now()));
+    return () => clearTimeout(timer);
+  }, [incomingRing, reportRing]);
+
   return (
-    <MessagingContext.Provider value={{ isConnected, sessionVersion, setChannelListener, setGlobalListener }}>
+    <MessagingContext.Provider value={{ isConnected, sessionVersion, setChannelListener, setGlobalListener, incomingRing, ringHeard, ringHeardAt, meetingNews, meetingNewsAfter, dismissRing, ringLate, localTimeOf }}>
       {children}
     </MessagingContext.Provider>
   );

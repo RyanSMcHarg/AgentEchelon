@@ -49,6 +49,19 @@ export interface ToolDescriptor {
   /** The RUNTIME precondition that must ALSO hold for the tool to be offered, even when a profile allows
    *  it — documented so the console can explain "enabled, but only active when X". */
   requires: string;
+  /**
+   * The assistant roles the tool is offered to, where its runtime precondition is a role: the loop offers it only to
+   * a turn acting in one of them (`toolOfferedToRole`), and the console disables it for an assistant in any other.
+   * The acting role's IAM grant is the enforcement; this keeps the model from being offered a tool its role is
+   * refused. Absent: every role.
+   */
+  roles?: readonly string[];
+  /**
+   * WHAT A STATE-CHANGING TOOL MAY WRITE, where that is its own conversation's dashboard alone (DESIGN-CONVERSATION-DASHBOARDS
+   * section 5): the key comes from the turn, never the input, and the session's edge reaches its classification's prefix only.
+   * An agent step may list such a tool beside its read tools; every other write stays refused there.
+   */
+  writes?: 'conversation-dashboard';
 }
 
 export const TOOL_REGISTRY: ToolDescriptor[] = [
@@ -76,8 +89,41 @@ export const TOOL_REGISTRY: ToolDescriptor[] = [
     changesState: false,
     owner: 'platform',
     description:
-      'Reads this deployment\'s own Amazon CloudWatch metrics (Lambda invocations, errors, throttles and average duration) for a bounded window, and its own CloudWatch alarms in ALARM or INSUFFICIENT_DATA (name, state, reason, since when; capped), so an operations assistant answers from telemetry rather than from guesswork. Runs under the assistant\'s own assumed role, so only a role whose boundary grants observability reads can use it; an assistant without that grant is told the figure is unavailable rather than shown an error. Executed in-loop.',
+      'Reads this deployment\'s own Amazon CloudWatch metrics (Lambda invocations, errors, throttles and average duration) for a bounded window, and its own CloudWatch alarms in ALARM or INSUFFICIENT_DATA (name, state, reason, since when; capped), and the alarm the conversation watches by name, in any state, which may be any alarm in the account (SPEC-WORKFLOWS-AND-TASKS WT120), so an operations assistant answers from telemetry rather than from guesswork. Runs under the assistant\'s own assumed role, so only a role whose boundary grants observability reads can use it; an assistant without that grant is told the figure is unavailable rather than shown an error. Executed in-loop.',
     requires: 'a turn acting as an assistant whose role boundary grants CloudWatch reads (the `ops` role)',
+    // The roles the acting role conditions its telemetry grant on (`observabilityRoles` reads this list).
+    roles: ['ops'],
+  },
+  {
+    name: 'publish_dashboard',
+    category: 'context',
+    changesState: true,
+    owner: 'platform',
+    description:
+      'Publishes this conversation\'s dashboard for its members to open in the chat app: the alarm the conversation watches against its threshold, and this deployment\'s Lambda invocations, errors, throttles and average duration over three hours, drawn by the platform. Reads the telemetry as the assistant, writes only its own conversation\'s dashboard, and keeps one dashboard message in the conversation, updated in place. Each member reads it with their own credential (DESIGN-CONVERSATION-DASHBOARDS). Executed in-loop, or as a workflow step\'s declared action.',
+    requires: 'a turn acting as an assistant whose role may publish dashboards and read telemetry (the `ops` role), in a conversation',
+    roles: ['ops'],
+    writes: 'conversation-dashboard',
+  },
+  {
+    name: 'publish_dashboard_page',
+    category: 'context',
+    changesState: true,
+    owner: 'platform',
+    description:
+      'Publishes this conversation\'s dashboard as a self-contained page, opened from the conversation on a short-lived signed link that is issued to members only, for viewing outside the chat app. The same figures and drawing as publish_dashboard; the page runs no script (DESIGN-CONVERSATION-DASHBOARDS). Executed in-loop, or as a workflow step\'s declared action.',
+    requires: 'a turn acting as an assistant whose role may publish dashboards and read telemetry (the `ops` role), in a conversation, on a deployment with the dashboard distribution',
+    roles: ['ops'],
+    writes: 'conversation-dashboard',
+  },
+  {
+    name: 'propose_meeting_invites',
+    category: 'work-item',
+    changesState: false,
+    owner: 'platform',
+    description:
+      "Proposes adding people a record names (such as each affected account's team, by the person id the record gives) to this conversation's running meeting, to the meeting and its chat only, each with a brief said privately when they join. Never executed in-loop: it records an add_to_meeting proposal and posts the person who asked a card, which only the meeting's host or a moderator can confirm (SPEC-ASSISTANT-MEETINGS FR42).",
+    requires: "a person's turn in a conversation whose meeting is running and takes people from outside it",
   },
   {
     name: 'search_corporate_travel',
@@ -148,6 +194,16 @@ export const TOOL_REGISTRY: ToolDescriptor[] = [
     requires: 'an active machine-backed task on the conversation',
   },
   {
+    // A NEW REQUEST MID-TASK (ADR-067 G15, WT106): opens the person's message as its own task, and moves nothing.
+    name: 'open_new_request',
+    category: 'task',
+    changesState: true,
+    owner: 'platform',
+    description:
+      'Opens the person\'s message as a separate request of another multi-step intent the version declares, as its own task, while the task the turn is on keeps waiting. Once per turn. Granted with advance_task_state.',
+    requires: 'an active machine-backed task and a multi-step intent other than its own',
+  },
+  {
     // A DECLARATION THAT SHIPS SOMETHING. The document it declares is packaged and delivered by the
     // turn, so a turn that ended on this call and no text did change something for the person.
     name: 'deliver_document',
@@ -184,6 +240,11 @@ export function toolOwnerOf(name: string): ToolOwner {
   return TOOL_REGISTRY.find((t) => t.name === name)?.owner ?? 'platform';
 }
 
+/** Whether a tool writes only its own conversation's dashboard (`writes`). */
+export function toolWritesOnlyItsDashboard(name: string): boolean {
+  return TOOL_REGISTRY.find((t) => t.name === name)?.writes === 'conversation-dashboard';
+}
+
 /** Whether a tool is declared to change something (the tool judge scores such a call by its effect). */
 export function toolChangesState(name: string): boolean {
   return TOOL_REGISTRY.find((t) => t.name === name)?.changesState === true;
@@ -191,4 +252,19 @@ export function toolChangesState(name: string): boolean {
 
 export function anyToolChangedState(toolNames: readonly string[]): boolean {
   return toolNames.some((n) => TOOL_REGISTRY.find((t) => t.name === n)?.changesState === true);
+}
+
+/**
+ * Whether a tool may be offered to a turn acting in `role`: true for a tool with no role precondition, and for one
+ * whose `roles` names it. An unknown tool name, or an empty role (no assistant identity held), is offered nothing
+ * a role precondition guards.
+ */
+/** The roles a tool names as its precondition, or undefined when it names none (offered to every role). */
+export function toolRolesOf(name: string): readonly string[] | undefined {
+  return TOOL_REGISTRY.find((t) => t.name === name)?.roles;
+}
+
+export function toolOfferedToRole(name: string, role: string): boolean {
+  const roles = TOOL_REGISTRY.find((t) => t.name === name)?.roles;
+  return !roles || (!!role && roles.includes(role));
 }

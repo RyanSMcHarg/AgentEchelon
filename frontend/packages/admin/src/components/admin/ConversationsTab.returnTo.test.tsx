@@ -50,14 +50,14 @@ describe('ConversationsTab - returning to where a conversation was opened from',
   it('returns to the page it was opened from', async () => {
     const user = userEvent.setup();
     const onReturn = vi.fn();
-    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL}
+    render(<ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL}
       returnTo={{ onReturn }} />);
     await user.click(await screen.findByRole('button', { name: '← Back' }));
     expect(onReturn).toHaveBeenCalledTimes(1);
   });
 
   it('offers the same Back when it was opened from the list', async () => {
-    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
+    render(<ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
     expect(await screen.findByRole('button', { name: '← Back' })).toBeTruthy();
   });
 });

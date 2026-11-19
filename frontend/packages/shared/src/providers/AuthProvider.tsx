@@ -14,7 +14,7 @@ import {
 import { setAuthToken, trackEvent } from '../services/eventTrackingService';
 import { REGION, USER_POOL_CLIENT_ID as CLIENT_ID, FEDERATED_CLIENT_ID, SIGN_IN_ISSUERS_JSON } from '../platform/config';
 import { idTokenDisplayClaims, idTokenExpiresWithin } from '../services/idTokenClaims';
-import { currentSessionEpoch, endSessionEpoch } from '../services/sessionEpoch';
+import { currentSessionEpoch, endSessionEpoch, type SessionEndReason } from '../services/sessionEpoch';
 import { resolvePersonIdentity, IdentitySupersededError } from '../services/personIdentity';
 import { ExchangeRefusedError } from '../services/credentialExchange';
 import {
@@ -298,7 +298,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const refreshRetryResumedRef = useRef<boolean>(false);
   const scheduleRefreshRetryRef = useRef<((opts?: RetryOptions) => void) | null>(null);
 
-  const clearTokens = useCallback(() => {
+  /** End the session in this window. `signed-out` only when the person chose to sign out here (`SessionEndReason`). */
+  const clearTokens = useCallback((reason: SessionEndReason = 'ended') => {
     localStorage.removeItem('accessToken');
     localStorage.removeItem('idToken');
     // The refresh token lives in sessionStorage so any successful XSS is
@@ -325,7 +326,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     refreshRetryDelayRef.current = REFRESH_RETRY_MIN_MS;
     // Anything already asking Cognito on the old session now has a stale epoch and will drop its
     // answer rather than write it back over what was just cleared.
-    endSessionEpoch();
+    endSessionEpoch(reason);
   }, []);
 
   const refreshTokens = useCallback(async (): Promise<TokenRefreshOutcome> => {
@@ -904,7 +905,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       console.error('Error signing out:', error);
     } finally {
       trackEvent('logout');
-      clearTokens();
+      clearTokens('signed-out');
     }
   };
 

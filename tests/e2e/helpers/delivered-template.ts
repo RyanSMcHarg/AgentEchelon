@@ -22,11 +22,11 @@ export interface DeliveryTemplateRecord {
   chosen?: true;
 }
 
-/** The attachments bucket, where templates are stored. */
-export function attachmentsBucket(): string | undefined {
+/** The profile bucket, where templates, intent packs and profile bodies are stored. */
+export function profileBucket(): string | undefined {
   const outputs = awsv(['cloudformation', 'describe-stacks', '--stack-name', stackName('Conversations')], { quiet: true })
     ?.Stacks?.[0]?.Outputs as Array<{ OutputKey: string; OutputValue: string }> | undefined;
-  return outputs?.find((o) => o.OutputKey === 'AttachmentsBucketName')?.OutputValue;
+  return outputs?.find((o) => o.OutputKey === 'ProfileBucketName')?.OutputValue;
 }
 
 /** The template on a task's latest delivery record, or undefined when it names none. */
@@ -37,8 +37,8 @@ export function lastDeliveryTemplate(task: Record<string, unknown> | undefined):
 
 /** The stored body of one template version, parsed. */
 export function storedTemplate(classification: string, name: string, contentHash: string): ParsedTemplate {
-  const bucket = attachmentsBucket();
-  if (!bucket) throw new Error(`${stackName('Conversations')} has no AttachmentsBucketName output`);
+  const bucket = profileBucket();
+  if (!bucket) throw new Error(`${stackName('Conversations')} has no ProfileBucketName output`);
   return parseTemplate(awsvText(['s3', 'cp', `s3://${bucket}/templates/${classification}/${name}/${contentHash}.md`, '-'], { quiet: true }));
 }
 

@@ -45,7 +45,7 @@ const MESSAGES: AdminConversationMessage[] = [
 
 function renderTab() {
   return render(
-    <ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />,
+    <ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />,
   );
 }
 

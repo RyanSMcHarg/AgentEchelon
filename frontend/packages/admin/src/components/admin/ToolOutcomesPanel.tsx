@@ -49,10 +49,10 @@ const ToolOutcomesPanel: React.FC<{
 
   return (
     <div className="admin-section" role="region" aria-label={t('admin.toolOutcomes.title')}>
-      <h4>
+      <h3>
         {t('admin.toolOutcomes.title')}{' '}
         <InfoTooltip label={t('admin.toolOutcomes.title')} content={t('admin.toolOutcomes.tip')} />
-      </h4>
+      </h3>
       {error && <p className="admin-error" role="alert">{error}</p>}
       {!error && rows === null && <p className="admin-help-text">{t('admin.toolOutcomes.loading')}</p>}
       {!error && rows !== null && rows.length === 0 && <p className="admin-tab-empty">{t('admin.toolOutcomes.empty')}</p>}

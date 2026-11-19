@@ -150,7 +150,7 @@ describe('context source catalog validation', () => {
   // an assistant deployed with no context because a config file failed to parse is a silent outage.
   describe('loadContextSourceCatalog', () => {
     it('falls back to the tracked example on a clean clone, and the example is valid', () => {
-      const { entries, source } = loadContextSourceCatalog({ classification: 'standard', attachmentsBucketArn: 'arn:aws:s3:::test-bucket', attachmentsBucketName: 'test-bucket', userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/UserProfile', userProfileTableName: 'UserProfile', region: 'us-east-1', account: '123456789012' });
+      const { entries, source } = loadContextSourceCatalog({ classification: 'standard', companyBucketArn: 'arn:aws:s3:::test-bucket', companyBucketName: 'test-bucket', userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/UserProfile', userProfileTableName: 'UserProfile', region: 'us-east-1', account: '123456789012' });
       expect(source).toContain('context-sources.example');
       expect(entries.length).toBeGreaterThan(0);
       expect(validateContextSourceCatalog(entries)).toEqual([]);
@@ -159,8 +159,8 @@ describe('context source catalog validation', () => {
     it('scopes s3-prefix entries to the classification it was asked for', () => {
       // The isolation boundary is per classification; a catalog that ignored its argument would hand
       // every classification the same prefix, which is the leak this design exists to prevent.
-      const standard = loadContextSourceCatalog({ classification: 'standard', attachmentsBucketArn: 'arn:aws:s3:::test-bucket', attachmentsBucketName: 'test-bucket', userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/UserProfile', userProfileTableName: 'UserProfile', region: 'us-east-1', account: '123456789012' }).entries.find((e) => e.key === 'company-docs');
-      const basic = loadContextSourceCatalog({ classification: 'basic', attachmentsBucketArn: 'arn:aws:s3:::test-bucket', attachmentsBucketName: 'test-bucket', userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/UserProfile', userProfileTableName: 'UserProfile', region: 'us-east-1', account: '123456789012' }).entries.find((e) => e.key === 'company-docs');
+      const standard = loadContextSourceCatalog({ classification: 'standard', companyBucketArn: 'arn:aws:s3:::test-bucket', companyBucketName: 'test-bucket', userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/UserProfile', userProfileTableName: 'UserProfile', region: 'us-east-1', account: '123456789012' }).entries.find((e) => e.key === 'company-docs');
+      const basic = loadContextSourceCatalog({ classification: 'basic', companyBucketArn: 'arn:aws:s3:::test-bucket', companyBucketName: 'test-bucket', userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/UserProfile', userProfileTableName: 'UserProfile', region: 'us-east-1', account: '123456789012' }).entries.find((e) => e.key === 'company-docs');
       expect(standard?.prefix).toBe('context/standard/');
       expect(basic?.prefix).toBe('context/basic/');
     });
@@ -168,14 +168,14 @@ describe('context source catalog validation', () => {
     it('the example marks user-profile unreadable at welcome time', () => {
       // WelcomeIntent fires before the creator's membership settles, so this must not be `always` -
       // mislabelling it does not cause a wait, it puts a wrong or empty name in the first message.
-      const e = loadContextSourceCatalog({ classification: 'standard', attachmentsBucketArn: 'arn:aws:s3:::test-bucket', attachmentsBucketName: 'test-bucket', userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/UserProfile', userProfileTableName: 'UserProfile', region: 'us-east-1', account: '123456789012' }).entries.find((s) => s.key === 'user-profile');
+      const e = loadContextSourceCatalog({ classification: 'standard', companyBucketArn: 'arn:aws:s3:::test-bucket', companyBucketName: 'test-bucket', userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/UserProfile', userProfileTableName: 'UserProfile', region: 'us-east-1', account: '123456789012' }).entries.find((s) => s.key === 'user-profile');
       expect(e?.availability).toBe('identity-settled');
     });
 
     it('the example declares user-profile per-person, and the published entry keeps the declaration', () => {
       // The declaration is what turns "this person has no record yet" into a skip instead of a failed
       // read. Lost at publication, every turn by a person not yet onboarded would page the alarm.
-      const { entries } = loadContextSourceCatalog({ classification: 'standard', attachmentsBucketArn: 'arn:aws:s3:::test-bucket', attachmentsBucketName: 'test-bucket', userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/UserProfile', userProfileTableName: 'UserProfile', region: 'us-east-1', account: '123456789012' });
+      const { entries } = loadContextSourceCatalog({ classification: 'standard', companyBucketArn: 'arn:aws:s3:::test-bucket', companyBucketName: 'test-bucket', userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/UserProfile', userProfileTableName: 'UserProfile', region: 'us-east-1', account: '123456789012' });
       const profile = entries.find((s) => s.key === 'user-profile')!;
       expect(profile.perPerson).toBe(true);
       expect(publishableContextSource(profile).perPerson).toBe(true);

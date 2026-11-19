@@ -227,11 +227,13 @@ export async function createConversation(
   // instead: a premium test then ran in a basic conversation and failed far from the cause, or passed on
   // the wrong classification.
   await page.locator('.ncm-class-card').first().waitFor({ state: 'visible', timeout: 15000 });
-  // BY THE CARD'S OWN NAME, never any other text on it: every card says who may join ("Open to: Basic,
-  // Standard, Premium"), so a match on the whole card's text took the basic card for "Premium". A
-  // classification is not a model (an intent may route a turn to another), so a card is never picked by one.
+  // BY THE CARD'S CLASSIFICATION, never any other text on it: the card carries its value (`data-classification`),
+  // which a caller names in any case ('Premium' is `premium`), so a deployment's display name ("Confidential") does not
+  // move the match. A name that is no card's value is matched as the card's display name, exactly. A classification is
+  // not a model (an intent may route a turn to another), so a card is never picked by one.
   const wanted = classification.trim().toLowerCase();
-  const classCard = page.locator('.ncm-class-card').filter({
+  const byValue = page.locator(`.ncm-class-card[data-classification="${wanted.replace(/"/g, '')}"]`);
+  const classCard = (await byValue.count()) > 0 ? byValue : page.locator('.ncm-class-card').filter({
     has: page.locator('.ncm-class-card-badge').filter({
       hasText: new RegExp(`^\\s*${wanted.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i'),
     }),

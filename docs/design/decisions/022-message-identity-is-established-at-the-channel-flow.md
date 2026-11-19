@@ -31,14 +31,11 @@ amended: |
   for every issuer, and an API caller resolves to the same AppInstanceUser. Nothing built by it.
 verified_by:
   - "test/lib/turn-correlation.test.ts - derivation is stable across a retry, distinct between turns"
-  - "tests/e2e/a-replayed-turn-claims-once.spec.ts - against a deployment: a replay derives the same
-     id, exactly one delivery wins the real dedup claim, a different turn still wins its own (negative
-     control), and a replay straddling the window boundary is recovered by previousBucket.
-     It replaced a spec that fabricated a Lex fulfillment event and invoked the router directly: that
-     imitated an entry the platform is minimizing, and because it bypassed Amazon Chime SDK nothing
-     materialized the returned message, so the dispatched worker ran a full inference and then logged
-     an undeliverable answer. What Chime does with two materialized responses to one turn is NOT
-     covered and is deliberately not imitated."
+  - "tests/e2e/a-replayed-turn-claims-once.spec.ts - passed on dev, 2026-10-07: a replay derives the
+     same id, exactly one delivery wins the real dedup claim against the deployed table, a different
+     turn still wins its own (negative control), and the derivation's previousBucket option reproduces
+     the id across a window boundary (no production call site passes it, section 4). What Amazon
+     Chime SDK does with two materialized responses to one turn is not covered."
 supersedes: SPEC-ABUSE-CONTROLS "Request deduplication (P0)", whose stated premise does not hold at runtime
 superseded_in_part_by: ADR-025 (who posts the placeholder on a bypass) - section 2
 ---
@@ -201,7 +198,7 @@ It now claims `flow-<MessageId>` through `claimCorrelation`, the same conditiona
 - Placeholder resolution becomes deterministic, so the replacement-placeholder compromise is not reachable and the one-message-updated-in-place pattern holds without exception.
 - The flow takes one conditional write per BOT message, and none on the inbound message, which the Decision rules out as both unnecessary and unsafe. It is a point operation on a table the flow already reaches for rate limiting.
 - A deployment without the shared table keeps today's behavior. Dedup fails open, as it does now.
-- Unit coverage that asserts the claim against a mocked table is not sufficient evidence that dedup works. It passes a key in directly, so it holds whether or not the derived key is stable, which is why it did not detect this. **Verification for this ADR is a test that delivers one message twice through the flow's own derivation and asserts exactly one assistant turn and one model call**, plus a test that the marker parser rejects an id it should not honor. `test/lib/turn-correlation.test.ts` covers the derivation properties: stable across a retry, distinct between turns and senders, separating again once the window passes, and short enough to ride in content. What unit coverage CANNOT establish is that a live retried fulfillment actually reuses the id, since that depends on Amazon Chime SDK replaying the same Lex `sessionId` and transcript. Confirming that against a deployment is required before this is described as verified.
+- A unit test that asserts the claim against a mocked table passes a key in directly, so it holds whether or not the derived key is stable; the verification is a derivation test plus a claim against the real table. `test/lib/turn-correlation.test.ts` covers the derivation: stable across a retry, distinct between turns and senders, separating again once the window passes, and short enough to ride in content. `tests/e2e/a-replayed-turn-claims-once.spec.ts` (passed on dev, 2026-10-07) shows one derived id winning the deployed claim exactly once. **Unproven:** that a live retried fulfillment reuses the id, which depends on Amazon Chime SDK replaying the same transcript; no test produces a real retried fulfillment.
 - The control is best-effort by construction, so no downstream component may assume exactly-once. The processor keeps its own dispatch claim, and anything that would be harmful to run twice stays individually guarded.
 - **Resolution is three deep and the claimed owner wins.** `resolvePlaceholderTarget` prefers the `corr#` owner over any handed id, then the handed id, then a single deferred marker scan run after the answer is ready. The preference order is not cosmetic: the flow's guard and the processor's dispatch claim pick their winners independently, and when they diverged the answer landed on a message the flow had already denied while the surviving placeholder never settled.
 - **The identifier rule holds on three entries of six** (section 4). The battle derivations are open work, and until they change, the section 2b guard reaches every placeholder but collapses only the entries whose id a redelivery reproduces. Cite the battle-state claims for those paths, not the guard.
@@ -212,8 +209,6 @@ It now claims `flow-<MessageId>` through `claimCorrelation`, the same conditiona
 
 **What this adds.** The sender this record keys on, in the correlation id and in every claim derived from it, is the sender ARN the flow and the router receive with the message (`CHIME.sender.arn`). That ARN is the person key: a person is one AppInstanceUser whichever identity provider signed them in ([IDENTITY-AND-ACCESS-MODEL.md](../../specs/interaction/governance/IDENTITY-AND-ACCESS-MODEL.md) §1a). A request that arrives through an API rather than as a message (a task, a vote, an attachment, a stop) resolves its caller to the same AppInstanceUser, once per request, so a record written from a message and a record read through an API name the same person for every issuer. The id is read from the ARN through one helper, `personIdFromArn`.
 
-**Why.** The decision above is unchanged; this states what its "sender" input is. Today the message path and the API path agree only because a pool user's AppInstanceUser id equals their Cognito `sub`, and an API handler reads the `sub` from the JWT. For a person from any other issuer the two would name different values, and a record written on one path would not be found on the other.
+**Why.** The decision above is unchanged; this states what its "sender" input is. If the API path read a token claim such as the Cognito `sub`, a person from any issuer other than the bundled pool would be named by two values, and a record written on one path would not be found on the other. Both paths therefore name the person by their AppInstanceUser id, which is never the Cognito `sub`.
 
-> **Amended 2026-10-17:** both paths name the person by their AppInstanceUser id, which is never the Cognito `sub`: the API path through `callerPersonId` (`backend/lambda/src/lib/auth.ts`), the message path from the sender ARN.
-
-**PARTIAL.** API handlers ask the one resolver, `callerPersonId` (`backend/lambda/src/lib/auth.ts`), which reads the caller the edge authorizer resolved through `Identities`, or a console session from its name (deployed to dev on 2026-10-27, **NOT VERIFIED** on a deployment). The message side reads the id from the sender ARN with `principalIdFromArn` (`backend/lambda/src/lib/task-tracking.ts:173`, re-exported from `backend/lambda/src/lib/person-arn.ts`).
+**As built.** API handlers ask the one resolver, `callerPersonId` (`backend/lambda/src/lib/auth.ts:308`), which reads the caller the edge authorizer resolved through `Identities`, or a console session from its name. The message side reads the id from the sender ARN with `personIdFromArn` / `principalIdFromArn` (`backend/lambda/src/lib/person-arn.ts:43`, `:74`, re-exported by `task-tracking.ts`). `Verified by:` `backend/test/a-person-is-their-app-instance-user.test.ts` (no source outside the resolver and the exchanges reads a caller off their token) and `backend/test/lib/a-person-is-keyed-by-their-issuer.test.ts` (one AppInstanceUser per registry id and subject; an undeclared issuer is refused).

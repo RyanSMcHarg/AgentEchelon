@@ -28,7 +28,7 @@ export const IMAGE_MODEL_KEYS = [
   'nova_canvas',
   'stability_image_core',
   'stability_image_ultra',
-  'openai_gpt_image_1',
+  'openai_gpt_image_2',
   'fal_flux_pro_1_1',
 ] as const;
 export type ImageGenModelKey = (typeof IMAGE_MODEL_KEYS)[number];

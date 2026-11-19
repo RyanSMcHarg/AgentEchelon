@@ -48,11 +48,11 @@ Aurora mode provisions:
 - **IAM Auth Setup**: Custom resource grants `rds_iam` role to DB user
 - **Kinesis Stream**: consumed, not provisioned: the stream belongs to the `<prefix>Messaging` stack in either mode (2 shards, 24h retention, `lib/stacks/messaging-stack.ts`)
 - **Firehose delivery stream**: delivers the Kinesis stream to the S3 conversation archive (`lib/constructs/conversation-archive.ts`)
-- **Archival Lambda**: VPC-attached, consumes Kinesis, writes to Aurora only
+- **Archival Lambda**: VPC-attached, consumes Kinesis, writes to Aurora only. A batch that fails every retry is kept in a dead-letter queue with an alarm (see [Archival failures](#archival-failures))
 - **Evaluation Runner**: VPC-attached, runs every 30 minutes, judges with the utility model (Claude Haiku 4.5) via Bedrock by default
 - **Analytics Query Lambda + API Gateway**: VPC-attached, serves admin dashboard queries
 - **Retrieval Data-Plane Lambda**: VPC-attached, runs RAG retrieval + drift detection (embed + pgvector) so the non-VPC agent handler can invoke it (ADR-013)
-- **S3 Archive Bucket**: Same layout as Athena mode. **Expires at 90 days as shipped** - see [Archive retention](#archive-retention), which you should read before the deployment is that old
+- **S3 Archive Bucket**: Same layout as Athena mode. The system of record is kept; see [Archive retention](#archive-retention)
 
 By default the Lambdas connect DIRECTLY to the Aurora writer endpoint using IAM database authentication (no hardcoded passwords). RDS Proxy is opt-in (`enableRdsProxy`, off by default); when enabled, the Lambdas connect through the proxy instead. See [Connection pooling](#connection-pooling).
 
@@ -135,7 +135,7 @@ A deploy with the other mode updates the `Archive` stack in place: it removes th
 5. On `environment=production`, an Aurora deployment also retains its database cluster, `<instance>-analytics`, with deletion protection on, and the archive KMS key that encrypts it and the Aurora archive bucket (`archive-stack-aurora.ts`). The cluster bills until it is deleted, and its fixed identifier blocks a fresh Aurora deploy: turn off deletion protection, delete the cluster, then schedule the key for deletion. The Athena stack's archive KMS key (`archive-stack.ts`) is `RETAIN` in every environment; its alias is deleted with the stack, so it does not block a fresh deploy, but it bills until it is scheduled for deletion.
 6. Remove `_analyticsModeChosenAtFirstDeploy` from `deploy.config.json`, set `analyticsMode` to the new mode, and run `npm run deploy`.
 
-**What it loses.** The fresh deployment starts empty: a new user pool and a new Amazon Chime SDK app instance, so no users and no conversations from the old deployment, an empty archive and an empty analytics store. The teardown retains the old user pool and the attachments bucket (`RemovalPolicy.RETAIN`), with the intent-pack and document-template bodies stored in it (`classification-packs/`, `templates/`), and the new deployment does not reattach them: put the templates again with `npm run template`. No tool loads one mode's data into the other.
+**What it loses.** The fresh deployment starts empty: a new user pool and a new Amazon Chime SDK app instance, so no users and no conversations from the old deployment, an empty archive and an empty analytics store. The teardown retains the old user pool, the attachments bucket and the profile and company buckets (`RemovalPolicy.RETAIN`), with the intent-pack and document-template bodies stored in the profile bucket (`classification-packs/`, `templates/`), and the new deployment does not reattach them: put the templates again with `npm run template`. No tool loads one mode's data into the other.
 
 **Rebuilding the projection.** Because the archive is the system of record and Aurora is a projection of it, a fresh Aurora deployment loses nothing the archive holds only if the projection can be rebuilt from a retained archive. **NOT BUILT:** no rebuild-from-archive job exists. Today Aurora is filled only from the live message stream, so a fresh Aurora deployment starts with an empty projection even when the old archive is kept.
 
@@ -312,6 +312,35 @@ Both settings are required for live drift. `enableLiveDrift=true` without `analy
 
 ---
 
+## Archival failures
+
+The archival Lambda writes each batch of message-stream events to Aurora in one transaction. A batch it cannot write is not dropped and not committed partially:
+
+| Step | What happens | Where it is visible |
+|---|---|---|
+| The batch fails | The transaction rolls back and the function throws. A failure to bring the schema up to date before the batch, or to write the batch, counts every record of the batch in `RecordErrors` | The `AgentEchelon/Archival` metrics (`archival-health.ts`) |
+| A turn's telemetry cannot be read | A failed read of the turn's row in the message-analytics table (as opposed to no row) fails the batch the same way, so the turn is retried rather than archived with NULL tokens, latency, steps and tool calls. No row (a message from before the table existed) still archives the turn from its inline metadata | `RecordErrors`, and the function's log names the message ids |
+| Retries | The event source retries the batch three times, splitting it in half on each failure, so a bad record is isolated from good ones (`ARCHIVAL_RETRY` in `archive-stack-aurora.ts`). The archival writes are idempotent, so a retry lands on the rows an earlier attempt wrote | `RecordErrors` counts a record on each failed attempt |
+| Retries exhausted | The batch's stream position (shard and sequence-number range) goes to the archival dead-letter queue, kept for 14 days, longer than the 7 days the message-analytics table keeps a turn's telemetry | The queue whose logical id starts with `ArchivalDeadLetterQueue` in the `<prefix>Archive` stack |
+| Alarm | `<prefix>Archive-archival-batch-failed` fires while the queue holds a batch, through the same notifier as the platform's other alarms (`alarm-to-admin-channel.ts`), so it reaches the admin notification channel. It clears when the queue is empty | The admin notification channel |
+
+The S3 conversation archive is written by its own consumer of the stream (Firehose), so a batch the projection failed is still in the archive.
+
+### Re-running a failed batch
+
+The queue holds a batch's position, not its records, and the message stream keeps a record for 24 hours. A failed batch is re-runnable for 24 hours after its records arrived. Fix the cause first (the function's log names the error), then from `backend/`:
+
+```bash
+AWS_PROFILE=<profile> node scripts/redrive-archival-dlq.mjs --dry-run   # what is queued, and whether the stream still holds it
+AWS_PROFILE=<profile> node scripts/redrive-archival-dlq.mjs             # re-run every batch the stream still holds
+```
+
+The script (`scripts/redrive-archival-dlq.mjs`) finds the queue and the archival function in the `<prefix>Archive` stack (`--queue-url=` and `--function=` name them directly), reads each batch's records back from the stream, and invokes the archival function with them synchronously. A batch that archives is removed from the queue; one that fails again stays, with the error printed. It needs the AWS CLI and `kinesis:GetShardIterator`, `kinesis:GetRecords`, `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility` and `lambda:InvokeFunction`.
+
+A batch the stream no longer holds is reported as expired and left in the queue as the record of what the projection is missing; `--discard-expired` removes it. Its events are in the S3 archive, but the projection has no rebuild-from-archive job (see [Switching modes](#switching-modes)), so they are not re-projected.
+
+---
+
 ## Cost breakdown
 
 The full per-component cost model lives in the single source of truth, [INFRASTRUCTURE-COST.md](INFRASTRUCTURE-COST.md). In summary: Aurora mode's at-rest baseline is roughly ~$76/month when importing a VPC that provides egress or ~$120/month on a stack-created VPC (which adds the interface endpoints). Both figures include the Kinesis stream, which Athena mode pays too; the Aurora cluster at its 0.5 ACU floor is the incremental line, and it scales to 4 ACU under load. The RDS Proxy is off by default (+~$88/month when enabled; see [Connection pooling](#connection-pooling) below).
@@ -320,40 +349,30 @@ The full per-component cost model lives in the single source of truth, [INFRASTR
 
 ## Archive retention
 
-**The archive expires at 90 days as shipped.** Objects transition to Infrequent Access at 30 days and are **deleted at 90**. This is a deliberate default for a demonstration deployment and it is almost certainly wrong for a production one, because the archive is described throughout this documentation as the append-only system of record and the audit trail. At 90 days it is neither. Nothing fails when the objects go: queries stop returning older rows, and anything built on the archive inherits the bound without being told - a regression set, an external evaluation tool, a Legal or HR audit.
-
-**Audience.** A demonstration or throwaway deployment can leave the default alone: it is a sensible bound for a stack nobody intends to keep, and that is why it is the default. **The deployment it matters to is yours** - one standing up AgentEchelon as an integration, where the archive is the audit trail and the only durable record of what was said, what it cost, and what a guardrail decided. There the default disagrees with how this documentation describes the archive, and it disagrees quietly: nothing errors and no metric moves.
-
-**Deadline.** Settle it before the deployment is 90 days old. Lengthening retention stops future deletions and applies to objects already in the bucket, but **it cannot bring back what has already expired**. A deployment that has been running longer than that has permanently lost everything older, and no later change recovers it.
+**The system of record is never expired.** The conversation archive's `conversations/` objects (and, in Athena mode, the `evaluations/` scores beside them) move to Infrequent Access at 30 days and stay, so the archive is the append-only record [tenet D7](../../overview/TENETS.md) describes. Every other family in an archive bucket is expired by a rule that names its prefix ([tenet D15](../../overview/TENETS.md)), and `backend/test/the-system-of-record-is-never-expired.test.ts` refuses a template in either mode whose rule expires the record or expires a bucket without naming a prefix.
 
 ### Buckets
 
-Aurora mode creates **two** archive buckets in the `<prefix>Archive` stack, and both carry the same rule. Athena mode creates one.
-
-| Bucket | Purpose | Defined in | Mode |
+| Bucket | Families and retention | Defined in | Mode |
 |---|---|---|---|
-| `<instance>-conversation-archive-<account>-<region>` | Conversation event archive: the audit trail read by the admin Conversations tab and by Legal/HR | `backend/lib/constructs/conversation-archive.ts` | Aurora (instantiated in `archive-stack-aurora.ts`) |
-| `<instance>-conversation-archive-<account>-<region>` | Same bucket, defined inline for the Athena path | `backend/lib/stacks/archive-stack.ts` | Athena |
-| `<instance>-aurora-archive-<account>-<region>` | Analytics archive behind the Aurora projection | `backend/lib/stacks/archive-stack-aurora.ts` | Aurora |
-
-Each carries a `lifecycleRules` block of the same shape. **Change all of the ones your mode deploys, or the two halves of the record diverge** and a conversation outlives its analytics or the reverse.
+| `<instance>-conversation-archive-<account>-<region>` | `conversations/`: kept. `errors/` (failed Firehose deliveries): 90 days. `athena-results/`: 7 days | `backend/lib/constructs/conversation-archive.ts` | Aurora (instantiated in `archive-stack-aurora.ts`) |
+| `<instance>-conversation-archive-<account>-<region>` | `conversations/` and `evaluations/`: kept. `errors/`, `client_events/` and `client_events-errors/` (browser telemetry and its failed deliveries), `delivered-documents/`: 90 days. `client_events/event_type=unknown/`: 7 days. `athena-results/`: 7 days | `backend/lib/stacks/archive-stack.ts` | Athena |
+| `<instance>-aurora-archive-<account>-<region>` | `delivered-documents/` (the copies a grading run reads): 90 days | `backend/lib/stacks/archive-stack-aurora.ts` | Aurora |
 
 ### How to change it
 
-1. Edit the `lifecycleRules` block in each file above. To keep the archive indefinitely, delete the `expiration` line; to extend it, raise the number of days.
-2. To keep long retention cheap, add a colder transition rather than deleting. **Use `GLACIER_INSTANT_RETRIEVAL` and nothing colder.** Athena has to read these objects in place, and `GLACIER` (Flexible) and `DEEP_ARCHIVE` require an explicit restore first, so a query touching an old partition fails rather than answering slowly. Instant Retrieval is queryable in place and costs roughly a third of Infrequent Access.
-3. Redeploy with `cd backend && npm run deploy`. A single-stack deploy of the stack that owns the bucket, `<prefix>Archive` in either mode, works too: `cd backend && npm run deploy:stack -- <prefix>Archive`, which applies every key from `deploy.config.json`. A lifecycle change is a bucket property update, so there is no data movement and no downtime.
+1. Edit the `lifecycleRules` block in the file above. Each rule names its prefix; a rule with no prefix and an `expiration` is refused by the D15 guard in `backend/test/tenets-are-enforced.test.ts`, which reads both `lib/stacks` and `lib/constructs`.
+2. To keep long retention cheap, add a colder transition rather than an expiry. **Use `GLACIER_INSTANT_RETRIEVAL` and nothing colder.** Athena has to read these objects in place, and `GLACIER` (Flexible) and `DEEP_ARCHIVE` require an explicit restore first, so a query touching an old partition fails rather than answering slowly. Instant Retrieval is queryable in place and costs roughly a third of Infrequent Access.
+3. Redeploy with `cd backend && npm run deploy`, or the stack that owns the bucket, `<prefix>Archive` in either mode: `cd backend && npm run deploy:stack -- <prefix>Archive`. A lifecycle change is a bucket property update, so there is no data movement and no downtime.
 4. Confirm against the live bucket rather than the template: `aws s3api get-bucket-lifecycle-configuration --bucket <name>`.
-
-An indefinite archive with the Glacier Instant Retrieval tier above is the configuration that matches how the rest of this documentation describes the archive.
 
 ### Unaffected by retention
 
-**Read-time erasure.** A redaction or deletion is recorded as a later event (the `-RED`/`-DEL` sibling rows in Aurora, the latest event per message in the S3 archive), and the console read paths show the redacted state. The original content stays in the raw archive objects and the original Aurora row until they expire, so a longer retention keeps pre-redaction content readable to a direct reader of the bucket for longer. **OPEN:** no path purges redacted content from the archive.
+**Read-time erasure.** A redaction or deletion is recorded as a later event (the `-RED`/`-DEL` sibling rows in Aurora, the latest event per message in the S3 archive), and the console read paths show the redacted state. The original content stays in the raw archive objects, which are kept, and in the original Aurora row, so pre-redaction content stays readable to a direct reader of the bucket. **OPEN:** no path purges redacted content from the archive.
 
-**No derived controls.** No query, retention claim or compliance control is derived from the 90 days, so changing it has no effect beyond how far back the archive reaches.
+**No derived controls.** No query, retention claim or compliance control is derived from a family's retention, so changing it has no effect beyond how far back that family reaches.
 
-**Attachments bucket.** It has its own rule, and the rule is not scoped to attachments: `conversations-stack.ts` declares `DeleteOldAttachments` with a 90-day expiration and no prefix, so it expires every object in the attachments bucket at 90 days, not only member uploads: anything else the platform writes to that bucket goes with them. Changing the archive rules above does not touch it.
+**Attachments bucket.** It has its own rules, one per key family a conversation produces: `conversations-stack.ts` expires `attachments/` (member uploads), `generated-docs/` (delivered documents) and `battle-images/` (generated images) at 90 days. What the platform serves from is in buckets of its own with no expiry: the company bucket (the company corpus and the platform's self-knowledge) and the profile bucket (profile bodies, intent packs and templates). Changing the archive rules above does not touch them.
 
 ---
 
@@ -402,3 +421,4 @@ With `createVpcEndpoints=false`, a handler whose call has no route (an S3 gatewa
 - The database starts empty - data accumulates as users chat
 - The dashboards query the base tables live, so an empty result means no matching rows in the base tables
 - Check the archival Lambda logs to confirm Kinesis events are being processed
+- Check the archival dead-letter queue: a batch that failed every retry is held there and raises an alarm in the admin channel (see [Archival failures](#archival-failures))

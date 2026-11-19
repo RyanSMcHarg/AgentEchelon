@@ -41,7 +41,19 @@ export async function sayThroughRouter(classification: string, notice: NoticeReq
 }
 
 /** `conversation-opened`, named by the canonical creator once the people its type admits are in the room. */
-export interface ConversationOpenedNaming { event: 'conversation-opened'; channelArn: string; personArn: string; label?: string }
+export interface ConversationOpenedNaming {
+  event: 'conversation-opened'; channelArn: string; personArn: string; label?: string;
+  /** What opened the room: a workflow's `open` step, or an event an opener declared. */
+  openedBy?: 'workflow' | 'event';
+  /** Where a workflow opened it: the resource the opening run was for, read from that run's values. */
+  resource?: string;
+  /** Where a workflow opened it: the opening run's process, which the run here inherits (SPEC-PROCESSES P3). */
+  process?: import('./event-workflow.js').RunProcess;
+  /** Where a workflow opened it: the customer impact the opening run's triage recorded on its card (DESIGN-PROCESSES O27). */
+  customerImpact?: import('./event-workflow.js').CustomerImpact;
+  /** Where a workflow opened it: the incident's facts the opening run holds, when it started and its Region (O28). */
+  facts?: import('./event-workflow.js').IncidentFacts;
+}
 
 /**
  * `person-joined`, named by each path that adds a person (the creator, the share and the add-member path) once the
@@ -185,6 +197,18 @@ export interface EventContinuation {
   subject?: string;
   values: Record<string, string>;
   transitions?: Array<{ step: string; outcome: string }>;
+  /** The version the run started on (ADR-067 stage 2), which the continuation reads its workflow from. */
+  origin?: import('./task-tracking.js').RunOrigin;
+  /** An intent's run only: the task its own step opened, whose row the continuation reads (never this hand-back's word). */
+  runTaskId?: string;
+  /** `task-reopened` only: the task that reopened, whose row the continuation reads, and which reopen. */
+  reopened?: { taskId: string; n: number };
+  /** `event-received` only: the rule that matched, which its room's tag is read again for, and the window. */
+  ruleEvent?: { rule: string; window: number; watch?: { kind: string; key: string } };
+  /** A meeting's events only: the meeting, which the run's natural key is computed from again. */
+  meeting?: { meetingId: string };
+  /** The run's process (SPEC-PROCESSES P2), checked for shape before the run goes on with it. */
+  process?: import('./event-workflow.js').RunProcess;
 }
 
 /**
@@ -209,10 +233,62 @@ export async function continueEventRunThroughRouter(routerArn: string, continuat
 }
 
 /**
+ * ASK THE CLASSIFICATION'S OWN ROUTER FOR A CONVERSATION'S MEETING PLACE (`propose_meeting_invites`, SPEC-ASSISTANT-MEETINGS
+ * FR42): the router reads the rows on its own role, for a conversation of its own classification only
+ * (`handleMeetingPlaceRead`). Awaited; undefined where none runs, the router refused, or it could not be reached.
+ */
+export async function meetingPlaceThroughRouter(
+  routerArn: string, channelArn: string,
+): Promise<import('./meeting-invite-offer.js').MeetingPlace | undefined> {
+  if (!routerArn || !channelArn) return undefined;
+  try {
+    lambda = lambda ?? new LambdaClient({});
+    const res = await lambda.send(new InvokeCommand({
+      FunctionName: routerArn,
+      InvocationType: InvocationType.RequestResponse,
+      Payload: Buffer.from(JSON.stringify({ aeMeetingPlace: { channelArn } })),
+    }));
+    if (res.FunctionError || !res.Payload) return undefined;
+    const out = JSON.parse(Buffer.from(res.Payload).toString() || '{}') as { place?: import('./meeting-invite-offer.js').MeetingPlace };
+    return out.place?.meetingArn && out.place.meetingRow ? out.place : undefined;
+  } catch (err) {
+    console.warn('[say-through-router] could not ask the router for the meeting place', { message: (err as Error)?.message });
+    return undefined;
+  }
+}
+
+/**
+ * HAND A MEETING'S SUMMARY BACK TO THE ROUTER (SPEC-ASSISTANT-MEETINGS FR66): the owning assistant's turn wrote it, and the
+ * router, which alone opens tasks and edits the ended card, checks the meeting's record, opens the action items' tasks,
+ * stores the summary and rewrites the card. Asynchronously; false when it could not be handed over.
+ */
+export async function meetingSummaryThroughRouter(
+  routerArn: string, written: import('./meeting-summary-turn.js').MeetingSummaryWritten,
+): Promise<boolean> {
+  if (!routerArn) return false;
+  try {
+    lambda = lambda ?? new LambdaClient({});
+    await lambda.send(new InvokeCommand({
+      FunctionName: routerArn,
+      InvocationType: InvocationType.Event,
+      Payload: Buffer.from(JSON.stringify({ aeMeetingSummary: written })),
+    }));
+    return true;
+  } catch (err) {
+    console.warn('[say-through-router] could not hand the meeting summary to the router', { message: (err as Error)?.message });
+    return false;
+  }
+}
+
+/**
  * WHAT A TASK SERVICE NAMES TO ITS OWN CLASSIFICATION'S ROUTER (ADR-063 decisions 3 and 5): a task a workflow run waits on
  * that settled, or a task that became an assistant's to take up. Ids only; the router reads the task back before it acts.
  */
-export interface TaskNaming { kind: 'settled' | 'ready'; channelArn: string; taskId: string }
+/**
+ * What the task service names: a task a run waits on that `settled`; one that is `ready` for an idle assistant; and one
+ * whose run goes on once it leaves its first state (`continue: opened`) that has `entered` another (ADR-067 WT18).
+ */
+export interface TaskNaming { kind: 'settled' | 'ready' | 'entered' | 'reopened' | 'notice' | 'request'; channelArn: string; taskId: string }
 
 /** Name a task's change to the router, asynchronously. Never throws; false when it could not be handed over. */
 export async function nameTaskThroughRouter(classification: string, naming: TaskNaming): Promise<boolean> {

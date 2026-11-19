@@ -110,6 +110,8 @@ describe('a battle turn resolves its task by the ANSWERING ASSISTANT', () => {
     });
     mockGetActiveTaskForOwner.mockResolvedValue(null);
     mockGetActiveTask.mockResolvedValue(null);
+    // The real read answers a list, empty when nothing is recorded; a declared side reads it to learn whether its duel was ended.
+    mockReadBattleRows.mockResolvedValue([]);
     ({ handler: routerHandler } = await import('../../lambda/src/router-agent-handler.js'));
   });
 

@@ -530,7 +530,8 @@ export async function recordDriftFire(input: RecordDriftInput): Promise<string> 
  */
 export async function recordDriftOutcome(input: {
   eventId: string;
-  outcome: 'declined' | 'rejected_in_new_channel' | 'accepted';
+  /** `moved_unasked`: a workflow moved the subject without an offer; `not_offered`: it neither offered nor moved (migration 101). Neither is an offer. */
+  outcome: 'declined' | 'rejected_in_new_channel' | 'accepted' | 'moved_unasked' | 'not_offered' | 'move_failed';
   newChannelArn?: string;
 }): Promise<void> {
   // WHEN IT WAS DECIDED (migration 077), and a decline is final at once. An acceptance is a move whose

@@ -155,7 +155,7 @@ describe('an experiment\'s page', () => {
     const settings = order[3];
     expect(settings).toHaveTextContent('50% of traffic');
     expect(settings).toHaveTextContent('alt-primary-premium');
-    expect(settings).toHaveTextContent('Battle Mode in Premium');
+    expect(settings).toHaveTextContent('Battle Mode in Confidential');
     await waitFor(() => expect(queryAnalytics).toHaveBeenCalledWith('battle_results', range, expect.objectContaining({ experimentId: 'exp-voice' })));
     // The battle numbers are the Battles section's own; Results does not repeat them as a table.
     expect(within(order[1]).queryByText(/Battle results/)).toBeNull();

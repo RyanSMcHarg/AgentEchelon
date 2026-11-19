@@ -15,6 +15,7 @@ import ConversationsTab from './ConversationsTab';
 import { messageLinkFromSearch, writeMessageLink, type MessageLink } from './messageLink';
 import LatencyTab from './LatencyTab';
 import PerformanceTab, { flowParams, type PerfView } from './PerformanceTab';
+import ProcessesTab from './ProcessesTab';
 import ClientTab from './ClientTab';
 import { filtersFromUrl, syncFiltersToUrl, type PerformanceFilters } from './PerformanceFilters';
 import OperationsTab from './OperationsTab';
@@ -22,6 +23,7 @@ import UserManagementTab from './UserManagementTab';
 import ModelStrategyTab from './ModelStrategyTab';
 import ExperimentsTab from './ExperimentsTab';
 import ReasonDialog from './ReasonDialog';
+import { ReasonDeclinedError } from '../../services/adminReason';
 import { useCan, useConsoleAccess } from '../../capabilities';
 import { setTeamAssistant, teamAssistant, teamCanQuery } from '../../services/teamScope';
 import ClassifierGatePanel from './ClassifierGatePanel';
@@ -32,13 +34,20 @@ import type { AnalyticsDateRange, AnalyticsResult, QueryType } from '@ae/shared'
 import './AdminDashboard.css';
 import MembershipAuditTab from './MembershipAuditTab';
 import AccessLogTab from './AccessLogTab';
+import MeetingsTab from './MeetingsTab';
+import { meetingAnalyticsAvailable } from '../../services/meetingAnalyticsService';
 import TurnKinds from './TurnKinds';
 import { UnservedSubjects } from './UnservedSubjects';
 import Handovers from './Handovers';
 import { experimentsAvailable } from '../../services/experimentsService';
-import { intentFromUrl, linkFilters, stepFromUrl, withIntentParam, type AssistantLink } from './assistantLinks';
+import {
+  intentFromUrl, linkFilters, withIntentParam, workflowEditorFromUrl, workflowEditorSearch,
+  type AssistantLink, type WorkflowEditorLink,
+} from './assistantLinks';
+import { effectivenessDrillFromUrl, effectivenessDrillParams, holdsViewOf, useUrlViews, withOnlyViewsOf } from './consoleViewUrl';
+import { WorkflowEditorNavigation } from './WorkflowEditorLink';
 
-type TabId = 'overview' | 'alerts' | 'models' | 'strategy' | 'profiles' | 'experiments' | 'classifier_gate' | 'evaluations' | 'latency' | 'flagged' | 'ground_truth' | 'effectiveness' | 'conversations' | 'users' | 'user_management' | 'security' | 'access_log' | 'client' | 'queue' | 'answer_types';
+type TabId = 'overview' | 'alerts' | 'models' | 'strategy' | 'profiles' | 'experiments' | 'classifier_gate' | 'evaluations' | 'latency' | 'flagged' | 'ground_truth' | 'effectiveness' | 'conversations' | 'users' | 'user_management' | 'security' | 'access_log' | 'client' | 'queue' | 'answer_types' | 'processes' | 'meetings';
 
 /**
  * The capability a tab reads with, so a role that does not hold it is never shown the tab
@@ -50,7 +59,7 @@ type TabId = 'overview' | 'alerts' | 'models' | 'strategy' | 'profiles' | 'exper
  * other tab reads something across assistants or classifications, so it is absent for them rather than
  * present and refusing.
  */
-export const TEAM_TABS: ReadonlySet<TabId> = new Set<TabId>(['effectiveness', 'latency', 'answer_types', 'models', 'flagged', 'ground_truth', 'profiles', 'experiments', 'conversations']);
+export const TEAM_TABS: ReadonlySet<TabId> = new Set<TabId>(['effectiveness', 'processes', 'latency', 'answer_types', 'models', 'flagged', 'ground_truth', 'profiles', 'experiments', 'conversations']);
 /** The team tabs served in Athena mode, which has no team analytics or conversation route. */
 export const TEAM_TABS_ATHENA: ReadonlySet<TabId> = new Set<TabId>(['profiles', 'experiments']);
 
@@ -69,6 +78,7 @@ export const TAB_CAPABILITY: Record<TabId, string> = {
   alerts: 'view-analytics',
   client: 'view-analytics',
   effectiveness: 'view-analytics',
+  processes: 'view-analytics',
   latency: 'view-analytics',
   answer_types: 'view-analytics',
   queue: 'view-analytics',
@@ -80,6 +90,7 @@ export const TAB_CAPABILITY: Record<TabId, string> = {
   conversations: 'view-conversations',
   security: 'view-security',
   access_log: 'view-access-log',
+  meetings: 'view-meeting-analytics',
   profiles: 'view-profiles',
   experiments: 'view-experiments',
   classifier_gate: 'view-experiments',
@@ -129,9 +140,12 @@ const DATE_PRESET_LABEL_KEYS: Record<DatePreset, string> = {
 };
 
 export function getDateRange(preset: DatePreset): AnalyticsDateRange {
-  const end = new Date().toISOString().split('T')[0];
-  const start = new Date();
-  start.setDate(start.getDate() - (preset === '24h' ? 1 : DATE_PRESETS[preset] - 1));
+  // WHOLE UTC DAYS, as both analytics modes serve them: the start is counted back on the UTC calendar, never the local one,
+  // whose day can be 23 or 25 hours across a daylight-saving change and so served one day more or less than named.
+  const now = new Date();
+  const end = now.toISOString().split('T')[0];
+  const back = preset === '24h' ? 1 : DATE_PRESETS[preset] - 1;
+  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - back));
   return { start: start.toISOString().split('T')[0], end };
 }
 
@@ -140,7 +154,7 @@ export function getDateRange(preset: DatePreset): AnalyticsDateRange {
 // Aurora-only sub-views still reachable from the nav. (flows/tasks/steps were retired from SECTIONS —
 // their detail folded into the Effectiveness drill — so they no longer appear here.) Alerts leans on
 // the Aurora-only effectiveness/model-effectiveness data, so it is Aurora-only too.
-const AURORA_TAB_IDS: TabId[] = ['flagged', 'ground_truth', 'effectiveness', 'alerts'];
+const AURORA_TAB_IDS: TabId[] = ['flagged', 'ground_truth', 'effectiveness', 'processes', 'alerts'];
 
 // Tabs available only in ATHENA mode (hidden in Aurora). `evaluations` is the basic daily
 // evaluation-score view; in Aurora the richer per-intent Effectiveness drill supersedes it, but Athena
@@ -159,6 +173,16 @@ const EXPERIMENT_TAB_IDS: TabId[] = ['experiments', 'classifier_gate'];
  * other tab is available in both. A section with no available tab is hidden entirely, so this is what
  * decides whether the Performance section (hence any evaluation UI) shows in Athena mode (B6).
  */
+/**
+ * WHERE BROWSER HISTORY LANDS ON THE ASSISTANTS TAB: an entry that names a workflow in its editor opens that editor, on
+ * whichever assistant the entry names; an entry naming none returns to the assistant whose analytics were opened from its
+ * page, where there is one; otherwise the list.
+ */
+export function profilesLanding(origin: string | null, linked: WorkflowEditorLink | null): { reopen: string } | { link: WorkflowEditorLink | null } {
+  if (linked) return { link: linked };
+  return origin ? { reopen: origin } : { link: null };
+}
+
 export function isTabAvailableIn(id: TabId, mode: 'athena' | 'aurora'): boolean {
   if (ATHENA_ONLY_TAB_IDS.includes(id)) return mode !== 'aurora';
   return mode === 'aurora' || !AURORA_TAB_IDS.includes(id);
@@ -219,7 +243,7 @@ export const SECTIONS: AdminSection[] = [
   // ONE VIEW, NOT TWO TABS. `effectiveness` is the Performance overview now: the cards
   // and the message flow, with Effectiveness and Latency as the drills a click opens. `latency` stays a
   // valid id so an old link or an alert still lands, on that drill.
-  { id: 'performance', label: 'Performance', tabs: ['effectiveness', 'answer_types', 'queue', 'evaluations', 'flagged', 'ground_truth'] },
+  { id: 'performance', label: 'Performance', tabs: ['effectiveness', 'processes', 'answer_types', 'queue', 'evaluations', 'flagged', 'ground_truth'] },
   // PERFORMANCE holds the two views of one population: how fast a turn was, and how good it was.
   // They are the same rows read two ways, which is why they now share one filter set rather than each
   // inventing its own.
@@ -235,6 +259,8 @@ export const SECTIONS: AdminSection[] = [
   // Membership Audit moves in here too. It was a top-level section called "Security" whose only child
   // was labeled something else, which teaches nobody where to look.
   { id: 'oversight', label: 'Oversight', tabs: ['conversations', 'security', 'access_log'] },
+  // MEETINGS: a conversation's meetings, read from their own events. Present only where the deployment serves them.
+  { id: 'meetings', label: 'Meetings', tabs: ['meetings'] },
   { id: 'models', label: 'Models', tabs: ['models', 'strategy'] },
   // Assistant profiles as versioned, portable artifacts (SPEC-PORTABLE-PROFILES): version /
   // activate / rollback / import / export the assistant definition, no redeploy. The retiring global
@@ -305,10 +331,12 @@ export const TABS_THAT_FETCH_NOTHING_HERE: Partial<Record<TabId, string>> = {
   strategy: 'Renders the shipped routing and capability constants. No query, in any mode.',
   security: 'Membership Audit reads findings and the enforce flag through membershipAuditService.',
   access_log: 'accessLogService (admin/access-log)',
+  meetings: 'meetingAnalyticsService (admin/meetings)',
   user_management: 'Reads the roster through its own user-management API, and not at all under an external IdP.',
   profiles: 'Reads the profile registry through profileService.',
   queue: 'Reads GET /analytics/queue-health through analyticsService, outside this fan-out.',
   answer_types: 'TurnKinds issues its own turn_kinds query when it mounts.',
+  processes: 'ProcessesPanel (process_runs)',
   classifier_gate: 'Its component issues its own reads when it mounts.',
 };
 
@@ -321,13 +349,13 @@ export const QUERIES_BY_TAB: Partial<Record<TabId, QueryType[]>> = {
     'active_messaging_users_daily' as QueryType,
     'error_rate_daily' as QueryType,
   ],
-  // Alerts scans everything that carries a target: per-intent quality, latency, per-model quality,
-  // literal error-response rows, and the platform error rate. All assembled client-side (see alerts.ts).
+  // Alerts scans everything that carries a target: per-intent quality and error-response counts, latency,
+  // per-model quality, and the platform error rate. All assembled client-side (see alerts.ts), and all
+  // counts and measurements, so opening Alerts reads no conversation content and asks for no reason.
   alerts: [
     'intent_effectiveness' as QueryType,
     'latency_metrics' as QueryType,
     'model_effectiveness' as QueryType,
-    'flagged_responses' as QueryType,
     'error_rate_daily' as QueryType,
   ],
   models: ['model_usage', 'model_effectiveness'],
@@ -365,7 +393,9 @@ export const QUERIES_BY_TAB: Partial<Record<TabId, QueryType[]>> = {
     'router_steps' as QueryType,
     'page_load_metrics' as QueryType,
   ],
-  conversations: ['conversation_summaries', 'drift_events'],
+  // The conversation list and each conversation's transcript are read by ConversationsTab itself, each
+  // with its own stated reason; the fan-out reads only the drift aggregate beside them.
+  conversations: ['drift_events'],
   users: [
     'user_activity', // partition-only fallback
     // Client-events per-user + funnels + DAU breakdown.
@@ -392,6 +422,9 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [results, setResults] = useState<Record<string, AnalyticsResult | null>>({});
+  // The content reads the operator declined to give a reason for. Each is held back, with nothing of it
+  // on screen, and the tab says why and offers to ask again.
+  const [declined, setDeclined] = useState<ReadonlySet<string>>(() => new Set());
   // Cross-tab deep-link: a Flagged/Ground-Truth row's "conversation" link sets the
   // target channel and jumps to the Conversations tab, which opens that channel's
   // detail page and clears the link (via onDeepLinkConsumed) so it fires once.
@@ -409,6 +442,8 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
    * not navigation, and pushing would make Back walk one pill at a time).
    */
   const [perfFilters, setPerfFilters] = React.useState<PerformanceFilters>(() => filtersFromUrl());
+  // ONE CHOICE OF WHETHER TASK TURNS COUNT, read by the Performance overview's TTFF card and the Latency section alike.
+  const [latencyIncludeTasks, setLatencyIncludeTasks] = React.useState(false);
   const applyPerfFilters = React.useCallback((next: PerformanceFilters) => {
     setPerfFilters(next);
     syncFiltersToUrl(next);
@@ -416,11 +451,11 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
 
   // SEEDED FROM `?intent=` (and `?step=` beside it), as the filters are from theirs: a link to one intent's
   // Effectiveness opens on that intent, its step and model breakdown narrowed to the step the link names.
-  const [effectivenessDrill, setEffectivenessDrill] = useState<EffectivenessDrill>(() => {
-    const intent = intentFromUrl();
-    const step = stepFromUrl();
-    return intent ? { level: 1, intent, ...(step ? { step } : {}) } : { level: 0 };
-  });
+  const [effectivenessDrill, setEffectivenessDrill] = useState<EffectivenessDrill>(() => effectivenessDrillFromUrl());
+  // EVERY LEVEL OF THE DRILL IS THE ADDRESS (`intent`, then `step`, or `delivery`, then `taskId`), corrected in place as the
+  // intent always was, so a link opens the level it names.
+  useUrlViews(activeTab === 'effectiveness' ? effectivenessDrillParams(effectivenessDrill) : {},
+    () => setEffectivenessDrill(effectivenessDrillFromUrl()), { replace: true });
   // Where the Performance view is: the overview, or the detail a click opened. Lifted, like the drill, so
   // it survives opening a conversation and coming Back.
   const [perfView, setPerfView] = useState<PerfView>(() => {
@@ -455,6 +490,8 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
     isTabAvailableIn(id, analyticsMode) && can(TAB_CAPABILITY[id])
     // Experiment administration exists only where AdminApi serves the `experiments` capability.
     && (!EXPERIMENT_TAB_IDS.includes(id) || experimentsAvailable())
+    // Meetings exist only where AdminApi serves the `meetings` capability.
+    && (id !== 'meetings' || meetingAnalyticsAvailable())
     && (!isTeam || isTabAvailableToTeam(id, analyticsMode, teamOwnsNone));
   // The assistant a team member's console is scoped to; changing it remounts every view on the new one.
   const [scopedTo, setScopedTo] = useState<string | null>(() => teamAssistant());
@@ -473,8 +510,9 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
     setActiveTab(tab);
     const url = new URL(window.location.href);
     url.searchParams.set('admin', tab);
-    // An open experiment belongs to the Experiments view; another view's URL does not carry it.
-    if (tab !== 'experiments') url.searchParams.delete('exp');
+    // WHAT A VIEW OPENED BELONGS TO ITS TAB (`VIEW_KEYS_OF_TAB`): another tab's URL does not carry it. An open meeting is the
+    // Conversations tab's too, so a conversation opened from it keeps it and Back reopens the meeting.
+    url.search = withOnlyViewsOf(tab, url.search);
     window.history.pushState({}, '', url);
   }, []);
 
@@ -494,9 +532,11 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
   const [assistantOrigin, setAssistantOrigin] = useState<string | null>(null);
   const assistantOriginRef = useRef<string | null>(null);
   const [reopenAssistant, setReopenAssistant] = useState<string | null>(null);
+  // ONE WORKFLOW OPENED IN ITS ASSISTANT'S EDITOR, from a link in analytics or a URL (`?admin=profiles&assistant=&workflow=`).
+  const [editorLink, setEditorLink] = useState<WorkflowEditorLink | null>(() => (tabFromUrl() === 'profiles' ? workflowEditorFromUrl() : null));
   // Handed to the Assistants tab once, when Back returns to it; leaving the tab spends it, so a later visit opens the list.
   useEffect(() => {
-    if (activeTab !== 'profiles') setReopenAssistant(null);
+    if (activeTab !== 'profiles') { setReopenAssistant(null); setEditorLink(null); }
   }, [activeTab]);
   // A caller that knows the message it is about (a battle's /battle message) hands it over, and the viewer opens at it.
   const openConversation = useCallback((channelArn: string, message?: MessageLink | null) => {
@@ -589,21 +629,25 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
     const onPop = () => {
       setConversationOrigin(null); // browser Back uses URL history, not the in-app origin shortcut
       const t = tabFromUrl();
+      const landing = t === 'profiles' ? profilesLanding(assistantOriginRef.current, workflowEditorFromUrl()) : { link: null };
+      if (t === 'profiles') { setAssistantOrigin(null); assistantOriginRef.current = null; }
       // Browser Back from an assistant's analytics lands on that assistant, as the in-app Back does.
-      if (t === 'profiles' && assistantOriginRef.current) {
-        setReopenAssistant(assistantOriginRef.current);
-        setAssistantOrigin(null);
-        assistantOriginRef.current = null;
-        setActiveTab(t);
+      if ('reopen' in landing) {
+        setReopenAssistant(landing.reopen);
+        setActiveTab('profiles');
         return;
       }
+      // Forward to a workflow's editor opens it again on that workflow.
+      setEditorLink(landing.link);
       if (t) setActiveTab(t);
       // Sync the conversation detail with the URL: forward to a `?conv` opens it,
       // Back (conv removed) closes the open detail via the registered drill-back.
       const arn = convFromUrl();
       if (arn) setMessageDeepLink(messageLinkFromUrl());
       if (arn) setConversationDeepLink(arn);
-      else if (drillBackRef.current) drillBackRef.current();
+      // A VIEW THE ADDRESS STILL NAMES stays open, and the tab follows the address itself (`useUrlView`); only an address back
+      // at the tab's own list closes the drill-down.
+      else if (drillBackRef.current && !holdsViewOf(t)) drillBackRef.current();
     };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
@@ -628,12 +672,6 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
 
     // A team member's console asks only for what their assistant's route answers (teamScope.ts).
     const queries: QueryType[] = (QUERIES_BY_TAB[activeTab] ?? []).filter((q) => teamCanQuery(q));
-    // Evaluations tab adds the per-exchange detail in Aurora mode only;
-    // it's not part of the base contract because Athena can't serve it.
-    if (activeTab === 'evaluations' && analyticsMode === 'aurora') {
-      queries.push('evaluation_exchanges');
-    }
-
     try {
       const queryResults = await Promise.all(
         queries.map(async (q) => {
@@ -645,9 +683,11 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             const extra = q === 'message_flow' || q === 'welcome_flow' || q === 'intent_effectiveness'
               ? flowParams(perfFilters)
               : undefined;
-            return { key: q, result: await queryAnalytics(q, dateRange, extra) };
-          } catch {
-            return { key: q, result: null };
+            return { key: q, result: await queryAnalytics(q, dateRange, extra), declined: false };
+          } catch (err) {
+            // A CONTENT READ WITH NO REASON IS NOT SENT, and nothing stands in its place: no earlier answer
+            // stays on screen in its place.
+            return { key: q, result: null, declined: err instanceof ReasonDeclinedError };
           }
         })
       );
@@ -657,12 +697,20 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
         newResults[key] = result;
       }
       setResults((prev) => ({ ...prev, ...newResults }));
+      setDeclined((prev) => {
+        const next = new Set(prev);
+        for (const { key, declined: wasDeclined } of queryResults) {
+          if (wasDeclined) next.add(key);
+          else next.delete(key);
+        }
+        return next;
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : t('admin.dashboard.failedToLoadAnalytics'));
     } finally {
       setIsLoading(false);
     }
-  }, [activeTab, activeTabAvailable, dateRange, analyticsMode, perfFilters]);
+  }, [activeTab, activeTabAvailable, dateRange, perfFilters]);
 
   // OPEN AN ASSISTANT PAGE'S PERFORMANCE LINK (`assistantLinks.ts`): Effectiveness for a version or an intent, or
   // Conversations, narrowed to the assistant. The values are the ones the link's URL carries, applied without a reload.
@@ -679,6 +727,14 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
     }
     selectTab(link.tab);
   }, [applyPerfFilters, changePerfView]);
+
+  // OPEN A WORKFLOW NAMED IN ANALYTICS IN ITS ASSISTANT'S EDITOR (`WorkflowEditorLink`): the Assistants tab, on that
+  // assistant's page, its Workflows section opened on the workflow. The URL is the link's own, so Back returns to the analytics.
+  const openWorkflowEditor = useCallback((link: WorkflowEditorLink) => {
+    setEditorLink(link);
+    setActiveTab('profiles');
+    window.history.pushState({}, '', `${window.location.pathname}${workflowEditorSearch(link)}${window.location.hash}`);
+  }, []);
 
   useEffect(() => {
     loadData();
@@ -745,12 +801,18 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
   const firstAvailable = SECTIONS.flatMap((sec) => sec.tabs).find(isTabAvailable);
   const activeAvailable = activeTabAvailable;
   // The tab whose view is mounted: none while the open tab is one this person cannot see.
-  const shownTab: TabId | null = activeAvailable ? activeTab : null;
+  // A tab whose every read was declined mounts nothing: its view would render an empty state that reads
+  // as "no data" when the truth is that nothing was opened. The banner above says so instead.
+  const activeQueries = (QUERIES_BY_TAB[activeTab] ?? []).filter((q) => teamCanQuery(q));
+  const activeDeclined = activeQueries.some((q) => declined.has(q));
+  const allDeclined = activeQueries.length > 0 && activeQueries.every((q) => declined.has(q));
+  const shownTab: TabId | null = activeAvailable && !(allDeclined && !isLoading) ? activeTab : null;
   useEffect(() => {
     if (access.status === 'ready' && !activeAvailable && firstAvailable) selectTab(firstAvailable);
   }, [access.status, activeAvailable, firstAvailable, selectTab]);
 
   return (
+    <WorkflowEditorNavigation.Provider value={openWorkflowEditor}>
     <div className="admin-dashboard">
       <ReasonDialog />
       {/* The operator's reach (FR0e) is stated on the Access log tab, beside the record of its use, not here. */}
@@ -768,7 +830,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
           >
             {t('admin.header.back')}
           </button>
-          <h2>{t('admin.header.title')}</h2>
+          <h1>{t('admin.header.title')}</h1>
           {/* The analytics mode, stated quietly: it explains why a tab is absent in Athena mode, and it is not a
               live status, so it carries no badge. */}
           {analyticsMode && (
@@ -835,7 +897,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
       )}
 
       <div key={scopedTo ?? 'all'} className="admin-content" role="tabpanel" id={`admin-tabpanel-${activeTab}`} aria-labelledby={`admin-tab-${activeTab}`}>
-        {!isLoading && activeTab !== 'user_management' && activeTab !== 'strategy' && activeTab !== 'conversations' && activeTab !== 'experiments' && activeTab !== 'classifier_gate' && activeTab !== 'security' && activeTab !== 'access_log' && (() => {
+        {!isLoading && activeTab !== 'user_management' && activeTab !== 'strategy' && activeTab !== 'conversations' && activeTab !== 'experiments' && activeTab !== 'classifier_gate' && activeTab !== 'security' && activeTab !== 'access_log' && activeTab !== 'meetings' && (() => {
           // Only inspect results for queries the *current* tab actually requested,
           // not the union of every previously-viewed tab's results. Otherwise a
           // stale Aurora-only result from a prior tab would mis-banner the
@@ -844,6 +906,16 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
           const tabResults = tabQueries.map(q => results[q]).filter(r => r !== undefined);
           const hasData = tabResults.some(r => r && r.data && r.data.length > 0);
           const allFailed = tabResults.length > 0 && tabResults.every(r => r === null);
+
+          if (activeDeclined) {
+            return (
+              <div className="admin-info-banner" data-testid="admin-reason-declined">
+                <strong>{t('admin.reason.declined')}</strong>{' '}
+                {t('admin.reason.declinedBody')}{' '}
+                <button className="btn-secondary" onClick={loadData}>{t('admin.reason.giveReason')}</button>
+              </div>
+            );
+          }
           // unsupported = backend confirmed this queryType isn't served in this
           // analytics mode (200 + { unsupported: true, reason }). Distinct from
           // "API down" (allFailed) and "no rows yet" (!hasData).
@@ -902,7 +974,6 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             intentEffectiveness={results.intent_effectiveness ?? null}
             latency={results.latency_metrics ?? null}
             modelEffectiveness={results.model_effectiveness ?? null}
-            flagged={results.flagged_responses ?? null}
             errorRate={results.error_rate_daily ?? null}
             // THE SAME CUT THE PERFORMANCE SURFACE IS SHOWING. An alert computed over every row while
             // the tab it links to shows one tier would send a reader to a card that does not breach.
@@ -936,7 +1007,8 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
           </div>
         )}
         {shownTab === 'profiles' && (
-          <ProfilesTab registerBack={registerDrillBack} onOpenLink={openAssistantLink} initialAssistant={reopenAssistant} />
+          <ProfilesTab registerBack={registerDrillBack} onOpenLink={openAssistantLink} initialAssistant={editorLink?.assistant ?? reopenAssistant}
+            linkedWorkflow={editorLink} />
         )}
         {shownTab === 'evaluations' && (
           <EvaluationsTab data={results.evaluation_scores ?? null} isLoading={isLoading} dateRange={dateRange} />
@@ -951,6 +1023,8 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             isLoading={isLoading}
             dateRange={dateRange}
             analyticsMode={analyticsMode}
+            includeTasks={latencyIncludeTasks}
+            onIncludeTasksChange={setLatencyIncludeTasks}
           />
         )}
         {shownTab === 'client' && (
@@ -1005,6 +1079,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             filters={perfFilters}
             onFiltersChange={applyPerfFilters}
             filterRows={(results.latency_metrics?.data ?? []) as Record<string, unknown>[]}
+            includeTasks={latencyIncludeTasks}
             view={perfView}
             onViewChange={changePerfView}
             onOpenConversation={openConversation}
@@ -1019,6 +1094,8 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
                 isLoading={isLoading}
                 dateRange={dateRange}
                 analyticsMode={analyticsMode}
+                includeTasks={latencyIncludeTasks}
+                onIncludeTasksChange={setLatencyIncludeTasks}
                 embedded
                 openTtff={openTtff}
               />
@@ -1042,9 +1119,14 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             )}
           />
         )}
+        {/* PROCESSES (SPEC-PROCESSES P9): over the Performance window and the shared filters' classification and assistant. */}
+        {shownTab === 'processes' && (
+          <ProcessesTab dateRange={dateRange} filters={perfFilters} onFiltersChange={applyPerfFilters}
+            filterRows={(results.latency_metrics?.data ?? []) as Record<string, unknown>[]} onOpenAssistants={() => selectTab('profiles')}
+            onOpenConversation={openConversation} />
+        )}
         {shownTab === 'conversations' && (
           <ConversationsTab
-            summaryData={results.conversation_summaries ?? null}
             driftData={results.drift_events ?? null}
             isLoading={isLoading}
             deepLinkChannelArn={conversationDeepLink}
@@ -1075,8 +1157,10 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
         )}
         {shownTab === 'security' && <MembershipAuditTab />}
         {shownTab === 'access_log' && <AccessLogTab />}
+        {shownTab === 'meetings' && <MeetingsTab onOpenConversation={openConversation} registerBack={registerDrillBack} />}
       </div>
     </div>
+    </WorkflowEditorNavigation.Provider>
   );
 };
 

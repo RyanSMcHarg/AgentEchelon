@@ -42,7 +42,7 @@ const MESSAGES: AdminConversationMessage[] = [
 function renderAs(capabilities: string[]) {
   return render(
     <CapabilityTestProvider capabilities={capabilities} role="team-members">
-      <ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />
+      <ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />
     </CapabilityTestProvider>,
   );
 }
@@ -89,7 +89,7 @@ describe('ConversationsTab renders only what the role holds', () => {
 describe('finding a conversation by its id (FR52)', () => {
   const renderList = (capabilities: string[]) => render(
     <CapabilityTestProvider capabilities={capabilities} role="team-members">
-      <ConversationsTab summaryData={null} driftData={null} isLoading={false} />
+      <ConversationsTab driftData={null} isLoading={false} />
     </CapabilityTestProvider>,
   );
   beforeEach(() => {

@@ -5,7 +5,8 @@
  * IAM-AUTHORIZED, ROUTE BY ROUTE. The console signs every admin call with a short-lived console session,
  * and each console role is granted `execute-api:Invoke` on exactly the routes its capabilities name in the
  * catalog (`lib/config/admin-capabilities.ts`), so a role without a capability is refused at the gateway
- * before a handler runs. The grants are made here, beside the API, on the roles `AdminServices` creates.
+ * before a handler runs. The grants are made here, beside the API, on the roles `AdminServices` creates, and
+ * the admin plane's grant names this API by its own id, so its vended sessions reach no other instance's API.
  *
  * ONE ROUTE TAKES A TOKEN: the console session, which is how the console obtains the credentials it signs
  * with. It is behind this API's own edge authorizer on the admin plane, which admits only a token whose
@@ -19,7 +20,7 @@ import type * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 import { adminOrigin } from '../config/app-origins';
 import type { AdminRole } from '../config/admin-capabilities';
-import { grantAdminRolesOnApi } from '../constructs/admin-role-grants';
+import { grantAdminPlaneOnApi, grantAdminRolesOnApi } from '../constructs/admin-role-grants';
 import { EdgeAuthorizer } from '../constructs/edge-authorizer';
 import { RouteTableApi, type RouteSpec } from '../constructs/http-api';
 import { INSTANCE_NAME } from './agent-classification-common';
@@ -29,6 +30,8 @@ export interface AdminApiStackProps extends cdk.StackProps {
   routes: readonly RouteSpec[];
   /** The console roles (`AdminServices`), granted here on the routes their capabilities name. */
   consoleRoles: Record<AdminRole, iam.IRole>;
+  /** The admin plane role (`AdminServices`), granted here on its routes by this API's own id. */
+  adminPlaneRole: iam.IRole;
   appInstanceArn: string;
   /** This deployment's own pool, or `''` when the registry declares none. */
   selfPoolId: string;
@@ -61,6 +64,7 @@ export class AdminApiStack extends cdk.Stack {
       edge: this.edge,
     });
     grantAdminRolesOnApi(this, this.api, props.consoleRoles);
+    grantAdminPlaneOnApi(this, this.api, props.adminPlaneRole);
 
     new cdk.CfnOutput(this, 'AdminApiUrl', {
       value: this.api.url,

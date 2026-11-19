@@ -93,8 +93,10 @@ export interface AdminConvPage {
 /**
  * One page of the admin conversation list, plus the TOTAL match count (server-side pagination).
  * `allowedClassifications` pushes the caller's classification scope INTO the SQL so the
- * page and total are consistent for a scoped admin (null = full access, no filter). COUNT(*) OVER()
- * returns the total in the same round-trip.
+ * page and total are consistent for a scoped admin. `null` is full access, with no filter; an EMPTY
+ * list is a scope that reaches no classification and answers an empty page with a total of 0 without
+ * reading the archive, so neither the page, the total nor a lookup by id (`channelArn`) says whether
+ * any conversation exists. COUNT(*) OVER() returns the total in the same round-trip.
  */
 export async function adminListConversations(
   limit = 50,
@@ -110,7 +112,8 @@ export async function adminListConversations(
 ): Promise<AdminConvPage> {
   const lim = Math.min(Math.max(1, limit), 200);
   const off = Math.max(0, offset);
-  const allowed = allowedClassifications && allowedClassifications.length ? allowedClassifications : null;
+  if (allowedClassifications !== null && allowedClassifications.length === 0) return { conversations: [], total: 0 };
+  const allowed = allowedClassifications;
   const res = await query<{
     channel_arn: string; classification: string | null; name: string | null;
     message_count: string; last_message_at: string | null; member_count: string;
@@ -267,6 +270,32 @@ export async function recordModerationAction(input: {
      VALUES ($1, $2, $3, $4, $5, $6)`,
     [input.channelArn, input.messageId, input.action, input.actorSub, input.actorName || null, input.actorArn || null],
   );
+}
+
+/**
+ * Whether a message is in the archive for this channel, and whether the archive holds the moderation
+ * event an audit row would attribute: the `-RED` sibling for a redaction, the `-DEL` sibling for a
+ * deletion (kinesis-archival suffixes the event's MessageId). `record_moderation` writes only when both hold.
+ */
+export async function moderationStateOf(
+  channelArn: string,
+  messageId: string,
+  action: 'redact' | 'delete',
+): Promise<{ archived: boolean; moderated: boolean }> {
+  const res = await query<{ archived: boolean | null; moderated: boolean | null }>(
+    `SELECT EXISTS (SELECT 1 FROM messages
+                     WHERE channel_arn = $1 AND message_id = $2 AND event_type = 'CREATE_CHANNEL_MESSAGE') AS archived,
+            EXISTS (SELECT 1 FROM messages
+                     WHERE channel_arn = $1 AND message_id = $3 AND event_type = $4) AS moderated`,
+    [
+      channelArn,
+      messageId,
+      `${messageId}${action === 'delete' ? '-DEL' : '-RED'}`,
+      action === 'delete' ? 'DELETE_CHANNEL_MESSAGE' : 'REDACT_CHANNEL_MESSAGE',
+    ],
+  );
+  const row = res.rows[0];
+  return { archived: row?.archived === true, moderated: row?.moderated === true };
 }
 
 export async function adminListMessages(channelArn: string): Promise<AdminConvMessage[]> {

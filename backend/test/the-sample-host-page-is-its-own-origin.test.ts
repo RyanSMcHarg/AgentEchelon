@@ -95,7 +95,7 @@ describe('who may declare it', () => {
 
   it('is refused in production and on any other kind', () => {
     expect(errors([DEPLOYMENT, GUEST], 'production')).toMatch(/"widget-host" is a sample page for testing the widget, refused in production/);
-    const host = { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', audience: 'host-client', allowedOrigins: [WIDGET_HOST_ORIGIN], clearance: { oneChannel: 'basic', classifications: ['basic'] } };
+    const host = { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', audience: 'host-client', allowedOrigins: [WIDGET_HOST_ORIGIN], clearance: { fixed: ['basic'], classifications: ['basic'] } };
     expect(errors([DEPLOYMENT, host])).toMatch(/"widget-host" is the sample host page a guest issuer's visitors arrive from/);
   });
 

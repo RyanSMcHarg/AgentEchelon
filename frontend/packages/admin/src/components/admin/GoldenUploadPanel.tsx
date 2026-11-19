@@ -130,10 +130,10 @@ export default function GoldenUploadPanel({ profileName }: { profileName: string
 
   return (
     <section className="admin-golden-upload" aria-labelledby="golden-upload-title" data-testid="golden-upload">
-      <h5 id="golden-upload-title">
+      <h4 id="golden-upload-title">
         {t('admin.goldenUpload.title')}{' '}
         <InfoTooltip label={t('admin.goldenUpload.title')} content={t('admin.goldenUpload.tip')} />
-      </h5>
+      </h4>
       {canUpload && (
         <>
           <p className="admin-field-hint">{t('admin.goldenUpload.help')}</p>

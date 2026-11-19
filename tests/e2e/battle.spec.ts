@@ -33,6 +33,7 @@ import {
   fireBattle,
   battleExpId,
   battleImageExpId,
+  battleIntentExpId,
   retireThisRunsBattleExperiments,
 } from './helpers/battle-setup';
 // No `missingUserReason` here any more: every user this suite needs is provisioned by
@@ -86,7 +87,7 @@ import { ADMIN_API_URL, adminUrl } from './helpers/api-urls';
  *
  * WHY THIS QUESTION. Three properties, and dropping any one brings the defect back:
  *
- *  1. IT IS IN THE TAXONOMY. `competitive_intel` in `backend/demo/intent-packs.ts` is exactly "why do
+ *  1. IT IS IN THE TAXONOMY. `competitive_intel` in `demo/stratum-company/intent-packs.ts` is exactly "why do
  *     we lose deals to Y", and the brief in `demo/context/premium/competitive-intel.json` records
  *     Zapier at a 38% win rate with three loss reasons. The assistant can answer it from context, so
  *     neither side has to decline and neither has to invent.
@@ -123,7 +124,7 @@ const BATTLE_PROMPT = 'Why do we lose deals to Zapier? One short paragraph, and 
  * (ADR-026, `reason: 'task-step'`), which is the state those tests are about.
  *
  * Same taxonomy rule as `BATTLE_PROMPT`, for the same reason: this is `report_generation` in the
- * premium pack (`backend/demo/intent-packs.ts`), which reaches financials, named accounts and the
+ * premium pack (`demo/stratum-company/intent-packs.ts`), which reaches financials, named accounts and the
  * competitive brief - so both sides can actually build it, and neither has to decline. It is also
  * one of the three headline prompts the demo's own welcome message advertises, so a duel fired here
  * exercises what the deployment tells people to ask for.
@@ -1707,6 +1708,25 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
       + 'downstream can read it as a finished comparison',
     ).toBe('ABANDONED');
 
+    // AND THE SIDES' WORK ENDS WITH THE DUEL. Every task this duel opened reads `cancelled` in the
+    // source-of-truth table, with the battle-ended ending on its history, so no side's report is
+    // left waiting on requirements in anyone's task list. Read from `agent-tasks` by this duel's id.
+    const agentTasks = resolveTaskTable('agent-tasks');
+    expect(agentTasks, 'the agent-tasks table resolves for this deployment').toBeTruthy();
+    const duelTasks = await pollFor(
+      () => channelTasks(agentTasks!, channelArnFor(channelId)).filter((t) => t.battleId === active!.battleId),
+      (rows) => rows.length > 0 && rows.every((t) => t.status === 'cancelled'),
+      { timeoutMs: 120_000 },
+    );
+    expect(duelTasks.length, 'the ended duel opened at least one task in this conversation').toBeGreaterThan(0);
+    for (const t of duelTasks) {
+      expect(t.status, `the side task ${t.taskId} (${t.assistantId}) ends with the duel`).toBe('cancelled');
+      expect(
+        historyOf(t).some((e) => e.reason === 'task cancelled: battle-ended'),
+        `the side task ${t.taskId} names why it ended; history: ${JSON.stringify(historyOf(t))}`,
+      ).toBe(true);
+    }
+
     // ── 3. the conversation is usable again ────────────────────────────────────────────────────
     //
     // TASK-SHAPED AGAIN, and not for symmetry. The pointer is now released the moment a duel resolves,
@@ -1774,7 +1794,7 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
 
     // THE CLIENT'S LIVE ROSTER AGREES. The members panel is the app's own copy, refreshed on the
     // membership event the alt's join sent; a mention resolves against it, so it must show the name.
-    await page.getByRole('button', { name: 'Show channel members' }).click();
+    await page.getByRole('button', { name: 'Show members' }).click();
     await expect(page.locator('.channel-members-panel-name', { hasText: altName }),
       "the members panel shows the challenger by its profile's name").toBeVisible({ timeout: 15_000 });
     // The panel's own close button: while it is open the header toggle carries the same label.
@@ -1805,11 +1825,32 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
       + `${[...new Set(botFrames.map((m) => m.senderArn))].join(', ')}`,
     ).toBe(true);
   });
+
+  // B-E11: A ROUTED INTENT IS COMPARED BY AN INTENT EXPERIMENT. A base-model battle never reaches
+  // an intent with its own route: that intent keeps its route in both arms, by design. To compare a different model
+  // for it, the operator runs an intent experiment with a battle on that intent. This arms one on `strategic_analysis`
+  // (routed on premium) with a Sonnet treatment, fires a prompt the classifier puts in that intent, and the duel's
+  // inspection (`fireBattle`, `varies`) requires both sides classified to it and on different models.
+  test('B-E11: an intent battle compares a routed intent on two models', async ({ page }) => {
+    test.setTimeout(8 * 60_000);
+    const intent = 'strategic_analysis';
+    // Premium routes this intent to Opus whatever the base model is, so the arm that differs names Sonnet.
+    await ensureBattleExperimentExists(page, { expId: battleIntentExpId(), intent, treatment: 'sonnet' });
+    await activateBattleExperiment(page, battleIntentExpId());
+    await newBattleChannel(page, 'E2E intent battle', battleIntentExpId());
+    const count = await fireBattle(
+      page,
+      '/battle Greenfield Energy renews in November with usage down 30%. Renegotiate or hold the price? One paragraph with your recommendation.',
+      260_000,
+      { intent },
+    );
+    expect(count).toBeGreaterThanOrEqual(2);
+  });
 });
 
 // Retire this run's experiments LAST, after every describe above has finished with them.
 //
-// A battle experiment is premium with a non-Opus control, and an active experiment outranks the
+// A battle experiment is premium with a non-Opus treatment, and an active experiment outranks the
 // active profile for the model it governs - so leaving one armed keeps splitting premium traffic
 // after the suite ends. The next agent-intents run then reports "a premium conversation was served
 // by ... sonnet, not an Opus model", which reads as a routing regression and is really this suite's

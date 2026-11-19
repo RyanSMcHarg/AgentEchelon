@@ -9,13 +9,16 @@
  * handle, `apply` or `decline`, and for a reminder the address the inviter types, used for that one email and stored
  * nowhere (K2). In this order, and nothing later runs when anything earlier refuses:
  *
- *  1. The caller is an ordinary signed-in person (`callerPerson`): a guest, a one-conversation session, a host
+ *  1. The caller is an ordinary signed-in person (`callerPerson`): a guest, a host
  *     assertion and an assistant's session resolve to nobody, so an assistant can never confirm its own proposal.
  *  2. The proposal is a `proposal` record, addressed to this caller (`personArn`), undecided and unexpired
  *     (`proposalRefusal`). Another member is refused here and again by the consuming update, whose condition names
  *     the addressee.
- *  3. The caller is still a member of the conversation: `DescribeChannel` bearing the caller, so the Amazon Chime SDK
- *     refuses a conversation they left. Not archived.
+ *  3. The caller still reaches the conversation (`lib/conversation-access.ts`): a current member, proven bearing the
+ *     caller so the Amazon Chime SDK refuses a conversation they left, and cleared for its classification tag, which
+ *     is the proposal's. A conversation an `open_conversation` proposal opens is created at that same classification
+ *     (the typed creator of the proposal's classification refuses any other), so the caller's clearance reaches the
+ *     conversation it opens as well as the one it concerns. Not archived.
  *  4. The caller is still the person the step addressed them as: the holder of the participant role, read from the
  *     context row's holdings at apply time (`holdersByRole`, never Metadata), or the invitation's inviter, which the
  *     invitations function reads from the invitation's record before it sends anything.
@@ -24,6 +27,8 @@
  *  6. The act: `send_nudge` asks the invitations function to remind the invitee, once (`nudgeOperation`);
  *     `open_conversation` asks the conversation's classification's typed creator to open the declared type for the
  *     caller, recording them as its creator (`confirmedBy`), who holds each `{ creator: true }` participant role.
+ *     `add_to_meeting` asks the same creator to add the people it names to the meeting's own conversation alone, once the
+ *     caller is still the meeting's host or a moderator of its room or its conversation, read live (`meetingAdderRefusal`).
  *  7. The outcome, as the act answered: `applied` once it was done; a refusal releases the claim, so the proposal is
  *     undecided and its addressee may apply it again; an act that did not answer is released where asking again cannot
  *     do it twice (a reminder) and recorded `failed` otherwise (an opening).
@@ -33,16 +38,19 @@
  */
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
-import { DescribeChannelCommand } from '@aws-sdk/client-chime-sdk-messaging';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { callerPerson } from './lib/auth.js';
+import { callerReachesConversation, refusalAnswer } from './lib/conversation-access.js';
+import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
 import { responder, originsFrom, DEV_ORIGIN, type HttpResult } from './lib/http-response.js';
 import { chimeMessagingClient } from './lib/chime/clients.js';
-import { CLASSIFICATION_TAG, readChannelTags } from './lib/channel-classification.js';
 import { holdersByRole } from './lib/participant-roles.js';
 import { userArnFor } from './lib/person-arn.js';
 import { redeemToken } from './lib/tokens.js';
-import { proposalRefusal, readProposal, releaseProposal, settleProposal, type ProposalRecord } from './lib/proposals.js';
+import { MEETING_ADDER, proposalRefusal, readProposal, releaseProposal, settleProposal, type ProposalRecord } from './lib/proposals.js';
+import { meetingAdmitsAddedPeople, storedInvites } from './lib/meeting-invites.js';
+import { isHostOrModerator } from './lib/meeting-host.js';
+import { personIdFromArn } from './lib/person-arn.js';
 import { loadProfileRegistry } from '../../lib/profile-registry';
 
 type Sender = { send(command: unknown): Promise<any> };
@@ -93,8 +101,40 @@ function bodyOf(event: any): Record<string, unknown> | null {
   }
 }
 
+/**
+ * THE MEETING AN `add_to_meeting` PROPOSAL ADDS TO, read now: still its room's meeting, still running, still taking people
+ * from outside its room, and the caller still its host or a moderator of its room or its own conversation. Returns the
+ * room it was started from, or the refusal.
+ */
+async function meetingAdderRefusal(record: ProposalRecord, callerArn: string, d: ProposalsDeps): Promise<{ roomArn: string } | { refused: HttpResult }> {
+  const { contextTable } = env(d);
+  const meetingArn = record.meetingChannelArn || '';
+  if (!contextTable || !meetingArn) return { refused: refuse(503, 'PROPOSALS_UNAVAILABLE', 'the meeting could not be read') };
+  const read = async (channelArn: string) => (await docOf(d).send(new GetCommand({
+    TableName: contextTable, Key: { channelArn }, ConsistentRead: true,
+    ProjectionExpression: 'channelArn, conversationType, meetingOf, meetingConversation, activeMeeting',
+  })))?.Item;
+  const meetingRow = await read(meetingArn);
+  const roomArn = typeof meetingRow?.meetingOf === 'string' ? meetingRow.meetingOf : '';
+  const roomRow = roomArn ? await read(roomArn) : undefined;
+  if (!roomArn || roomRow?.meetingConversation?.channelArn !== meetingArn || !meetingRow?.activeMeeting?.meetingId) {
+    return { refused: refuse(409, 'NO_ACTIVE_MEETING', 'the meeting this proposal adds people to is no longer running') };
+  }
+  if (!meetingAdmitsAddedPeople(meetingRow as never)) return { refused: refuse(403, 'NOT_PERMITTED', 'this meeting does not take people from outside its conversation') };
+  // THE PROPOSAL WAS OFFERED IN THE ROOM OR IN THE MEETING'S OWN CONVERSATION, never anywhere else.
+  if (record.channelArn !== roomArn && record.channelArn !== meetingArn) return { refused: refuse(403, 'NOT_PERMITTED', 'the proposal does not concern this meeting') };
+  // THE SAME RULE THAT ENDS THE MEETING (`isHostOrModerator`): its host, or a moderator of either conversation, read live.
+  const may = await isHostOrModerator(meetingRow.activeMeeting, { personId: personIdFromArn(callerArn) ?? '', personArn: callerArn }, { roomArn, meetingArn }, messagingOf(d));
+  if (!may) return { refused: refuse(403, 'NOT_HOST_OR_MODERATOR', "only the meeting's host or a moderator can add people to it") };
+  return { roomArn };
+}
+
 /** Whether the caller is still the person the step addressed them as, read now (rule 8). Undefined when they are. */
 async function addresseeRefusal(record: ProposalRecord, callerArn: string, d: ProposalsDeps): Promise<HttpResult | undefined> {
+  if (record.addressedAs === MEETING_ADDER) {
+    const checked = await meetingAdderRefusal(record, callerArn, d);
+    return 'refused' in checked ? checked.refused : undefined;
+  }
   if (!record.addressedAs.startsWith('participantRole:')) return undefined;
   const role = record.addressedAs.slice('participantRole:'.length);
   const { contextTable } = env(d);
@@ -119,7 +159,7 @@ async function invoke(d: ProposalsDeps, functionName: string, payload: unknown):
  * is sent at most once per invitation by the invitations function's own condition (`nudgedAt`), so asking again cannot
  * send a second; a conversation the creator was asked to open may already be open, so it is not asked for again.
  */
-const ACT_REPEATABLE: Record<ProposalRecord['op'], boolean> = { send_nudge: true, open_conversation: false };
+const ACT_REPEATABLE: Record<ProposalRecord['op'], boolean> = { send_nudge: true, open_conversation: false, add_to_meeting: true };
 
 /**
  * Perform the act a proposal names, for the person who applied it. `done` is true only when the act was done; a refusal
@@ -139,8 +179,24 @@ async function performAct(record: ProposalRecord, callerArn: string, address: st
     }
     return { result: http.respond(200, { applied: true, op: record.op, sent: (out.body as { sent?: boolean })?.sent === true }), done: true };
   }
+  if (record.op === 'add_to_meeting') {
+    // THE PEOPLE, TO THE MEETING'S OWN CONVERSATION ALONE, by the creator of the proposal's classification, which admits
+    // only a person cleared for it and never touches the room. Adding a member twice is a no-op, so asking again is safe.
+    const checked = await meetingAdderRefusal(record, callerArn, d);
+    if ('refused' in checked) return notDone(checked.refused);
+    const invites = storedInvites(record.invites, e.appInstanceArn);
+    if (!invites.length || !record.briefBy) return notDone(refuse(400, 'PROPOSAL_INVALID', 'the proposal names nobody to add'));
+    const creator = e.creatorOf(profiles.resolveClassification(record.classification) ?? record.classification);
+    if (!creator) return notDone(refuse(503, 'PROPOSALS_UNAVAILABLE', 'no creator is configured to add people to the meeting'));
+    const out = await invoke(d, creator, {
+      aeMeeting: 'add', meetingChannelArn: record.meetingChannelArn, parentChannelArn: checked.roomArn, invites, invitedBy: callerArn, briefBy: record.briefBy,
+    });
+    if (out.ok !== true) return notDone(refuse(502, typeof out.code === 'string' ? out.code : 'ADD_REFUSED', 'the people could not be added to the meeting'));
+    return { result: http.respond(200, { applied: true, op: record.op, channelArn: record.meetingChannelArn, added: typeof out.added === 'number' ? out.added : 0 }), done: true };
+  }
   if (!record.conversationType) return notDone(refuse(400, 'PROPOSAL_INVALID', 'the proposal names no conversation type'));
-  const creator = e.creatorOf(record.classification);
+  // The creator of the classification the proposal resolves to, the one the caller was checked against.
+  const creator = e.creatorOf(profiles.resolveClassification(record.classification) ?? record.classification);
   if (!creator) return notDone(refuse(503, 'PROPOSALS_UNAVAILABLE', 'no creator is configured to open the conversation'));
   const out = await invoke(d, creator, {
     detail: {
@@ -185,18 +241,18 @@ export async function applyProposal(event: any, d: ProposalsDeps = {}): Promise<
     return refuse(400, 'ADDRESS_INVALID', 'a reminder is sent to the email address you enter');
   }
 
-  // STILL A MEMBER, as the Amazon Chime SDK answers for the caller, and the conversation not archived.
-  try {
-    await messagingOf(d).send(new DescribeChannelCommand({ ChannelArn: proposal.channelArn, ChimeBearer: callerArn }));
-    const tags = await readChannelTags(messagingOf(d) as never, proposal.channelArn);
-    if (tags[CLASSIFICATION_TAG] !== proposal.classification) return refuse(403, 'UNCLASSIFIED', 'the conversation is not at the proposal\'s classification');
-    if (String(tags.archived) === 'true') return refuse(409, 'ARCHIVED', 'the conversation is archived');
-  } catch (err) {
-    const n = nameOf(err);
-    if (n === 'ForbiddenException' || n === 'NotFoundException' || n === 'BadRequestException') return refuse(403, 'NOT_A_MEMBER', 'only a member of the conversation decides its proposals');
-    console.error('[Proposals] the conversation could not be read', { err: n });
-    return refuse(503, 'PROPOSALS_UNAVAILABLE', 'the conversation could not be read');
+  // STILL REACHES THE CONVERSATION: a current member, as the Amazon Chime SDK answers for the caller, and cleared for
+  // its classification. That classification is the proposal's, so an opening is created at a classification the
+  // caller's clearance reaches; and the conversation is not archived.
+  // Tags read live in this request, so `archived` below is the conversation's now.
+  const access = await callerReachesConversation(event, proposal.channelArn, { appInstanceArn: e.appInstanceArn, client: messagingOf(d), liveTags: true });
+  if (!access.ok) {
+    const { statusCode, body } = refusalAnswer(access);
+    return refuse(statusCode, body.code, body.error);
   }
+  // Both sides resolved through the registry, so a tag written under an alias names the same classification.
+  if (access.classification !== profiles.resolveClassification(proposal.classification)) return refuse(403, 'UNCLASSIFIED', 'the conversation is not at the proposal\'s classification');
+  if (String(access.tags?.archived) === 'true') return refuse(409, 'ARCHIVED', 'the conversation is archived');
   const stillAddressed = await addresseeRefusal(proposal, callerArn, d).catch((err) => {
     console.error('[Proposals] the participant roles could not be read', { err: nameOf(err) });
     return refuse(503, 'PROPOSALS_UNAVAILABLE', 'the conversation\'s participant roles could not be read');

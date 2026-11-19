@@ -131,16 +131,20 @@ describe('the raw Lambdas admit exactly who the registry says', () => {
     // (`resolveRoomPrimaryBotArn`, DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION 3.8), which compares the
     // primary's classification with the channel's and throws on a mismatch - so an unestablished
     // classification reaching it turns a 403 the caller could act on into a 500 that names nothing.
+    // The refusal is the caller's own check (`lib/conversation-access.ts`), which answers a conversation with
+    // no recognized classification `CLASSIFICATION_UNREADABLE`: the tier is only ever one it admitted.
     const src = sourceOf('share-conversation');
-    const refusal = src.indexOf('CLASSIFICATION_UNKNOWN');
+    const check = src.indexOf('await callerReachesConversation(event, requested');
+    const refusal = src.indexOf('if (!access.ok)');
+    const tier = src.indexOf('const channelTier = access.classification;');
     const botLookup = src.indexOf('await resolveRoomPrimaryBotArn(conversationArn, channelTier)');
-    expect(`refuses: ${refusal !== -1}`).toBe('refuses: true');
-    expect(`resolves a bot: ${botLookup !== -1}`).toBe('resolves a bot: true');
-    expect(`refusal precedes the bot lookup: ${refusal < botLookup}`)
-      .toBe('refusal precedes the bot lookup: true');
-    // And the tag reader hands back nothing rather than a substitute value.
-    expect(`returns undefined for an unreadable tag: ${/if \(tag && VALID_CLASSIFICATIONS\.has\(tag\)\) return tag;[\s\S]*?return undefined;/.test(src)}`)
-      .toBe('returns undefined for an unreadable tag: true');
+    expect(`checks: ${check !== -1}, refuses: ${refusal !== -1}, takes its tier: ${tier !== -1}, resolves a bot: ${botLookup !== -1}`)
+      .toBe('checks: true, refuses: true, takes its tier: true, resolves a bot: true');
+    expect(`check, refusal, tier, bot lookup in that order: ${check < refusal && refusal < tier && tier < botLookup}`)
+      .toBe('check, refusal, tier, bot lookup in that order: true');
+    // And no tag read of its own that could substitute a value for an absent one.
+    expect(`reads a tag of its own: ${/readChannelTags|new ListTagsForResourceCommand/.test(codeOnly(src))}`)
+      .toBe('reads a tag of its own: false');
   });
 
   it('agrees on FAILING CLOSED when no declared classification names the combination', () => {

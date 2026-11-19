@@ -11,9 +11,22 @@
 import { useTranslation } from 'react-i18next';
 import type { ProfileVersionSummary } from '../../services/profileService';
 
-/** Whether the console offers to activate (roll back to) this version. A candidate never; the active one needs none. */
-export function canActivateVersion(row: Pick<ProfileVersionSummary, 'active' | 'derivedFrom'>): boolean {
-  return !row.active && !row.derivedFrom;
+/**
+ * Whether the console offers to activate (roll back to) this version. A candidate never; the active one needs none; a
+ * version carrying the retired welcome is refused by the server until the migration writes it as a new version.
+ */
+export function canActivateVersion(row: Pick<ProfileVersionSummary, 'active' | 'derivedFrom' | 'retiredWelcome'>): boolean {
+  return !row.active && !row.derivedFrom && !row.retiredWelcome;
+}
+
+/** What the rollback cell says for a version carrying the retired welcome: the migration that makes it activatable. */
+export function RetiredWelcomeNotActivatable() {
+  const { t } = useTranslation();
+  return (
+    <span className="admin-muted" data-testid="version-retired-welcome">
+      {t('admin.profiles.retiredWelcomeMigrateFirst')}
+    </span>
+  );
 }
 
 /** The provenance mark for one version row: a derived candidate, a promoted copy, or nothing. */

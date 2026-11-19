@@ -51,11 +51,13 @@ export default function ReasonDialog(): React.ReactElement | null {
       }}
     >
       <div className="admin-modal admin-section" style={{ maxWidth: '520px', width: '100%', margin: 0 }}>
-        <h4>{t('admin.reason.title')}</h4>
+        <h3>{t('admin.reason.title')}</h3>
         <p>
           {!isRead
             ? t('admin.reason.changePrompt', { capability: pending.request.capability })
-            : pending.request.subject === 'responses' ? t('admin.reason.readResponsesPrompt') : t('admin.reason.readPrompt')}
+            : pending.request.subject === 'responses' ? t('admin.reason.readResponsesPrompt')
+              : pending.request.subject === 'content' ? t('admin.reason.readContentPrompt')
+                : t('admin.reason.readPrompt')}
         </p>
         <textarea
           ref={inputRef}

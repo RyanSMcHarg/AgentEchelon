@@ -117,7 +117,8 @@ import { evaluateAbuseGate, claimPlaceholderMapping, claimCorrelation, flowDeliv
 import { canRunBattle } from './lib/battle-enablement.js';
 // A dispatch that never reached an assistant is recorded for the person it happened to, rather than
 // posted as the assistant that never ran.
-import { recordDispatchFailure } from './lib/turn-lock.js';
+import { recordDispatchFailure, takeStopEvaluation } from './lib/turn-lock.js';
+import { dispatchStopEvaluationTurn } from './lib/stop-evaluation.js';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { randomUUID } from 'node:crypto';
 import { primaryAssistantOf, memoizedTagReader } from './lib/conversation-primary.js';
@@ -548,6 +549,37 @@ async function handleFlowEvent(event: ChannelFlowEvent): Promise<void> {
     // `callbackAllow` first, so nothing delays a message reaching the channel - now holds on the
     // assistant pass too.
     await callbackAllow(CallbackId, channelArn, MessageId, storedContent, Metadata);
+
+    // ── A STOP'S QUESTION FOLLOWS ITS ACKNOWLEDGEMENT (`deferStopEvaluation`, lib/turn-lock.ts)
+    //
+    // AFTER the release, because the release is what puts the acknowledgement in the room: Amazon Chime SDK stamps a
+    // message when this flow allows it, so a question dispatched any earlier could be stamped first. The router
+    // recorded the question's dispatch against this message id; it is taken once (the flow sees the message again on
+    // every update), and only for a message the assistant itself marked `stopped`, which no member can write.
+    if (stopAcknowledgement(Metadata)) {
+      try {
+        const evaluation = await takeStopEvaluation({
+          channelArn, responderId: senderArn.split('/').pop() || '', acknowledgementId: MessageId,
+        });
+        if (evaluation) {
+          // THE CONVERSATION'S OWN CLASSIFICATION ROUTES IT, read from its immutable tag as every turn this flow
+          // dispatches is: the recorded value names what the router resolved, and a record naming another
+          // classification, or a conversation whose tag cannot be read, sends nothing (ADR-046).
+          const classification = await getChannelClassification(channelArn, senderArn);
+          if (!classification || classification !== evaluation.classification || evaluation.channelArn !== channelArn) {
+            console.error('[ChannelFlow][SecurityEvent] a deferred stop question does not match its conversation; not sent', {
+              messageId: MessageId, tagRead: !!classification,
+            });
+          } else if (!(await dispatchStopEvaluationTurn({ ...evaluation, classification }))) {
+            console.error('[ChannelFlow] the stop question could not be dispatched after its acknowledgement', { messageId: MessageId });
+          }
+        }
+      } catch (err) {
+        console.error('[ChannelFlow] the deferred stop question could not be read; it is not sent', {
+          messageId: MessageId, err: err instanceof Error ? err.name : String(err),
+        });
+      }
+    }
 
     // ── AN ASSISTANT HANDING A PERSON'S MESSAGE TO ANOTHER ASSISTANT (DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION §3.4)
     //
@@ -1679,6 +1711,17 @@ function reasonWord(err: unknown): string {
   return 'non-pending';
 }
 
+/** Whether an assistant's message is a stop acknowledgement: the `stopped` fact the router writes on it. */
+function stopAcknowledgement(metadata: string | undefined): boolean {
+  if (!metadata) return false;
+  try {
+    const m = JSON.parse(metadata) as { stopped?: unknown };
+    return !!m && typeof m.stopped === 'object' && m.stopped !== null;
+  } catch {
+    return false;
+  }
+}
+
 async function callbackAllow(
   callbackId: string,
   channelArn: string,
@@ -1828,13 +1871,22 @@ async function resolveReferenceTarget(args: {
     }));
     if (result.FunctionError) throw new Error(`task service returned ${result.FunctionError}`);
     const raw = result.Payload ? Buffer.from(result.Payload).toString() : '';
-    const found = (raw ? JSON.parse(raw) : null) as { taskId?: string; assistantId?: string } | null;
+    const found = (raw ? JSON.parse(raw) : null) as { taskId?: string; assistantId?: string; private?: true } | null;
     console.log('[ChannelFlow] a message named an open item', {
       namedBy: metadataTaskId ? 'metadata' : 'reference',
       ...(reference ? { taskRef: reference.taskRef } : {}),
       answerable: Boolean(found?.taskId),
     });
     if (!found?.taskId) return null;
+    // A PRIVATE ITEM NAMED BY ID IS ANSWERED BY A TARGETED MESSAGE, which is never the flow's turn (ADR-036). The client
+    // answers a private item with the item's id in the metadata AND a `Target` on its assistant (`MessageInput.tsx`), and
+    // Amazon Chime SDK invokes that assistant's Amazon Lex entry for the `Target` (`TargetedMessages: ALL`). The flow
+    // cannot see the `Target`, so it reads the privacy from the item: dispatching here as well would start the same
+    // message's turn twice. A typed `#<n>` carries no `Target`, so the flow still routes it.
+    if (metadataTaskId && found.private) {
+      console.log('[ChannelFlow] a private item answered by id is a targeted message; its assistant\'s Amazon Lex entry carries it', { taskId: found.taskId });
+      return null;
+    }
     // THE ASSISTANT THAT OWNS THE ITEM posts anything the flow must say on this turn's behalf. Which
     // router runs the turn is the classification's, as for an `@<assistant>`, and that router hands a
     // foreign item to its owner.
@@ -2093,16 +2145,6 @@ async function handOffTurnToRouter(params: RouterTurnParams): Promise<void> {
   });
 }
 
-/**
- * Send a message from the bot, optionally targeted to specific member ARNs.
- * When Target is set, the message is only visible to the listed members.
- *
- * Also stamps `targetedSender` into the message metadata when targeted: the
- * Chime WebSocket CREATE event doesn't reliably echo the Target field to
- * recipients, so the frontend's sticky-mention auto-set keys off the
- * metadata flag instead. (Same fields stay in `Target` for server-side
- * visibility enforcement -- this is a delivery-channel signal only.)
- */
 /**
  * A NOTICE IS SAID BY THE ASSISTANT IT CONCERNS, IN ITS OWN WORDS; THE FLOW ONLY NAMES IT.
  *

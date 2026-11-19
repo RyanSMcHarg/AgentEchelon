@@ -38,8 +38,84 @@ describe('queryAnalytics for a team', () => {
   });
 
   it('sends anything for an admin', async () => {
+    const { setReasonProvider, clearReasons } = await import('./adminReason');
+    clearReasons();
+    const release = setReasonProvider(async () => 'quality review');
     await queryAnalytics('evaluation_exchanges' as never, { start: '2026-01-01', end: '2026-01-02' });
+    release();
     expect(signed).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('an admin\'s read of conversation content', () => {
+  afterEach(() => { signed.mockClear(); });
+
+  it('posts to the content resource with a stated reason, asked once for the content lists', async () => {
+    const { setReasonProvider, clearReasons } = await import('./adminReason');
+    clearReasons();
+    const ask = vi.fn(async () => 'investigating a complaint');
+    const release = setReasonProvider(ask);
+    for (const q of ['conversation_summaries', 'evaluation_exchanges', 'flagged_responses', 'ground_truth', 'label_queue', 'user_ratings']) {
+      await queryAnalytics(q as never, undefined);
+    }
+    release();
+    expect(ask).toHaveBeenCalledTimes(1);
+    expect(ask).toHaveBeenCalledWith(expect.objectContaining({ capability: 'view-events', subject: 'content' }));
+    for (const call of signed.mock.calls as unknown[][]) {
+      expect(call[0]).toBe('https://admin.example.com/query/events-log');
+      expect(call[1]).toMatchObject({ accessReason: 'investigating a complaint' });
+    }
+  });
+
+  it('reuses the reason a conversation was opened for on that conversation\'s event log', async () => {
+    const { setReasonProvider, clearReasons } = await import('./adminReason');
+    clearReasons();
+    const ask = vi.fn(async () => 'a reported message');
+    const release = setReasonProvider(ask);
+    await queryAnalytics('channel_events' as never, undefined, { channelArn: 'arn:c1' });
+    await queryAnalytics('channel_events' as never, undefined, { channelArn: 'arn:c1' });
+    release();
+    expect(ask).toHaveBeenCalledTimes(1);
+    expect(ask).toHaveBeenCalledWith(expect.objectContaining({ capability: 'view-events', channelArn: 'arn:c1' }));
+  });
+
+  it('asks no reason for an aggregate, or for a write', async () => {
+    const { setReasonProvider, clearReasons } = await import('./adminReason');
+    clearReasons();
+    const ask = vi.fn(async () => 'unused');
+    const release = setReasonProvider(ask);
+    await queryAnalytics('model_usage' as never, undefined);
+    await queryAnalytics('flagged_responses' as never, undefined, { action: 'flag', channelArn: 'arn:c', messageId: 'm1', reason: 'poor_answer' });
+    release();
+    expect(ask).not.toHaveBeenCalled();
+    expect((signed.mock.calls[0] as unknown[])[0]).toBe('https://admin.example.com/query');
+    expect((signed.mock.calls[1] as unknown[])[0]).toBe('https://admin.example.com/query/triage');
+  });
+});
+
+describe('the moderation attribution', () => {
+  afterEach(() => { signed.mockReset(); signed.mockImplementation(async () => ({ data: [{ intent: 'x' }], columns: [] })); });
+
+  it('retries while the archive has not yet recorded the moderation, then stops', async () => {
+    const { recordModeration, MODERATION_RECORD_ATTEMPTS } = await import('./analyticsService');
+    const pending = Object.assign(new Error('not yet'), { status: 409 });
+    signed.mockRejectedValueOnce(pending).mockRejectedValueOnce(pending);
+    const wait = vi.fn(async () => undefined);
+    await recordModeration('arn:c', 'm1', 'redact', wait);
+    await vi.waitFor(() => expect(signed).toHaveBeenCalledTimes(3));
+    expect(wait).toHaveBeenCalledTimes(2);
+    expect(MODERATION_RECORD_ATTEMPTS).toBeGreaterThanOrEqual(3);
+  });
+
+  it('does not retry a refusal that is not "not yet recorded"', async () => {
+    const { recordModeration } = await import('./analyticsService');
+    signed.mockRejectedValueOnce(Object.assign(new Error('no such message'), { status: 404 }));
+    const wait = vi.fn(async () => undefined);
+    await recordModeration('arn:c', 'm1', 'delete', wait);
+    await vi.waitFor(() => expect(signed).toHaveBeenCalledTimes(1));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(signed).toHaveBeenCalledTimes(1);
+    expect(wait).not.toHaveBeenCalled();
   });
 });
 

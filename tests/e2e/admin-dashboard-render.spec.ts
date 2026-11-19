@@ -77,7 +77,7 @@ async function readMetricCards(page: Page): Promise<Record<string, string>> {
 /** Read visible section headings + the data-row count under each. */
 async function readSections(page: Page): Promise<string[]> {
   const out: string[] = [];
-  for (const h of await page.locator('.admin-content h3').all()) {
+  for (const h of await page.locator('.admin-content h2').all()) {
     if (!(await h.isVisible().catch(() => false))) continue;
     const label = ((await h.textContent().catch(() => '')) || '').trim();
     if (label) out.push(label);

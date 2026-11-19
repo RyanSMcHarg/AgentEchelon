@@ -35,6 +35,8 @@ export interface ExchangeAnswer {
   invitationChannelArn?: string;
   /** A path A bind only: the visit's continuation, the conversation the client opens. */
   bound?: { conversationArn: string };
+  /** A dashboard read only: the one object the session reads, and where (DESIGN-CONVERSATION-DASHBOARDS). */
+  dashboard?: { bucket: string; key: string; region: string };
 }
 
 /**
@@ -71,6 +73,8 @@ function answerFrom(data: Record<string, any>): ExchangeAnswer {
     ...(role === 'admins' || role === 'team-members' || role === null ? { consoleRole: role } : {}),
     ...(typeof data.invitation?.channelArn === 'string' ? { invitationChannelArn: data.invitation.channelArn } : {}),
     ...(typeof data.bound?.conversationArn === 'string' ? { bound: { conversationArn: data.bound.conversationArn } } : {}),
+    ...(typeof data.dashboard?.bucket === 'string' && typeof data.dashboard?.key === 'string' && typeof data.dashboard?.region === 'string'
+      ? { dashboard: { bucket: data.dashboard.bucket, key: data.dashboard.key, region: data.dashboard.region } } : {}),
   };
 }
 

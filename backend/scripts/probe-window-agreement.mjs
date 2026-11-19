@@ -6,9 +6,9 @@
  * each window on its own looks plausible. It failed on 2026-09-29 with differences as large as
  * `assistant_turn_count: narrow=49 wide=5`.
  *
- * That run happened while this session was driving heavy live traffic through the deployment, so the
- * confound is obvious and has to be removed before anything is called a defect: the archival pipeline is
- * asynchronous, and a partial day is still being written. A day that is CLOSED cannot have that excuse.
+ * That run happened while heavy live traffic was going through the deployment, so the confound has to
+ * be removed before anything is called a defect: the archival pipeline is asynchronous, and a partial day
+ * is still being written. A day that is CLOSED cannot have that excuse.
  *
  * So this asks the same question of a settled day. Same query, same two window widths, no traffic being
  * generated into it.
@@ -94,7 +94,7 @@ async function main() {
   }
   for (const k of w.keys()) if (!n.has(k)) diffs.push(`${k}: present in WIDE, ABSENT from narrow`);
 
-  console.log(`day under test: ${day}  (closed day, no traffic generated into it by this session)`);
+  console.log(`day under test: ${day}  (closed day, no traffic generated into it by this probe)`);
   console.log(`rows on that day: narrow=${n.size}  wide=${w.size}`);
   if (!n.size && !w.size) {
     console.log('\nNO ROWS on that day in either window - this settles nothing. Pick a day with traffic.');

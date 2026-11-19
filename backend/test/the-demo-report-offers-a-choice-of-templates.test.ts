@@ -10,7 +10,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { stratumIntentPack, PREMIUM_REPORT_TEMPLATES } from '../demo/intent-packs';
+import { stratumIntentPack, PREMIUM_REPORT_TEMPLATES } from '../../demo/stratum-company/intent-packs';
 import { parseIntentPack, validateIntentPackBody, taskStateMachines, MAX_INTENT_PACK_BYTES } from '../lambda/src/lib/intent-pack';
 import { DEFAULT_TASK_STATE_MACHINES, validateTaskStateMachines, templateChoiceOf } from '../lambda/src/lib/task-state-machines';
 import { parseTemplate } from '../lambda/src/lib/document-template';
@@ -46,7 +46,7 @@ describe('the premium demo report offers a choice of templates', () => {
 
   it('names templates the demo ships, each parsing to the name it is offered under', () => {
     for (const name of PREMIUM_REPORT_TEMPLATES) {
-      const source = fs.readFileSync(path.join(__dirname, '..', 'demo', 'templates', `${name}.md`), 'utf8');
+      const source = fs.readFileSync(path.join(__dirname, '..', '..', 'demo', 'stratum-company', 'templates', `${name}.md`), 'utf8');
       expect(parseTemplate(source).name).toBe(name);
     }
   });

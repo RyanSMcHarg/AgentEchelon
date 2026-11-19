@@ -164,6 +164,18 @@ export async function deIdentify(source: SourceRow[], anonymize: Anonymize): Pro
   });
 }
 
+/**
+ * De-identify texts that belong to no participant row, such as a recorded tool call's arguments and result (ADR-066
+ * decision 7): a user's ARN is replaced by rule, as in the copy, and the rest goes through the same detector, in one
+ * call. Returned in the same order; a detector that returns a different count is refused, never trusted.
+ */
+export async function deIdentifyTexts(texts: string[], anonymize: Anonymize): Promise<string[]> {
+  if (!texts.length) return [];
+  const masked = await anonymize(texts.map((t) => t.replace(USER_ARN, '[a user id removed]')));
+  if (masked.length !== texts.length) throw new Error(`detector returned ${masked.length} texts for ${texts.length}`);
+  return masked;
+}
+
 /** The separator a batch of texts is joined with for one detector call: no personal data in it. */
 export const SEGMENT = '\n<<<AE-SEGMENT>>>\n';
 

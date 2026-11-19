@@ -54,7 +54,7 @@ const ClientTab: React.FC<ClientTabProps> = ({ pageLoadData, connectionHealthDat
     <div className="admin-tab">
       {/* ---------- Page-load (web-vitals) ---------- */}
       <div className="admin-section">
-        <h3>
+        <h2>
           {t('admin.client.pageLoadWebVitals')}
           <InfoTooltip
             label={t('admin.client.whereThesePageLoadFigures')}
@@ -64,7 +64,7 @@ const ClientTab: React.FC<ClientTabProps> = ({ pageLoadData, connectionHealthDat
               </>
             }
           />
-        </h3>
+        </h2>
         <p className="admin-tab-description">
           How the app itself performed in the browser, for the people who actually loaded it.
         </p>
@@ -128,7 +128,7 @@ const ClientTab: React.FC<ClientTabProps> = ({ pageLoadData, connectionHealthDat
 
       {/* ---------- Connection health ---------- */}
       <div className="admin-section">
-        <h3>
+        <h2>
           {t('admin.client.websocketConnectionHealth')}
           <InfoTooltip
             label={t('admin.client.howToReadTheConnection')}
@@ -138,7 +138,7 @@ const ClientTab: React.FC<ClientTabProps> = ({ pageLoadData, connectionHealthDat
               </>
             }
           />
-        </h3>
+        </h2>
         <p className="admin-tab-description">
           Whether the live message connection is holding.
         </p>

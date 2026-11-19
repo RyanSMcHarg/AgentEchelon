@@ -10,7 +10,7 @@
  * nothing is told so and offered the create flow.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, within, waitFor, act } from '@testing-library/react';
 import ProfilesTab from './ProfilesTab';
 import * as svc from '../../services/profileService';
 import { listTeamRoster, createAssistant } from '../../services/rosterService';
@@ -49,7 +49,7 @@ beforeEach(() => {
     runtimeAssistants: [{ assistant: 'finance-advisor', classification: 'premium', role: 'primary', status: 'active', displayName: 'Finance' }],
     rosterTargets: [{ classification: 'premium', roles: ['primary', 'ops'] }],
   });
-  vi.mocked(svc.exportProfile).mockResolvedValue({ body: { modelKey: 'sonnet', displayName: 'Ops', tools: [] } } as unknown as svc.ProfileManifest);
+  vi.mocked(svc.exportProfile).mockResolvedValue({ body: { modelKey: 'sonnet', displayName: 'Ops', tools: [] }, provenance: { exportedConfigId: 'draft-tax' } } as unknown as svc.ProfileManifest);
   vi.mocked(listOwnership).mockResolvedValue({ assistants: [], teams: ['finance', 'ops'] });
 });
 
@@ -101,9 +101,9 @@ describe('an admin', () => {
     vi.mocked(svc.listProfilesAndTools).mockResolvedValue(listing('provisioning'));
     await createTaxAdvisor();
     // The wizard waits on its next step; leaving it keeps the notice.
-    expect(await screen.findByTestId('create-building')).toHaveTextContent('tax-advisor is being built');
+    expect(await screen.findByTestId('create-building')).toHaveTextContent('Building tax-advisor');
     fireEvent.click(screen.getByRole('button', { name: 'Finish later' }));
-    expect(await screen.findByTestId('created-notice')).toHaveTextContent('tax-advisor is being created');
+    expect(await screen.findByTestId('created-notice')).toHaveTextContent('Creating tax-advisor');
     // The build finished: the next load shows it active, and its row (draft ready) takes over from the notice.
     vi.mocked(svc.listProfilesAndTools).mockResolvedValue(listing('active'));
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
@@ -123,28 +123,42 @@ describe('an admin', () => {
     fireEvent.click(screen.getByTestId('create-check-build'));
     const setup = await screen.findByTestId('assistant-setup');
     const heading = () => within(setup).getByTestId('setup-step-heading');
-    expect(heading()).toHaveTextContent('Step 3 of 7: Behavioral');
+    expect(heading()).toHaveTextContent('Step 3 of 9: Behavioral');
     // The page's own editor for the name and persona, not a parallel one.
     expect(within(setup).getByTestId('assistant-config-identity')).toBeTruthy();
     expect(await within(setup).findByTestId('draft-step-identity')).toBeTruthy();
     // An edit on the step is saved on the way to the next, as one patch of that step's areas.
     vi.mocked(svc.editProfileDraft).mockResolvedValue({ profileName: 'tax-advisor', draftConfigId: 'draft-tax-2' });
+    // The reload after the save reads the draft that save made, once the test lets it land.
+    let landSaved: () => void = () => undefined;
+    const saved = { body: { modelKey: 'sonnet', displayName: 'Ops', tools: [], persona: 'You do taxes.' }, provenance: { exportedConfigId: 'draft-tax-2' } } as unknown as svc.ProfileManifest;
+    vi.mocked(svc.exportProfile).mockImplementation(() => new Promise((resolve) => { landSaved = () => resolve(saved); }));
     fireEvent.change(within(setup).getByTestId('draft-persona'), { target: { value: 'You do taxes.' } });
     expect(within(setup).getByTestId('setup-next')).toHaveTextContent('Save and continue');
     fireEvent.click(within(setup).getByTestId('setup-next'));
-    await waitFor(() => expect(heading()).toHaveTextContent('Step 4 of 7: Workflows'));
-    expect(svc.editProfileDraft).toHaveBeenCalledWith('tax-advisor', { persona: 'You do taxes.' });
+    await waitFor(() => expect(heading()).toHaveTextContent('Step 4 of 9: Purview'));
+    // Named by the draft the wizard is showing, so a draft saved elsewhere since is refused rather than merged over.
+    expect(svc.editProfileDraft).toHaveBeenCalledWith('tax-advisor', { persona: 'You do taxes.' }, 'draft-tax');
     vi.mocked(svc.editProfileDraft).mockClear();
-    expect(within(setup).getByTestId('draft-step-welcome')).toBeTruthy();
     // Nothing edited here: the step moves on without a save.
+    // The next step's Next waits for that draft to load, so a save is never built from the values before it.
+    expect(within(setup).getByTestId('setup-next')).toBeDisabled();
+    await act(async () => { landSaved(); });
+    await waitFor(() => expect(within(setup).getByTestId('setup-next')).not.toBeDisabled());
     fireEvent.click(within(setup).getByTestId('setup-next'));
-    expect(heading()).toHaveTextContent('Step 5 of 7: Scope and models');
+    expect(heading()).toHaveTextContent('Step 5 of 9: Workflows');
+    expect(within(setup).getByTestId('draft-step-events')).toBeTruthy();
     expect(svc.editProfileDraft).not.toHaveBeenCalled();
     fireEvent.click(within(setup).getByTestId('setup-next'));
-    expect(heading()).toHaveTextContent('Step 6 of 7: Tools and context');
+    expect(heading()).toHaveTextContent('Step 6 of 9: Templates');
+    expect(within(setup).getByTestId('draft-step-messages')).toBeTruthy();
+    fireEvent.click(within(setup).getByTestId('setup-next'));
+    expect(heading()).toHaveTextContent('Step 7 of 9: Tools and context');
+    fireEvent.click(within(setup).getByTestId('setup-next'));
+    expect(heading()).toHaveTextContent('Step 8 of 9: Security');
     fireEvent.click(within(setup).getByTestId('setup-next'));
     // The review is the page's draft banner: Discard, Validate and Activate over what the draft sets.
-    expect(heading()).toHaveTextContent('Step 7 of 7: Review and activate');
+    expect(heading()).toHaveTextContent('Step 9 of 9: Review and activate');
     expect(within(setup).getByTestId('assistant-draft')).toBeTruthy();
     expect(within(setup).getByTestId('draft-diff')).toBeVisible();
     expect(within(setup).getByRole('button', { name: /^Activate draft as v1$/ })).toBeTruthy();
@@ -165,12 +179,12 @@ describe('an admin', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Open Ops' }));
     const menu = await screen.findByRole('navigation', { name: 'Configuration sections' });
     const items = within(menu).getAllByRole('button').map((b) => b.textContent);
-    expect(items).toEqual(['Behavioral', 'Workflows', 'Scope and models', 'Tools and context', 'Variables', 'Versions']);
+    expect(items).toEqual(['Behavioral', 'Purview', 'Workflows', 'Processes', 'Templates', 'Tools and context', 'Security', 'Variables', 'Versions', 'Infrastructure']);
     expect(within(menu).getAllByRole('listitem')[0]).toHaveTextContent('Name and persona');
     // One section shows: Behavioral first, then whichever the menu opens.
-    expect((await screen.findAllByRole('heading', { level: 4 })).map((h) => h.textContent)).toEqual(['Behavioral']);
+    expect((await screen.findAllByRole('heading', { level: 3 })).map((h) => h.textContent)).toEqual(['Behavioral']);
     fireEvent.click(within(menu).getByRole('button', { name: 'Versions' }));
-    expect(screen.getAllByRole('heading', { level: 4 }).map((h) => h.textContent)).toEqual(['Versions']);
+    expect(screen.getAllByRole('heading', { level: 3 }).map((h) => h.textContent)).toEqual(['Versions']);
   });
 
   it('finds the owning team inside the identity group, with classification and role shown as facts, not settings', async () => {
@@ -190,7 +204,7 @@ describe('an admin', () => {
   it('shows turns per hour as a limit, with what it limits', async () => {
     renderAs(ADMIN_CAPS);
     fireEvent.click(await screen.findByRole('button', { name: 'Open Ops' }));
-    fireEvent.click(await screen.findByTestId('assistant-nav-tools'));
+    fireEvent.click(await screen.findByTestId('assistant-nav-settings'));
     const limits = await screen.findByTestId('assistant-config-limits');
     expect(within(limits).getByText('120 turns per hour')).toBeTruthy();
     expect(limits).toHaveTextContent('one person may send this assistant');

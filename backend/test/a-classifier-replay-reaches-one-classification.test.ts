@@ -30,7 +30,7 @@ describe('each classification replays on its own role, with only its own models'
   beforeAll(async () => {
     const { ArchiveStackAurora } = await import('../lib/stacks/archive-stack-aurora');
     const app = new cdk.App({ context: { adminAppUrl: 'https://admin.example.com', appUrl: 'https://chat.example.com' } });
-    const archiveStack = new ArchiveStackAurora(app, 'TestReplayReach', {
+    const archiveStack = new ArchiveStackAurora(app, 'TestReplayReach', { companyBucketArn: 'arn:aws:s3:::test-company-bucket',
       env,
       appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
       messageStream: testMessageStream(app),

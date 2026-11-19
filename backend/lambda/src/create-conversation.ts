@@ -40,16 +40,15 @@
  *
  * After the checks it invokes the requested classification's creator
  * (`create-conversation-at-classification.ts`), one per conversational classification, whose role can
- * create only a conversation of that classification. This role holds the invoke and no Amazon Chime SDK
- * grant, so no one role spans every classification's conversations.
+ * create only a conversation of that classification. This role holds the invoke, the live clearance read
+ * and no Amazon Chime SDK grant on a conversation, so no one role spans every classification's conversations.
  *
- * ── ONE PATH FOR EVERY ISSUER ────────────────────────────────────────────────────────────────────
+ * ── WHO OPENS A CONVERSATION HERE ─────────────────────────────────────────────────────────────────
  *
- * Which conversation a caller opens follows from their issuer's entry in the trusted-issuer registry
- * (`lib/config/issuers.ts`), never from a route. A person whose issuer declares the one-conversation
- * session (`clearance: { oneChannel }`) opens a HOST'S CONTEXT CONVERSATION: create-or-get on the
- * host's `{contextType, contextId}`, at the classification their issuer names, by that classification's
- * creator. Everyone else opens a typed conversation at a classification their clearance reaches.
+ * A person opens a new room with a generated id, at a classification their clearance reaches, with only
+ * themselves in it and no context. A
+ * conversation tied to a host's record is opened by the host's backend, through the IAM-invoked
+ * membership function (`membershipHandler`, `conversation-management.ts`).
  */
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
@@ -62,12 +61,11 @@ import {
 import type {
   CreateAtClassificationRequest,
   CreateAtClassificationResult,
-  CreateContextAtClassificationRequest,
-  CreateContextAtClassificationResult,
 } from './create-conversation-at-classification.js';
 import { userArnFor } from './lib/person-arn.js';
 import type { APIGatewayProxyEvent } from 'aws-lambda';
-import { callerHolderToken, callerOneChannel, callerPerson, callerPersonId } from './lib/auth.js';
+import { callerHolderToken, callerPerson, callerPersonId } from './lib/auth.js';
+import { callerStillCleared } from './lib/conversation-access.js';
 import { responder } from './lib/http-response.js';
 import { resolveConversationCreatorArn, useConversationCreatorArnSsmClient } from './lib/conversation-creator-arn.js';
 import { loadProfileRegistry, useProfileRegistrySsmClient } from '../../lib/profile-registry';
@@ -122,14 +120,14 @@ async function creatorFor(classification: string, timer?: PhaseTimer): Promise<s
 let coldContainer = true;
 
 /** Invoke a classification's creator synchronously and return its parsed answer, timed. */
-async function invokeCreator<T>(creator: string, request: unknown, timer: PhaseTimer): Promise<{ functionError?: string; result: T }> {
+async function invokeCreator(creator: string, request: unknown, timer: PhaseTimer): Promise<{ functionError?: string; result: CreateAtClassificationResult }> {
   const invoked = await timer.time('invokeCreator', () => lambdaClient.send(new InvokeCommand({
     FunctionName: creator,
     InvocationType: 'RequestResponse',
     Payload: new TextEncoder().encode(JSON.stringify(request)),
   })));
-  if (invoked.FunctionError) return { functionError: invoked.FunctionError, result: undefined as T };
-  return { result: JSON.parse(new TextDecoder().decode(invoked.Payload)) as T };
+  if (invoked.FunctionError) return { functionError: invoked.FunctionError, result: undefined as unknown as CreateAtClassificationResult };
+  return { result: JSON.parse(new TextDecoder().decode(invoked.Payload)) as CreateAtClassificationResult };
 }
 
 // This route allows any origin and any header, and sends no Content-Type header.
@@ -141,39 +139,6 @@ const EXPIRATION_CRITERIA: ExpirationCriterion[] = ['CREATED_TIMESTAMP', 'LAST_M
 interface ApiEvent {
   body?: string | Record<string, unknown> | null;
   requestContext?: { authorizer?: { claims?: Record<string, unknown> } };
-}
-
-/** The context creator's refusals, as this API has always answered them. */
-const CONTEXT_REFUSAL_STATUS: Record<string, number> = {
-  INVALID_REQUEST: 400,
-  NOT_A_MEMBER: 403,
-  CLASSIFICATION_MISMATCH: 500,
-  SERVER_MISCONFIG: 500,
-  CONVERSATION_CREATION_FAILED: 500,
-};
-
-/**
- * A ONE-CONVERSATION PERSON OPENS THEIR HOST'S CONTEXT CONVERSATION, by the creator of the
- * classification their issuer names. The creator bounds every host field, creates or re-opens, and
- * admits to an existing conversation only its own members.
- */
-async function openContextConversation(classification: string, userArn: string, body: Record<string, unknown>, timer: PhaseTimer) {
-  const creator = profiles.isKnownClassification(classification) ? await creatorFor(classification, timer) : undefined;
-  if (!creator) {
-    return reply(500, { error: 'no conversation creator is deployed for this classification', code: 'SERVER_MISCONFIG' });
-  }
-  const request: CreateContextAtClassificationRequest = { kind: 'context', classification, userArn, body };
-  const { functionError, result } = await invokeCreator<CreateContextAtClassificationResult>(creator, request, timer);
-  if (functionError) throw new Error(`the ${classification} creator failed: ${functionError}`);
-  if (!result.ok) {
-    return reply(CONTEXT_REFUSAL_STATUS[result.code] ?? 500, { error: result.error, code: result.code });
-  }
-  return reply(200, {
-    conversationArn: result.conversationArn,
-    userArn: result.userArn,
-    contextType: result.contextType,
-    contextId: result.contextId,
-  });
 }
 
 export const handler = async (event: ApiEvent) => {
@@ -209,10 +174,8 @@ async function openConversation(event: ApiEvent, timer: PhaseTimer) {
     // NEVER TRUST A BODY-SUPPLIED userArn. It would let a caller impersonate any user, or bypass the
     // reach gate by submitting another person's sub. The API Gateway authorizer rejects unauthenticated
     // requests; the person is resolved from the verified token and the ARN is composed from it.
-    // A one-conversation person is admitted HERE, because what follows is decided by that reach: they
-    // open their host's context conversation and nothing else.
     const apiEvent = event as unknown as APIGatewayProxyEvent;
-    const callerSub = await callerPersonId(apiEvent, { oneChannel: true });
+    const callerSub = await callerPersonId(apiEvent);
     if (!callerSub) return reply(401, { error: 'Unauthorized', code: 'MISSING_CLAIMS' });
     if (!APP_INSTANCE_ARN) {
       return reply(500, { error: 'APP_INSTANCE_ARN not configured', code: 'SERVER_MISCONFIG' });
@@ -221,8 +184,6 @@ async function openConversation(event: ApiEvent, timer: PhaseTimer) {
 
     const body = (typeof event.body === 'string' ? JSON.parse(event.body) : event.body) || {};
 
-    const oneChannel = callerOneChannel(apiEvent);
-    if (oneChannel) return await openContextConversation(oneChannel, userArn, body as Record<string, unknown>, timer);
     const {
       title, modelId, modelName, modelTier, topic, triggerContext, expirationDays, expirationCriterion,
     } = body as Record<string, unknown>;
@@ -305,9 +266,7 @@ async function openConversation(event: ApiEvent, timer: PhaseTimer) {
     // fail-closed direction. The mirror this replaces implemented the same rule by hand; asking the
     // registry is what stops the two drifting.
     // The caller's token, through their issuer's clearance source and within its declared classifications, which is
-    // where their reach comes from. READ FROM THE CLAIMS AND NOT FROM A LIVE LOOKUP: the IAM
-    // classification-tag gate is the real enforcement, so a claim at most one token-lifetime stale
-    // cannot exceed it.
+    // where their reach comes from, narrowed by what their directory says now, since the creator's role acts for them.
     const holderToken = callerHolderToken(apiEvent);
     const userReach = holderToken ? profiles.grantsFor(holderToken) : [];
     if (!userReach.includes(requestedClassification)) {
@@ -317,6 +276,9 @@ async function openConversation(event: ApiEvent, timer: PhaseTimer) {
         code: 'TIER_FORBIDDEN',
       });
     }
+    const stillCleared = await callerStillCleared(requestedClassification, userArn);
+    if (stillCleared === 'unavailable') return reply(503, { error: 'Your clearance could not be read just now', code: 'UNAVAILABLE' });
+    if (stillCleared === 'not-cleared') return reply(403, { error: 'Your clearance no longer reaches this classification', code: 'TIER_FORBIDDEN' });
 
     // ── THE TYPE'S ISSUER NARROWING (T1, FR23), AFTER THE REACH GATE ─────────────────────────────
     //
@@ -330,7 +292,7 @@ async function openConversation(event: ApiEvent, timer: PhaseTimer) {
 
     // ── DISPATCHED TO THAT CLASSIFICATION'S CREATOR ───────────────
     //
-    // This function holds no Amazon Chime SDK grant. Each conversational classification has its own
+    // This function holds no Amazon Chime SDK grant on a conversation. Each conversational classification has its own
     // creator (`create-conversation-at-classification.ts`), whose role can create a conversation of
     // that classification only, so the reach gate above decides WHICH creator is asked and IAM bounds
     // what that creator can make. A classification with no creator is a deployment fault.
@@ -348,7 +310,7 @@ async function openConversation(event: ApiEvent, timer: PhaseTimer) {
       triggerContext: triggerContext === undefined ? undefined : String(triggerContext),
       expirationOverride,
     };
-    const { functionError, result: created } = await invokeCreator<CreateAtClassificationResult>(creator, request, timer);
+    const { functionError, result: created } = await invokeCreator(creator, request, timer);
     if (functionError) {
       throw new Error(`the ${requestedClassification} creator failed: ${functionError}`);
     }

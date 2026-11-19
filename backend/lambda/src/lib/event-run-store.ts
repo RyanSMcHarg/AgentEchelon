@@ -7,7 +7,8 @@
  * decides between an agent step's output and its fallback and the step records are the run's transition log.
  *
  * MARKED AS AN EVENT RUN, NEVER AS WORK. The records carry `eventRun: true` and the status `event_run`, which no
- * open-work read selects, and they expire (`ttl`) a week after they are written.
+ * open-work read selects, and they expire (`ttl`) 45 days after they are written (ADR-067 WT26): past every wait a run
+ * may still hold, since a task step's deadline falls at most 30 days out. They hold references only.
  *
  * Reached only through the task service (`task-service.ts`), whose role holds the table; the router and the
  * processor ask it (`task-store.ts`).
@@ -16,7 +17,8 @@ import { GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 
 export const EVENT_RUN_PREFIX = 'event-run#';
 export const EVENT_RUN_STATUS = 'event_run';
-export const EVENT_RUN_TTL_SECONDS = 7 * 24 * 3600;
+/** At most 45 days (ADR-067 WT26), past the longest wait a run may hold (`MAX_TASK_DEADLINE_MINUTES`, 30 days). */
+export const EVENT_RUN_TTL_SECONDS = 45 * 24 * 3600;
 
 export interface EventRunClaim {
   claimed: boolean;
@@ -73,6 +75,60 @@ export function claimEventStep(
     step: input.step,
     outcome: input.outcome,
   }, deps);
+}
+
+/** The most step claims one read names: a run's steps, its continuations and its end (`MAX_EVENT_RUN_STEPS` bounds a run). */
+export const MAX_STEP_CLAIMS_READ = 64;
+
+/**
+ * WHICH OF A RUN'S STEP CLAIMS ARE HELD (the run's own transition log): each name a step, a continuation claim
+ * (`after#<step>`) or the run's end (`end`), answered with the outcome its claim recorded. Null where any read fails, so
+ * a caller never takes a step that could not be read for one not reached.
+ */
+export async function readEventSteps(
+  input: { runKey: string; channelArn: string; steps: readonly string[] },
+  deps: { send: (command: GetCommand) => Promise<{ Item?: Record<string, unknown> }>; table: string },
+): Promise<Record<string, string> | null> {
+  try {
+    const names = [...new Set(input.steps)].slice(0, MAX_STEP_CLAIMS_READ);
+    const out: Record<string, string> = {};
+    await Promise.all(names.map(async (step) => {
+      // READ CONSISTENTLY: a join counts a part's ending from the claim its hand-back has just written (`joinPartStates`).
+      const got = await deps.send(new GetCommand({ TableName: deps.table, Key: { taskId: `${EVENT_RUN_PREFIX}${input.runKey}#step#${step}`, channelArn: input.channelArn }, ConsistentRead: true }));
+      if (got?.Item?.eventRun === true) out[step] = typeof got.Item.outcome === 'string' ? got.Item.outcome : '';
+    }));
+    return out;
+  } catch (err) {
+    console.warn('[event-run] a run\'s step claims could not be read', { err: (err as Error)?.name });
+    return null;
+  }
+}
+
+/**
+ * A RUN WAITING ON A TIME (ADR-067 decision 2, WT20): one record per wait, keyed by its id (`runWaitId`), holding the
+ * run's continuation (the run key, the workflow, the step, the event's references and the run's values, never a message),
+ * which the wait's one-shot schedule names by id when it fires. Written once, so a redelivered run schedules no second
+ * wait; read once the schedule fires.
+ */
+export function holdRunWait(
+  input: { waitId: string; channelArn: string; continuation: Record<string, unknown> },
+  deps: EventRunStoreDeps,
+): Promise<EventRunClaim> {
+  return putOnce({ taskId: `${EVENT_RUN_PREFIX}wait#${input.waitId}`, channelArn: input.channelArn, continuation: input.continuation }, deps);
+}
+
+export async function readRunWait(
+  input: { waitId: string; channelArn: string },
+  deps: { send: (command: GetCommand) => Promise<{ Item?: Record<string, unknown> }>; table: string },
+): Promise<Record<string, unknown> | null> {
+  try {
+    const out = await deps.send(new GetCommand({ TableName: deps.table, Key: { taskId: `${EVENT_RUN_PREFIX}wait#${input.waitId}`, channelArn: input.channelArn } }));
+    const c = out?.Item?.eventRun === true ? out.Item.continuation : undefined;
+    return c && typeof c === 'object' ? c as Record<string, unknown> : null;
+  } catch (err) {
+    console.warn('[event-run] a wait record could not be read', { err: (err as Error)?.name });
+    return null;
+  }
 }
 
 /**

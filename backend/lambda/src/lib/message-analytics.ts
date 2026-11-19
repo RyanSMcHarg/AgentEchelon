@@ -16,11 +16,13 @@
  * `analytics-metadata.ts`), freeing the budget and making analytics robust
  * against the cap.
  *
- * Both calls are env-gated (`MESSAGE_ANALYTICS_TABLE`) and FAIL OPEN: if the
- * table is not provisioned (e.g. Athena mode, which has no archival consumer for
- * these fields) or DynamoDB rejects the call, the caller proceeds — the write is
- * skipped and the read returns null. Coupling the producer's slim decision to
- * this same env var leaves Athena mode unchanged.
+ * Both calls are env-gated (`MESSAGE_ANALYTICS_TABLE`): when the table is not
+ * provisioned (e.g. Athena mode, which has no archival consumer for these fields)
+ * the write is skipped and the read returns null. The WRITE fails open, so a
+ * DynamoDB error never holds up the reply post. The READ does not: archival
+ * retries a record whose read failed, because the row may exist and its
+ * telemetry would otherwise be committed as NULL. Coupling the producer's slim
+ * decision to this same env var leaves Athena mode unchanged.
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
@@ -74,10 +76,24 @@ export async function writeMessageAnalytics(args: {
 }
 
 /**
- * Read the out-of-band analytics record for a Chime MessageId, or null when
- * absent / unavailable. The returned object carries the same field names the
- * analytics metadata uses (bedrockModel, inputTokens, …) plus the bookkeeping
- * keys (messageId/channelArn/ttl), which downstream column derivation ignores.
+ * A read of the out-of-band record that DynamoDB refused or could not answer. Distinct from "no record":
+ * the record may exist, so the reader does not know the turn's telemetry and must not write it as absent.
+ */
+export class MessageAnalyticsReadError extends Error {
+  constructor(readonly messageId: string, readonly failure: unknown) {
+    super(`[message-analytics] read of ${messageId} failed: ${failure instanceof Error ? failure.message : String(failure)}`);
+    this.name = 'MessageAnalyticsReadError';
+  }
+}
+
+/**
+ * Read the out-of-band analytics record for a Chime MessageId. The returned object carries the same field
+ * names the analytics metadata uses (bedrockModel, inputTokens, …) plus the bookkeeping keys
+ * (messageId/channelArn/ttl), which downstream column derivation ignores.
+ *
+ * Null means there is no record to read: the table is not provisioned in this deployment, or no row is
+ * stored under the id. A failed read throws {@link MessageAnalyticsReadError} instead, so archival retries
+ * the record rather than committing its telemetry as NULL while the row still exists.
  */
 export async function readMessageAnalytics(
   messageId: string,
@@ -90,7 +106,6 @@ export async function readMessageAnalytics(
     );
     return (res.Item as Record<string, unknown> | undefined) ?? null;
   } catch (err) {
-    console.warn('[message-analytics] read failed (failing open):', err);
-    return null;
+    throw new MessageAnalyticsReadError(id, err);
   }
 }

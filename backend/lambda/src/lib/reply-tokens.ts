@@ -15,7 +15,11 @@
  *     that is not the one in From;
  *  5. From is the address the person's issuer holds for them now (`Directory.contactFor`), which answers
  *     nothing for a person offboarded or disabled at their issuer's pool, so their reply is refused then;
- *  6. there is text left once the quoted thread is removed.
+ *  6. the person's current clearance reaches the conversation's classification, read from its immutable
+ *     tag (`lib/email-clearance.ts`). Membership alone is not clearance, so a member whose clearance was
+ *     lowered, or never reached the conversation, is refused, and so is a reply whose conversation
+ *     classification or person clearance cannot be read;
+ *  7. there is text left once the quoted thread is removed.
  *
  * Anything else posts nothing and sends nothing back: a refusal is counted by reason, and no bounce is
  * generated, so a forged reply cannot turn this deployment into a source of backscatter.
@@ -24,6 +28,7 @@
  * takes (`email-reply.ts`): never as a service identity.
  */
 import type { RedemptionRefusal } from './tokens.js';
+import type { EmailClearanceRefusal } from './email-clearance.js';
 
 /** How long a reply address accepts replies. */
 export const REPLY_TOKEN_TTL_SECONDS = 14 * 86_400;
@@ -61,6 +66,7 @@ export type ReplyRefusal =
   | 'dmarc'
   | 'person-not-reachable'
   | 'from-not-the-person'
+  | EmailClearanceRefusal
   | 'empty';
 
 /** What SES says about one received message (the receipt rule's Lambda event). */
@@ -87,12 +93,17 @@ export interface ReplyDeps {
   token(token: string): Promise<{ ok: true; record: ReplyTokenRecord } | { ok: false; reason: RedemptionRefusal }>;
   /** The address the person's issuer holds for them now, or null for a person who cannot be reached. */
   contactOf(personArn: string): Promise<string | null>;
+  /**
+   * Whether the person's current clearance reaches the conversation's classification, with that
+   * classification when it does. Answers a refusal for anything it cannot read.
+   */
+  cleared(personArn: string, channelArn: string): Promise<{ ok: true; classification: string } | { ok: false; reason: EmailClearanceRefusal }>;
   /** The message's text, with the quoted thread removed. */
   text(): Promise<string>;
 }
 
 export type ReplyDecision =
-  | { post: true; channelArn: string; personArn: string; text: string; noticeId?: string }
+  | { post: true; channelArn: string; personArn: string; classification: string; text: string; noticeId?: string }
   | { post: false; reason: ReplyRefusal };
 
 const verdict = (v?: string): string => String(v || '').toUpperCase();
@@ -111,9 +122,14 @@ export async function decideReply(mail: ReceivedMail, deps: ReplyDeps): Promise<
   const contact = await deps.contactOf(record.personArn);
   if (!contact) return { post: false, reason: 'person-not-reachable' };
   if (addressOf(mail.from) !== contact.trim().toLowerCase()) return { post: false, reason: 'from-not-the-person' };
+  const clearance = await deps.cleared(record.personArn, record.channelArn);
+  if (!clearance.ok) return { post: false, reason: clearance.reason };
   const text = (await deps.text()).trim();
   if (!text) return { post: false, reason: 'empty' };
-  return { post: true, channelArn: record.channelArn, personArn: record.personArn, text, ...(record.noticeId ? { noticeId: record.noticeId } : {}) };
+  return {
+    post: true, channelArn: record.channelArn, personArn: record.personArn, classification: clearance.classification, text,
+    ...(record.noticeId ? { noticeId: record.noticeId } : {}),
+  };
 }
 
 // ── THE TEXT OF A REPLY ──────────────────────────────────────────────────────────────────────────

@@ -263,6 +263,19 @@ describe('the console\'s writer: an assistant\'s own family, and only the assist
     expect(store.objects.size + store.params.size).toBe(0);
   });
 
+  it('DENIED: a team console session on the administrator\'s route, where the body names the assistant, writes nothing', async () => {
+    const store = fakeStore();
+    const scope = jest.fn(async () => null);
+    const res = await handleTemplates(event({
+      body: JSON.stringify({ profileName: 'concierge', source }),
+      requestContext: { identity: { userArn: 'arn:aws:sts::1:assumed-role/agent-echelon-team-console/console-0192f0e0-0000-7000-8000-0000000000a1@basic' } } as never,
+    }), { store: store.deps, identities, scope });
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.body).code).toBe('ADMIN_ROUTE');
+    expect(scope).not.toHaveBeenCalled();
+    expect(store.objects.size + store.params.size).toBe(0);
+  });
+
   it('DENIED: a team route for an assistant the caller\'s team does not own is refused before anything is read', async () => {
     const store = fakeStore();
     const refused = { statusCode: 403, body: JSON.stringify({ code: 'ASSISTANT_NOT_OWNED' }), headers: {} };

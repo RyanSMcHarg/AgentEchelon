@@ -212,3 +212,13 @@ describe('OpenWorkItems while a battle is waiting', () => {
     expect(screen.getByText('workItems.finish').closest('button')?.disabled).toBe(false);
   });
 });
+
+describe('an item title that names a member', () => {
+  it('reads the mention by name, with no id, pipe or brackets', () => {
+    ctx.openWorkItems = [item({ title: 'Send @<Ryan McHarg|ryan-sub> the Q3 report' })];
+    const { container } = render(<OpenWorkItems />);
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    expect(screen.getByText('Send @Ryan McHarg the Q3 report')).toBeTruthy();
+    expect(container.textContent).not.toContain('ryan-sub');
+  });
+});

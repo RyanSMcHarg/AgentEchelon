@@ -12,7 +12,7 @@
  * it validates, it is DECLARED in an order the keyword fallback can live with, it names only tools the
  * profile permits, and a health question is answered in the turn instead of deferred behind a task.
  */
-import { OPS_INLINE_INTENTS, opsIntentPack } from '../demo/intent-packs';
+import { OPS_INLINE_INTENTS, opsIntentPack } from '../../demo/stratum-company/intent-packs';
 import {
   validateIntentPackBody,
   WORK_MANAGEMENT_INTENT_KEYS,

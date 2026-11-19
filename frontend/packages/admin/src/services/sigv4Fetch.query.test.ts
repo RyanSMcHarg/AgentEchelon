@@ -47,6 +47,20 @@ describe('a signed GET', () => {
   });
 });
 
+describe('a value carrying characters encodeURIComponent leaves raw', () => {
+  it('is sent with the encoding SigV4 signs it with, so the gateway computes the same signature', async () => {
+    const { sigv4GetJson } = await import('./sigv4Fetch');
+    const reason = "customer's call (urgent)! *see ticket*";
+    await sigv4GetJson('https://api.example.com/admin/meetings/m-1/content', { reason }, CREDS);
+    const raw = sent[0].split('?')[1];
+    expect(raw).not.toMatch(/[!'()*]/);
+    expect(raw).toContain('%21');
+    expect(raw).toContain('%28');
+    expect(raw).toContain('%2A');
+    expect(new URL(sent[0]).searchParams.get('reason')).toBe(reason);
+  });
+});
+
 describe('the message templates listing', () => {
   it('names the assistant whose templates it lists', async () => {
     vi.stubEnv('VITE_ADMIN_API_URL', 'https://api.example.com/');

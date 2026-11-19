@@ -2,7 +2,7 @@
  * AN ASSISTANT'S OWN MESSAGE TEMPLATE, AS THE STORE HOLDS IT, AND HOW A SPEC PUTS IT BACK (ADR-062 decision 2).
  *
  * A template's body is stored once under its content hash, `templates/<classification>/_assistants/<assistant>/<name>/
- * <sha256>.md` in the attachments bucket, and the version said is the SSM pointer
+ * <sha256>.md` in the profile bucket, and the version said is the SSM pointer
  * `<ssmRoot>/assistant/<classification>/templates/_assistants/<assistant>/<name>` (`templatePointerName`,
  * `backend/lambda/src/lib/template-store.ts`). Only the pointer decides what is said, so a spec that saves a template
  * records the pointer's value first and writes that value back afterwards, or deletes the pointer when there was
@@ -17,7 +17,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { awsv, awsvText } from './aws';
 import { SSM_ROOT } from './stack-prefix';
-import { attachmentsBucket } from './delivered-template';
+import { profileBucket } from './delivered-template';
 
 /** The pointer parameter of one template in an assistant's own family. */
 export function assistantTemplatePointer(classification: string, assistant: string, name: string): string {
@@ -52,8 +52,8 @@ export function restorePointer(param: string, value: string | null): void {
  * the body first, under its content hash, then the pointer, keeping the version it replaces in the pointer's history.
  */
 export function putAssistantTemplate(classification: string, assistant: string, name: string, source: string): { contentHash: string } {
-  const bucket = attachmentsBucket();
-  if (!bucket) throw new Error('the Conversations stack publishes no AttachmentsBucketName, where templates are stored');
+  const bucket = profileBucket();
+  if (!bucket) throw new Error('the Conversations stack publishes no ProfileBucketName, where templates are stored');
   const contentHash = createHash('sha256').update(source, 'utf8').digest('hex');
   const file = path.join(os.tmpdir(), `template-${contentHash}.md`);
   fs.writeFileSync(file, source, 'utf8');

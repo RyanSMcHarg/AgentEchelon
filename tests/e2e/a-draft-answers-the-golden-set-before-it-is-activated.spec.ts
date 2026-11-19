@@ -18,6 +18,7 @@
  * on a sample, as `a-conversation-is-read-without-who-said-it.spec.ts` does, and nominates again.
  */
 import { test, expect, declareWait, expectAlarm } from './helpers/fixtures';
+import { replacingDraft, draftIdOf } from './helpers/profile-draft';
 import { signIn, idTokenOf } from './helpers/agent-helpers';
 import { signedAnalyticsPost, signedAdminGet } from './helpers/signed-analytics';
 import { getAdminUser, hasTestCredentials, missingUserReason } from './helpers/test-credentials';
@@ -64,6 +65,8 @@ test.describe.serial('a draft answers the golden set before it is activated', ()
   let PROFILE = '';
   let CLASSIFICATION = '';
   let entryId = '';
+  /** The draft this spec made and edits, named on each edit and activation (SPEC-PORTABLE-PROFILES FR19). */
+  let draftId: string | undefined;
 
   test.beforeAll(async ({ browser }) => {
     const admin = await getAdminUser();
@@ -135,9 +138,10 @@ test.describe.serial('a draft answers the golden set before it is activated', ()
   test('Activate is refused until the draft has been run against the set', async () => {
     test.setTimeout(180_000);
     test.skip(!entryId, 'no entry was nominated');
-    const draft = await call(profileUrl('version'), idToken, { profileName: PROFILE });
+    const draft = await replacingDraft((b) => call(profileUrl('version'), idToken, b), { profileName: PROFILE });
     expect(draft?.draftConfigId, `a draft: ${JSON.stringify(draft)}`).toBeTruthy();
-    const activated = await call(profileUrl('activate'), idToken, { profileName: PROFILE });
+    draftId = draftIdOf(draft);
+    const activated = await call(profileUrl('activate'), idToken, { profileName: PROFILE, configId: draftId });
     expect(JSON.stringify(activated), 'Activate without a run').toMatch(/GOLDEN_RUN_REQUIRED|GOLDEN_RUN_OUTDATED/);
     const gate = await call(profileUrl('golden-gate'), idToken, { profileName: PROFILE });
     expect(gate?.available, 'the deployment has a golden run').toBe(true);
@@ -181,9 +185,10 @@ test.describe.serial('a draft answers the golden set before it is activated', ()
   test('an edit after the run needs a new run, because a run belongs to one configId', async () => {
     test.setTimeout(180_000);
     test.skip(!entryId, 'no entry was nominated');
-    const edited = await call(profileUrl('draft'), idToken, { profileName: PROFILE, patch: { systemPromptAddendum: 'Answer in one short paragraph.' } });
+    const edited = await call(profileUrl('draft'), idToken, { profileName: PROFILE, patch: { systemPromptAddendum: 'Answer in one short paragraph.' }, configId: draftId });
     expect(edited?.draftConfigId, `the edit: ${JSON.stringify(edited)}`).toBeTruthy();
-    const activated = await call(profileUrl('activate'), idToken, { profileName: PROFILE });
+    draftId = draftIdOf(edited);
+    const activated = await call(profileUrl('activate'), idToken, { profileName: PROFILE, configId: draftId });
     expect(JSON.stringify(activated), 'Activate after an edit').toMatch(/GOLDEN_RUN_REQUIRED|GOLDEN_RUN_OUTDATED/);
   });
 

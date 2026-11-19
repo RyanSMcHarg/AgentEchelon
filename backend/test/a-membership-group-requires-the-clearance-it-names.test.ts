@@ -165,8 +165,8 @@ describe('GET /users', () => {
   it('shows who is in each membership group, and what clearance each requires', async () => {
     directory({ groups: [] });
     const { users, membershipGroups } = JSON.parse((await loadHandler()(event('GET', '/users'))).body);
-    expect(membershipGroups).toEqual([{ name: 'ops', requires: 'premium' }]);
-    expect(users.find((u: { username: string }) => u.username === 'lead@x').membershipGroups).toEqual(['ops']);
+    expect(membershipGroups).toEqual([{ name: 'ops', requires: 'premium' }, { name: 'ops-on-call', requires: 'premium' }, { name: 'ops-secondary', requires: 'premium' }, { name: 'account-management', requires: 'premium' }, { name: 'account-team-lead', requires: 'premium' }]);
+    expect(users.find((u: { username: string }) => u.username === 'lead@x').membershipGroups).toEqual(['ops', 'ops-on-call', 'ops-secondary', 'account-management', 'account-team-lead']);
     expect(users.find((u: { username: string }) => u.username === 'other@x').membershipGroups).toEqual([]);
   });
 });

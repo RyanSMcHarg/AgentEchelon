@@ -37,6 +37,7 @@ vi.mock('@ae/shared/i18n', () => ({ default: { t: (k: string) => k } }));
 vi.stubEnv('VITE_ADMIN_API_URL', 'https://admin.example.com/');
 
 import { queryAnalytics, listChannelEvents, recordModeration } from './analyticsService';
+import { setReasonProvider, clearReasons } from './adminReason';
 
 const postedBody = () =>
   (mockApiCall.mock.calls[0]?.[1] as Record<string, unknown> | undefined) ?? {};
@@ -44,6 +45,9 @@ const postedBody = () =>
 beforeEach(() => {
   mockApiCall.mockReset();
   mockApiCall.mockResolvedValue({ data: [] });
+  // The event log is conversation content, read with a stated reason.
+  clearReasons();
+  setReasonProvider(async () => 'reviewing a report');
 });
 
 describe('the analytics seam omits a window it cannot name', () => {
@@ -83,6 +87,8 @@ describe('the two call sites the operator actually meets', () => {
 
   it('the moderation audit is not silently refused on every call', async () => {
     await recordModeration('arn:aws:chime:test:channel/abc', 'msg-1', 'redact');
+    // The write runs in the background, so the caller is never held up by it.
+    await vi.waitFor(() => expect(mockApiCall).toHaveBeenCalled());
     expect(postedBody()).not.toHaveProperty('dateRange');
     expect(postedBody()).toMatchObject({ queryType: 'record_moderation', moderation: 'redact' });
   });

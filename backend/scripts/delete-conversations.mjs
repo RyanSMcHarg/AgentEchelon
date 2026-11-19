@@ -12,7 +12,16 @@
  *                                 What an e2e run made: older rooms (the admin notification channel, demo
  *                                 rooms) are never selected, whoever is in them.
  *
- *   --only-test-people            with either: keep any room a real person is in (see onlyTestPeople).
+ *   --only-test-people            with either: keep any room a real person is in (see onlyTestPeople), team rooms
+ *                                 included, before anything is deleted or cleared.
+ *   --clear-team-rooms            with --created-since: also clear the standing team rooms the test users are in
+ *                                 (`team-<type>-<classification>`), which are kept: the room and its older history
+ *                                 stay, and from the window only what the test users made goes (teamRoomClearing,
+ *                                 lib/reset-demo.cjs). A message goes when a test user wrote it, or an assistant did
+ *                                 in a room only test users are in; a message anyone else wrote never goes. The task
+ *                                 rows created since that time go only from a room only test users are in, and a room
+ *                                 holding an open task from the window is left as it is and named. The dry run lists,
+ *                                 per author, how many of their messages would go and how many stay.
  *
  * THE ROOM'S TASKS GO WITH IT. A task row outlives its channel otherwise, and a person's open items then list
  * work in a conversation that no longer exists and cannot be answered. Each deleted room's rows are deleted from
@@ -28,10 +37,11 @@
 import {
   ChimeSDKMessagingClient, ListChannelsCommand, ListTagsForResourceCommand, DescribeChannelCommand,
   DeleteChannelCommand, ListChannelMembershipsForAppInstanceUserCommand, ListChannelMembershipsCommand,
+  ListChannelMessagesCommand, DeleteChannelMessageCommand,
 } from '@aws-sdk/client-chime-sdk-messaging';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
-import { CognitoIdentityProviderClient, ListUsersCommand } from '@aws-sdk/client-cognito-identity-provider';
+import { CognitoIdentityProviderClient, ListUsersCommand, ListUsersInGroupCommand } from '@aws-sdk/client-cognito-identity-provider';
 import { DynamoDBClient, QueryCommand, BatchWriteItemCommand, GetItemCommand } from '@aws-sdk/client-dynamodb';
 import { createRequire } from 'node:module';
 
@@ -40,14 +50,20 @@ const REGION = process.env.AWS_REGION || 'us-east-1';
 // cleanup run by validate addresses the deployment under test and never the default one.
 const { resolveInstanceName } = createRequire(import.meta.url)('./lib/stack-lookup.cjs');
 const { appInstanceArnOf, personIdFromArn } = createRequire(import.meta.url)('./lib/person-arn.cjs');
+const { isTeamRoom, teamRoomClearing, seededAccountTeamEmails, ACCOUNT_TEAM_GROUP } = createRequire(import.meta.url)('./lib/reset-demo.cjs');
 const INSTANCE = resolveInstanceName(process.env);
 const SECRET_NAME = process.env.TEST_SECRET_NAME || 'agent-interface/test-credentials';
 const APPLY = process.argv.includes('--apply');
 const ARCHIVED = process.argv.includes('--archived');
+const CLEAR_TEAM_ROOMS = process.argv.includes('--clear-team-rooms');
 const sinceArg = process.argv.find((a) => a.startsWith('--created-since='))?.slice('--created-since='.length);
 
 if (ARCHIVED === Boolean(sinceArg)) {
   console.error('Name exactly one selection: --archived, or --created-since=<ISO time>.');
+  process.exit(2);
+}
+if (CLEAR_TEAM_ROOMS && !sinceArg) {
+  console.error('--clear-team-rooms clears what was posted since a time: name it with --created-since=<ISO time>.');
   process.exit(2);
 }
 const since = sinceArg ? new Date(sinceArg) : null;
@@ -136,6 +152,15 @@ async function readTestUserArns() {
   const pool = process.env.VITE_USER_POOL_ID;
   if (!pool) throw new Error('VITE_USER_POOL_ID is not set; it names the pool the test users are in.');
   const cognito = new CognitoIdentityProviderClient({ region: REGION });
+  // THE SEED'S ACCOUNT TEAMS ARE TEST PEOPLE TOO, so the meeting conversations they are in go with a reset.
+  const groupEmails = [];
+  let groupToken;
+  do {
+    const r = await cognito.send(new ListUsersInGroupCommand({ UserPoolId: pool, GroupName: ACCOUNT_TEAM_GROUP, NextToken: groupToken })).catch(() => ({}));
+    for (const u of r.Users || []) groupEmails.push(u.Attributes?.find((a) => a.Name === 'email')?.Value || '');
+    groupToken = r.NextToken;
+  } while (groupToken);
+  emails.push(...seededAccountTeamEmails(secret, groupEmails, { emailDomain: process.env.TEST_EMAIL_DOMAIN }));
   const identitiesParam = `/${INSTANCE}/shared/tables/identities-name`;
   const identities = (await ssm.send(new GetParameterCommand({ Name: identitiesParam }))).Parameter?.Value;
   if (!identities) throw new Error(`${identitiesParam} is not published; the test users' AppInstanceUsers cannot be resolved.`);
@@ -154,6 +179,12 @@ async function readTestUserArns() {
   }
   return [...new Set(arns)];
 }
+
+/**
+ * The team rooms the test users are in: kept whenever they were created, and cleared with --clear-team-rooms. A team room
+ * has a fixed id that alarm triggers and room tags name, so it stands and only what the window added to it goes.
+ */
+const standingTeamRooms = [];
 
 async function createdSinceWithTestUsers() {
   const users = await testUserArns();
@@ -174,6 +205,7 @@ async function createdSinceWithTestUsers() {
   }
   const picked = [];
   for (const arn of candidates) {
+    if (isTeamRoom(arn)) { standingTeamRooms.push(arn); continue; }
     const c = (await send(new DescribeChannelCommand({ ChannelArn: arn, ChimeBearer: adminArn }))).Channel;
     if (c?.CreatedTimestamp && new Date(c.CreatedTimestamp) > since) picked.push(arn);
   }
@@ -186,24 +218,27 @@ async function createdSinceWithTestUsers() {
  * HUMAN member is a test user (assistants and the service admin are not people). The admin notification
  * channel and demo rooms have real people in them, so they are kept however old they are.
  */
+/** Whether every HUMAN member of a room is a test user, and it has at least one. */
+async function hasOnlyTestPeople(arn, tests) {
+  const humans = [];
+  let NextToken;
+  do {
+    const r = await send(new ListChannelMembershipsCommand({ ChannelArn: arn, ChimeBearer: adminArn, MaxResults: 50, NextToken }));
+    for (const m of r.ChannelMemberships || []) {
+      const a = m.Member?.Arn || '';
+      if (a.includes('/user/') && a !== adminArn) humans.push(a);
+    }
+    NextToken = r.NextToken;
+  } while (NextToken);
+  return humans.length > 0 && humans.every((h) => tests.has(h));
+}
+
 async function onlyTestPeople(arns) {
   const tests = new Set(await testUserArns());
   const kept = [];
   for (let i = 0; i < arns.length; i += 8) {
     const batch = arns.slice(i, i + 8);
-    const verdicts = await Promise.all(batch.map(async (arn) => {
-      const humans = [];
-      let NextToken;
-      do {
-        const r = await send(new ListChannelMembershipsCommand({ ChannelArn: arn, ChimeBearer: adminArn, MaxResults: 50, NextToken }));
-        for (const m of r.ChannelMemberships || []) {
-          const a = m.Member?.Arn || '';
-          if (a.includes('/user/') && a !== adminArn) humans.push(a);
-        }
-        NextToken = r.NextToken;
-      } while (NextToken);
-      return humans.length > 0 && humans.every((h) => tests.has(h));
-    }));
+    const verdicts = await Promise.all(batch.map((arn) => hasOnlyTestPeople(arn, tests)));
     batch.forEach((arn, j) => { if (verdicts[j]) kept.push(arn); });
   }
   console.log(`${kept.length} of ${arns.length} have only test users as their people; the rest are kept.`);
@@ -248,13 +283,106 @@ async function deleteTasksOf(channelArn) {
   return removed;
 }
 
+/** Every message in a room since the window, as the admin and as each member: a targeted message is listed only to the person it targets. */
+async function messagesSince(channelArn) {
+  const bearers = [adminArn];
+  let NextToken;
+  do {
+    const r = await send(new ListChannelMembershipsCommand({ ChannelArn: channelArn, ChimeBearer: adminArn, MaxResults: 50, NextToken }));
+    for (const m of r.ChannelMemberships || []) if (m.Member?.Arn?.includes('/user/') && m.Member.Arn !== adminArn) bearers.push(m.Member.Arn);
+    NextToken = r.NextToken;
+  } while (NextToken);
+  const out = [];
+  for (const ChimeBearer of bearers) {
+    let token;
+    do {
+      const r = await send(new ListChannelMessagesCommand({ ChannelArn: channelArn, ChimeBearer, NotBefore: since, SortOrder: 'DESCENDING', MaxResults: 50, NextToken: token }));
+      for (const m of r.ChannelMessages || []) out.push({ MessageId: m.MessageId, CreatedTimestamp: m.CreatedTimestamp, author: m.Sender?.Arn || '' });
+      token = r.NextToken;
+    } while (token);
+  }
+  return out;
+}
+
+/**
+ * A task row has ended when its status is a terminal one (`TERMINAL_TASK_STATUS`, lambda/src/lib/task-tracking.ts).
+ * `abandoned` is not: an abandoned task can be resumed, so it is open.
+ */
+const ENDED_STATUS = new Set(['completed', 'failed', 'cancelled']);
+
+/** A room's task rows in both tables, with what the clearing reads. */
+async function taskRowsOf(channelArn) {
+  const rows = [];
+  for (const t of TASK_TABLES) {
+    let ExclusiveStartKey;
+    do {
+      const r = await dynamo.send(new QueryCommand({
+        TableName: t.name, IndexName: t.index, KeyConditionExpression: 'channelArn = :c',
+        ExpressionAttributeValues: { ':c': { S: channelArn } }, ExclusiveStartKey,
+      }));
+      for (const item of r.Items || []) {
+        rows.push({
+          table: t.name, key: Object.fromEntries(t.keys.map((k) => [k, item[k]])),
+          taskId: item.taskId?.S, createdAt: item.createdAt?.S, terminal: ENDED_STATUS.has(item.status?.S),
+        });
+      }
+      ExclusiveStartKey = r.LastEvaluatedKey;
+    } while (ExclusiveStartKey);
+  }
+  return rows;
+}
+
+/** Clear one standing team room of the window's messages and task rows. Returns true when it could not be cleared. */
+async function clearTeamRoom(channelArn) {
+  const id = channelArn.split('/').pop();
+  const cast = new Set(await testUserArns());
+  const onlyCastInRoom = await hasOnlyTestPeople(channelArn, cast);
+  const rows = await taskRowsOf(channelArn);
+  const plan = teamRoomClearing(await messagesSince(channelArn), rows, since, { cast, onlyCastInRoom });
+  if (!plan.clear) {
+    console.log(`  ${id}: kept as it is; task(s) from the window still open: ${plan.open.join(', ')}. Settle them, then run again.`);
+    return true;
+  }
+  console.log(`  ${id}: ${plan.messageIds.length} message(s) and ${plan.taskIds.length} task(s) since ${since.toISOString()}${APPLY ? '' : ' would go'}${onlyCastInRoom ? '' : '; a person outside the test users is in the room, so its tasks and its assistants\x27 messages stay'}`);
+  for (const a of plan.authors) {
+    const who = a.kind === 'cast' ? `test user ${personIdFromArn(a.author) || a.author}` : a.kind === 'assistant' ? `assistant ${a.author.split('/').pop()}` : `${personIdFromArn(a.author) || a.author.split('/').pop() || 'unknown sender'} (not a test user)`;
+    console.log(`    ${who}: ${a.included} message(s)${APPLY ? ' deleted' : ' would go'}, ${a.kept} kept`);
+  }
+  if (!APPLY) return false;
+  let failed = false;
+  for (const MessageId of plan.messageIds) {
+    try { await send(new DeleteChannelMessageCommand({ ChannelArn: channelArn, MessageId, ChimeBearer: adminArn })); }
+    catch (err) {
+      if (err?.name === 'NotFoundException') continue;
+      failed = true;
+      console.warn(`  could not delete a message in ${id}: ${err?.name}: ${err?.message}`);
+    }
+  }
+  const going = new Set(plan.taskIds);
+  for (const row of rows.filter((r) => going.has(r.taskId))) {
+    const r = await dynamo.send(new BatchWriteItemCommand({ RequestItems: { [row.table]: [{ DeleteRequest: { Key: row.key } }] } }));
+    if (r.UnprocessedItems?.[row.table]?.length) { failed = true; console.warn(`  could not delete task ${row.taskId} in ${row.table}`); }
+  }
+  return failed;
+}
+
 let picked = ARCHIVED ? await archivedChannels() : await createdSinceWithTestUsers();
-if (process.argv.includes('--only-test-people')) picked = await onlyTestPeople(picked);
+const ONLY_TEST_PEOPLE = process.argv.includes('--only-test-people');
+if (ONLY_TEST_PEOPLE) picked = await onlyTestPeople(picked);
+let teamRoomFailures = 0;
+if (CLEAR_TEAM_ROOMS) {
+  let teamRooms = standingTeamRooms;
+  // A team room a real person is in is kept as it is, as every other room is under --only-test-people.
+  if (ONLY_TEST_PEOPLE) teamRooms = await onlyTestPeople(teamRooms);
+  console.log(`${teamRooms.length} standing team room(s) the test users are in to clear:`);
+  for (const arn of teamRooms) if (await clearTeamRoom(arn)) teamRoomFailures += 1;
+}
 if (!APPLY) {
   for (const arn of picked.slice(0, 10)) console.log(`  would delete ${arn.split('/').pop()}`);
   if (picked.length > 10) console.log(`  ... and ${picked.length - 10} more`);
+  if (teamRoomFailures) console.log(`${teamRoomFailures} team room(s) could not be cleared.`);
   console.log(`Dry run: nothing was deleted. With --apply each room's task rows go too (${TASK_TABLES.map((t) => t.name).join(', ') || 'no task tables found'}).`);
-  process.exit(0);
+  process.exit(teamRoomFailures ? 1 : 0);
 }
 
 let deleted = 0;
@@ -289,4 +417,5 @@ for (const arn of [...failed]) {
 }
 console.log(`Deleted ${deleted} of ${picked.length} conversation(s).${failed.length ? ` ${failed.length} could not be deleted.` : ''}`);
 console.log(`Deleted ${tasksDeleted} task row(s) across ${TASK_TABLES.map((t) => t.name).join(', ') || 'no task tables'}.${taskFailures.length ? ` The tasks of ${taskFailures.length} room(s) could not be deleted.` : ''}`);
-process.exit(failed.length || taskFailures.length ? 1 : 0);
+if (teamRoomFailures) console.log(`${teamRoomFailures} team room(s) could not be cleared.`);
+process.exit(failed.length || taskFailures.length || teamRoomFailures ? 1 : 0);

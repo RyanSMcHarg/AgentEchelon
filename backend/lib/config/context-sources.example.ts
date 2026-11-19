@@ -31,8 +31,8 @@ export function contextSourceCatalog(ctx: CatalogDeploymentContext): ContextSour
       description: 'Titles and one-line summaries of the documents this classification may read',
       useWhen: 'Deciding whether an answer exists in company knowledge before answering generally',
       type: 's3-prefix',
-      arn: ctx.attachmentsBucketArn,
-      locator: ctx.attachmentsBucketName,
+      arn: ctx.companyBucketArn,
+      locator: ctx.companyBucketName,
       // The classification's OWN prefix, which is what makes this the isolation boundary: the grant
       // the stack emits names this exact path, so a lower classification cannot reach a higher one's.
       prefix: `context/${ctx.classification}/`,

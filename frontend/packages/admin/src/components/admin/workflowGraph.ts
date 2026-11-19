@@ -10,6 +10,7 @@
 import { edgeTargets, type EventWorkflow } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
 import type { StepPosition, WorkflowLayout } from '../../../../../../backend/lambda/src/lib/workflow-layout.ts';
 import { layoutFor } from '../../../../../../backend/lambda/src/lib/workflow-layout.ts';
+import type { TaskStateMachine } from '../../../../../../backend/lambda/src/lib/task-state-machines.ts';
 import { orderedSteps, type EdgeName } from './workflowEdits';
 
 export const NODE_W = 232;
@@ -83,6 +84,51 @@ export function autoLayout(wf: EventWorkflow): Record<string, StepPosition> {
 export function positionsOf(wf: EventWorkflow, saved: Readonly<Record<string, StepPosition>> | undefined): Record<string, StepPosition> {
   const auto = autoLayout(wf);
   return Object.fromEntries(Object.keys(wf.states).map((k) => [k, saved?.[k] ?? auto[k]]));
+}
+
+/**
+ * A TASK MACHINE AS THE CANVAS DRAWS IT (the builder's task-machine mode): one edge per declared transition, and the
+ * computed point of every state by its distance from the initial state over transitions. A machine may loop, so a
+ * transition back to a state already placed is drawn and never re-places it.
+ */
+export function machineEdgesOf(m: TaskStateMachine): GraphEdge[] {
+  const out: GraphEdge[] = [];
+  for (const [from, def] of Object.entries(m.states)) {
+    for (const to of def.transitions ?? []) if (m.states[to]) out.push({ from, to, edge: 'onSuccess' });
+  }
+  return out;
+}
+
+/** Where each state is drawn: rows by distance from the initial state, unreached states in a row below. */
+export function machinePositionsOf(m: TaskStateMachine): Record<string, StepPosition> {
+  const depth = new Map<string, number>();
+  const rows: string[][] = [];
+  const queue: string[] = m.states[m.initial] ? [m.initial] : [];
+  if (queue.length) depth.set(m.initial, 0);
+  while (queue.length) {
+    const at = queue.shift()!;
+    const d = depth.get(at)!;
+    (rows[d] ??= []).push(at);
+    for (const next of m.states[at].transitions ?? []) {
+      if (m.states[next] && !depth.has(next)) { depth.set(next, d + 1); queue.push(next); }
+    }
+  }
+  const unreached = Object.keys(m.states).filter((k) => !depth.has(k));
+  if (unreached.length) rows.push(unreached);
+  const out: Record<string, StepPosition> = {};
+  rows.forEach((row, r) => row.forEach((key, c) => {
+    out[key] = { x: MARGIN + c * (NODE_W + GAP_X), y: MARGIN + r * (NODE_H + GAP_Y) };
+  }));
+  return out;
+}
+
+/** The path a transition is drawn on: down to a later row, or around the side when it returns to an earlier one. */
+export function transitionPath(from: StepPosition, to: StepPosition): { d: string; mid: StepPosition } {
+  if (to.y > from.y) return edgePath(from, to, 'onSuccess');
+  const start = { x: from.x + NODE_W, y: from.y + NODE_H / 2 };
+  const end = { x: to.x + NODE_W, y: to.y + NODE_H / 2 };
+  const out = Math.max(start.x, end.x) + 48;
+  return { d: `M ${start.x} ${start.y} C ${out} ${start.y}, ${out} ${end.y}, ${end.x} ${end.y}`, mid: { x: out - 12, y: (start.y + end.y) / 2 } };
 }
 
 /** The event's point: above the step the run starts at. */

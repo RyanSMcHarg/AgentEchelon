@@ -14,7 +14,7 @@ jest.mock('@aws-sdk/lib-dynamodb', () => ({
   UpdateCommand: jest.fn().mockImplementation((args) => ({ __type: 'Update', input: args })),
 }), { virtual: true });
 
-import { getChannelContext, getParticipantContext, putChannelContext, advanceOnboardingIntake } from '../../lambda/src/lib/channel-context-client';
+import { getChannelContext, getParticipantContext, putChannelContext, advanceOnboardingIntake, recordChildConversation, claimActiveMeeting, releaseActiveMeeting } from '../../lambda/src/lib/channel-context-client';
 
 const ARN = 'arn:aws:chime:us-east-1:111:app-instance/i/channel/c1';
 
@@ -254,5 +254,145 @@ describe('a conversation is created once and enrolled once (ADR-050)', () => {
     expect(expr).toContain('#createdAt = if_not_exists(#createdAt, :createdAt)');
     expect(expr).toContain('#enrollment = if_not_exists(#enrollment, :enrollment)');
     expect(expr).toContain('#userName = :userName');
+  });
+});
+
+describe('recordChildConversation', () => {
+  const PARENT = 'arn:aws:chime:us-east-1:111:app-instance/i/channel/team';
+  const child = { channelId: 'esc-new', typeKey: 'ops', openedAt: '2026-11-08T00:00:00Z' };
+  const full = Array.from({ length: 50 }, (_, i) => ({ channelId: `esc-${i}`, typeKey: 'ops', openedAt: '2026-11-07T00:00:00Z' }));
+  const raced = [...full.slice(1), { channelId: 'esc-other', typeKey: 'ops', openedAt: '2026-11-07T12:00:00Z' }];
+  const failed = () => Object.assign(new Error('c'), { name: 'ConditionalCheckFailedException' });
+
+  it('under the cap, appends on a size condition and reads nothing', async () => {
+    mockDdbSend.mockResolvedValue({});
+    await expect(recordChildConversation(PARENT, child)).resolves.toBe(true);
+    expect(mockDdbSend).toHaveBeenCalledTimes(1);
+    const cmd = mockDdbSend.mock.calls[0][0];
+    expect(cmd.__type).toBe('Update');
+    expect(cmd.input.UpdateExpression).toContain('list_append');
+    expect(cmd.input.ConditionExpression).toBe('attribute_not_exists(#children) OR size(#children) < :cap');
+    expect(cmd.input.ExpressionAttributeValues[':cap']).toBe(50);
+  });
+
+  it('at the cap, replaces the list on the condition that it is exactly the list it read, oldest dropped', async () => {
+    mockDdbSend.mockRejectedValueOnce(failed()).mockResolvedValueOnce({ Item: { children: full } }).mockResolvedValueOnce({});
+    await expect(recordChildConversation(PARENT, child)).resolves.toBe(true);
+    const [, get, replace] = mockDdbSend.mock.calls.map((c) => c[0]);
+    expect(get.__type).toBe('Get');
+    expect(get.input.ConsistentRead).toBe(true);
+    expect(replace.input.ConditionExpression).toBe('#children = :read');
+    expect(replace.input.ExpressionAttributeValues[':read']).toEqual(full);
+    expect(replace.input.ExpressionAttributeValues[':list']).toEqual([...full.slice(1), child]);
+  });
+
+  it('DENY: a replace raced by another child never overwrites it; it reads again and keeps both', async () => {
+    mockDdbSend
+      .mockRejectedValueOnce(failed())
+      .mockResolvedValueOnce({ Item: { children: full } }).mockRejectedValueOnce(failed())
+      .mockResolvedValueOnce({ Item: { children: raced } }).mockResolvedValueOnce({});
+    await expect(recordChildConversation(PARENT, child)).resolves.toBe(true);
+    const last = mockDdbSend.mock.calls[4][0];
+    expect(last.input.ExpressionAttributeValues[':read']).toEqual(raced);
+    expect(last.input.ExpressionAttributeValues[':list']).toContainEqual({ channelId: 'esc-other', typeKey: 'ops', openedAt: '2026-11-07T12:00:00Z' });
+    expect(last.input.ExpressionAttributeValues[':list']).toContainEqual(child);
+  });
+
+  it('gives up after a bounded number of tries, unlisted and without throwing', async () => {
+    mockDdbSend.mockImplementation(async (cmd: { __type: string }) => {
+      if (cmd.__type === 'Get') return { Item: { children: full } };
+      throw failed();
+    });
+    await expect(recordChildConversation(PARENT, child)).resolves.toBe(false);
+    expect(mockDdbSend.mock.calls.filter((c) => c[0].__type === 'Update')).toHaveLength(4);
+  });
+
+  it('a failure other than the condition is not retried', async () => {
+    mockDdbSend.mockRejectedValue(Object.assign(new Error('t'), { name: 'ProvisionedThroughputExceededException' }));
+    await expect(recordChildConversation(PARENT, child)).resolves.toBe(false);
+    expect(mockDdbSend).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('the active meeting is claimed and released conditionally', () => {
+  const MEETING = {
+    meetingId: 'm-1',
+    meeting: { MeetingId: 'm-1' },
+    classification: 'premium',
+    createdAt: '2026-10-01T00:00:00.000Z',
+    createdBy: 'alice',
+  };
+
+  it('claims only when the conversation has no meeting recorded', async () => {
+    mockDdbSend.mockResolvedValue({});
+    expect(await claimActiveMeeting(ARN, MEETING)).toBe('claimed');
+    const cmd = mockDdbSend.mock.calls[0][0];
+    expect(cmd.input.ConditionExpression).toBe('attribute_not_exists(#meeting)');
+    expect(cmd.input.ExpressionAttributeNames['#meeting']).toBe('activeMeeting');
+    expect(cmd.input.ExpressionAttributeValues[':meeting']).toEqual(MEETING);
+  });
+
+  it('tells a losing starter it lost, so it can delete the meeting it made', async () => {
+    mockDdbSend.mockRejectedValue(Object.assign(new Error('c'), { name: 'ConditionalCheckFailedException' }));
+    expect(await claimActiveMeeting(ARN, MEETING)).toBe('lost');
+  });
+
+  it('reports a store failure as failed, never as claimed', async () => {
+    mockDdbSend.mockRejectedValue(Object.assign(new Error('x'), { name: 'ProvisionedThroughputExceededException' }));
+    expect(await claimActiveMeeting(ARN, MEETING)).toBe('failed');
+  });
+
+  it('releases only the meeting the caller observed', async () => {
+    mockDdbSend.mockResolvedValue({});
+    expect(await releaseActiveMeeting(ARN, 'm-1')).toBe('released');
+    const cmd = mockDdbSend.mock.calls[0][0];
+    expect(cmd.input.ConditionExpression).toBe('#meeting.#meetingId = :meetingId');
+    expect(cmd.input.ExpressionAttributeValues[':meetingId']).toBe('m-1');
+    // The field is removed, not set to null: `attribute_not_exists` is the claim condition, and a null
+    // left behind would read as "a meeting is recorded" and block every later start.
+    expect(cmd.input.UpdateExpression).toContain('REMOVE #meeting');
+  });
+
+  it('records when the meeting ended in the same write that clears it, so no reader finds it neither running nor ended', async () => {
+    mockDdbSend.mockResolvedValue({});
+    expect(await releaseActiveMeeting(ARN, 'm-1', '2026-11-17T10:00:00.000Z')).toBe('released');
+    expect(mockDdbSend).toHaveBeenCalledTimes(1);
+    const cmd = mockDdbSend.mock.calls[0][0];
+    expect(cmd.input.UpdateExpression).toBe('REMOVE #meeting SET #updatedAt = :updatedAt, #last.#endedAt = :endedAt');
+    expect(cmd.input.ConditionExpression).toBe('#meeting.#meetingId = :meetingId AND #last.#meetingId = :meetingId');
+    expect(cmd.input.ExpressionAttributeValues[':endedAt']).toBe('2026-11-17T10:00:00.000Z');
+  });
+
+  it('releases without the stamp a record whose last meeting is not this one, and reports a superseded one as superseded', async () => {
+    const lost = Object.assign(new Error('c'), { name: 'ConditionalCheckFailedException' });
+    mockDdbSend.mockRejectedValueOnce(lost).mockResolvedValueOnce({});
+    expect(await releaseActiveMeeting(ARN, 'm-1', '2026-11-17T10:00:00.000Z')).toBe('released');
+    expect(mockDdbSend.mock.calls[1][0].input.UpdateExpression).toBe('REMOVE #meeting SET #updatedAt = :updatedAt');
+    mockDdbSend.mockReset();
+    mockDdbSend.mockRejectedValue(lost);
+    expect(await releaseActiveMeeting(ARN, 'm-1', '2026-11-17T10:00:00.000Z')).toBe('superseded');
+  });
+
+  it('does not clear a different meeting that was claimed in the meantime', async () => {
+    mockDdbSend.mockRejectedValue(Object.assign(new Error('c'), { name: 'ConditionalCheckFailedException' }));
+    expect(await releaseActiveMeeting(ARN, 'm-1')).toBe('superseded');
+  });
+
+  it('refuses both writes when the table is unconfigured rather than reporting success', async () => {
+    delete process.env.CHANNEL_CONTEXT_TABLE;
+    expect(await claimActiveMeeting(ARN, MEETING)).toBe('failed');
+    expect(await releaseActiveMeeting(ARN, 'm-1')).toBe('failed');
+    expect(mockDdbSend).not.toHaveBeenCalled();
+  });
+
+  // THE GUARD, PINNED. `activeMeeting` is deliberately absent from OWNED_FIELDS so that the
+  // last-write-wins writer cannot express an unconditional claim, which would orphan a running meeting.
+  // If somebody adds it to that list to "fix" a discarded write, this fails and says why.
+  it('cannot be written through the unconditional writer at all', async () => {
+    mockDdbSend.mockResolvedValue({});
+    const wrote = await putChannelContext(ARN, { activeMeeting: MEETING } as never);
+    // Nothing but the timestamp was in the patch, so the writer no-ops without touching the store.
+    expect(mockDdbSend).not.toHaveBeenCalled();
+    expect(wrote).toBe(true);
   });
 });

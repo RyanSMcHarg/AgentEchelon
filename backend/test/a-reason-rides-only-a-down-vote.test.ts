@@ -17,11 +17,11 @@ jest.mock('@aws-sdk/lib-dynamodb', () => ({
   PutCommand: jest.fn((input) => ({ __put: input })),
   DeleteCommand: jest.fn((input) => ({ __del: input })),
 }));
-// No APP_INSTANCE_ARN: the channel-membership check is skipped, so these tests exercise the record
-// that gets written rather than the Chime call in front of it.
-jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
-  ChimeSDKMessagingClient: jest.fn(() => ({ send: jest.fn() })),
-  DescribeChannelMembershipCommand: jest.fn(),
+// THE CALLER REACHES THE CONVERSATION here, so these tests exercise the record that gets written rather than
+// the check in front of it (`lib/conversation-access.ts`), whose refusals are proven for this route in
+// `lib/a-person-route-reaches-only-a-conversation-its-caller-reaches.test.ts`.
+jest.mock('../lambda/src/lib/conversation-access', () => ({
+  callerReachesConversation: async (_e: unknown, channelArn: string) => ({ ok: true, channelArn, classification: 'premium' }),
 }));
 
 process.env.FEEDBACK_TABLE = 'test-feedback';

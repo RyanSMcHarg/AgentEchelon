@@ -373,6 +373,14 @@ export function toolStepOutcome(name: string, payload: unknown): ToolStepOutcome
 /**
  * Analytics metadata attached to each message
  */
+/** A run's process as a message's out-of-band record carries it (SPEC-PROCESSES P8): its id, name, edition and the run's team. */
+export interface ProcessRunRecord { processId: string; process: string; processEdition?: string; ownerTeam?: string }
+
+/** The out-of-band record of a run's process, one shape for every writer: the router's sends, a step's turn and a task's turns. */
+export function processRunOf(proc: { id: string; name: string; edition?: string; ownerTeam?: string }): ProcessRunRecord {
+  return { processId: proc.id, process: proc.name, ...(proc.edition ? { processEdition: proc.edition } : {}), ...(proc.ownerTeam ? { ownerTeam: proc.ownerTeam } : {}) };
+}
+
 export interface AnalyticsMetadata {
   // Message context
   messageNumber: number;
@@ -448,6 +456,13 @@ export interface AnalyticsMetadata {
   subjectDecision?: { decision: 'same' | 'new' | 'skipped'; distance?: number };
   /** How the item this message answers was decided (ADR-035): named by reference, or ranked. */
   taskResolution?: 'reference' | 'id' | 'ranked';
+  /**
+   * How the classifier placed the message against the conversation's open work (ADR-064, amended 2026-11-12):
+   * `continues_task` when it read the message as continuing an open task, which the turn then runs on, `own_intent`
+   * when it was offered open work and read the message as a request of its own. Absent when no open work was offered.
+   * The classifier's own decision, so its accuracy is measured against what it decided.
+   */
+  routedAs?: 'continues_task' | 'own_intent';
   deliveryOption?: string;
 
   // Bedrock metrics (assistant messages only)
@@ -524,6 +539,16 @@ export interface AnalyticsMetadata {
   taskTrajectory?: TaskTrajectory;
   /** How the task ended when this turn ended it, from the runtime's pack-merged machines (`machineTerminalKind`). */
   taskTerminal?: TerminalKind;
+  /** The `configId` of the version the turn's task started on (`Task.originConfigId`, ADR-066). Analytics-only. */
+  taskOriginConfigId?: string;
+  /** The content hash of the machine the turn's task started on (`Task.originMachineHash`, ADR-066). Analytics-only. */
+  taskOriginMachineHash?: string;
+  /** The run the turn's task belongs to (ADR-067 WT60): its workflow, step, key, version and workflow hash. Analytics-only. */
+  workflowRun?: { workflow: string; step: string; runKey: string; originConfigId?: string; workflowHash?: string; trigger?: 'person' | 'assistant' | 'event' };
+  /** The process step that asked for this turn's task (SPEC-PROCESSES P9), whose stage counts the turn's time and cost. */
+  askedStep?: { runKey: string; step: string };
+  /** The process the turn's task's run belongs to (SPEC-PROCESSES P8), as a run message's out-of-band record carries it. */
+  processRun?: ProcessRunRecord;
 
   /**
    * The INPUT guardrail blocked this turn before the model was called; the reply text is the
@@ -693,6 +718,8 @@ export interface AnalyticsContext {
   subjectDecision?: { decision: 'same' | 'new' | 'skipped'; distance?: number };
   /** See AnalyticsMetadata.taskResolution. */
   taskResolution?: 'reference' | 'id' | 'ranked';
+  /** See AnalyticsMetadata.routedAs. */
+  routedAs?: 'continues_task' | 'own_intent';
   deliveryOption?: string;
   /** What KIND of interaction this turn is. See `AnalyticsMetadata.trigger`. */
   trigger?: InteractionKind;
@@ -732,6 +759,15 @@ export interface AnalyticsContext {
   taskTrajectory?: TaskTrajectory;
   /** How the task ended when this turn ended it, from the runtime's pack-merged machines (`machineTerminalKind`). */
   taskTerminal?: TerminalKind;
+  /** See AnalyticsMetadata.taskOriginConfigId and taskOriginMachineHash (ADR-066). */
+  taskOriginConfigId?: string;
+  taskOriginMachineHash?: string;
+  /** The run the turn's task belongs to (ADR-067 WT60): its workflow, step, key, version and workflow hash. Analytics-only. */
+  workflowRun?: { workflow: string; step: string; runKey: string; originConfigId?: string; workflowHash?: string; trigger?: 'person' | 'assistant' | 'event' };
+  /** The process step that asked for this turn's task (SPEC-PROCESSES P9), whose stage counts the turn's time and cost. */
+  askedStep?: { runKey: string; step: string };
+  /** The process the turn's task's run belongs to (SPEC-PROCESSES P8), as a run message's out-of-band record carries it. */
+  processRun?: ProcessRunRecord;
   /** See AnalyticsMetadata.modelFrom (ADR-064 decision 4). */
   modelChoice?: { taskType?: string; taskMachine?: string; turnStep?: string; modelKind: 'text' | 'image'; modelFrom: string; imageEgress?: { provider: string; model: string; contextSourced: boolean } };
 
@@ -836,6 +872,7 @@ export function buildAnalyticsMetadata(context: AnalyticsContext): AnalyticsMeta
   if (context.intentConfidence) metadata.intentConfidence = context.intentConfidence;
   if (context.subjectDecision) metadata.subjectDecision = context.subjectDecision;
   if (context.taskResolution) metadata.taskResolution = context.taskResolution;
+  if (context.routedAs) metadata.routedAs = context.routedAs;
   if (context.deliveryOption) metadata.deliveryOption = context.deliveryOption;
   // Copied through, never derived here: the router declares what caused the turn and this is a
   // carrier. A default invented at this layer would be indistinguishable from a declaration.
@@ -877,6 +914,11 @@ export function buildAnalyticsMetadata(context: AnalyticsContext): AnalyticsMeta
   if (context.taskTransition) metadata.taskTransition = context.taskTransition;
   if (context.taskTrajectory) metadata.taskTrajectory = context.taskTrajectory;
   if (context.taskTerminal) metadata.taskTerminal = context.taskTerminal;
+  if (context.taskOriginConfigId) metadata.taskOriginConfigId = context.taskOriginConfigId;
+  if (context.taskOriginMachineHash) metadata.taskOriginMachineHash = context.taskOriginMachineHash;
+  if (context.workflowRun) metadata.workflowRun = context.workflowRun;
+  if (context.askedStep) metadata.askedStep = context.askedStep;
+  if (context.processRun) metadata.processRun = context.processRun;
   if (context.modelChoice) {
     if (context.modelChoice.taskType) metadata.taskType = context.modelChoice.taskType;
     if (context.modelChoice.taskMachine) metadata.taskMachine = context.modelChoice.taskMachine;

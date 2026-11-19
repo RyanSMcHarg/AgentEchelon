@@ -47,6 +47,7 @@ describe('task index names line up with the stack', () => {
     expect(declared).toContain('principalId-taskType-index'); // the type-scoped active lookup
     expect(declared).toContain('contextId-index'); // cascade-cancel across a plan
     expect(declared).toContain('channelArn-updatedAt-index'); // ADR-024 D4, what is open in this conversation
+    expect(declared).toContain('openedFrom-taskType-index'); // WT122, the open incidents a team conversation opened
   });
 
   it('the owner lookup uses NO index at all', () => {

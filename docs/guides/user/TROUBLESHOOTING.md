@@ -180,7 +180,7 @@ aws cognito-idp admin-add-user-to-group \
 ```
 They reach it at their next sign-in. A person from another identity provider is placed in the provider group their issuer's entry maps ([IDENTITY-PROVIDER-GUIDE](IDENTITY-PROVIDER-GUIDE.md#groups-from-your-provider)).
 
-**Prevention** - `seed-demo.ts`, `provision-admin.mjs` and `provision-test-users.mjs` place the people they create in their groups, and `post-confirmation.js` places a self-signed-up person at sign-up. A person created any other way is in no group until someone places them.
+**Prevention** - `seed-demo.ts`, `provision-admin.mjs` and `provision-test-users.mjs` place the people they create in their groups, and an administrator places a self-signed-up person at approval. A person created any other way is in no group until someone places them.
 
 ---
 

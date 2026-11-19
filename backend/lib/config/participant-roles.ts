@@ -153,6 +153,8 @@ export function roleSaidInRoom(typeKey: string | undefined | null, name: string,
 export interface ParticipantRoleContext extends MixedTrustContext {
   /** The membership groups the deployment declares (`membershipGroups()`). */
   membershipGroups?: Readonly<Record<string, string>>;
+  /** The classifications the deployment declares. A type permitting none of them is not built here, so its roles are not checked. */
+  classifications?: readonly string[];
   /** The connectors the registry declares, with what each is used for. */
   connectors?: ReadonlyArray<{ id: string; capabilities: readonly string[] }>;
 }
@@ -169,16 +171,26 @@ export function participantRoleDeclarationErrors(
 ): string[] {
   const errs: string[] = [];
   for (const [typeKey, config] of Object.entries(types)) {
+    if (ctx.classifications && config.classifications?.length && !config.classifications.some((c) => ctx.classifications!.includes(c))) continue;
     const p = config.participants;
     const roles = p?.participantRoles;
     if (roles === undefined) {
       if (p?.defaultRole !== undefined) errs.push(`type '${typeKey}' names defaultRole '${p.defaultRole}' and declares no participant roles`);
+      if (p?.meetingHost?.length) errs.push(`type '${typeKey}' names a meetingHost and declares no participant roles`);
+      if (p?.meetingSpeakers?.length) errs.push(`type '${typeKey}' names meetingSpeakers and declares no participant roles`);
       continue;
     }
     if (!isObj(roles)) { errs.push(`type '${typeKey}': participants.participantRoles maps a role name to its declaration`); continue; }
     const names = Object.keys(roles);
     if (names.length > MAX_PARTICIPANT_ROLES) errs.push(`type '${typeKey}' declares ${names.length} participant roles; at most ${MAX_PARTICIPANT_ROLES}`);
     if (p?.defaultRole !== undefined && !names.includes(p.defaultRole)) errs.push(`type '${typeKey}': defaultRole '${p.defaultRole}' is not one of its participant roles`);
+    for (const host of p?.meetingHost ?? []) {
+      if (!names.includes(host)) errs.push(`type '${typeKey}': meetingHost '${host}' is not one of its participant roles`);
+      else if (roles[host].holders !== 'one') errs.push(`type '${typeKey}': meetingHost '${host}' must be held by one person`);
+    }
+    for (const speaker of p?.meetingSpeakers ?? []) {
+      if (!names.includes(speaker)) errs.push(`type '${typeKey}': meetingSpeakers '${speaker}' is not one of its participant roles`);
+    }
     const openerFields = (config.openedBy ?? []).map((o) => ({ ...(o.fields ?? {}), ...(o.values ?? {}) }));
     const mixed = typeIsMixedTrust(typeKey, ctx);
     const invitations = invitationPolicyOf(typeKey);
@@ -235,7 +247,7 @@ export function participantRoleDeclarationErrors(
       // A ROLE AS A MEMBER (FR31) adds its holders, which a type that keeps its room equal to a membership source would
       // remove again on its next reconcile: the two cannot both hold, so the declaration is refused.
       if (decl.adds === true && config.membershipSource) {
-        errs.push(`${at}: adds its holders, and the type's membership source keeps its room equal to that source, so the reconcile would remove them`);
+        errs.push(`${at}: adds its holders, and the type's membership source keeps its conversation equal to that source, so the reconcile would remove them`);
       }
       if (decl.adds === true && !kinds.has('group')) errs.push(`${at}: adds needs a source that names people who are not members yet (group)`);
       // A HOST'S ASSERTION NEVER DECIDES: a role it fills confers nothing and is never said to the room.

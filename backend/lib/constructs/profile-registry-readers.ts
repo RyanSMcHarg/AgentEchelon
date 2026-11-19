@@ -129,6 +129,7 @@ export class ProfileRegistryReaders implements cdk.IAspect {
   private readonly boundaries = new WeakSet<iam.ManagedPolicy>();
   private readonly copyBoundaries = new WeakSet<iam.ManagedPolicy>();
   private readonly readers = new WeakSet<iam.Role>();
+  private readonly importedReaders = new WeakSet<iam.IRole>();
   private readonly copyReaders = new WeakSet<iam.Role>();
 
   /**
@@ -183,6 +184,12 @@ export class ProfileRegistryReaders implements cdk.IAspect {
           this.boundaries.add(boundary);
           boundary.addStatements(...registryReadStatements(boundary, this.path));
         }
+      } else if (role && !(role instanceof iam.Role) && !this.importedReaders.has(role)) {
+        // A ROLE ANOTHER STACK BUILT, imported here: a managed policy cannot be attached to it from this
+        // stack, so the read is added to its principal policy, which a mutable import writes in this stack.
+        // An immutable import accepts nothing, and the synth test names the function whose role it is.
+        this.importedReaders.add(role);
+        for (const statement of registryReadStatements(node, this.path)) role.addToPrincipalPolicy(statement);
       }
       if (attachedToAVpc(node)) {
         node.addEnvironment(PROFILE_REGISTRY_S3_ENV, registryS3LocationOf(registryBucketIn(node, this.resPrefix)));

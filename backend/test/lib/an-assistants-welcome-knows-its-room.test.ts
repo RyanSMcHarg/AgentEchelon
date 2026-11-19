@@ -23,7 +23,7 @@ import { welcomePlan, welcomeWorkflowOf, type EventWorkflow } from '../../lambda
 /** What an assistant's own opening says in a room of this type, or null for the classification's copy. */
 const openingOf = (own: Record<string, EventWorkflow> | undefined, conversationType: string | undefined) =>
   selectOpening(welcomePlan(welcomeWorkflowOf(own, conversationType).workflow).opening);
-import { OPS_WELCOME, ADVISOR_WELCOME } from '../../demo/welcomes';
+import { OPS_WELCOME, ADVISOR_WELCOME } from '../../../demo/portable-assistants/welcomes';
 import { CONVERSATION_TYPES } from '../../lib/config/conversation-types';
 
 describe('an assistant\'s welcome knows what kind of room it is in', () => {
@@ -48,10 +48,10 @@ describe('an assistant\'s welcome knows what kind of room it is in', () => {
   });
 
   it('opens the operations team\'s standing room on what the room is, not on a company introduction', () => {
-    // ops-team has no event behind it, so the classification orientation (company intro, leadership
+    // ops-team has no event behind it, and the ops assistant is its primary, so the classification orientation (company intro, leadership
     // examples) answered a question nobody there asks. Its variant names the room's topic and why its
     // membership changes on its own, and never claims another thread.
-    const t = openingOf(ADVISOR_WELCOME, 'ops-team')!.template!;
+    const t = openingOf(OPS_WELCOME, 'ops-team')!.template!;
     const out = renderWelcomeTemplate(t, { topic: 'payments on-call' });
     expect(out.content).toContain('payments on-call');
     expect(out.content).toMatch(/ops group/);
@@ -82,7 +82,7 @@ describe('an assistant\'s welcome knows what kind of room it is in', () => {
     });
     expect(out.content).toContain('p95 latency on the checkout API');
     expect(out.contributed).toContain('eventSummary');
-    expect(out.content).toMatch(/operations issue/i);
+    expect(out.content).toMatch(/start from the metrics and alarm state/i);
   });
 
   it('DROPS a line whose field the room does not carry, rather than printing a hole', () => {
@@ -92,7 +92,7 @@ describe('an assistant\'s welcome knows what kind of room it is in', () => {
     expect(out.content).not.toMatch(/undefined/);
     expect(out.missing).toContain('eventSummary');
     // The lines naming nothing still render, so a room with no summary is still welcomed.
-    expect(out.content).toMatch(/operations issue/i);
+    expect(out.content).toMatch(/start from the metrics and alarm state/i);
   });
 
   it('lets a template name its own role without the resolver branching on it', () => {
@@ -131,13 +131,13 @@ describe('an assistant\'s welcome knows what kind of room it is in', () => {
 });
 
 describe('a template can include the suggested prompts', () => {
-  // A template replaces the built-in opening, which is where the suggested prompts were listed, so a template
-  // dropped them with nothing to say so. `{examples}` puts them back, as a list, where the template says.
-  it('renders {examples} as a list on its own lines', () => {
+  // The opening is one piece of text, and its suggested prompts are written in it like any other words. `{examples}` is
+  // no field, so a line that still names one is left out, as a line naming any field with no value is.
+  it('{examples} is not a field: its line is left out and the rest is said', () => {
     const out = renderWelcomeTemplate('Hi, I am the {role} assistant.\nTry one of these:\n{examples}', {
       examples: ['Summarize the Q3 renewals', 'Draft the board update'],
     }, { role: 'primary' });
-    expect(out.content).toBe('Hi, I am the primary assistant.\nTry one of these:\n- Summarize the Q3 renewals\n- Draft the board update');
+    expect(out.content).toBe('Hi, I am the primary assistant.\nTry one of these:');
   });
 
   it('leaves out the line that names {examples} when the assistant has none', () => {

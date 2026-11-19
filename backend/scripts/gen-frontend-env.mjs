@@ -286,6 +286,10 @@ async function main() {
   // the admin console carries none.
   chatLines.push(await chatFallbackClassificationsLine());
 
+  // HOW LONG A PERSON'S START RINGS the room (`meetingRingSeconds`), where the deployment sets it; the app rings 10 seconds otherwise.
+  const ringSeconds = String(config.meetingRingSeconds ?? '').trim();
+  if (ringSeconds) chatLines.push(`VITE_MEETING_RING_SECONDS=${ringSeconds}`);
+
   // A DECLARED CAPABILITY, or a declared kind of sign-in, whose output is missing is refused: the bundle
   // would build and be unable to reach it (scripts/lib/frontend-env-requirements.cjs).
   const capabilities = declaredCapabilities(contextFlagsFromConfig({ capabilities: config.capabilities }));

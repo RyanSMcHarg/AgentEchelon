@@ -6,7 +6,7 @@ type Agg = Parameters<typeof evaluateObjective>[1];
 const agg = (over: Partial<Agg>): Agg =>
   ({
     variant_id: 'control',
-    model_name: 'm',
+    model_names: ['m'],
     exchange_count: 100,
     task_count: 0,
     avg_score: null,

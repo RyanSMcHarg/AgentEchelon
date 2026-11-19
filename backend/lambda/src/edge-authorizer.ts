@@ -17,8 +17,6 @@
  *  - A subject with no `Identities` row yet (a first sign-in), or whose AppInstanceUser create never
  *    landed: allowed on the credential exchange route only, with no person in the context. The exchange
  *    is what mints or repairs the person.
- *  - A person whose issuer declares the one-conversation session: allowed on the one-conversation routes
- *    only (`ONE_CHANNEL_ROUTES`, handed in as data).
  *  - A guest (the guest issuer's token): allowed on the guest routes only (`GUEST_ROUTES`: the credential
  *    exchange, which vends their one conversation, and path B's registration). A guest subject with no `Identities` row is denied
  *    every route rather than sent to the exchange: guest start mints the visitor before it signs their
@@ -49,14 +47,14 @@
  *
  * The gateway caches an authorizer's answer by token, for every route behind that authorizer, for up to
  * `EDGE_RESULT_TTL_SECONDS`. A yes or no is the answer to "this route", and a cached yes would then admit
- * the same token on routes it was never decided for: a one-conversation person admitted on conversation
- * creation would reach every other cached route for five minutes. A policy names the routes it allows,
+ * the same token on routes it was never decided for: a first sign-in admitted on the exchange
+ * would reach every other cached route for five minutes. A policy names the routes it allows,
  * and the gateway evaluates the cached policy against each request's own route, so the answer stays
  * correct for every route it is reused on. Which routes is data (`EDGE_ROUTES`), never a branch here.
  *
  * ── FAIL CLOSED ──────────────────────────────────────────────────────────────────────────────────
  *
- * An unreadable `EDGE_ROUTES` admits a first sign-in and a one-conversation person nowhere. An unreadable
+ * An unreadable `EDGE_ROUTES` admits a first sign-in nowhere. An unreadable
  * registry trusts no issuer. A lookup that throws is not answered at all: the gateway returns an error,
  * caches nothing, and admits nobody.
  */
@@ -67,7 +65,7 @@ import { personIdFromArn } from './lib/person-arn.js';
 import { TokenRefused, verifyToken, type VerifiedToken } from './lib/token-verification.js';
 import { recordAssertionJti } from './lib/tokens.js';
 import { MAX_CLOCK_SKEW_SECONDS } from '../../lib/config/edge-verification.js';
-import { isGuestIssuer, isProvisionedOnly, oneChannelOf, subjectOf } from '../../lib/config/issuers.js';
+import { isGuestIssuer, isProvisionedOnly, subjectOf } from '../../lib/config/issuers.js';
 import { countAssertionRefused } from './lib/host-assertion-metric.js';
 // The deployment's set, read at runtime from the rows its stacks publish, before the handler runs.
 import { withProfileRegistry } from '../../lib/profile-registry';
@@ -78,8 +76,6 @@ export interface EdgeRoutes {
   plane?: 'person' | 'admin';
   /** The credential exchange: the one route a subject with no person yet may call. */
   exchange: string[];
-  /** The routes a one-conversation person calls. */
-  oneChannel: string[];
   /** The routes a guest calls. Absent or unreadable: none. */
   guest?: string[];
   /** The admin plane: the routes an `admin: true` issuer's token reaches, and the only ones any token does. */
@@ -155,18 +151,18 @@ async function recordJtiInTokens(issuerId: string, jti: string, expiresAt: numbe
 
 /** The routes from `EDGE_ROUTES`. Unreadable or absent, no route admits anyone without full reach. */
 export function edgeRoutesFromEnv(raw: string | undefined = process.env.EDGE_ROUTES): EdgeRoutes {
-  const none: EdgeRoutes = { exchange: [], oneChannel: [] };
+  const none: EdgeRoutes = { exchange: [] };
   if (!raw) return none;
   try {
     const parsed = JSON.parse(raw) as Partial<EdgeRoutes>;
     const list = (v: unknown): string[] => (Array.isArray(v) ? v.filter((r): r is string => typeof r === 'string' && /^[A-Z]+ \//.test(r)) : []);
     // A plane it does not know is the admin plane with no route: it admits nobody, never a person everywhere.
     if (parsed.plane !== undefined && parsed.plane !== 'person') {
-      return { plane: 'admin', exchange: [], oneChannel: [], guest: [], admin: parsed.plane === 'admin' ? list(parsed.admin) : [] };
+      return { plane: 'admin', exchange: [], guest: [], admin: parsed.plane === 'admin' ? list(parsed.admin) : [] };
     }
-    return { exchange: list(parsed.exchange), oneChannel: list(parsed.oneChannel), guest: list(parsed.guest) };
+    return { exchange: list(parsed.exchange), guest: list(parsed.guest) };
   } catch {
-    console.error('[edge-authorizer][SecurityEvent] EDGE_ROUTES is not readable; a first sign-in and a one-conversation person are admitted nowhere');
+    console.error('[edge-authorizer][SecurityEvent] EDGE_ROUTES is not readable; a first sign-in is admitted nowhere');
     return none;
   }
 }
@@ -278,7 +274,6 @@ export async function decide(token: string | null, deps: EdgeDeps = {}, routeKey
   const context: EdgeContext = { ...base, personId, personArn: state.personArn };
   if (isGuestIssuer(issuer)) return { effect: 'allow', routes: routes.guest ?? [], context, reason: 'guest' };
   if (assertion) return { effect: 'allow', routes: routes.exchange, context, reason: 'host-assertion' };
-  if (oneChannelOf(issuer)) return { effect: 'allow', routes: routes.oneChannel, context, reason: 'one-conversation' };
   return { effect: 'allow', routes: 'all', context, reason: 'person' };
 }
 

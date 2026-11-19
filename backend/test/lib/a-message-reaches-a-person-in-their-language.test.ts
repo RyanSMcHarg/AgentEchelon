@@ -487,7 +487,8 @@ describe('the router and the processor wire the order and the voice (source text
     expect(languages).toContain('to.length === 1 ? getReplyPreferences(');
     expect(languages).toContain('PREFERRED_LANGUAGE_KEY');
     expect(send).toContain('chooseLanguage(template, { audience, ...languages })');
-    expect(send).toContain('renderMessageTemplate(written,');
+    // Rendered through the run's one render, which a send and an ask share (`renderRunWritten`).
+    expect(send).toContain('renderRunWritten({ written: choice.written,');
   });
 
   it('a router notice with a variant is said in the language of those who read it', () => {
@@ -505,7 +506,7 @@ describe('the router and the processor wire the order and the voice (source text
     expect(voice).toContain('renderVoice(');
     expect(voice).toContain('machineWritten: true');
     expect(voice).toContain('const persona = baseSystemPrompt + personaAddendumBlock(');
-    expect(voice).toContain('invokeBedrockWithFallback(\n          persona,');
+    expect(voice).toMatch(/invokeBedrockWithFallback\(\r?\n\s+persona,/);
     expect(voice).toContain('tools: []');
     expect(voice).toContain('voiceFill: { target: req.target, language: voiced.language, outcome: voiced.outcome }');
   });

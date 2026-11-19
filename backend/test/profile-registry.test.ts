@@ -106,7 +106,7 @@ describe('profile-registry (default config = legacy behavior)', () => {
     expect(reg.requireProfileFor('standard').timeoutSeconds).toBe(60);
 
     const premium = reg.requireProfileFor('premium');
-    expect(premium.modelKey).toBe('opus');
+    expect(premium.modelKey).toBe('sonnet');
     expect(premium.classifierMode).toBe('llm');
     expect(premium.timeoutSeconds).toBe(90);
     expect(premium.rateLimitPerHour).toBe(240);

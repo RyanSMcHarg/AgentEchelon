@@ -21,31 +21,33 @@
  * WHAT THIS PINS. The producer, the two Firehose copies and the projection are four places that have
  * to agree, and nothing made them. Here they do:
  *   1. every metadata key the JQ reads survives `pickFrontendMetadata`;
- *   2. the Aurora-mode and Athena-mode Firehose definitions carry the SAME expression;
+ *   2. the Aurora-mode and Athena-mode Firehose definitions carry the SAME expression, one constant;
  *   3. neither table projects `user_type`: both register each partition the Firehose writes.
  */
 import * as fs from 'fs';
 import * as path from 'path';
 import { FRONTEND_METADATA_KEYS, pickFrontendMetadata } from '../lambda/src/lib/analytics-metadata';
-import { ARCHIVE_CONVERSATIONS_PREFIX } from '../lib/constructs/archive-partitions';
+import { ARCHIVE_CONVERSATIONS_PREFIX, ARCHIVE_PARTITION_QUERY } from '../lib/constructs/archive-partitions';
 
 const AURORA_MODE = path.join(__dirname, '../lib/constructs/conversation-archive.ts');
 const ATHENA_MODE = path.join(__dirname, '../lib/stacks/archive-stack.ts');
 
-/** The `MetadataExtractionQuery` value out of a CDK source, or null when it has moved. */
+/** The `MetadataExtractionQuery` a CDK source sets, or null when it does not set the shared expression. */
 function extractionQuery(file: string): string | null {
   const src = fs.readFileSync(file, 'utf8');
-  const m = /parameterValue:\s*\n?\s*'(\{user_type:[^']*)'/.exec(src);
-  return m ? m[1] : null;
+  const at = src.indexOf("parameterName: 'MetadataExtractionQuery'");
+  if (at < 0) return null;
+  return /parameterValue:\s*ARCHIVE_PARTITION_QUERY\b/.test(src.slice(at, at + 600)) ? ARCHIVE_PARTITION_QUERY : null;
 }
 
 /**
  * The top-level Metadata keys a JQ expression reads. `.analytics.classification` and `.classification`
- * both depend on `classification` surviving, since `analytics` is a nested block built from it.
+ * both depend on `classification` surviving, since `analytics` is a nested block built from it. Only what
+ * follows `fromjson` is read out of the Metadata; the record envelope (`.Payload.Sender.Arn`) precedes it.
  */
 function metadataKeysRead(jq: string): string[] {
   const keys = new Set<string>();
-  for (const m of jq.matchAll(/\.(?:analytics\.)?([a-zA-Z_][a-zA-Z0-9_]*)/g)) {
+  for (const m of jq.slice(jq.indexOf('fromjson')).matchAll(/\.(?:analytics\.)?([a-zA-Z_][a-zA-Z0-9_]*)/g)) {
     // `Payload`/`Metadata` are the envelope, `fromjson`/`analytics` the traversal, not leaf keys.
     if (!['Payload', 'Metadata', 'fromjson', 'analytics'].includes(m[1])) keys.add(m[1]);
   }

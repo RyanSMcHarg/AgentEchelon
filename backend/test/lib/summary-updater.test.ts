@@ -96,7 +96,7 @@ function routeSql(existingRow?: Record<string, unknown>) {
     if (sql.includes('COUNT(DISTINCT')) return { rows: [{ count: '3' }] };  // 2 humans + the assistant
     if (sql.includes('COUNT(*)::text')) return { rows: [{ count: '12' }] };
     if (sql.includes('SELECT version, name')) return { rows: existingRow ? [existingRow] : [] };
-    if (sql.includes('SELECT sender_name')) {
+    if (sql.includes('SELECT message_id, sender_name')) {
       return { rows: [{ sender_name: 'Demo', is_bot: false, content: 'hello', created_at: '2026-07-28T00:00:00Z' }] };
     }
     if (sql.includes('INSERT INTO conversation_summaries')) return { rows: [{ version: 1 }] };

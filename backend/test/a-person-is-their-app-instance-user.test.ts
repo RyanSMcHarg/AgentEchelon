@@ -127,7 +127,7 @@ function scan(): Map<string, string[]> {
 
 /** Where a `userSub` identifier still stands, by file, with the exact number of code lines. */
 const USER_SUB_ALLOWLIST: Record<string, { count: number; why: string }> = {
-  'backend/lambda/src/user-feedback.ts': { count: 7, why: 'the feedback record\'s `userSub` attribute; feedback is kept when a person is offboarded' },
+  'backend/lambda/src/user-feedback.ts': { count: 5, why: 'the feedback record\'s `userSub` attribute; feedback is kept when a person is offboarded' },
   'backend/lambda/src/analytics-aurora/variant-feedback.ts': { count: 7, why: 'reads the feedback record\'s `userSub` attribute' },
   'backend/lambda/src/analytics-aurora/analytics-query.ts': { count: 3, why: 'reads the feedback record\'s `userSub` attribute' },
 };

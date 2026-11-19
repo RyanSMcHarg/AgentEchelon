@@ -33,7 +33,7 @@ jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   // the REAL `channel-notify`, which constructs these.
   ListChannelMembershipsCommand: jest.fn().mockImplementation((input) => ({ __cmd: 'ListMemberships', input })),
   DescribeChannelCommand: jest.fn(),
-  ListTagsForResourceCommand: jest.fn(),
+  ListTagsForResourceCommand: jest.fn().mockImplementation((input) => ({ __cmd: 'ListTags', input })),
 }), { virtual: true });
 jest.mock('@aws-sdk/client-s3', () => ({ S3Client: jest.fn(), PutObjectCommand: jest.fn() }), { virtual: true });
 jest.mock('@aws-sdk/client-lambda', () => ({
@@ -196,8 +196,14 @@ describe('the subject the alert chose is the subject the email carries', () => {
       messageText: 'the alert body',
       directive: directive!,
       deps: {
-        chime: { send: async () => ({ ChannelMemberships: [{ Member: { Arn: MEMBER } }] }) },
-        directory: { contactFor: async () => ({ route: 'email', address: 'admin@example.com', name: null }) },
+        // The admin conversation, of the admin plane's classification, and a member who holds it.
+        chime: { send: async (cmd: { __cmd?: string }) => (cmd.__cmd === 'ListTags'
+          ? { Tags: [{ Key: 'classification', Value: 'admin' }] }
+          : { ChannelMemberships: [{ Member: { Arn: MEMBER } }] }) },
+        directory: {
+          contactFor: async () => ({ route: 'email', address: 'admin@example.com', name: null }),
+          clearanceOf: async () => ({ state: 'held', token: 'admin', adminPlane: true, held: ['admin'], groups: ['admins'], admin: true }),
+        },
         isEmailConversation: async () => true,
         send: async (_recipients: unknown, opts: { subject?: string }) => {
           emails.push(opts);

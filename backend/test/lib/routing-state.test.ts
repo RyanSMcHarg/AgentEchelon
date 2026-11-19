@@ -1,80 +1,16 @@
 /**
- * routing-state - the pending drift offer between the turn that makes it and the turn that answers it.
- *
- * ONE STORE: Aurora `conversation_creation_tasks`. The offer used to ride the Amazon Lex session first,
- * which a turn the channel flow answers does not have, so nothing here reads or writes a session.
- *
- * The durable row is tested against a mocked query: what matters at this layer is that the row carries
- * everything the answering turn needs, including the drift event its outcome is recorded on. The yes/no
- * reply classification is tested below.
+ * routing-state - whether a person's reply reads as a yes or a no.
  */
 
-const mockQuery = jest.fn();
-jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
-  query: (...a: unknown[]) => mockQuery(...a),
-}));
-
 import * as routingState from '../../lambda/src/lib/routing-state';
-import {
-  classifyConfirmDeclineReply,
-  savePendingSuggestion,
-  readPendingSuggestion,
-} from '../../lambda/src/lib/routing-state';
+import { classifyConfirmDeclineReply } from '../../lambda/src/lib/routing-state';
 
 describe('routing-state', () => {
-  beforeEach(() => mockQuery.mockReset());
-
   describe('no Amazon Lex session state', () => {
     it('exports nothing that reads or writes a session', () => {
-      // The session helpers and the declined-distance list are gone: an open offer is read from Aurora,
-      // and a declined subject becomes a topic of the conversation (migration 044).
       expect(Object.keys(routingState)).not.toEqual(expect.arrayContaining(['readRoutingFromSession']));
       expect(Object.keys(routingState)).not.toEqual(expect.arrayContaining(['writeRoutingToSession']));
       expect(Object.keys(routingState)).not.toEqual(expect.arrayContaining(['recordDecline']));
-    });
-  });
-
-  describe('the durable offer carries its drift event', () => {
-    it('saves the drift event id on the row', async () => {
-      mockQuery.mockResolvedValueOnce({ rows: [{ task_id: 't-1', created_at: '2026-09-12T00:00:00Z' }] });
-
-      const saved = await savePendingSuggestion({
-        channelArn: 'arn:chan', personId: 'u1', kind: 'confirm', originatingMessageId: 'msg-1',
-        cosineDistance: 0.5, correlationId: 'corr-1', driftEventId: 'evt-1',
-      });
-
-      const [sql, params] = mockQuery.mock.calls[0];
-      expect(String(sql)).toContain('drift_event_id');
-      expect(params).toContain('evt-1');
-      expect(saved.driftEventId).toBe('evt-1');
-    });
-
-    it('reads it back, so the answering turn can record the outcome', async () => {
-      mockQuery.mockResolvedValueOnce({
-        rows: [{
-          task_id: 't-1', suggestion_kind: 'confirm', rival_conversation_arn: null, originating_message_id: 'msg-1',
-          cosine_distance: '0.5000', correlation_id: 'corr-1', drift_event_id: 'evt-1', created_at: '2026-09-12T00:00:00Z',
-        }],
-      });
-
-      const pending = await readPendingSuggestion({ personId: 'u1', channelArn: 'arn:chan' });
-
-      expect(pending).toEqual(expect.objectContaining({
-        taskId: 't-1', correlationId: 'corr-1', driftEventId: 'evt-1', originatingMessageId: 'msg-1',
-      }));
-    });
-
-    it('an offer from before migration 044 simply has no drift event', async () => {
-      mockQuery.mockResolvedValueOnce({
-        rows: [{
-          task_id: 't-0', suggestion_kind: 'confirm', rival_conversation_arn: null, originating_message_id: 'msg-0',
-          cosine_distance: null, correlation_id: 'corr-0', drift_event_id: null, created_at: '2026-09-01T00:00:00Z',
-        }],
-      });
-
-      const pending = await readPendingSuggestion({ personId: 'u1', channelArn: 'arn:chan' });
-
-      expect(pending).not.toHaveProperty('driftEventId');
     });
   });
 

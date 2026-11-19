@@ -272,6 +272,14 @@ export const MEMBERSHIP_GROUP_PRECEDENCE_BASE = 100;
 export const BADGE_TOKENS = ['cls-1', 'cls-2', 'cls-3', 'cls-4', 'cls-5', 'cls-6', 'cls-7', 'cls-8'] as const;
 export type BadgeToken = (typeof BADGE_TOKENS)[number];
 
+/** A route a profile's seeded version declares for one intent: its text model and the steps on a model of their own. */
+export interface SeedRoute {
+  primary: string;
+  fallback?: string;
+  /** Keyed by a state of the intent's workflow (`models.byIntent[<intent>].steps`, ADR-064 decision D). */
+  steps?: Record<string, { primary: string; fallback?: string }>;
+}
+
 /** A named assistant capability bundle, bound to classifications by config. */
 export interface AssistantProfile {
   /**
@@ -298,6 +306,16 @@ export interface AssistantProfile {
   displayName?: string;
   /** The base model, a catalog key its classification selects (`DeploymentClassification.models`). */
   modelKey: string;
+  /**
+   * THE SEEDED VERSION'S OWN ROUTES, keyed by intent, each written as `models.byIntent[<intent>]` in place of the
+   * platform's route for that intent (ADR-064 decisions C and D). A route names its text model and, in `steps`, the
+   * states of the intent's workflow that run on a model of their own, so the base model answers a workflow's
+   * bookkeeping and the larger model is paid for only where the work is written:
+   * `{ report_generation: { primary: 'sonnet', steps: { generating: { primary: 'opus' } } } }`. Each model is a
+   * Bedrock text model the serving classification selects. An intent the seeded pack does not declare carries no
+   * route, so its declared route is not written.
+   */
+  routes?: Record<string, SeedRoute>;
   /** 'keyword' = the no-LLM keyword classifier; 'llm' = the model-backed classifier. */
   classifierMode: 'keyword' | 'llm';
   /** async-processor Lambda timeout. */
@@ -461,7 +479,7 @@ export const DEFAULT_PROFILES_CONFIG: ProfilesConfig = {
     // routing or persona parameter); standard adds the persona parameter and external model routing;
     // premium adds response streaming.
     {
-      value: 'basic', profile: 'concierge', grants: ['basic'], displayName: 'Basic', badgeToken: 'cls-1', groupPrecedence: 5, models: { selected: ['haiku'], default: 'haiku' },
+      value: 'basic', profile: 'concierge', grants: ['basic'], displayName: 'Public', badgeToken: 'cls-1', groupPrecedence: 5, models: { selected: ['haiku'], default: 'haiku' },
       topology: {
         timeoutSeconds: 30, memorySize: 512, reservedConcurrency: 100, maxTokens: 1024,
         streaming: false, contextRouting: false, systemPromptParam: false, intentPackParam: true,
@@ -469,7 +487,7 @@ export const DEFAULT_PROFILES_CONFIG: ProfilesConfig = {
       },
     },
     {
-      value: 'standard', profile: 'analyst', grants: ['basic', 'standard'], battleCapable: true, produces: ['document'], displayName: 'Standard', badgeToken: 'cls-2', holdsBriefing: true, groupPrecedence: 4, models: { selected: ['haiku', 'sonnet', 'titan', 'gpt_oss_20b', 'deepseek_v3', 'deepseek_r1'], default: 'sonnet' },
+      value: 'standard', profile: 'analyst', grants: ['basic', 'standard'], battleCapable: true, produces: ['document'], displayName: 'Internal', badgeToken: 'cls-2', holdsBriefing: true, groupPrecedence: 4, models: { selected: ['haiku', 'sonnet', 'titan', 'gpt_oss_20b', 'deepseek_v3', 'deepseek_r1'], default: 'sonnet' },
       topology: {
         timeoutSeconds: 60, memorySize: 512, reservedConcurrency: 50, maxTokens: 4096,
         streaming: false, contextRouting: true, systemPromptParam: true, intentPackParam: true,
@@ -494,8 +512,8 @@ export const DEFAULT_PROFILES_CONFIG: ProfilesConfig = {
     // at ${SSM_ROOT}/assistant/premium/assistant-intent-pack, which is where the demo seeds premium's
     // domain intents.
     {
-      value: 'premium', profile: 'advisor', grants: ['basic', 'standard', 'premium'], battleCapable: true, roles: ['primary', 'ops'], roleContext: { ops: ['basic', 'standard'] }, produces: ['document'], displayName: 'Premium', badgeToken: 'cls-3', groupPrecedence: 3,
-      models: { selected: ['haiku', 'sonnet', 'opus', 'titan', 'gpt_oss_20b', 'gpt_oss_120b', 'deepseek_v3', 'titan_image', 'nova_canvas', 'stability_image_core', 'stability_image_ultra', 'openai_gpt_image_1', 'fal_flux_pro_1_1'], default: 'opus' },
+      value: 'premium', profile: 'advisor', grants: ['basic', 'standard', 'premium'], battleCapable: true, roles: ['primary', 'ops'], roleContext: { ops: ['basic', 'standard'] }, produces: ['document'], displayName: 'Confidential', badgeToken: 'cls-3', groupPrecedence: 3,
+      models: { selected: ['haiku', 'sonnet', 'opus', 'titan', 'gpt_oss_20b', 'gpt_oss_120b', 'deepseek_v3', 'titan_image', 'nova_canvas', 'stability_image_core', 'stability_image_ultra', 'openai_gpt_image_2', 'fal_flux_pro_1_1'], default: 'opus' },
       topology: {
         timeoutSeconds: 90, memorySize: 1024, reservedConcurrency: 20, maxTokens: 4096,
         streaming: true, contextRouting: false, systemPromptParam: false, intentPackParam: true,
@@ -584,7 +602,20 @@ export const DEFAULT_PROFILES_CONFIG: ProfilesConfig = {
     // than premium's 240.
     { name: 'concierge', displayName: 'Concierge', modelKey: 'haiku', classifierMode: 'llm', timeoutSeconds: 30, contextScope: 'granted', rateLimitPerHour: 60, attachmentsReadable: false, defaultPersona: CONCIERGE_PERSONA },
     { name: 'analyst', displayName: 'Analyst', modelKey: 'sonnet', classifierMode: 'llm', timeoutSeconds: 60, contextScope: 'granted', rateLimitPerHour: 120, attachmentsReadable: true, defaultPersona: ANALYST_PERSONA },
-    { name: 'advisor', displayName: 'Advisor', modelKey: 'opus', classifierMode: 'llm', timeoutSeconds: 90, contextScope: 'granted', rateLimitPerHour: 240, attachmentsReadable: true, defaultPersona: ADVISOR_PERSONA },
+    // THE ADVISOR ANSWERS ON SONNET AND WRITES A REPORT ON OPUS. A report's bookkeeping steps (taking the brief,
+    // putting the outline, moving the task) run on the base model, and the two steps that write the document
+    // (`generating`, `revising`) run on Opus through the version's step override (ADR-064 decision D), so the turn
+    // record names `step` as the rule that chose it. The report route itself names Sonnet, so a report's other turns
+    // stay on a model that calls the workflow's tools. Strategic analysis keeps its own Opus route.
+    {
+      name: 'advisor', displayName: 'Advisor', modelKey: 'sonnet', classifierMode: 'llm', timeoutSeconds: 90, contextScope: 'granted', rateLimitPerHour: 240, attachmentsReadable: true, defaultPersona: ADVISOR_PERSONA,
+      routes: {
+        report_generation: {
+          primary: 'sonnet',
+          steps: { generating: { primary: 'opus', fallback: 'sonnet' }, revising: { primary: 'opus', fallback: 'sonnet' } },
+        },
+      },
+    },
     // ── THE `ops` ROLE'S ASSISTANT, SERVING (premium, ops) ───────────────────────────────────────
     //
     // A SECOND ASSISTANT IN ONE CLASSIFICATION, which is the shape the platform was built for and had
@@ -597,14 +628,14 @@ export const DEFAULT_PROFILES_CONFIG: ProfilesConfig = {
     // classification it serves, which is what makes the console column and the analytics dimension
     // mean what they say.
     //
-    // A SMALLER MODEL AND A KEYWORD CLASSIFIER, because the questions are narrow and repetitive
-    // ("what is the error rate", "show me the slow lambdas") and paying for a frontier model plus a
-    // model-backed classifier on them is the cost control tenet P5 asks for. A product manager can
-    // raise either in a profile version without a deploy, which is the point of the split.
+    // A SMALLER MODEL, because the questions are narrow and repetitive ("what is the error rate", "show me
+    // the slow lambdas") and paying for a frontier model on them is the cost control tenet P5 asks for. A
+    // product manager can raise it in a profile version without a deploy, which is the point of the split.
+    // Its turns are classified by the model, like every assistant's (tenet D11).
     //
     // OWNED BY THE OPS TEAM from the moment it is provisioned: its `team-ops` members manage it and read
     // its analytics in the console, and nothing else.
-    { name: 'ops-premium', displayName: 'Ops', modelKey: 'sonnet', classifierMode: 'keyword', timeoutSeconds: 60, contextScope: 'granted', rateLimitPerHour: 120, ownerTeam: 'ops' },
+    { name: 'ops-premium', displayName: 'Ops', modelKey: 'sonnet', classifierMode: 'llm', timeoutSeconds: 60, contextScope: 'granted', rateLimitPerHour: 120, ownerTeam: 'ops' },
     // ── THE ADMIN ASSISTANT, SERVING THE `admin` CLASSIFICATION (DESIGN-ADMIN-AGENT-NOTIFICATIONS) ──
     //
     // An assistant like any other, expressed as config rather than as a hardcoded bot ARN, which is
@@ -643,7 +674,11 @@ export const DEFAULT_PROFILES_CONFIG: ProfilesConfig = {
   // `ops` is the operators' group the `ops` and `ops-team` conversation types take their people from.
   // It grants nothing: its members must already be cleared for `premium`, the classification those
   // types are created at.
-  membershipGroups: { ops: 'premium' },
+  // `account-management` holds the people who own customer accounts, whom an incident's meeting may add; it is its own group,
+  // never `ops`, so they join an ops room's meeting muted. It grants nothing either.
+  // `ops-on-call` and `ops-secondary` name who is on call and the secondary on-call; they host an ops room's meetings.
+  // `account-team-lead` names the account team's lead, who approves an incident's customer notices (`customer-messaging`).
+  membershipGroups: { ops: 'premium', 'ops-on-call': 'premium', 'ops-secondary': 'premium', 'account-management': 'premium', 'account-team-lead': 'premium' },
 };
 
 /**
@@ -1399,6 +1434,21 @@ export function validateProfilesConfig(config: ProfilesConfig): void {
       // image model named here would be ignored and every turn answered on the classification default.
       if (prof && modelKindOf(prof.modelKey) !== 'bedrock') {
         throw new Error(`profiles config: profile '${prof.name}' uses '${prof.modelKey}', which is not a Bedrock text model; a profile's base model is one`);
+      }
+      // A DECLARED ROUTE'S MODELS, ITS STEPS' INCLUDED, ARE HELD TO THE SAME TWO RULES AS THE BASE MODEL: selected
+      // here, and a Bedrock text model.
+      for (const [intent, route] of Object.entries(prof?.routes ?? {})) {
+        const named: Array<[string, string | undefined]> = [[intent, route.primary], [intent, route.fallback]];
+        for (const [state, step] of Object.entries(route.steps ?? {})) named.push([`${intent}.${state}`, step.primary], [`${intent}.${state}`, step.fallback]);
+        for (const [where, key] of named) {
+          if (key === undefined) continue;
+          if (c.models && !c.models.selected.includes(key)) {
+            throw new Error(`profiles config: profile '${prof!.name}' routes '${where}' to '${key}', which classification '${c.value}' does not select`);
+          }
+          if (modelKindOf(key) !== 'bedrock') {
+            throw new Error(`profiles config: profile '${prof!.name}' routes '${where}' to '${key}', which is not a Bedrock text model`);
+          }
+        }
       }
     }
   }

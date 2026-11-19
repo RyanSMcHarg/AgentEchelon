@@ -151,9 +151,6 @@ describe('a pool is read only through its adapters', () => {
   const ALLOWED: Record<string, string> = {
     'src/lib/clearance-source.ts': 'THE clearance adapter: the groups a subject holds.',
     'src/lib/cognito-pool-directory.ts': 'THE pool adapter: group members, a record, an address lookup, the console listing.',
-    'cognito-triggers/post-confirmation.js':
-      'A trigger of the pool itself, invoked by Cognito for one of its own users before that user has signed in, '
-      + 'so there is no person to resolve yet; it reads the groups of the user the event names and nothing else.',
   };
 
   const files: string[] = [];
@@ -212,7 +209,7 @@ describe('an adapter is constructed only in the seam factory', () => {
   const LAMBDA = path.join(__dirname, '..', '..', 'lambda');
   const CONSTRUCTORS = [
     'cognitoPoolDirectory', 'new CognitoClearanceSource', 'claimsDirectory', 'cognitoAdapter', 'claimsAdapter', 'noDirectory',
-    'groupsClearanceSource', 'mappingClearanceSource', 'fixedClearanceSource', 'oneChannelClearanceSource',
+    'groupsClearanceSource', 'mappingClearanceSource', 'fixedClearanceSource',
   ];
   /** Where a construction may stand, each with why. */
   const ALLOWED: Record<string, string> = {

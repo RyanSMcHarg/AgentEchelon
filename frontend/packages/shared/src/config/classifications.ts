@@ -173,13 +173,16 @@ export function memberConversationalClassifications(): ClientClassification[] {
 }
 
 /**
- * The classifications a person holding `holder` may open a conversation at, in declaration order: the
- * conversational, members-audience ones the holder's grants name. An outside conversation (a guest's, a
+ * The classifications a person holding `holder` may open a conversation at, the one that reaches the fewest
+ * classifications first, and otherwise in the order served: the conversational, members-audience ones the
+ * holder's grants name. An outside conversation (a guest's, a
  * customer's) is opened by its own path, never from the picker. Undeclared or absent: none.
  */
 export function creatableClassifications(holder: string | null | undefined): ClientClassification[] {
   const held = classificationOf(holder);
   if (!held) return [];
   const reach = new Set(held.grants);
-  return memberConversationalClassifications().filter((c) => reach.has(c.value));
+  return memberConversationalClassifications()
+    .filter((c) => reach.has(c.value))
+    .sort((a, b) => a.grants.length - b.grants.length);
 }

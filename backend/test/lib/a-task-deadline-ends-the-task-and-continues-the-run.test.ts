@@ -59,8 +59,7 @@ describe('firing means nothing until the router checks it, and the run continues
   it('the router checks the conversation and the task, and has the task service cancel it; settled and archived delete the schedule', () => {
     const router = read('router-agent-handler.ts');
     const fired = router.slice(router.indexOf('export async function handleTaskDeadlineFired('), router.indexOf('export async function handleDeadlineFired('));
-    expect(fired).toMatch(/tags\[CLASSIFICATION_TAG\] !== STATIC_CLASSIFICATION/);
-    expect(fired).toMatch(/tags\.archived === 'true'/);
+    expect(fired).toContain('roomRefusal(await readChannelTags(chimeClient, firing.channelArn)');
     expect(fired.indexOf('settlementOutcome(')).toBeLessThan(fired.indexOf('cancelForDeadline('));
     const settled = router.slice(router.indexOf('export async function handleTaskNaming('));
     expect(settled.indexOf('deleteTaskDeadline(')).toBeLessThan(settled.indexOf('handleEventContinuation('));
@@ -88,6 +87,15 @@ describe('firing means nothing until the router checks it, and the run continues
     return { d, sent };
   };
   const ctx = { event: 'assistant-joined' as const, channelArn: CH, subject: 'arn:x/user/s', values: {} };
+
+  it('a deadline that fires on a task already settled continues a run whose naming was lost, once (ADR-067 OPEN 10, WT15)', () => {
+    const router = read('router-agent-handler.ts');
+    const fired = router.slice(router.indexOf('export async function handleTaskDeadlineFired('), router.indexOf('export async function handleDeadlineFired('));
+    // Settled: the run goes on through the naming's own path, whose continuation claim takes it once.
+    expect(fired).toMatch(/if \(settlementOutcome\(task, machinesForTask\(task\)\)\) \{[\s\S]*handleTaskNaming\(\{ kind: 'settled', channelArn: firing\.channelArn, taskId: firing\.taskId \}\)/);
+    // The naming deletes the schedule before it continues, so only a lost naming leaves one to fire.
+    expect(router).toContain("if (r.kind === 'settled') await deleteTaskDeadline(r.channelArn, task.taskId);");
+  });
 
   it('the run takes onDeadline, and onFailure where the step declares none', async () => {
     const a = deps();

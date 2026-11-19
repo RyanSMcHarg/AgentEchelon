@@ -127,6 +127,18 @@ describe('a card press is taken for the task\'s assignee alone (T3, every deny c
     expect(edge.input.ExpressionAttributeValues[':to']).toBe('approved');
   });
 
+  it('a press names what changed, and one whose caller goes on with the run itself names nothing, so the run goes on once', async () => {
+    const named = nextChannel();
+    mockSend.mockResolvedValue({ Item: approvalTask({ channelArn: named }) });
+    await press(named);
+    expect(mockName).toHaveBeenCalled();
+    mockName.mockClear();
+    const relayed = nextChannel();
+    mockSend.mockResolvedValue({ Item: approvalTask({ channelArn: relayed }) });
+    expect(await press(relayed, { continuedByCaller: true })).toEqual({ ok: true, to: 'approved' });
+    expect(mockName).not.toHaveBeenCalled();
+  });
+
   it('DENY: another member, a moved state, an undeclared choice and a settled task are each refused, and nothing moves', async () => {
     const CH = nextChannel();
     mockSend.mockResolvedValue({ Item: approvalTask({ channelArn: CH }) });

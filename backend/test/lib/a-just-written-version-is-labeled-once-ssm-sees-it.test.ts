@@ -8,11 +8,37 @@
  */
 import { LabelParameterVersionCommand } from '@aws-sdk/client-ssm';
 import { labelJustWrittenVersion } from '../../lambda/src/lib/label-active';
+import { createDraft } from '../../lambda/src/lib/profile-lifecycle';
+import { fakeSsmStore } from '../helpers/fake-ssm-store';
 import * as fs from 'fs';
 import * as path from 'path';
 
 const notFound = () => Object.assign(new Error('could not find version'), { name: 'ParameterVersionNotFound' });
+const tooMany = () => Object.assign(new Error('too many updates'), { name: 'TooManyUpdates' });
 const noSleep = async () => undefined;
+
+describe('a write SSM refuses with TooManyUpdates', () => {
+  it('a label refused that way is moved again, and stops after its pauses', async () => {
+    const send = jest.fn().mockRejectedValueOnce(tooMany()).mockResolvedValueOnce({});
+    await labelJustWrittenVersion({ send } as never, '/x', 1, 'active', noSleep);
+    expect(send).toHaveBeenCalledTimes(2);
+    const always = jest.fn().mockRejectedValue(tooMany());
+    await expect(labelJustWrittenVersion({ send: always } as never, '/x', 1, 'active', noSleep)).rejects.toThrow('too many updates');
+    expect(always).toHaveBeenCalledTimes(6);
+  });
+
+  it('a definition write is sent once: the refusal reaches the caller, and an overlapping save is not overwritten', async () => {
+    const { client } = fakeSsmStore();
+    const send = client.send as jest.Mock;
+    const real = send.getMockImplementation()!;
+    send.mockImplementation(async (cmd: unknown) => {
+      if (cmd?.constructor?.name === 'PutParameterCommand') throw tooMany();
+      return real(cmd);
+    });
+    await expect(createDraft(client, '/agent-echelon', 'analyst', 'admin-sub')).rejects.toThrow('too many updates');
+    expect(send.mock.calls.filter(([c]) => c?.constructor?.name === 'PutParameterCommand')).toHaveLength(1);
+  });
+});
 
 describe('labeling a version just written', () => {
   it('retries while SSM does not see the version yet, then labels it', async () => {

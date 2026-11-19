@@ -61,11 +61,11 @@ export interface PostProcessingStackProps extends cdk.StackProps {
   /** The message stream, from the Messaging stack. */
   messageStream: kinesis.IStream;
   /**
-   * The bucket holding profile BODIES (an active version's persona lives under `profiles/*`). Needed
+   * The profile bucket, holding profile BODIES (an active version's persona lives under `profiles/*`). Needed
    * because arrival triage resolves the active profile for its configured copy.
    */
-  attachmentsBucketName: string;
-  attachmentsBucketArn: string;
+  profileBucketName: string;
+  profileBucketArn: string;
 }
 
 export class PostProcessingStack extends cdk.Stack {
@@ -152,7 +152,7 @@ export class PostProcessingStack extends cdk.Stack {
             }),
             new iam.PolicyStatement({
               actions: ['s3:GetObject'],
-              resources: [`${props.attachmentsBucketArn}/profiles/*`],
+              resources: [`${props.profileBucketArn}/profiles/*`],
             }),
           ],
         }),
@@ -200,7 +200,7 @@ export class PostProcessingStack extends cdk.Stack {
       role: postProcessingRole,
       environment: {
         ...speakAsAssistantEnv(),
-        PROFILE_BODY_BUCKET: props.attachmentsBucketName,
+        PROFILE_BODY_BUCKET: props.profileBucketName,
         ...routerByNameEnvironment(),
         TASKS_TABLE: shared.agentTasksName,
         // The queue record triage reads, and the same kill switch every other queue path honors -

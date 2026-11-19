@@ -301,10 +301,10 @@ Premium
 
 ### The context prefixes
 
-Company context is read from the deployment's attachments bucket by the `load_company_context` tool inside the self-hosted Converse loop. The key layout is the security model.
+Company context is read from the deployment's company bucket by the `load_company_context` tool inside the self-hosted Converse loop. The key layout is the security model.
 
 ```
-s3://<AttachmentsBucketName>/
+s3://<CompanyBucketName>/
   context/
     basic/
       _digest.json                 what basic may read, title plus one line each
@@ -389,21 +389,21 @@ For a blank-slate or production deployment, do not run the seed: no context is u
 
 | File | Purpose |
 |---|---|
-| `backend/demo/context/basic/company-public.json` | Public company info, FAQ, product descriptions |
-| `backend/demo/context/standard/employee-directory.json` | Departments, team leads and staff |
-| `backend/demo/context/standard/product-roadmap.json` | The quarter's roadmap, owners and target dates |
-| `backend/demo/context/standard/internal-processes.json` | Escalation matrix, SLA definitions, ticket trends |
-| `backend/demo/context/premium/financial-data.json` | ARR, growth, churn, burn, runway |
-| `backend/demo/context/premium/customer-accounts.json` | Top accounts, renewals, account health |
-| `backend/demo/context/premium/board-summary.json` | The quarter's board notes |
-| `backend/demo/context/premium/competitive-intel.json` | Feature and pricing comparison |
-| `backend/demo/context/premium/team-metrics.json` | OKR progress and velocity |
-| `backend/demo/context-digest-manifest.json` | The curated source the per-classification digests are built from |
-| `backend/demo/platform-knowledge/standard/agentechelon-about.json` | The generated index of the platform's own documentation |
-| `backend/demo/platform-knowledge/basic/agentechelon-about.json` | The generated public overview the external classification reads |
-| `backend/demo/personas.ts` | One persona per assistant, each scoped to the corpus its classification reaches |
-| `backend/demo/intent-packs.ts` | The Stratum domain intent taxonomy, per assistant |
-| `backend/demo/onboarding.ts` | How each assistant introduces itself, per assistant |
-| `backend/demo/boundaries.ts` | What each assistant does NOT reach, authored rather than derived |
+| `demo/stratum-company/context/basic/company-public.json` | Public company info, FAQ, product descriptions |
+| `demo/stratum-company/context/standard/employee-directory.json` | Departments, team leads and staff |
+| `demo/stratum-company/context/standard/product-roadmap.json` | The quarter's roadmap, owners and target dates |
+| `demo/stratum-company/context/standard/internal-processes.json` | Escalation matrix, SLA definitions, ticket trends |
+| `demo/stratum-company/context/premium/financial-data.json` | ARR, growth, churn, burn, runway |
+| `demo/stratum-company/context/premium/customer-accounts.json` | Top accounts, renewals, account health |
+| `demo/stratum-company/context/premium/board-summary.json` | The quarter's board notes |
+| `demo/stratum-company/context/premium/competitive-intel.json` | Feature and pricing comparison |
+| `demo/stratum-company/context/premium/team-metrics.json` | OKR progress and velocity |
+| `demo/stratum-company/context-digest-manifest.json` | The curated source the per-classification digests are built from |
+| `demo/stratum-company/platform-knowledge/standard/agentechelon-about.json` | The generated index of the platform's own documentation |
+| `demo/stratum-company/platform-knowledge/basic/agentechelon-about.json` | The generated public overview the external classification reads |
+| `demo/stratum-company/personas.ts` | One persona per assistant, each scoped to the corpus its classification reaches |
+| `demo/stratum-company/intent-packs.ts` | The Stratum domain intent taxonomy, per assistant |
+| `demo/stratum-company/onboarding.ts` | How each assistant introduces itself, per assistant |
+| `demo/stratum-company/boundaries.ts` | What each assistant does NOT reach, authored rather than derived |
 | `backend/scripts/seed-demo.ts` | The seeder. Creates identities, writes configuration and profile versions, uploads context. Creates no conversations |
 | `backend/scripts/sync-project-knowledge.mjs` | Generates the platform-knowledge index and the public overview, excluding this document and failing the run on a restricted name |

@@ -18,6 +18,7 @@
  * - the platform's self-knowledge (`platform-knowledge/`), selected by `load_platform_info`;
  * - deployment telemetry (CloudWatch reads), selected by `read_deployment_health` and still conditioned
  *   on the `ops` role tag by the acting role;
+ * - a conversation's dashboard (`dashboards/`), selected by `publish_dashboard` or `publish_dashboard_page`;
  * - text models: the classification's routed set (its intent strategy, its default and the utility
  *   model, computed at synth) plus what the definition and a running experiment variant name;
  * - image models: every image route's primary and fallback (`image-route.ts`), and a variant's.
@@ -146,11 +147,25 @@ export function grantEdgesFor(
   if (allTools || tools.has('load_company_context') || sources === undefined || sources.includes('company-docs')) edges.add('context');
   if (allTools || tools.has('load_platform_info')) edges.add('platform');
   if (allTools || tools.has('read_deployment_health')) edges.add('telemetry');
+  // A DASHBOARD TOOL WRITES ITS CONVERSATION'S DASHBOARD and reads the telemetry it shows (DESIGN-CONVERSATION-DASHBOARDS).
+  // ONE EDGE, NOT TWO: `dashboard` carries the telemetry read it draws from, so declaring a dashboard tool adds no session policy
+  // beyond the health read it replaces, and no definition passes STS's limit by declaring one.
+  if ((allTools || tools.has('publish_dashboard') || tools.has('publish_dashboard_page')) && has('dashboard')) { edges.delete('telemetry'); edges.add('dashboard'); }
 
-  // Every image model the definition names: each image route's primary and fallback, and the legacy field.
+  // Every image model the definition names: each image route's primary and fallback, and the legacy field. A running variant's
+  // comes first, so it is the last the limit below gives up.
   const imageKeys = def ? imageModelKeysOf(def.models as ImageRouteSource | undefined) : [catalog.defaultImageModelKey];
-  for (const k of [...imageKeys, variant?.imageModelKey]) {
+  for (const k of [variant?.imageModelKey, ...imageKeys]) {
     if (k && has(`image-${k}`)) edges.add(`image-${k}`);
+  }
+  for (const e of [...edges]) if (e !== 'base' && !has(e)) edges.delete(e);
+
+  // STS'S LIMIT HOLDS ON EVERY CATALOG. The text-model edges are what a turn cannot run without, so their room is kept; image
+  // edges past what fits are left out, last named first, and a session only ever narrows.
+  const reserved = (has('models-all') ? 1 : 0) + (has('models-cn') ? 1 : 0);
+  for (const e of [...edges].reverse()) {
+    if (edges.size + reserved <= MAX_SESSION_POLICIES) break;
+    if (e.startsWith('image-')) edges.delete(e);
   }
 
   // TEXT MODELS. Only keys this classification has an edge for: a disallowed pick is degraded to the

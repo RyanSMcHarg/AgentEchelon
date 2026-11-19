@@ -15,8 +15,8 @@
  *    `CLASSIFICATION_ADMISSION_JSON` payload, so this suite exercises the registry's own answer.
  *  - `lib/channel-creation.ts` - drift-spawned conversations and the queue's split offer
  *    (`live-drift-flow.ts`, `conversation-split.ts`). Refused here, asserted below.
- *  - a host's context conversation (`create-conversation-at-classification.ts`, `conversation-management.ts`)
- *    - created at the classification the trusted-issuer registry's oneChannel issuers name, which the
+ *  - a host's context conversation (`conversation-management.ts`)
+ *    - created at the trusted-issuer registry's `contextClassification`, which the
  *    registry refuses at synth when it is admin-plane. Asserted below.
  *  - `proactive-briefing.ts` - always `standard`, through the shared creator's briefing entry, which
  *    refuses an admin-plane classification as every entry does (asserted in `channel-creation.test.ts`).
@@ -202,14 +202,14 @@ describe('a drift-spawned or split conversation is never created at the admin pl
 });
 
 describe("a host's context conversations cannot be configured at the admin plane", () => {
-  it('the trusted-issuer registry refuses a oneChannel issuer naming an admin-plane classification', () => {
+  it('the trusted-issuer registry refuses a contextClassification naming an admin-plane classification', () => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { issuerErrors } = require('../../lib/config/issuers') as typeof import('../../lib/config/issuers');
     const errors = issuerErrors([
       { id: 'deployment', kind: 'cognito-pool', pool: 'self', clearance: { groups: true, classifications: ['basic', 'standard', 'premium', 'admin'] }, admin: true },
-      { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', clearance: { oneChannel: 'admin', classifications: ['admin'] } },
+      { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', clearance: { fixed: ['admin'], classifications: ['admin'] }, contextClassification: 'admin' },
     ], defaultProfileRegistry);
-    expect(errors).toEqual([expect.stringMatching(/oneChannel names "admin", which is not a classification a conversation can be created at/)]);
+    expect(errors).toEqual([expect.stringMatching(/contextClassification names "admin", which is not a classification a conversation can be created at/)]);
   });
 
   it('the stack hands each context Lambda the value the registry checked, not a second read of the context', () => {

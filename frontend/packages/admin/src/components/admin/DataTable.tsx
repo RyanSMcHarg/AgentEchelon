@@ -1,5 +1,5 @@
 import i18n from '@ae/shared/i18n';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import './DataTable.css';
 
@@ -71,9 +71,11 @@ interface DataTableProps<T extends AnyRow = AnyRow> {
    * and highlights it briefly. A key no row carries does nothing, so a caller can set it before its data arrives.
    */
   focusKey?: string | null;
+  /** A class for a row, so a table can tint the rows that need attention. */
+  rowClassName?: (row: T) => string | undefined;
 }
 
-function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = i18n.t('admin.dataTable.noDataAvailable'), onRowClick, pageSize = 25, serverPagination, rowKey, focusKey = null }: DataTableProps<T>) {
+function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = i18n.t('admin.dataTable.noDataAvailable'), onRowClick, pageSize = 25, serverPagination, rowKey, focusKey = null, rowClassName }: DataTableProps<T>) {
   const { t } = useTranslation();
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
@@ -125,8 +127,9 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = i18n.t
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusKey, focusIndex, pageSize, data.length]);
 
-  // Scrolled into view once per key, after the render that shows it. Smooth unless the reader asked for less motion.
-  useEffect(() => {
+  // Scrolled into view once per key, in the commit of the render that shows it, before it is painted, so the row is never
+  // shown highlighted without having been brought into view. Smooth unless the reader asked for less motion.
+  useLayoutEffect(() => {
     if (!focusKey) { scrolledFor.current = null; return; }
     if (scrolledFor.current === focusKey) return;
     const row = Array.from(wrapperRef.current?.querySelectorAll<HTMLElement>('tr[data-row-key]') ?? [])
@@ -251,7 +254,7 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = i18n.t
               key={`${curPage}_${i}`}
               data-row-key={key}
               aria-current={focused ? 'true' : undefined}
-              className={[onRowClick ? 'data-table-row--clickable' : '', focused ? 'data-table-row--focus' : ''].filter(Boolean).join(' ')}
+              className={[onRowClick ? 'data-table-row--clickable' : '', focused ? 'data-table-row--focus' : '', rowClassName?.(row) ?? ''].filter(Boolean).join(' ')}
               onClick={onRowClick
                 ? (e) => {
                     // Let nested buttons/links handle their own click; only a bare-row click drills.

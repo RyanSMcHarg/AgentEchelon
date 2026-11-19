@@ -18,7 +18,8 @@
     "Widget",
     "Connectors",
     "Operations",
-    "Meetings"
+    "Meetings",
+    "DashboardPages"
   ],
   "_testOnly": "Opt-in stacks the e2e suite reads, never part of a production deployment.",
   "testOnly": ["TestInbox", "TestIssuer", "WidgetHost"],

@@ -35,7 +35,7 @@ describe('classificationChips', () => {
     setClassificationsForTest(SAMPLE_CLASSIFICATIONS);
     // `basic` is busiest here. A rank order would have put premium first and buried the finding.
     const chips = classificationChips(new Map([['premium', 2], ['basic', 40], ['standard', 9]]), label);
-    expect(chips.map((c) => c.label)).toEqual(['Basic', 'Standard', 'Premium']);
+    expect(chips.map((c) => c.label)).toEqual(['Public', 'Internal', 'Confidential']);
   });
 
   it('labels a custom set by its own display names', () => {
@@ -57,6 +57,6 @@ describe('classificationChips', () => {
     // `unknown` is what the rollup writes for a row with no classification. Hiding it would make the
     // per-classification numbers silently fail to add up to the total above them.
     const chips = classificationChips(new Map([['unknown', 3], ['basic', 1]]), label);
-    expect(chips.map((c) => c.label)).toEqual(['Unknown', 'Basic']);
+    expect(chips.map((c) => c.label)).toEqual(['Unknown', 'Public']);
   });
 });

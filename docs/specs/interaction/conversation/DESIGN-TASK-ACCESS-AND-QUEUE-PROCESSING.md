@@ -898,7 +898,7 @@ Unit coverage sits with each component. What no unit test can show is the proper
 | An unaddressed stop in a room with several assistants asks, and stops nothing | `backend/test/lib/stop-names-its-assistant.test.ts` |
 | A stop cancels work in progress by id, keeps completed work, and says only what happened | `backend/test/lib/a-stop-cancels-work-in-progress-and-asks.test.ts` |
 | The person's answer to the stop question is read before routing, and restarts, leaves or passes the message on | `backend/test/lib/a-stop-question-owns-its-follow-up.test.ts` |
-| The judged half is dispatched behind the acknowledgment, never in front of it | Same, asserted on the order of the two in the stop path |
+| The judged half is sent when the channel flow releases the acknowledgment, so it is never shown in front of it | Same, asserted on the router's deferral and the flow's dispatch; the record is taken once, for its own acknowledgment (`backend/test/lib/a-stop-question-follows-its-acknowledgement.test.ts`) |
 | Triage stops looping at the pass bound and asks rather than guessing | `backend/test/lib/triage-is-a-bounded-loop.test.ts` |
 | A triage turn cannot reach a side-effecting tool | `backend/test/lib/triage-on-arrival.test.ts` |
 | One drain per queue, and the remainder branch really is the remainder branch | `backend/test/lib/one-drain-per-queue-not-per-pass.test.ts` |
@@ -928,7 +928,7 @@ The e2e phase is `turn-queue` in `backend/scripts/validate.mjs` and needs the de
 
 **Whether a returned amendment's copy is honest.** The proposal says the work starts "now", while a returned amendment goes back on the queue for the next arrival to read (2.0).
 
-**Secondary:** whether `dynamodb:LeadingKeys` binds a GSI partition key (section 5), and the `CONTROL` message size limit ADR-033 flags as unverified, which the notification path depends on.
+**Secondary:** whether `dynamodb:LeadingKeys` binds a GSI partition key (section 5), and the `CONTROL` message size limit, an open question in ADR-033, which the notification path depends on.
 
 ---
 

@@ -8,33 +8,28 @@
  *
  * Invoked directly by the person-facing API (`create-conversation.ts`), which has already authenticated
  * the person, refused an admin-plane classification, bounded the TTL and checked the person's reach, and
- * which holds no Amazon Chime SDK grant of its own. This function decides nothing about the person; it
+ * which holds no Amazon Chime SDK grant on a conversation. This function decides nothing about the person; it
  * refuses only what is not its own to create.
  *
- * ── TWO REQUESTS, ONE CREATOR ────────────────────────────────────────────────────────────────────
+ * ── A PERSON'S CONVERSATION ───────────────────────────────────────────────────────────────────────
  *
- * A person's typed conversation, and a HOST'S CONTEXT CONVERSATION (`kind: 'context'`): the
- * conversation a one-conversation person (their issuer declares `clearance: { oneChannel }`) opens for
- * a host's context, at the deterministic id `contextChannelId` derives, create-or-get. Which one the
- * API sends follows from the caller's issuer entry, never from a route. The context request is served
- * only by the creator of the classification the registry's oneChannel issuers name, the one whose role
- * also holds the re-open reads (`CONTEXT_CONVERSATIONS=true`).
+ * The typed request the person-facing API sends: a new room with a generated id, with only that person in it.
  *
  * ── AND A VISITOR'S ───────────────────────────────────────────────────────────────────────────────
  *
- * A third request, `kind: 'guest'`, opens an anonymous visitor's conversation (`guest-visitor`). It is
+ * A second request, `kind: 'guest'`, opens an anonymous visitor's conversation (`guest-visitor`). It is
  * sent by guest start, in the credential exchange, never by the person-facing API, and it is served only
  * by the creator of an outside classification (the guest's), the one whose stack grants that exchange
  * the invoke.
  *
  * ── AND A CUSTOMER'S, FROM A CLAIM ────────────────────────────────────────────────────────────────
  *
- * A fourth, `kind: 'upgrade'`, opens the conversation a path B claim lands in (`guest-upgrade.ts`), at the
+ * A third, `kind: 'upgrade'`, opens the conversation a path B claim lands in (`guest-upgrade.ts`), at the
  * claim target's classification only (`claimTargetOf`), tagged with the visitor's conversation.
  *
  * ── AND A BOUND VISITOR'S CONTINUATION ────────────────────────────────────────────────────────────
  *
- * A fifth, `kind: 'bind'`, opens the conversation a path A bind continues the visit in (`lib/guest-bind.ts`),
+ * A fourth, `kind: 'bind'`, opens the conversation a path A bind continues the visit in (`lib/guest-bind.ts`),
  * sent by the credential exchange for the visitor's own AppInstanceUser, at the account's classification
  * and never the visitor's (`bindTargetOf`). Its channel id is deterministic from the visitor's
  * conversation, so a retried bind re-opens the one it opened, and only when its tags name that visit and
@@ -52,23 +47,15 @@
  *  - `kind: 'retire'` deletes the visitor's conversation once the new one and its seed exist.
  */
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
-import {
-  DescribeChannelCommand,
-  DescribeChannelMembershipCommand,
-  ListChannelMembershipsCommand,
-  UpdateChannelCommand,
-} from '@aws-sdk/client-chime-sdk-messaging';
 import type { ExpirationCriterion } from '../../lib/config/conversation-types.js';
 import type { Classification } from '../../lib/config/model-strategy.js';
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
 import {
-  contextChannelId,
-  createConversationForContext,
+  completeBoundContinuation,
   createConversationForGuest,
   createConversationForPerson,
   createConversationForUpgrade,
   isVisitorConversation,
-  reseatContextOpener,
   retireVisitorConversation,
 } from './lib/channel-creation.js';
 import { ApplyGuardrailCommand, BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime';
@@ -81,12 +68,8 @@ import { primaryAssignmentOf } from './lib/conversation-primary.js';
 import { conversationNameFor, conversationNameText, PLACEHOLDER_TITLE, type ConversationNameKind } from './lib/conversation-name.js';
 import { loadMessageTemplateSet } from './lib/message-template-selection.js';
 import { resolveServiceAdminBearer } from './lib/service-admin-bearer.js';
-import { rosterOf, userArnFor } from './lib/person-arn.js';
-import { contextRoomName } from './lib/conversation-name.js';
-import { contextTitleOf, putChannelContext, type ChannelContextPatch } from './lib/channel-context-client.js';
-import { boundedDomainContext, boundedOtherContexts } from './lib/host-grounding.js';
+import { userArnFor } from './lib/person-arn.js';
 import { chimeMessagingClient } from './lib/chime/clients.js';
-import { CHANNEL_METADATA_CAP_BYTES } from './lib/chime/channel-meta.js';
 import { bindTargetOf, claimTargetOf, GUEST_VISITOR_TYPE } from '../../lib/config/conversation-types.js';
 import { boundChannelIdOf, registrationFieldsOf, UPGRADE_SOURCE_PERSON_TAG, UPGRADE_SOURCE_TAG, type VisitAssessment, type VisitRequest } from './lib/upgrade.js';
 import { readChannelTags } from './lib/channel-classification.js';
@@ -114,24 +97,6 @@ const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN || '';
 const CHANNEL_FLOW_ARN_PARAM = process.env.CHANNEL_FLOW_ARN_PARAM || '';
 const SSM_ROOT = process.env.SSM_ROOT || '';
 const CLASSIFICATION = (process.env.CREATOR_CLASSIFICATION || '').trim();
-/** True on the one creator whose classification the registry's oneChannel issuers name. */
-const CONTEXT_CONVERSATIONS = process.env.CONTEXT_CONVERSATIONS === 'true';
-
-/**
- * A HOST'S CONTEXT CONVERSATION, opened by a one-conversation person. `body` is the host's request as
- * it arrived; this function bounds every field of it.
- */
-export interface CreateContextAtClassificationRequest {
-  kind: 'context';
-  classification: string;
-  /** The person, composed by the API from the verified token. */
-  userArn: string;
-  body: Record<string, unknown>;
-}
-
-export type CreateContextAtClassificationResult =
-  | { ok: true; conversationArn: string; userArn: string; contextType: string; contextId: string }
-  | { ok: false; code: 'CLASSIFICATION_MISMATCH' | 'SERVER_MISCONFIG' | 'INVALID_REQUEST' | 'NOT_A_MEMBER' | 'CONVERSATION_CREATION_FAILED'; error: string };
 
 /** What the API hands over. `classification` is checked against this function's own, never adopted. */
 export interface CreateAtClassificationRequest {
@@ -260,17 +225,16 @@ let coldContainer = true;
 export function handler(req: CreateGuestAtClassificationRequest): Promise<CreateAtClassificationResult>;
 export function handler(req: CreateUpgradeAtClassificationRequest): Promise<CreateAtClassificationResult>;
 export function handler(req: CreateBindAtClassificationRequest): Promise<CreateAtClassificationResult>;
-export function handler(req: CreateContextAtClassificationRequest): Promise<CreateContextAtClassificationResult>;
 export function handler(req: VisitAtClassificationRequest): Promise<VisitAtClassificationResult>;
 export function handler(req: CreateAtClassificationRequest): Promise<CreateAtClassificationResult>;
 export async function handler(
-  req: CreateAtClassificationRequest | CreateContextAtClassificationRequest | CreateGuestAtClassificationRequest
+  req: CreateAtClassificationRequest | CreateGuestAtClassificationRequest
     | CreateUpgradeAtClassificationRequest | CreateBindAtClassificationRequest | VisitAtClassificationRequest,
-): Promise<CreateAtClassificationResult | CreateContextAtClassificationResult | VisitAtClassificationResult> {
+): Promise<CreateAtClassificationResult | VisitAtClassificationResult> {
   const timer = phaseTimer();
   const cold = coldContainer;
   coldContainer = false;
-  let result: CreateAtClassificationResult | CreateContextAtClassificationResult | VisitAtClassificationResult | undefined;
+  let result: CreateAtClassificationResult | VisitAtClassificationResult | undefined;
   try {
     // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
     await timer.time('registry', async () => { await loadProfileRegistry(); });
@@ -288,10 +252,10 @@ export async function handler(
 }
 
 async function dispatch(
-  req: CreateAtClassificationRequest | CreateContextAtClassificationRequest | CreateGuestAtClassificationRequest
+  req: CreateAtClassificationRequest | CreateGuestAtClassificationRequest
     | CreateUpgradeAtClassificationRequest | CreateBindAtClassificationRequest | VisitAtClassificationRequest,
   timer: PhaseTimer,
-): Promise<CreateAtClassificationResult | CreateContextAtClassificationResult | VisitAtClassificationResult> {
+): Promise<CreateAtClassificationResult | VisitAtClassificationResult> {
   // A FUNCTION WITH NO CLASSIFICATION, OR AN ADMIN-PLANE ONE, CREATES NOTHING. The stack builds one per
   // conversational classification, so either is a deployment fault.
   if (!CLASSIFICATION || !profiles.isConversational(CLASSIFICATION) || !APP_INSTANCE_ARN) {
@@ -306,11 +270,12 @@ async function dispatch(
     });
     return { ok: false, code: 'CLASSIFICATION_MISMATCH', error: `this creator creates ${CLASSIFICATION} conversations only` };
   }
-  if (req.kind === 'context') return createContextConversation(req, timer);
   if (req.kind === 'guest') return createGuestConversation(req, timer);
   if (req.kind === 'upgrade') return createUpgradeConversation(req, timer);
   if (req.kind === 'bind') return createBoundConversation(req, timer);
   if (req.kind === 'assess' || req.kind === 'retire') return visitRequest(req);
+  // AN ORDINARY CREATE NAMES NO KIND, so a kind this creator does not serve opens nothing.
+  if ((req as { kind?: unknown }).kind !== undefined) return { ok: false, code: 'INVALID_REQUEST', error: 'this creator does not serve that kind of request' };
   return createTypedConversation(req as CreateAtClassificationRequest, timer);
 }
 
@@ -566,193 +531,11 @@ async function createBoundConversation(req: CreateBindAtClassificationRequest, t
       console.error('[CreateConversationAtClassification][SecurityEvent] a bind channel id names a conversation that is not its continuation', { channelArn });
       return { ok: false, code: 'CONVERSATION_CREATION_FAILED', error: 'the continuation channel names another visit' };
     }
-    // A creation that stopped part way is finished: the assistant and the person, each idempotent.
-    await reseatContextOpener({ channelArn, botArn, userArn: req.userArn, bearerArn: creatorBearerArn });
+    // A creation that stopped part way is finished: its flow, its context row, the assistant and the person, each idempotent.
+    await completeBoundContinuation({ channelArn, botArn, userArn: req.userArn, bearerArn: creatorBearerArn, channelFlowArn });
     return { ok: true, channelArn, channelId };
   } catch (err) {
     console.error('[CreateConversationAtClassification] a bound visitor conversation could not be opened', { message: (err as Error)?.message });
-    return { ok: false, code: 'CONVERSATION_CREATION_FAILED', error: (err as Error)?.message || 'creation failed' };
-  }
-}
-
-// ── A HOST'S CONTEXT CONVERSATION ───────────────────────────────────────────────────────────────
-
-/**
- * May this caller re-open an EXISTING context conversation? Yes when they are already a member. Also yes
- * when no person is in it yet: that is the first create still in flight (the channel exists but its
- * creator has not been added), and refusing it would fail a double-submitted first open. Any read
- * failure refuses, because admitting on an unknown is admitting a stranger.
- *
- * Read as the service admin, which as an AppInstanceAdmin reads any channel of the instance. It is NOT a
- * person here, although its ARN is a `/user/` one: it is a member while a first creation is in flight,
- * and counting it would refuse exactly the double-submit this admits.
- */
-async function mayReopen(channelArn: string, userArn: string, serviceAdmin: string): Promise<boolean> {
-  try {
-    await messaging.send(new DescribeChannelMembershipCommand({ ChannelArn: channelArn, MemberArn: userArn, ChimeBearer: serviceAdmin }));
-    return true;
-  } catch (err) {
-    if ((err as { name?: string }).name !== 'NotFoundException') {
-      console.error('[CreateContextConversation] could not read the caller\'s membership; refusing', { channelArn, err: (err as Error)?.name });
-      return false;
-    }
-  }
-  try {
-    let token: string | undefined;
-    do {
-      const page = await messaging.send(new ListChannelMembershipsCommand({ ChannelArn: channelArn, ChimeBearer: serviceAdmin, MaxResults: 50, NextToken: token }));
-      if (rosterOf(page.ChannelMemberships).some((m) => m.kind === 'person' && m.arn !== serviceAdmin)) return false;
-      token = page.NextToken;
-    } while (token);
-    return true;
-  } catch (err) {
-    console.error('[CreateContextConversation] could not read the conversation\'s members; refusing', { channelArn, err: (err as Error)?.name });
-    return false;
-  }
-}
-
-/**
- * CREATE-OR-GET A HOST'S CONTEXT CONVERSATION for the one-conversation person the API resolved.
- *
- * The channel is created by the shared creator (`lib/channel-creation.ts`), as every other conversation
- * is: the service admin creates, the flow is attached, the assistant and the person are added, and the
- * admin leaves. An existing conversation admits only its own members here; admission is the host's
- * decision, made through the IAM-gated membership function (`conversation-management.ts`).
- */
-async function createContextConversation(req: CreateContextAtClassificationRequest, timer: PhaseTimer): Promise<CreateContextAtClassificationResult> {
-  if (!CONTEXT_CONVERSATIONS) {
-    console.error('[CreateContextConversation][SecurityEvent] a context request reached a creator no oneChannel issuer names', {
-      classification: CLASSIFICATION,
-    });
-    return { ok: false, code: 'SERVER_MISCONFIG', error: 'this deployment creates no context conversation at this classification' };
-  }
-  const userArn = String(req?.userArn || '');
-  if (!userArn.startsWith(userArnFor(APP_INSTANCE_ARN, ''))) return { ok: false, code: 'INVALID_REQUEST', error: 'userArn is required' };
-  const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>;
-  const contextType = String(body.contextType || '').trim();
-  const contextId = String(body.contextId || '').trim();
-  if (!contextType || !contextId) return { ok: false, code: 'INVALID_REQUEST', error: 'contextType and contextId are required' };
-  const title = String(body.title || contextId).slice(0, 80);
-
-  // Grounding context: the host passes the user's name, a compact current-plan summary and a title-only
-  // list of their other contexts. The assistant's prompt reads them (current plan = primary grounding;
-  // other contexts = disambiguation). The user's site language and a free-text participant profile too.
-  const userName = String(body.userName || '').slice(0, 80);
-  const userLanguage = String(body.userLanguage || '').slice(0, 8);
-  const participantProfile = String(body.participantProfile || '').slice(0, 600);
-  // BOUNDED, like every other field. Unbounded, a plan's items push every turn's dispatch past the
-  // 256KB Event-invoke cap, `invokeAsync` logs and returns, and the person waits on "One moment..."
-  // forever - on every turn, because the grounding is re-read and re-sent each time.
-  const domainContext = boundedDomainContext(body.domainContext, '[CreateContextConversation]');
-  const otherContexts = boundedOtherContexts(body.otherContexts);
-  // The roster: membership + role + home-issuer pointer ONLY ({sub, iss?, role}). Identity (name, email)
-  // is resolved by the directory at the point of need, never stored here.
-  const participants = Array.isArray(body.participants)
-    ? (body.participants as Array<{ sub?: unknown; iss?: unknown; role?: unknown }>)
-        .map((p) => ({
-          sub: String(p.sub || '').slice(0, 64),
-          ...(typeof p.iss === 'string' && p.iss ? { iss: p.iss.slice(0, 256) } : {}),
-          role: String(p.role || '').slice(0, 16),
-        }))
-        .filter((p) => p.sub)
-        .slice(0, 8)
-    : undefined;
-  // Geography routing signal (SPEC-CONTEXT-AWARE-MODEL-ROUTING), a 2-letter ISO country or nothing.
-  const segmentCountry = body.segment && typeof body.segment === 'object'
-    ? String((body.segment as { country?: unknown }).country || '').slice(0, 3).toUpperCase()
-    : '';
-  const segment = /^[A-Z]{2}$/.test(segmentCountry) ? { country: segmentCountry } : undefined;
-
-  const channelId = contextChannelId(CLASSIFICATION, contextType, contextId);
-  const deterministicArn = `${APP_INSTANCE_ARN}/channel/${channelId}`;
-
-  // Amazon Chime SDK channel Metadata is capped at ~1 KB and is MEMBER-READABLE and member-WRITABLE. It
-  // carries only the conversation's identity bits. The PRIVATE grounding (participantProfile,
-  // domainContext, otherContexts, userName), the ROUTING signals (userLanguage, segment) and the roster
-  // go to the server-only Channel Context store, which no member can read or write.
-  const contextBinding = {
-    contextType: contextType.slice(0, 64),
-    contextId: contextId.slice(0, 128),
-    topic: title,
-  };
-  const metadata = JSON.stringify({ modelTier: CLASSIFICATION, ...contextBinding });
-  if (Buffer.byteLength(metadata, 'utf8') > CHANNEL_METADATA_CAP_BYTES) {
-    console.warn('[CreateContextConversation] metadata exceeds the cap', { bytes: Buffer.byteLength(metadata, 'utf8') });
-  }
-  // `null` where the host OMITTED a field, so removing it from a plan clears the stored value: the store
-  // reads `undefined` as "not part of this patch" and `null` as a removal.
-  const grounding: ChannelContextPatch = {
-    participantProfile: body.participantProfile === undefined ? null : participantProfile,
-    domainContext: body.domainContext === undefined ? null : domainContext,
-    otherContexts: body.otherContexts === undefined ? null : otherContexts,
-    userName: body.userName === undefined ? null : userName,
-    userLanguage: body.userLanguage === undefined ? null : userLanguage,
-    segment: body.segment === undefined ? null : segment,
-    memberIdentities: participants === undefined ? null : (participants ?? null),
-    // The host's title the room was named from, on the server-only row: what a reopen compares the room's name to.
-    topic: title,
-  };
-
-  try {
-    const [primary, channelFlowArn, serviceAdmin] = await creationReads(timer);
-    const botArn = primary?.botArn || '';
-    if (!botArn) return { ok: false, code: 'SERVER_MISCONFIG', error: 'no assistant is published for this classification' };
-    // NO SERVICE ADMIN, NO CONVERSATION (step 33): both branches below act as the service admin.
-    if (!serviceAdmin) return { ok: false, code: 'SERVER_MISCONFIG', error: 'no service admin is configured to create conversations' };
-
-    // 1. Create through the shared creator. Create-or-get on the deterministic ChannelId: a repeat call
-    //    throws ConflictException before anything is written, and is handled below.
-    try {
-      const created = await createConversationForContext({
-        appInstanceArn: APP_INSTANCE_ARN,
-        botArn,
-        userArn,
-        classification: CLASSIFICATION as Classification,
-        channelId,
-        title,
-        metadataExtras: contextBinding,
-        tagExtras: [{ Key: 'contextType', Value: contextType.slice(0, 128) }],
-        contextExtras: grounding,
-        channelFlowArn,
-        creatorBearerArn: serviceAdmin,
-        timer,
-      });
-      return { ok: true, conversationArn: created.channelArn || deterministicArn, userArn, contextType, contextId };
-    } catch (err) {
-      if ((err as { name?: string }).name !== 'ConflictException') throw err;
-    }
-
-    // 2. AN EXISTING CONVERSATION ADMITS ONLY ITS OWN MEMBERS HERE. The channel id is derived from the
-    //    context alone, so this branch is reached by ANY person of the host who names a context, and
-    //    admitting them would let a sharee the host removed back in. Checked before anything is written.
-    if (!(await mayReopen(deterministicArn, userArn, serviceAdmin))) {
-      console.warn('[CreateContextConversation][SecurityEvent] refused: the caller is not a member of the existing conversation', {
-        conversationArn: deterministicArn, userArn,
-      });
-      return { ok: false, code: 'NOT_A_MEMBER', error: 'This conversation is not yours to open' };
-    }
-    // Refresh Metadata so an EDITED plan's context reaches the assistant. THE CREATOR NAMES THE ROOM FROM ITS CONTEXT
-    // (SPEC-CONVERSATION-TYPES FR32): a room still carrying the host title it was last named from follows the host's new
-    // title; a name anyone else gave it since is kept. The title it was named from is read from the server-only row.
-    try {
-      const [current, stored] = await Promise.all([
-        messaging.send(new DescribeChannelCommand({ ChannelArn: deterministicArn, ChimeBearer: serviceAdmin })),
-        contextTitleOf(deterministicArn),
-      ]);
-      const name = contextRoomName(current.Channel?.Name, stored, title);
-      await messaging.send(new UpdateChannelCommand({
-        ChannelArn: deterministicArn, Name: name, Mode: 'RESTRICTED', Metadata: metadata, ChimeBearer: serviceAdmin,
-      }));
-    } catch (uerr) {
-      console.warn('[CreateContextConversation] metadata refresh failed (non-fatal):', uerr);
-    }
-    // When it began, for profile-experiment enrollment (ADR-050); the store keeps the first value.
-    await putChannelContext(deterministicArn, { createdAt: new Date().toISOString(), ...grounding });
-    // 3. Finish the room, idempotently, in case the first creation stopped part way.
-    await reseatContextOpener({ channelArn: deterministicArn, botArn, userArn, bearerArn: serviceAdmin, channelFlowArn });
-    return { ok: true, conversationArn: deterministicArn, userArn, contextType, contextId };
-  } catch (err) {
-    console.error('[CreateContextConversation] failed', { message: (err as Error)?.message });
     return { ok: false, code: 'CONVERSATION_CREATION_FAILED', error: (err as Error)?.message || 'creation failed' };
   }
 }

@@ -45,7 +45,6 @@ describe('ConversationsTab — redacted/deleted tombstones', () => {
     // deepLinkChannelArn auto-opens the conversation detail → loads the messages above.
     render(
       <ConversationsTab
-        summaryData={null}
         driftData={null}
         isLoading={false}
         deepLinkChannelArn={CHANNEL}
@@ -71,7 +70,6 @@ describe('ConversationsTab — redacted/deleted tombstones', () => {
     vi.mocked(svc.listAdminConversationMessages).mockResolvedValue([MESSAGES[0]]);
     render(
       <ConversationsTab
-        summaryData={null}
         driftData={null}
         isLoading={false}
         deepLinkChannelArn={CHANNEL}
@@ -90,7 +88,6 @@ describe('ConversationsTab — redacted/deleted tombstones', () => {
     vi.mocked(svc.listAdminConversationMessages).mockResolvedValue([MESSAGES[2]]); // the deleted one
     render(
       <ConversationsTab
-        summaryData={null}
         driftData={null}
         isLoading={false}
         deepLinkChannelArn={CHANNEL}
@@ -104,7 +101,7 @@ describe('ConversationsTab — redacted/deleted tombstones', () => {
     vi.mocked(svc.listAdminConversationMessages).mockResolvedValue([
       { ...MESSAGES[2], moderatedByName: 'Alice Admin' }, // deleted + audited actor
     ]);
-    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
+    render(<ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
     expect(await screen.findByText('Deleted by Alice Admin')).toBeTruthy();
     expect(screen.queryByText('Deleted by an admin')).toBeNull(); // the role fallback is not used
   });
@@ -112,7 +109,7 @@ describe('ConversationsTab — redacted/deleted tombstones', () => {
   it('hides Redact once redacted, and both actions once deleted', async () => {
     // Redacted → Redact gone, Delete stays.
     vi.mocked(svc.listAdminConversationMessages).mockResolvedValue([MESSAGES[1]]);
-    const view = render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
+    const view = render(<ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
     await screen.findByText(/Redacted by/);
     expect(screen.queryByRole('button', { name: 'Redact' })).toBeNull();
     expect(screen.getByRole('button', { name: 'Delete' })).toBeTruthy();
@@ -120,7 +117,7 @@ describe('ConversationsTab — redacted/deleted tombstones', () => {
 
     // Deleted → neither action.
     vi.mocked(svc.listAdminConversationMessages).mockResolvedValue([MESSAGES[2]]);
-    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
+    render(<ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
     await screen.findByText(/Deleted by/);
     expect(screen.queryByRole('button', { name: 'Redact' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull();

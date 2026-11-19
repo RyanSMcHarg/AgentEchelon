@@ -405,6 +405,13 @@ describe('trigger #3 - on-downgrade user re-eval', () => {
     const kinds = chimeSends.map((c) => c._t);
     expect(kinds).toContain('listuserchannels'); // listed the user's channels
     expect(kinds).toContain('send');             // flagged the uncleared membership
+    // REMOVED, in report-only mode: a downgrade is the operator's decision, not a detection (R1).
+    expect(kinds).toContain('delete');
+  });
+
+  it('the event stream, in the same report-only mode, still only reports the same membership', async () => {
+    await audit.handler(kinesisEvent(`${APP}/user/basic-sub`));
+    expect(chimeSends.map((c) => c._t)).not.toContain('delete');
   });
 
   it('re-evaluates a person disabled at their pool: their row stays active, so a downgrade while disabled is audited', async () => {

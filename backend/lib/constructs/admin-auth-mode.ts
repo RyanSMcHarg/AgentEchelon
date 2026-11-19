@@ -8,8 +8,9 @@
  *
  *   -c adminAuthMode=ae-cognito   (default) AE's own pool and console.
  *   -c adminAuthMode=service      A trusted backend principal granted `execute-api:Invoke` calls the
- *                                  admin APIs; the handler trusts any IAM-signed caller as admin
- *                                  (`isServiceAdminCall` in lambda auth.ts).
+ *                                  admin APIs; the handler trusts an IAM-signed caller as admin
+ *                                  (`isServiceAdminCall` in lambda auth.ts), except a session another
+ *                                  instance minted (`trustedIamAdminPrincipal`).
  *
  * `federated` is retired and refused at synth: every admin route is AWS_IAM, so a mode that names a
  * host's admin sign-in would select nothing, and a deployer passing it would believe it did.
@@ -20,6 +21,7 @@
 
 import type { Construct } from 'constructs';
 import { issuersOf } from './trusted-issuers';
+import { adminSessionRoleEnv } from './admin-role-grants';
 
 export type AdminAuthMode = 'ae-cognito' | 'service';
 
@@ -49,9 +51,11 @@ export function getAdminAuthMode(scope: Construct): AdminAuthMode {
  *   `adminGroups`) tells the
  *   handler which group value denotes admin: the groups it names on a trusted
  *   IAM-signed call, and the `cognito:groups` value its claim check accepts.
+ * - `ADMIN_CONSOLE_ROLE_NAME`, `TEAM_CONSOLE_ROLE_NAME` and `ADMIN_PLANE_ROLE_NAME` (`adminSessionRoleEnv`) name
+ *   the roles this instance mints admin sessions on, the only sessions the handler admits as its own.
  */
 export function adminAuthEnv(scope: Construct): Record<string, string> {
-  const env: Record<string, string> = { ADMIN_AUTH_MODE: getAdminAuthMode(scope) };
+  const env: Record<string, string> = { ADMIN_AUTH_MODE: getAdminAuthMode(scope), ...adminSessionRoleEnv() };
   const groups = issuersOf(scope).deploymentAdminGroups();
   if (groups) env.ADMIN_GROUP_NAMES = groups.join(',');
   return env;

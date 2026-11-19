@@ -94,6 +94,12 @@ describe('what a person may open a conversation at', () => {
     expect(creatableClassifications('guest')).toEqual([]);
   });
 
+  it('lists the one that reaches the fewest first, however the set is served', () => {
+    const byName = Object.fromEntries(SAMPLE_CLASSIFICATIONS.map((c) => [c.value, c]));
+    setClassificationsForTest([byName.admin, byName.basic, byName.premium, byName.standard]);
+    expect(creatableClassifications('premium').map((c) => c.value)).toEqual(['basic', 'standard', 'premium']);
+  });
+
   it('is a custom set\'s own classifications, which no sample list names', () => {
     setClassificationsForTest(CUSTOM);
     expect(creatableClassifications('legal').map((c) => c.value)).toEqual(['legal']);

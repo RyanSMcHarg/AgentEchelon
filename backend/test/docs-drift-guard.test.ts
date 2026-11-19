@@ -14,6 +14,7 @@
  * The authoritative source for every fact below is `backend/lib/config/profiles.ts`
  * (`DEFAULT_PROFILES_CONFIG`) and `backend/lambda/src/lib/intent-pack.ts`.
  */
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { excludeIgnored } from './helpers/shipped-files';
@@ -25,6 +26,7 @@ const REPO_ROOT = path.resolve(__dirname, '..', '..');
 // output (*.d.ts / *.js / node_modules / cdk.out).
 const SCAN_ROOTS = [
   'README.md',
+  'AGENTS.md',
   'docs',
   'backend/lambda/src',
   'backend/lib',
@@ -45,6 +47,15 @@ const SCAN_EXTENSIONS = new Set(['.md', '.ts']);
  * keyword-classified" notes) must not trip it.
  */
 const BANNED: Array<{ phrase: string; truth: string }> = [
+  // --- A guardrail that cannot be applied withholds the turn. ---
+  {
+    phrase: 'guardrail outage never drops a reply',
+    truth: 'A guardrail that cannot be applied, for any reason, withholds the turn and counts `GuardrailUnavailable` (`runGuardrail`, `lib/async-processor-core.ts`; `lib/guardrail-unavailable.ts`).',
+  },
+  {
+    phrase: 'failure of the default itself fails open',
+    truth: 'A default guardrail that cannot be applied withholds the turn (SPEC-CONFIGURABLE-ASSISTANTS FR6).',
+  },
   // --- The Cognito triggers are the one raw asset; share-conversation is bundled. ---
   {
     phrase: 'several lambdas are deployed with `lambda.code.fromasset`',
@@ -71,6 +82,15 @@ const BANNED: Array<{ phrase: string; truth: string }> = [
   {
     phrase: '{manifest, targetprofilename?}',
     truth: 'The import body is `{manifest, targetProfileName}`, and the target is required.',
+  },
+  // --- The seed serves only a profile with no active version; an unreadable version never resolves to it. ---
+  {
+    phrase: 'when the parameter is missing or invalid',
+    truth: 'The compiled seed serves only a profile with no active version. A version that exists and cannot be read is answered by the last version read, else the turn ends in its degraded reply (HOW-TO-ADD-OR-MANAGE-A-PROFILE 2.14).',
+  },
+  {
+    phrase: 'invalid version fails closed to the seed',
+    truth: 'An invalid stored version is refused (`ProfileVersionUnreadableError`), never served as the seed.',
   },
   {
     phrase: 'npm run assistant -- draft standard',
@@ -633,13 +653,9 @@ const BANNED: Array<{ phrase: string; truth: string }> = [
   // that fires on a correct negation gets switched off.
   { phrase: 'fast-path keyword matching', truth: 'the default path is the LLM classifier; the keyword classifier is opt-in per profile via classifierMode' },
   { phrase: 'keywords, else the llm', truth: 'the LLM classifier is the default for every shipped profile; keyword mode is an opt-in alternative, not a second choice after keywords' },
-  // The "no shipped profile uses keyword mode" half of this truth went stale and was corrected on
-  // 2026-09-26. `ops-premium` in profiles.ts sets `classifierMode: 'keyword'` on purpose, with the
-  // reasoning in its own comment: the ops questions are narrow and repetitive, so a frontier model
-  // plus a model-backed classifier on them is the cost that tenet P5 asks a builder to control. The
-  // banned phrase is still right - keyword is an ALTERNATIVE, never a fallback behind llm - but a
-  // correction text that denies a shipped profile exists teaches the wrong fact while fixing another.
-  { phrase: 'with keyword fallback', truth: 'keyword and llm are alternative classifierMode values, not a chain. The three default classification profiles set llm; the opt-in `ops-premium` role sets keyword deliberately as a cost control. Never describe keyword as a fallback behind llm, and never as the default path' },
+  // Keyword is an ALTERNATIVE classifierMode value, never a fallback behind llm. No shipped profile sets it.
+  { phrase: 'with keyword fallback', truth: 'keyword and llm are alternative classifierMode values, not a chain. Every shipped profile, `ops-premium` included, sets llm. Never describe keyword as a fallback behind llm, and never as the default path' },
+  { phrase: 'ops-premium` role uses `\'keyword\'', truth: 'every shipped profile, `ops-premium` included, is classified by the model (classifierMode llm)' },
   { phrase: 'llm classifier for unmatched messages', truth: 'the LLM classifier handles essentially every message; only exact greeting/acknowledgment tokens short-circuit before it' },
 
   // --- Class: A RETRACTED MEASUREMENT that already traveled once. ---
@@ -764,8 +780,10 @@ const BANNED: Array<{ phrase: string; truth: string }> = [
   // The host-pool copies of the exchange, the create and the membership changes are deleted, and the
   // six context keys that configured them are retired (RETIRED_CONTEXT_KEYS in deploy-context.ts, which
   // names each bare key to refuse it, so the phrases here are the stale instruction or the removed name).
-  { phrase: 'federated-credential-exchange', truth: 'one exchange serves every issuer: credential-exchange.ts, with the one-conversation vend for a oneChannel issuer' },
-  { phrase: 'federated-create-conversation', truth: 'one create path: create-conversation.ts, which dispatches a oneChannel caller\'s context request to its classification\'s creator' },
+  { phrase: 'federated-credential-exchange', truth: 'one exchange serves every issuer: credential-exchange.ts' },
+  { phrase: 'federated-create-conversation', truth: 'one create path: create-conversation.ts; a host opens a context conversation through membershipHandler' },
+  { phrase: 'context_not_in_token', truth: 'a host opens the conversation through membershipHandler, never from a token naming a context' },
+  { phrase: 'opens or re-opens it', truth: 'the host opens the conversation through membershipHandler; a person signs in through the ordinary exchange' },
   { phrase: 'federated-add-member', truth: 'a host\'s add and remove: membershipHandler in conversation-management.ts (ConversationMembershipFunction)' },
   { phrase: 'federated-remove-member', truth: 'a host\'s add and remove: membershipHandler in conversation-management.ts (ConversationMembershipFunction)' },
   { phrase: 'lib/federated-identity', truth: 'a person from any issuer is minted and resolved by lib/person-identity.ts, keyed on the issuer\'s registry id' },
@@ -774,7 +792,12 @@ const BANNED: Array<{ phrase: string; truth: string }> = [
   { phrase: 'federatedexchangeapiurl', truth: 'a host pool\'s people use CredentialExchangeApiUrl, the one exchange' },
   { phrase: 'federatedaddmemberfunctionarn', truth: 'the host\'s membership changes go to ConversationMembershipFunctionArn ({ op: add | remove })' },
   { phrase: '-c federateduserpoolid=', truth: 'retired; a host app\'s pool is an issuers entry in deploy.config.json (lib/config/issuers.ts)' },
-  { phrase: '-c assistanttier=', truth: 'retired; a context conversation\'s classification is its issuer\'s clearance.oneChannel' },
+  { phrase: '-c assistanttier=', truth: 'retired; a context conversation\'s classification is its issuer\'s contextClassification' },
+  // --- A person's clearance comes from an ordinary source (lib/config/issuers.ts). ---
+  //
+  // What limits a person is how their issuer is declared with groups, mapping or fixed. A guest's single
+  // conversation is its own mechanism. The phrase is the removed source's own name.
+  { phrase: 'onechannel', truth: 'the clearance sources are groups, mapping and fixed; a host\'s context conversations take their classification from contextClassification on the issuer\'s entry' },
   { phrase: '-c notifyuserpoolid=', truth: 'retired; the email bridge resolves recipients in the pools the trusted-issuer registry declares, on with the notifications capability' },
   { phrase: '-c notifyadditionaluserpoolids=', truth: 'retired; every cognito-pool entry in the trusted-issuer registry is a pool recipients are resolved in' },
   { phrase: '-c admingroupnames=', truth: 'retired; adminGroups on the registry\'s deployment entry names the admin group' },
@@ -850,8 +873,14 @@ const BANNED: Array<{ phrase: string; truth: string }> = [
   { phrase: 'admin foundations', truth: 'the four components are the core, the chat interface, the admin backend and the admin interface; Foundations is a layer (STACKS.md "Component rule")' },
   { phrase: 'enablebattle=', truth: 'retired; declare "battle" (with "experiments") in capabilities in deploy.config.json (deploy-context.ts refuses the key)' },
   { phrase: '"enablebattle"', truth: 'retired; declare "battle" (with "experiments") in capabilities in deploy.config.json' },
-  { phrase: 'enablemeetings=', truth: 'retired; meetings is the meetings capability, NOT BUILT and refused at synth (capabilities.ts)' },
-  { phrase: '"enablemeetings"', truth: 'retired; meetings is the meetings capability, NOT BUILT and refused at synth (capabilities.ts)' },
+  { phrase: 'enablemeetings=', truth: 'retired; declare "meetings" (with "chat") in capabilities in deploy.config.json (capabilities.ts)' },
+  { phrase: '"enablemeetings"', truth: 'retired; declare "meetings" (with "chat") in capabilities in deploy.config.json (capabilities.ts)' },
+  // meetings is a built capability (the Meetings stack, capabilities.ts); the phrasing that called it refused at synth is stale.
+  { phrase: '**not built:** `meetings`', truth: 'meetings is built: declare "meetings" (with "chat") in capabilities; it stands up the Meetings stack (capabilities.ts)' },
+  { phrase: '**not built** (`meetings`)', truth: 'meetings is built: declare "meetings" (with "chat") in capabilities; it stands up the Meetings stack (capabilities.ts)' },
+  { phrase: '`meetings` is **not built**', truth: 'meetings is built: declare "meetings" (with "chat") in capabilities; it stands up the Meetings stack (capabilities.ts)' },
+  { phrase: '`meetings` is refused at synth', truth: 'meetings is built: declare "meetings" (with "chat") in capabilities; it stands up the Meetings stack (capabilities.ts)' },
+  { phrase: 'meetings is not built and synth refuses it', truth: 'meetings is built: declare "meetings" (with "chat") in capabilities; it stands up the Meetings stack (capabilities.ts)' },
   { phrase: 'additionalroles=', truth: 'retired; a declared role is deployed: name its assistant in profiles (ops-premium), or run npm run add-assistant-role (deploy-context.ts refuses the key)' },
   { phrase: '"additionalroles"', truth: 'retired; a declared role is deployed: name its assistant in profiles (ops-premium), or run npm run add-assistant-role' },
   { phrase: '`additionalroles` set to', truth: 'retired; a declared role is deployed: name its assistant in profiles (ops-premium), or run npm run add-assistant-role' },
@@ -898,7 +927,7 @@ const BANNED: Array<{ phrase: string; truth: string }> = [
   { phrase: 'whole reply becomes the document', truth: 'the document is declared as an argument and the reply posts as chat (deliveringContract, task-tracking.ts)' },
   { phrase: 'trailing-question veto', truth: 'an in-state rewrite declares its document with deliver_document; nothing reads the shape of the reply' },
   // --- The ops assistant reads metrics and alarm state, and no logs (deployment-health.ts). ---
-  { phrase: 'reads cloudwatch and logs', truth: 'read_deployment_health reads CloudWatch metrics and this deployment\'s alarm state (DescribeAlarms, scoped to its alarm ARNs); no CloudWatch Logs client exists under lambda/src' },
+  { phrase: 'reads cloudwatch and logs', truth: 'read_deployment_health reads CloudWatch metrics and this deployment\'s alarm state and the alarm its conversation watches (DescribeAlarms by name, on the account\'s alarms); no CloudWatch Logs client exists under lambda/src' },
   // --- A version's `copy` is retired: selection reads none, and the console has one Message templates section (ADR-062, 2026-10-29). ---
   { phrase: 'read as the assistant\'s own template until', truth: 'selection reads no `copy`; `npm run migrate-legacy-copy` writes a version\'s retired lines as the assistant\'s own templates (ADR-062 decision 3)' },
   { phrase: 'one field per named message', truth: 'the console edits no `copy`; what an assistant says is its Message templates section, which also picks `messages`' },
@@ -911,6 +940,10 @@ const BANNED: Array<{ phrase: string; truth: string }> = [
   { phrase: '`draftextras`', truth: 'the draft form is split into one editor per area (`DraftAreaFields.tsx`, `WelcomeFields`, `EventWorkflowsFields`), each rendered inline in its section by `DraftStep` in `DraftControls.tsx`' },
   { phrase: 'new version → event workflows', truth: 'event workflows are the draft\'s Events card: Assistants → New version → Events' },
   { phrase: 'new version → message templates', truth: 'what an assistant says is the draft\'s What it says card: Assistants → New version → What it says' },
+  // --- An alarm in a team conversation opens an incident: triage, then the on-call owns it until resolved. ---
+  { phrase: 'ops-escalation', truth: 'the team conversation\'s workflow is `incident-triage`; the on-call\'s task in the incident conversation is the `incident_ownership` machine' },
+  { phrase: 'escalation-lead-task', truth: 'the on-call\'s task message is `incident-owner-task` (`incident-owner-task-no-call` where no meetings are declared)' },
+  { phrase: 'maxopenescalationsperroom', truth: 'the event policy caps open incidents per team conversation with `maxOpenIncidentsPerRoom`' },
 ];
 
 function walk(abs: string, out: string[]): void {
@@ -1306,6 +1339,74 @@ describe('battle, not duel, in what a person reads', () => {
 });
 
 /**
+ * CONVERSATION, NOT ROOM, IN WHAT A PERSON READS (owner decision, 2026-11-14). Everything the product says to a person
+ * calls an AgentEchelon channel a conversation: one word for one thing, the word the chat app, the console and the docs
+ * already use. Identifiers keep their names, because stored tags, keys and workflow names are read back by them: a word
+ * joined to other letters (`ops-room`, `team-room`, `roomArn`), a string that is one bare identifier (the `'room'`
+ * audience), and a `{{room}}` placeholder all pass. What fails is the word in a sentence: a reply template's text or
+ * description, or a locale string.
+ */
+const ROOM_WORD = /(?<![\w-])rooms?(?![\w-])/i;
+const saysRoom = (text: string): boolean =>
+  !/^[\w.-]+$/.test(text) && ROOM_WORD.test(withoutCode(text).replace(/\{\{[^}]*\}\}/g, ''));
+const ROOM_LOCALE_DIRS = ['frontend/packages/shared/src/locales', 'frontend/packages/widget/src/locales'];
+
+describe('conversation, not room, in what a person reads', () => {
+  /** Every string value of the locale files, with the key path it sits at. Keys are code, so they are not read. */
+  const localeStrings = (): Array<{ at: string; text: string }> => {
+    const out: Array<{ at: string; text: string }> = [];
+    const walk = (node: unknown, at: string): void => {
+      if (typeof node === 'string') out.push({ at, text: node });
+      else if (node && typeof node === 'object') for (const [k, v] of Object.entries(node)) walk(v, at ? `${at}.${k}` : k);
+    };
+    for (const rel of ROOM_LOCALE_DIRS) {
+      const dir = path.join(REPO_ROOT, rel);
+      if (!fs.existsSync(dir)) continue;
+      for (const f of fs.readdirSync(dir).filter((n) => n.endsWith('.json'))) {
+        walk(JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8')), `${rel}/${f}`);
+      }
+    }
+    return out;
+  };
+
+  /** The string literals of the reply templates' code lines, comments left out: every text and description a person reads. */
+  const templateStrings = (): Array<{ at: string; text: string }> => {
+    const out: Array<{ at: string; text: string }> = [];
+    const literal = /'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|`((?:[^`\\]|\\.)*)`/g;
+    fs.readFileSync(path.join(REPO_ROOT, REPLY_TEMPLATES), 'utf-8').split(/\r?\n/).forEach((line, i) => {
+      const code = line.trim();
+      if (code.startsWith('*') || code.startsWith('//') || code.startsWith('/*')) return;
+      for (const m of code.replace(/\s\/\/\s.*$/, '').matchAll(literal)) {
+        out.push({ at: `${REPLY_TEMPLATES}:${i + 1}`, text: (m[1] ?? m[2] ?? m[3] ?? '').replace(/\\'/g, "'") });
+      }
+    });
+    return out;
+  };
+
+  it('the detector fires on the word and passes identifiers and placeholders', () => {
+    expect(saysRoom('This room is for {label}.')).toBe(true);
+    expect(saysRoom('{{type}} Room')).toBe(true);
+    expect(saysRoom("the room's assistant")).toBe(true);
+    expect(saysRoom('alerts open their own rooms.')).toBe(true);
+    expect(saysRoom('room')).toBe(false);
+    expect(saysRoom('ops-room-opening')).toBe(false);
+    expect(saysRoom('Starts {{event}}, in {{rooms}}.')).toBe(false);
+    expect(saysRoom('runs in the `team-room` tag')).toBe(false);
+    expect(saysRoom('the roomArn it holds')).toBe(false);
+    expect(localeStrings().length).toBeGreaterThan(1000);
+    expect(templateStrings().length).toBeGreaterThan(200);
+  });
+
+  it('no locale string calls a conversation a room', () => {
+    expect(localeStrings().filter((s) => saysRoom(s.text)).map((s) => `${s.at}: ${s.text}`)).toEqual([]);
+  });
+
+  it('no reply template calls a conversation a room', () => {
+    expect(templateStrings().filter((s) => saysRoom(s.text)).map((s) => `${s.at}: ${s.text}`)).toEqual([]);
+  });
+});
+
+/**
  * SPEC-STATUS GATE (PA-3 in docs COE-SPEC-VS-CODE-OVERCLAIM, private). A spec may declare
  * `**Status:** Implemented` only if it names the test(s) that verify its shipped claims, via a
  * `Verified by:` line. For a security/accuracy claim that test must assert real backend state (DB row /
@@ -1545,5 +1646,72 @@ describe('every store is in the erasure inventory (SPEC-CREDENTIAL-EXCHANGE §5b
   it('keeps no reason for a store that no longer exists', () => {
     const keys = new Set(stores.map((s) => s.key));
     expect(Object.keys(NAMES_NO_PERSON).filter((k) => !keys.has(k))).toEqual([]);
+  });
+});
+
+/**
+ * THE OWNER'S PRIVATE SIBLING PROJECTS ARE NEVER NAMED HERE. This repository is public, and the owner's
+ * other builds are not: a name, a source file or a commit of theirs in a comment or a doc describes code
+ * nobody reading this repository can see. A comment states what this code guarantees, and a doc that needs
+ * to say a design was proven elsewhere says "a sibling deployment". The owner's website, mcharg.site, may
+ * appear as a link; its build may not.
+ *
+ * Scope is every file git would ship (`git ls-files --cached --others --exclude-standard`) outside
+ * `private/`, the same authority the tracker-row guard uses, so a new file is checked before it is
+ * committed and every kind of text file is covered, not only the roots the phrase guard walks.
+ */
+describe('private sibling projects are never named', () => {
+  // THE NAMES ARE ENCODED (base64) AND DECODED HERE, so this file, which ships with the repository, does
+  // not itself publish the names it refuses. The patterns and the detector's samples are both read from
+  // the decoded lists, so a name added to one is tested by the other.
+  const decode = (encoded: string): string => Buffer.from(encoded, 'base64').toString('utf8');
+  const SIBLING_PATTERNS = ['Y29tbVstXyAuXT9odWI=', 'Y29tbXVuaWNhdGlvblstXyBdaHVi', 'bWNoYXJnWy1fXT8oPzphcHB8c2l0ZSk='].map(decode);
+  const SIBLING_SAMPLES = [
+    'Y29tbS1odWI=', 'Q29tbUh1Yg==', 'Q09NTV9IVUI=', 'Q29tbXVuaWNhdGlvbiBIdWI=', 'bWNoYXJnLWFwcA==', 'bWNoYXJnLXNpdGU=',
+  ].map(decode);
+  const SIBLING_NAME = new RegExp(SIBLING_PATTERNS.join('|'), 'i');
+  const BINARY = new Set([
+    '.png', '.jpg', '.jpeg', '.gif', '.ico', '.webp', '.bmp', '.pdf', '.zip', '.gz',
+    '.woff', '.woff2', '.ttf', '.otf', '.eot', '.pem', '.mp3', '.mp4', '.wav',
+  ]);
+  const shipped = (): string[] =>
+    execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    })
+      .split('\0')
+      .filter(Boolean)
+      .map((rel) => rel.replace(/\\/g, '/'))
+      .filter((rel) => !rel.startsWith('private/'))
+      .filter((rel) => !BINARY.has(path.posix.extname(rel).toLowerCase()))
+      .filter((rel) => {
+        const abs = path.join(REPO_ROOT, rel);
+        return fs.existsSync(abs) && fs.statSync(abs).isFile();
+      });
+  const files = shipped();
+
+  it('the detector fires on each name and spelling, and passes the owner\'s name and website', () => {
+    // Every pattern is exercised by at least one sample, so a pattern that matches nothing is noticed.
+    for (const pattern of SIBLING_PATTERNS) {
+      expect([pattern, SIBLING_SAMPLES.some((s) => new RegExp(pattern, 'i').test(s))]).toEqual([pattern, true]);
+    }
+    for (const name of SIBLING_SAMPLES) expect([name, SIBLING_NAME.test(name)]).toEqual([name, true]);
+    for (const ok of ['mcharg.site', 'Ryan McHarg', 'a sibling deployment', 'communication layer', 'a commit hub']) {
+      expect([ok, SIBLING_NAME.test(ok)]).toEqual([ok, false]);
+    }
+    expect(files.length).toBeGreaterThan(500);
+  });
+
+  it('no shipped file names a private sibling project', () => {
+    const hits: string[] = [];
+    for (const rel of files) {
+      const text = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf-8');
+      if (text.includes('\0') || !SIBLING_NAME.test(text)) continue;
+      text.split(/\r?\n/).forEach((line, i) => {
+        if (SIBLING_NAME.test(line)) hits.push(`${rel}:${i + 1}: ${line.trim().slice(0, 160)}`);
+      });
+    }
+    expect(hits).toEqual([]);
   });
 });

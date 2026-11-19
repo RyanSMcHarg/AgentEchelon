@@ -29,7 +29,7 @@ import { lookupChannelClassification } from './channel-classification.js';
 import { writeTurnEvents, battleRoundOf } from './turn-events-live.js';
 import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry';
 import { updateConversationContext } from './cross-conversation-context.js';
-import { readMessageAnalytics } from '../lib/message-analytics.js';
+import { readMessageAnalytics, type MessageAnalyticsReadError } from '../lib/message-analytics.js';
 import { S3Client } from '@aws-sdk/client-s3';
 import { deliveredDocumentOf } from '../lib/delivered-document.js';
 import { archiveDeliveredDocument } from './delivered-document-archive.js';
@@ -39,6 +39,8 @@ import { backfillModelFromAnalytics, ModelBackfillResult } from './model-backfil
 import { touchActivity } from '../lib/sleep-mode.js';
 import { emitArchivalHealth } from './archival-health.js';
 import { updateEventMessageId, baseMessageIdOf, isUpdateEventId, updateJoinSql } from './update-events.js';
+import { PLATFORM_FACT_EVENT_TYPES } from '../lib/archive-facts.js';
+import { contentHash12 } from '../lib/canonical-json.js';
 // The shared principal taxonomy - the same rules the membership audit classifies members by.
 import { classifyPrincipal } from '../lib/principal-role.js';
 import { personIdFromArn } from '../lib/person-arn.js';
@@ -133,10 +135,30 @@ const MEMBERSHIP_EVENT_TYPES = [
   'UPDATE_CHANNEL_MEMBERSHIP',
 ];
 
+/**
+ * THE PLATFORM'S OWN FACTS on the same stream (ADR-067 decision 6, WT61): a settlement no message records, put by the
+ * task service. Archived beside the Amazon Chime SDK's events, in the same batch and the same transaction.
+ */
+const PLATFORM_FACT_TYPES: readonly string[] = PLATFORM_FACT_EVENT_TYPES;
+
+/**
+ * A FACT'S ROW ID ALWAYS FITS ITS COLUMN (messages.message_id, VARCHAR(128)), and two long ids stay two rows: an id over
+ * the limit keeps its readable start and ends in a hash of the whole. The id is what a replay lands on, so one that fits
+ * is left exactly as it is and the same fact always gets the same row.
+ */
+const MESSAGE_ID_MAX = 128;
+function factMessageId(eventType: string, factId: string): string {
+  const id = `${eventType}-${factId}`;
+  if (id.length <= MESSAGE_ID_MAX) return id;
+  const hash = contentHash12(id);
+  return `${id.slice(0, MESSAGE_ID_MAX - hash.length - 1)}-${hash}`;
+}
+
 const ALL_ARCHIVABLE_EVENTS = [
   ...MESSAGE_EVENT_TYPES,
   ...CHANNEL_EVENT_TYPES,
   ...MEMBERSHIP_EVENT_TYPES,
+  ...PLATFORM_FACT_TYPES,
 ];
 
 // Internal record format
@@ -303,6 +325,24 @@ interface MessageRecord {
   model_kind: string | null;
   model_from: string | null;
   /**
+   * THE VERSION AND THE MACHINE THE TURN'S TASK STARTED ON (ADR-066, migration 097): the version's `configId` and the
+   * content hash of the machine, so a workflow change is measured by what each task ran. A bot turn's own statement only.
+   */
+  task_origin_config_id?: string | null;
+  task_origin_machine_hash?: string | null;
+  /**
+   * THE RUN A MESSAGE BELONGS TO (ADR-067 decision 6, WT60, migration 099): its workflow, the run-level step, the run, the
+   * version it started on and its workflow's hash, from the message's own `eventStep` and `eventRun`, or a task turn's
+   * `workflowRun`. A bot message's own statement only.
+   */
+  workflow_name?: string | null;
+  workflow_step?: string | null;
+  workflow_run_key?: string | null;
+  workflow_origin_config_id?: string | null;
+  workflow_origin_hash?: string | null;
+  /** What started the run (WT118, migration 100): `person`, `assistant` or `event`. */
+  workflow_trigger?: string | null;
+  /**
    * The router's step instants, carried straight through to the ledger.
    *
    * NOT a `messages` column and deliberately so: it is a set of instants, and the ledger is where
@@ -339,6 +379,11 @@ interface MessageRecord {
   experiment_id: string | null;
   variant_id: string | null;
   was_fallback: boolean;
+}
+
+/** Whether a record failed because its out-of-band analytics could not be read (`readMessageAnalytics`). */
+function isAnalyticsReadError(error: unknown): error is MessageAnalyticsReadError {
+  return error instanceof Error && error.name === 'MessageAnalyticsReadError';
 }
 
 /**
@@ -395,24 +440,50 @@ export async function handler(
     touchActivity(Date.now()).catch((e) => console.warn('[sleep] touchActivity failed', e));
   }
 
-  await initializeSchemaWithRetry();
+  // A BATCH THAT FAILS IS RECORDED AS FAILED before it is handed back for retry. Every throw below is
+  // preceded by a health datapoint counting the batch's records in RecordErrors, so the archival health
+  // series shows the failure while the event source retries it, and after the last retry the batch's
+  // position is kept in the archival dead-letter queue, whose alarm reaches the admin channel.
+  try {
+    await initializeSchemaWithRetry();
+  } catch (error) {
+    emitArchivalHealth({ archived: 0, errors: event.Records.length });
+    throw error;
+  }
 
   const records: MessageRecord[] = [];
   const errors: Error[] = [];
+  // Records whose telemetry could not be read. The record is sound and the read may succeed on a retry,
+  // so these fail the batch rather than being archived without what they carried.
+  const unreadable: MessageAnalyticsReadError[] = [];
 
   for (const record of event.Records) {
     try {
       const payload = parseKinesisRecord(record);
       if (!payload) continue;
 
-      const messageRecord = await transformToMessageRecord(payload);
+      const messageRecord = await transformToMessageRecord(payload, { sequenceNumber: record.kinesis?.sequenceNumber });
       if (messageRecord) {
         records.push(messageRecord);
       }
     } catch (error) {
+      if (isAnalyticsReadError(error)) {
+        console.error('Analytics read failed; the batch is retried:', error);
+        unreadable.push(error);
+        continue;
+      }
       console.error('Error parsing record:', error);
       errors.push(error instanceof Error ? error : new Error(String(error)));
     }
+  }
+
+  if (unreadable.length > 0) {
+    // Nothing is committed: the whole batch is retried, and redelivery lands on the rows it would write.
+    emitArchivalHealth({ archived: 0, errors: unreadable.length + errors.length });
+    throw new Error(
+      `[archival] the analytics record of ${unreadable.length} message(s) could not be read `
+      + `(${unreadable.map((e) => e.messageId).join(', ')}); the batch is retried`,
+    );
   }
 
   if (records.length === 0) {
@@ -497,6 +568,13 @@ export async function handler(
           console.log(`Created ${queuedExchangeCount} exchanges for answered queued messages`);
         }
 
+        // 8. A TURN THE PLATFORM STARTED IS AN EXCHANGE TOO, once its model-served answer is final (migration 106), so
+        // every Performance view counts it under its entry. After the update fold, which brings its model onto the row.
+        const platformExchangeCount = await createPlatformExchanges(touchedChannels);
+        if (platformExchangeCount > 0) {
+          console.log(`Created ${platformExchangeCount} exchanges for platform-started turns`);
+        }
+
         // 6. Sync membership events
         const membershipRecords = records.filter((r) =>
           MEMBERSHIP_EVENT_TYPES.includes(r.event_type)
@@ -567,6 +645,7 @@ export async function handler(
   }
 
   console.error('All retry attempts failed');
+  emitArchivalHealth({ archived: 0, errors: records.length + errors.length });
   throw lastError;
 }
 
@@ -613,10 +692,54 @@ function parseKinesisRecord(
 }
 
 /**
+ * THE RUN A BOT MESSAGE BELONGS TO (WT60): a run's own message carries `eventStep` (its workflow and step) and `eventRun`
+ * (its run key, version and workflow hash); a turn of a task a run opened carries the task's `workflowRun` in its
+ * analytics. Nothing for a person's message, which no run says.
+ */
+export function runFieldsOf(isBot: boolean, metadata: Record<string, any> | null, analytics: Record<string, any>): Pick<MessageRecord,
+  'workflow_name' | 'workflow_step' | 'workflow_run_key' | 'workflow_origin_config_id' | 'workflow_origin_hash' | 'workflow_trigger'> {
+  const none = { workflow_name: null, workflow_step: null, workflow_run_key: null, workflow_origin_config_id: null, workflow_origin_hash: null, workflow_trigger: null };
+  if (!isBot) return none;
+  const step = metadata?.eventStep ?? analytics?.eventStep;
+  const run = metadata?.eventRun ?? analytics?.eventRun;
+  const taskRun = analytics?.workflowRun;
+  const str = (v: unknown, max: number) => (typeof v === 'string' && v ? v.slice(0, max) : null);
+  return {
+    workflow_name: str(step?.workflow ?? taskRun?.workflow, 64),
+    workflow_step: str(step?.step ?? taskRun?.step, 64),
+    workflow_run_key: str(run?.runKey ?? taskRun?.runKey, 200),
+    workflow_origin_config_id: str(run?.originConfigId ?? taskRun?.originConfigId, 64),
+    workflow_origin_hash: str(run?.workflowHash ?? taskRun?.workflowHash, 64),
+    // ONE OF THREE, OR NOTHING: a value outside the set is not recorded.
+    workflow_trigger: (() => { const t = run?.trigger ?? taskRun?.trigger; return t === 'person' || t === 'assistant' || t === 'event' ? t : null; })(),
+  };
+}
+
+/**
  * Transform any Chime event into unified MessageRecord format
  */
 export async function transformToMessageRecord(
-  event: ChimeKinesisEvent
+  event: ChimeKinesisEvent,
+  /** The stream record the event arrived on, when there is one. */
+  source?: { sequenceNumber?: string },
+): Promise<MessageRecord | null> {
+  const record = await transformEvent(event, source);
+  // A PLATFORM FACT IS FILED AGAINST THE PERSON IT NAMES (a card's presser), by AppInstanceUser id, so it is counted and
+  // erased with them; it was sent by nobody, so it names no sender.
+  if (record && PLATFORM_FACT_TYPES.includes(event.EventType)) {
+    const fact = (event.Payload ?? {}) as unknown as Record<string, unknown>;
+    return {
+      ...record,
+      person_id: typeof fact.personId === 'string' ? fact.personId : null,
+      conversation_classification: typeof fact.classification === 'string' ? fact.classification : null,
+    };
+  }
+  return record;
+}
+
+async function transformEvent(
+  event: ChimeKinesisEvent,
+  source?: { sequenceNumber?: string },
 ): Promise<MessageRecord | null> {
   const { EventType, Payload } = event;
 
@@ -779,7 +902,22 @@ export async function transformToMessageRecord(
       .update(`${channelArn}-${memberArn}`)
       .digest('hex')
       .substring(0, 16);
-    messageId = `${EventType.substring(0, 20)}-${hash}-${Date.now()}`;
+    // ONE ID PER EVENT, DERIVED FROM THE EVENT, as for channel events above. A join, a leave and a rejoin
+    // of the same member in one batch are three rows (the event type separates the join from the leave,
+    // the membership's own timestamps separate the two joins), and a redelivery of an event lands on the
+    // row it already wrote. An event that carries no timestamp is told apart by its Kinesis sequence
+    // number, which is the same on every delivery of that record.
+    const evtDisc = crypto
+      .createHash('md5')
+      .update([
+        Payload.CreatedTimestamp || '',
+        Payload.LastUpdatedTimestamp || '',
+        Payload.Type || '',
+        (Payload.CreatedTimestamp || Payload.LastUpdatedTimestamp) ? '' : (source?.sequenceNumber || ''),
+      ].join('|'))
+      .digest('hex')
+      .substring(0, 12);
+    messageId = `${EventType.substring(0, 20)}-${hash}-${evtDisc}`;
     targetArn = Payload.Member?.Arn || null;
     senderArn = Payload.InvitedBy?.Arn || null;
     senderName = Payload.InvitedBy?.Name || null;
@@ -789,6 +927,17 @@ export async function transformToMessageRecord(
     // the projection keeps it too: without it no view can tell a hidden join (an operator joining
     // invisibly) from a visible one, or show what participants saw (SPEC-ADMIN-CONSOLE FR55).
     if (Payload.Type) metadata = { ...(metadata || {}), membershipType: Payload.Type };
+  } else if (PLATFORM_FACT_TYPES.includes(EventType)) {
+    // ITS REFERENCES ARE THE RECORD: no content, no sender, its own id, its own moment.
+    const fact = (Payload ?? {}) as unknown as Record<string, unknown>;
+    if (typeof fact.channelArn !== 'string' || typeof fact.factId !== 'string') {
+      console.warn(`Platform fact ${EventType} missing its conversation or id`);
+      return null;
+    }
+    channelArn = fact.channelArn;
+    messageId = factMessageId(EventType, fact.factId);
+    metadata = { ...fact };
+    createdAt = typeof fact.at === 'string' ? fact.at : new Date().toISOString();
   } else {
     return null;
   }
@@ -799,9 +948,9 @@ export async function transformToMessageRecord(
   // The heavy analytics-only fields do not ride the (size-capped) Chime
   // Metadata; they are persisted to a dedicated table keyed by the message id.
   // For bot messages, read that row and merge it over the slim inline metadata
-  // (out-of-band wins; inline still carries the frontend-kept fields). Absent
-  // row (pre-migration message, Athena mode, or fail-open) → fall back to
-  // whatever the inline metadata holds, exactly as before.
+  // (out-of-band wins; inline still carries the frontend-kept fields). No row
+  // (a message from before the store, or Athena mode) falls back to whatever the inline metadata holds;
+  // a read that FAILED throws, and the batch is retried rather than archiving the turn without its telemetry.
   if (isBot && rawChimeMessageId) {
     const oob = await readMessageAnalytics(rawChimeMessageId);
     if (oob) {
@@ -830,7 +979,10 @@ export async function transformToMessageRecord(
     }
   }
 
-  const analytics = (metadata as any)?.analytics || metadata || {};
+  // A TURN'S DECLARATIONS ARE READ FROM AN ASSISTANT'S MESSAGE ONLY. A person writes their own message's
+  // Metadata on their own credential, so every field below (the conversation's classification, the
+  // clearance, the experiment arm, the tokens) is the platform's statement only when an assistant sent it.
+  const analytics = isBot ? ((metadata as any)?.analytics || metadata || {}) : {};
 
   // ── WHAT A HANDLER-ANSWERED TURN DECLARED, BECAUSE IT HAS NOWHERE ELSE TO PUT IT ──────────────
   //
@@ -1023,8 +1175,10 @@ export async function transformToMessageRecord(
     // `model` — reading the wrong key left bedrock_model NULL on every archived message, which zeroed
     // out model_usage + the Effectiveness cost/reply estimate (tokens landed because their keys matched).
     bedrock_model: analytics.bedrockModel || analytics.model || null,
-    input_tokens: analytics.inputTokens || null,
-    output_tokens: analytics.outputTokens || null,
+    // typeof-guarded, NOT ||: an image reply and a guard-blocked turn record 0 tokens by design, and a
+    // recorded 0 is a measurement, where NULL says the turn's telemetry never arrived.
+    input_tokens: typeof analytics.inputTokens === 'number' ? analytics.inputTokens : null,
+    output_tokens: typeof analytics.outputTokens === 'number' ? analytics.outputTokens : null,
     latency_ms: analytics.latencyMs || analytics.bedrockLatencyMs || null,
     total_ms: analytics.totalMs || null,
     // typeof-guarded, NOT ||: a resolve that completed inside a millisecond is a real 0 and the
@@ -1090,6 +1244,9 @@ export async function transformToMessageRecord(
     task_step: isBot ? shortString(analytics.turnStep, 32) : null,
     model_kind: isBot && (analytics.modelKind === 'text' || analytics.modelKind === 'image') ? analytics.modelKind : null,
     model_from: isBot ? shortString(analytics.modelFrom, 16) : null,
+    task_origin_config_id: isBot ? shortString(analytics.taskOriginConfigId, 64) : null,
+    task_origin_machine_hash: isBot ? shortString(analytics.taskOriginMachineHash, 64) : null,
+    ...runFieldsOf(isBot, metadata as Record<string, any> | null, analytics as Record<string, any>),
     router_steps: analytics.routerSteps ?? null,
     flow_received_at: typeof analytics.flowReceivedAt === 'number' ? analytics.flowReceivedAt : null,
     // ── WHICH ROUND OF A DUEL, READ OFF THE PLACEHOLDER ITSELF ─────────────────────────────────
@@ -1245,6 +1402,17 @@ async function insertMessageRecords(records: MessageRecord[]): Promise<number> {
     'task_step',
     'model_kind',
     'model_from',
+    // ADR-066 (migration 097).
+    'task_origin_config_id',
+    'task_origin_machine_hash',
+    // ADR-067 decision 6 (migration 099).
+    'workflow_name',
+    'workflow_step',
+    'workflow_run_key',
+    'workflow_origin_config_id',
+    'workflow_origin_hash',
+    // WT118 (migration 100).
+    'workflow_trigger',
     'experiment_id',
     'variant_id',
     'was_fallback',
@@ -1341,6 +1509,14 @@ async function insertMessageRecords(records: MessageRecord[]): Promise<number> {
     task_step: r.task_step,
     model_kind: r.model_kind,
     model_from: r.model_from,
+    task_origin_config_id: r.task_origin_config_id ?? null,
+    task_origin_machine_hash: r.task_origin_machine_hash ?? null,
+    workflow_name: r.workflow_name ?? null,
+    workflow_step: r.workflow_step ?? null,
+    workflow_run_key: r.workflow_run_key ?? null,
+    workflow_origin_config_id: r.workflow_origin_config_id ?? null,
+    workflow_origin_hash: r.workflow_origin_hash ?? null,
+    workflow_trigger: r.workflow_trigger ?? null,
     experiment_id: r.experiment_id,
     variant_id: r.variant_id,
     was_fallback: r.was_fallback,
@@ -2447,6 +2623,94 @@ async function createQueuedExchanges(channelArns: string[]): Promise<number> {
     [channelArns]
   );
 
+  return parseInt(result.rows[0]?.count || '0', 10);
+}
+
+/**
+ * EVERY MODEL TURN IS AN EXCHANGE, WHOEVER STARTED IT (migration 106, SPEC-ADMIN-CONSOLE-EFFECTIVENESS FR43).
+ *
+ * A turn the platform started - a workflow or event step, a task step, a welcome, a meeting's summary, a request another
+ * assistant made - answers no person's message, so the pairers above give it no exchange, and Effectiveness, the message
+ * flow, model effectiveness and the judge, which all read exchanges, never saw it. Here each such answer gets one:
+ *
+ *   - which turns: an assistant's CREATE whose entry is `platform` (`turnEntryOf`), whose answer is final and was served by
+ *     a model, that no exchange already holds. A receipt or a queue notice is not an answer, and a duel's turns are paired
+ *     with the person's message by the sweep, so neither is minted here.
+ *   - its request: none (`user_message_id` NULL); `user_message_at` is when the platform dispatched the turn
+ *     (`trigger_at`), else its first post, so its reply time is dispatch to first post and its end to end dispatch to the
+ *     final answer: what the people waiting on that step waited.
+ *   - its attribution: the answer's own, as every pairer copies it - assistant, role, version, model, intent, task.
+ *
+ * Unique on the agent message where the user message is NULL, so a re-delivered batch inserts nothing twice.
+ */
+async function createPlatformExchanges(channelArns: string[]): Promise<number> {
+  if (channelArns.length === 0) return 0;
+  const result = await query<{ count: string }>(
+    `WITH platform AS (
+       SELECT am.id AS agent_id, am.channel_arn, am.created_at AS agent_created_at, am.agent_final_at,
+              COALESCE(am.trigger_at, am_upd.trigger_at) AS trigger_at,
+              COALESCE(am_upd.conversation_classification, am.conversation_classification) AS conversation_classification,
+              COALESCE(am_upd.assistant, am.assistant) AS assistant,
+              COALESCE(am_upd.assistant_role, am.assistant_role) AS assistant_role,
+              COALESCE(am_upd.profile_version, am.profile_version) AS profile_version,
+              COALESCE(am_upd.profile_config_id, am.profile_config_id) AS profile_config_id,
+              COALESCE(am_upd.profile_name, am.profile_name) AS profile_name,
+              -- WHAT IT COUNTS UNDER BESIDE THE INTENTS: its intent where it ran one (an asked turn runs the taker's), else the
+              -- workflow whose step it was, else its kind (a welcome, a meeting summary), so Effectiveness ranks it by name.
+              LEFT(COALESCE(am_upd.metadata->>'intent', am.metadata->>'intent',
+                            am_upd.metadata->'eventStep'->>'workflow', am.metadata->'eventStep'->>'workflow',
+                            am_upd.turn_kind, am.turn_kind, am_upd.metadata->>'turnKind', am.metadata->>'turnKind'), 32) AS intent,
+              COALESCE(am_upd.delivery_option, am.delivery_option, am_upd.metadata->>'deliveryOption', am.metadata->>'deliveryOption') AS delivery_option,
+              COALESCE(am_upd.task_id, am.task_id) AS task_id,
+              COALESCE(am_upd.task_status, am.task_status) AS task_status,
+              COALESCE(am_upd.task_state, am.task_state) AS task_state,
+              COALESCE(am_upd.task_transition, am.task_transition) AS task_transition,
+              COALESCE(am_upd.task_type, am.task_type) AS task_type,
+              COALESCE(am_upd.task_step, am.task_step) AS task_step,
+              COALESCE(am_upd.model_kind, am.model_kind) AS model_kind,
+              COALESCE(am_upd.model_from, am.model_from) AS model_from
+         FROM messages am
+         ${updateJoinSql({ alias: 'am_upd', create: 'am', pick: 'latest' })}
+        WHERE am.channel_arn = ANY($1)
+          AND am.is_bot = true
+          AND am.event_type = 'CREATE_CHANNEL_MESSAGE'
+          AND am.created_at > NOW() - INTERVAL '24 hours'
+          AND COALESCE(am_upd.turn_entry, am.turn_entry) = 'platform'
+          AND am.agent_final_at IS NOT NULL
+          AND COALESCE(am_upd.bedrock_model, am.bedrock_model) IS NOT NULL
+          AND COALESCE(am_upd.turn_kind, am.turn_kind, am_upd.metadata->>'turnKind', am.metadata->>'turnKind', '') NOT IN ('receipt', 'queue_ack')
+          AND COALESCE(am_upd.battle_id, am.battle_id) IS NULL
+          AND NOT EXISTS (SELECT 1 FROM exchanges x WHERE x.agent_message_id = am.id)
+     ),
+     new_exchanges AS (
+       INSERT INTO exchanges (
+         conversation_id, user_message_id, agent_message_id,
+         channel_arn, conversation_classification, assistant,
+         assistant_role, profile_version, profile_config_id, profile_name,
+         response_latency_ms, user_message_at, agent_response_at,
+         intent, delivery_option, task_id, task_status, task_state, task_transition,
+         paired_by, e2e_ms, task_type, task_step, model_kind, model_from
+       )
+       SELECT c.id, NULL, p.agent_id,
+              p.channel_arn, COALESCE(p.conversation_classification, c.conversation_classification), COALESCE(p.assistant, c.assistant),
+              p.assistant_role, p.profile_version, p.profile_config_id, p.profile_name,
+              CASE WHEN p.trigger_at IS NOT NULL AND p.agent_created_at >= p.trigger_at
+                   THEN EXTRACT(EPOCH FROM (p.agent_created_at - p.trigger_at)) * 1000 END,
+              COALESCE(p.trigger_at, p.agent_created_at),
+              p.agent_created_at,
+              p.intent, p.delivery_option, p.task_id, p.task_status, p.task_state, p.task_transition,
+              'platform',
+              CASE WHEN p.trigger_at IS NOT NULL AND p.agent_final_at > p.trigger_at
+                   THEN (EXTRACT(EPOCH FROM (p.agent_final_at - p.trigger_at)) * 1000)::integer END,
+              p.task_type, p.task_step, p.model_kind, p.model_from
+         FROM platform p
+         JOIN conversations c ON c.channel_arn = p.channel_arn
+       ON CONFLICT DO NOTHING
+       RETURNING id
+     )
+     SELECT COUNT(*)::text AS count FROM new_exchanges`,
+    [channelArns],
+  );
   return parseInt(result.rows[0]?.count || '0', 10);
 }
 

@@ -21,7 +21,7 @@ import { derToJose, signGuestToken } from '../../lambda/src/lib/guest-token';
 import { edgeIssuers, type EdgeIssuer } from '../../lib/config/edge-verification';
 import { expandIssuer, guestIssuerUri, issuerRegistry } from '../../lib/config/issuers';
 import { EXCHANGE_ROUTE } from '../../lib/constructs/edge-authorizer';
-import { GUEST_ROUTES, ONE_CHANNEL_ROUTES } from '../../lib/constructs/trusted-issuers';
+import { GUEST_ROUTES } from '../../lib/constructs/trusted-issuers';
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
 
 const DEPLOYMENT = 'test-instance';
@@ -136,7 +136,7 @@ describe('a guest token is checked like every other issuer\'s, against the KMS k
 });
 
 describe('a verified guest is admitted at the exchange and the registration alone', () => {
-  const ROUTES: EdgeRoutes = { exchange: [EXCHANGE_ROUTE], oneChannel: [...ONE_CHANNEL_ROUTES], guest: [...GUEST_ROUTES] };
+  const ROUTES: EdgeRoutes = { exchange: [EXCHANGE_ROUTE], guest: [...GUEST_ROUTES] };
   const verify = (t: string) => verifyToken(t, issuers);
   const PERSON = 'arn:aws:chime:us-east-1:111122223333:app-instance/test/user/0190a000-0000-7000-8000-000000000001';
 
@@ -161,7 +161,7 @@ describe('a verified guest is admitted at the exchange and the registration alon
 
   it('a guest route list the function cannot read admits a guest nowhere', async () => {
     const d = await decide(forge(head(), claims()), {
-      verify, routes: { exchange: [EXCHANGE_ROUTE], oneChannel: [] }, lookup: async () => ({ state: 'active', personArn: PERSON }),
+      verify, routes: { exchange: [EXCHANGE_ROUTE] }, lookup: async () => ({ state: 'active', personArn: PERSON }),
     });
     expect(d).toMatchObject({ effect: 'allow', routes: [] });
   });

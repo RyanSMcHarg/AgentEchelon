@@ -137,7 +137,10 @@ describe('a duel side keeps its state transitions', () => {
     // `createBattleTask` was a near-duplicate of `createTask`. Being a separate door is what put it
     // ahead of the continue check; collapsing it is what keeps the ordering honest (ADR-026).
     expect(code).not.toContain('createBattleTask');
-    expect(count('await createTask(')).toBe(2); // the battle side, and the ordinary path
+    // The battle side, and the ordinary path's one door (`openRequestTask`), which a request's workflow opens through too.
+    expect(count('await createTask(')).toBe(1);
+    expect(count('const openRequestTask = async (run?: WorkflowRunRef, extra?: { dueBy?: string; ttlSeconds?: number }) => createTask(')).toBe(1);
+    expect(count('createTask(')).toBe(2);
   });
 
   it('isTaskContinuation is not forced false for a battle turn', () => {

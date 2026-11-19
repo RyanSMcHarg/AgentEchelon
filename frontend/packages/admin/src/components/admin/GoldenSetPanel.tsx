@@ -83,10 +83,10 @@ const GoldenSetPanel: React.FC<{
       {error && <p className="admin-error" role="alert">{error}</p>}
       {notice && <p className="admin-help-text" role="status">{notice}</p>}
 
-      <h4>
+      <h3>
         {t('admin.goldenSet.queueTitle')}{' '}
         <InfoTooltip label={t('admin.goldenSet.queueTitle')} content={t('admin.goldenSet.queueTip')} />
-      </h4>
+      </h3>
       {queue !== null && queue.length === 0 && <p className="admin-tab-empty">{t('admin.goldenSet.queueEmpty')}</p>}
       {queue !== null && queue.length > 0 && (
         <DataTable
@@ -108,10 +108,10 @@ const GoldenSetPanel: React.FC<{
         />
       )}
 
-      <h4>
+      <h3>
         {t('admin.goldenSet.title')}{' '}
         <InfoTooltip label={t('admin.goldenSet.title')} content={t('admin.goldenSet.tip')} />
-      </h4>
+      </h3>
       {entries !== null && entries.length === 0 && <p className="admin-tab-empty">{t('admin.goldenSet.empty')}</p>}
       {entries !== null && entries.length > 0 && (
         <DataTable

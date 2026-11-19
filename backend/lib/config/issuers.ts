@@ -36,10 +36,18 @@
  *    record older than `recordMaxAgeDays` (default `CLEARANCE_RECORD_MAX_AGE_DAYS`) is flagged as stale.
  *    Nothing grants from a record: it is evidence for a finding, never a clearance.
  *  - `fixed`: a fixed classification set.
- *  - `oneChannel`: the one-conversation session at a named classification. The person is vended a
- *    credential naming one conversation, read and post only, on the `restricted` role, and their
- *    conversations are created at that classification. Never a default: an issuer gets it only by
- *    declaring it.
+ *
+ * A person from any of these is an ordinary identity: the ordinary exchange vends them their classification,
+ * and Amazon Chime SDK membership and that classification decide what they reach. What limits them is how
+ * their issuer is declared.
+ *
+ * ── THE CONTEXT CLASSIFICATION ───────────────────────────────────────────────────────────────────
+ *
+ * An entry may declare `contextClassification`, the classification a host's context conversations are
+ * created at (`membershipHandler`, lambda/src/conversation-management.ts). It is one of that issuer's own
+ * classifications and conversational, and the registry names at most one value, because a host finds a
+ * context conversation at a channel derived from it. Declaring it is what stands up the host membership
+ * function. It says where those conversations live and grants nobody anything.
  *
  * ── THE GUEST ────────────────────────────────────────────────────────────────────────────────────
  *
@@ -259,7 +267,6 @@ export type ClearanceConfig =
   | ({ classifications: string[] } & (
     | { mapping: { claim: string; values: Record<string, string | string[]>; recordMaxAgeDays?: number } }
     | { fixed: string[] }
-    | { oneChannel: string }
   ));
 
 /** What an issuer's reach is read from: its clearance and whether it declares `admin: true`. */
@@ -725,6 +732,8 @@ export interface IssuerConfig {
   hostAssertion?: HostAssertionSettings;
   /** `invitation-link`: the link session and its abuse controls (`InvitationLinkSettings`). Refused on any other kind. */
   invitationLink?: InvitationLinkSettings;
+  /** The classification a host's context conversations are created at: one of this issuer's own, and conversational. */
+  contextClassification?: string;
 }
 
 /**
@@ -809,10 +818,13 @@ export interface IssuerCheckOptions {
 
 const isStringList = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === 'string' && s.length > 0);
 
+/** The clearance sources an entry can declare. */
+const CLEARANCE_SOURCES = ['groups', 'mapping', 'fixed'] as const;
+
 /** The clearance source an entry declares, by name, or null when it declares none or several. */
-export function clearanceSourceOf(c: Partial<ClearanceConfig> | undefined): 'groups' | 'mapping' | 'fixed' | 'oneChannel' | null {
+export function clearanceSourceOf(c: Partial<ClearanceConfig> | undefined): 'groups' | 'mapping' | 'fixed' | null {
   if (!c || typeof c !== 'object') return null;
-  const named = (['groups', 'mapping', 'fixed', 'oneChannel'] as const).filter((k) => (c as Record<string, unknown>)[k] !== undefined);
+  const named = CLEARANCE_SOURCES.filter((k) => (c as Record<string, unknown>)[k] !== undefined);
   return named.length === 1 ? named[0] : null;
 }
 
@@ -908,8 +920,16 @@ function entryErrors(e: IssuerConfig, profiles: Profiles, environment = 'dev'): 
   // THE CLEARANCE SOURCE AND THE CLASSIFICATIONS IT MAY GRANT, both required (Q5).
   const c = e.clearance as ClearanceConfig | undefined;
   const source = clearanceSourceOf(c);
+  // A SOURCE THE REGISTRY DOES NOT KNOW IS REFUSED, never ignored beside one it does.
+  if (c && typeof c === 'object') {
+    for (const k of Object.keys(c)) {
+      if (k !== 'classifications' && !(CLEARANCE_SOURCES as readonly string[]).includes(k)) {
+        errors.push(`${at}: clearance.${k} is not a clearance source; the sources are ${CLEARANCE_SOURCES.join(', ')}`);
+      }
+    }
+  }
   if (!c || !source) {
-    errors.push(`${at}: declares no clearance source; name exactly one of groups, mapping, fixed or oneChannel, with the classifications it may grant. `
+    errors.push(`${at}: declares no clearance source; name exactly one of groups, mapping or fixed, with the classifications it may grant. `
       + 'There is no fallback reach: an issuer without one reaches nothing, so synth refuses it');
   } else {
     const declared = c.classifications;
@@ -1021,19 +1041,20 @@ function entryErrors(e: IssuerConfig, profiles: Profiles, environment = 'dev'): 
       if (!isStringList(fixed) || !fixed.length) errors.push(`${at}: fixed lists the classifications it grants`);
       else for (const v of fixed) if (!within(v)) errors.push(`${at}: fixed names "${v}", outside the issuer's classifications`);
     }
-    if (source === 'oneChannel') {
-      const one = (c as { oneChannel: unknown }).oneChannel;
-      if (typeof one !== 'string' || !one) errors.push(`${at}: oneChannel names the classification its conversations are created at`);
-      else {
-        if (!within(one)) errors.push(`${at}: oneChannel names "${one}", outside the issuer's classifications`);
-        if (!profiles.isConversational(one)) errors.push(`${at}: oneChannel names "${one}", which is not a classification a conversation can be created at`);
-        // THE GATEWAY MUST BE A SECOND LAYER (tenet D3). This deployment's own pool is admitted on every
-        // person route, so its authorizers could never refuse a one-conversation person there.
-        if (e.pool === 'self') {
-          errors.push(`${at}: oneChannel cannot be declared on this deployment's own pool: that pool serves every person route, `
-            + 'so the gateway cannot be a second layer for a one-conversation person. A one-conversation population must be its own pool');
-        }
-      }
+  }
+
+  // THE CONTEXT CLASSIFICATION: one of the issuer's own, at which a conversation can be held.
+  if (e.contextClassification !== undefined) {
+    const named = e.contextClassification as unknown;
+    if (typeof named !== 'string' || !named) {
+      errors.push(`${at}: contextClassification names the classification a host's context conversations are created at`);
+    } else {
+      const r = profiles as Partial<ReachRegistry>;
+      const own = !c ? []
+        : isStringList(c.classifications) ? c.classifications
+          : r.memberClassificationValues && r.adminPlaneValues ? issuerClassificationsOf({ clearance: c, admin: e.admin === true }, r as ReachRegistry) : [];
+      if (!own.includes(named)) errors.push(`${at}: contextClassification names "${named}", outside the issuer's classifications`);
+      if (!profiles.isConversational(named)) errors.push(`${at}: contextClassification names "${named}", which is not a classification a conversation can be created at`);
     }
   }
 
@@ -1049,7 +1070,6 @@ function entryErrors(e: IssuerConfig, profiles: Profiles, environment = 'dev'): 
       errors.push(`${at}: adminGroups names which of a pool's own groups mark an admin; a translation marks its admins by mapping a provider group to admins`);
     }
   }
-  if (e.admin === true && source === 'oneChannel') errors.push(`${at}: a oneChannel issuer cannot declare admin: true; its people reach one conversation`);
 
   // DESCRIPTIVE FIELDS.
   if (e.groupsClaim !== undefined && (typeof e.groupsClaim !== 'string' || !e.groupsClaim)) errors.push(`${at}: groupsClaim names a claim`);
@@ -1092,8 +1112,6 @@ function entryErrors(e: IssuerConfig, profiles: Profiles, environment = 'dev'): 
     else if (e.provisioning === 'provisioned-only') {
       // THE FIRST ADMINISTRATOR SIGNS IN THROUGH THE ONE MINTER (P-1), so this deployment's own pool mints.
       if (e.pool === 'self') errors.push(`${at}: this deployment's own pool mints its people at their first sign-in; provisioned-only is for another issuer`);
-      // The one-conversation vend mints on its own path; a provisioned subject is bound on the exchange's.
-      if (source === 'oneChannel') errors.push(`${at}: a oneChannel issuer mints its people at their first sign-in; provisioned-only takes a mapping, a fixed set or groups`);
     }
   }
   if (e.lifecycle !== undefined) {
@@ -1162,9 +1180,9 @@ export function issuerErrors(raw: unknown[], profiles: Profiles, options: readon
 
   // ONE CONTEXT CLASSIFICATION. A host's context conversation lives at a deterministic channel derived
   // from the classification, so a host sharing it across issuers must find it at one value.
-  const oneChannel = [...new Set(entries.map((e) => (e.clearance as { oneChannel?: string } | undefined)?.oneChannel).filter(Boolean))];
-  if (oneChannel.length > 1) {
-    errors.push(`oneChannel issuers name ${oneChannel.join(' and ')}: context conversations at more than one classification are NOT BUILT, so every oneChannel issuer names the same one`);
+  const contexts = [...new Set(entries.map((e) => e.contextClassification).filter(Boolean))];
+  if (contexts.length > 1) {
+    errors.push(`issuers name contextClassification ${contexts.join(' and ')}: context conversations at more than one classification are NOT BUILT, so every contextClassification names the same one`);
   }
 
   // AN APPROVAL NEEDS SOMEBODY TO APPROVE IT: the operator's action is on AdminApi, which only `admin` deploys.
@@ -1212,18 +1230,14 @@ export interface IssuerRegistry {
    * provider federating into it. False, the deployment creates no user pool (L15).
    */
   ownsPool(): boolean;
-  /** The one classification oneChannel issuers create context conversations at, or undefined. */
+  /** The one classification the registry's `contextClassification` names, or undefined. */
   contextClassification(): string | undefined;
   /** Every user pool id a token may come from: `self` resolved to `selfPoolId`, deduplicated. */
   poolIds(selfPoolId: string): string[];
   /** The other trusted pools, for names and contacts (the deployment's own pool excluded). */
   otherPoolIds(): string[];
   /** Every pool other than the deployment's own a token may come from, with the entry that names it. */
-  /**
-   * Every pool other than the deployment's own a token may come from, with the entry that names it, and
-   * whether every entry naming it is a oneChannel issuer (its people reach one conversation and nothing else).
-   */
-  foreignPools(): Array<{ id: string; pool: string; oneChannelOnly: boolean; admin: boolean }>;
+  foreignPools(): Array<{ id: string; pool: string; admin: boolean }>;
   /** The other pools whose lifecycle events offboard their people. */
   lifecyclePoolIds(): string[];
   /** The group values that mark an admin of this deployment's own pool, when they are not the default. */
@@ -1264,7 +1278,7 @@ export function issuerRegistry(raw: unknown, profiles: Profiles, options: readon
     byId: (id) => byId.get(id),
     self: () => byId.get(DEPLOYMENT_ISSUER_ID),
     ownsPool: () => entries.some((e) => COGNITO_KINDS.includes(e.kind) && e.pool === 'self'),
-    contextClassification: () => entries.map((e) => (e.clearance as { oneChannel?: string }).oneChannel).find(Boolean),
+    contextClassification: () => entries.map((e) => e.contextClassification).find(Boolean),
     poolIds: (selfPoolId) => [...new Set(entries
       .filter((e) => COGNITO_KINDS.includes(e.kind))
       .map((e) => (e.pool === 'self' ? selfPoolId : e.pool!)))],
@@ -1276,8 +1290,6 @@ export function issuerRegistry(raw: unknown, profiles: Profiles, options: readon
         .map((e) => ({
           id: e.id,
           pool: e.pool!,
-          oneChannelOnly: entries.filter((x) => COGNITO_KINDS.includes(x.kind) && x.pool === e.pool)
-            .every((x) => clearanceSourceOf(x.clearance) === 'oneChannel'),
           admin: entries.some((x) => COGNITO_KINDS.includes(x.kind) && x.pool === e.pool && x.admin === true),
         }));
     },
@@ -1549,11 +1561,6 @@ export function isGuestIssuer(issuer: Pick<TrustedIssuer, 'kind'> | null | undef
   return issuer?.kind === 'guest';
 }
 
-/** The classification a oneChannel issuer's people reach their one conversation at, or null. */
-export function oneChannelOf(issuer: TrustedIssuer | null | undefined): string | null {
-  return issuer && 'oneChannel' in issuer.clearance ? issuer.clearance.oneChannel : null;
-}
-
 type ReachProfiles = Pick<ProfileRegistry, 'grantsFor' | 'clearancesForGroups' | 'holderOf'> & ReachRegistry;
 
 /**
@@ -1561,8 +1568,7 @@ type ReachProfiles = Pick<ProfileRegistry, 'grantsFor' | 'clearancesForGroups' |
  *
  * The classifications the source names (groups through the profile registry, a mapping's declared
  * values, a fixed set) are each kept only when everything they grant sits inside the issuer's classifications, and the
- * declared classification standing for exactly what remains is the token. A oneChannel issuer has no
- * token: its people are vended one conversation, never a classification.
+ * declared classification standing for exactly what remains is the token.
  */
 export function holderTokenOf(issuer: TrustedIssuer, claims: Claims, profiles: ReachProfiles): string | undefined {
   return holderOfClaims(issuer, claims, profiles).token;
@@ -1570,34 +1576,30 @@ export function holderTokenOf(issuer: TrustedIssuer, claims: Claims, profiles: R
 
 /**
  * THE HOLDER this token's person is vended as: the member token (`holderTokenOf`) and whether the admin plane
- * is held beside it (`ProfileRegistry.holderOf`). A oneChannel issuer's people hold neither.
+ * is held beside it (`ProfileRegistry.holderOf`).
  */
 export function holderOfClaims(issuer: TrustedIssuer, claims: Claims, profiles: ReachProfiles): Holder {
-  const c = issuer.clearance;
-  if ('oneChannel' in c) return { token: undefined, adminPlane: false };
   return profiles.holderOf(heldWithinIssuer(issuer, heldFromClaims(issuer, claims, profiles), profiles));
 }
 
 /**
  * The classifications a token's claims name through the issuer's source, before its classifications apply: groups
- * through the profile registry, a mapping's declared values (an undeclared value names nothing), a fixed
- * set, or the oneChannel classification.
+ * through the profile registry, a mapping's declared values (an undeclared value names nothing), or a fixed
+ * set.
  */
 export function heldFromClaims(issuer: TrustedIssuer, claims: Claims, profiles: Pick<ProfileRegistry, 'clearancesForGroups'>): string[] {
   const c = issuer.clearance;
   if ('groups' in c) return profiles.clearancesForGroups(groupsOf(issuer, claims));
   if ('mapping' in c) return mappedValues(c.mapping, claimValues(claims[c.mapping.claim]));
-  if ('fixed' in c) return [...c.fixed];
-  return [c.oneChannel];
+  return [...c.fixed];
 }
 
 /**
  * What an issuer's rule matched on a token, for the record the exchange keeps of its decision
  * (`clearanceDecision`): the source, a mapping's claim, and the values that mapped (a mapping's declared
- * values present on the token, the groups, or the fixed set). Null for a oneChannel issuer, which is vended
- * on its own path.
+ * values present on the token, the groups, or the fixed set).
  */
-export function clearanceBasisOf(issuer: TrustedIssuer, claims: Claims): { source: 'groups' | 'mapping' | 'fixed'; claim?: string; matched: string[] } | null {
+export function clearanceBasisOf(issuer: TrustedIssuer, claims: Claims): { source: 'groups' | 'mapping' | 'fixed'; claim?: string; matched: string[] } {
   const c = issuer.clearance;
   if ('groups' in c) {
     if (!isTranslation(c.groups)) return { source: 'groups', matched: groupsOf(issuer, claims) };
@@ -1609,8 +1611,7 @@ export function clearanceBasisOf(issuer: TrustedIssuer, claims: Claims): { sourc
     const declared = claimValues(claims[c.mapping.claim]).filter((v) => Object.prototype.hasOwnProperty.call(c.mapping.values, v));
     return { source: 'mapping', claim: c.mapping.claim, matched: declared };
   }
-  if ('fixed' in c) return { source: 'fixed', matched: [...c.fixed] };
-  return null;
+  return { source: 'fixed', matched: [...c.fixed] };
 }
 
 /** The classifications a mapping's declared values name. A value the mapping does not declare names nothing. */

@@ -57,7 +57,7 @@ describe('an intent by step and by model', () => {
   });
 
   it('reads the breakdown under the row\'s filters and shows each step and each model with its summed cost', async () => {
-    renderAt({ level: 1, intent: 'image_generation' }, vi.fn(), { ...EMPTY_FILTERS, assistant: 'advisor', version: '4' });
+    renderAt({ level: 1, intent: 'image_generation' }, vi.fn(), { ...EMPTY_FILTERS, assistant: 'advisor', version: ['4'] });
     await waitFor(() => expect(mockQuery).toHaveBeenCalledWith('intent_steps', RANGE, { intent: 'image_generation', agentType: 'advisor', profileVersion: '4' }));
     const steps = await screen.findByTestId('intent-steps-table');
     expect(within(steps).getByText('generate')).toBeTruthy();

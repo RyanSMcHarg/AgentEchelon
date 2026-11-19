@@ -110,6 +110,10 @@ export type QueryType =
   | 'intent_exchanges'
   // One intent's turns by the step they started in and the model that served them (ADR-064). Aurora only.
   | 'intent_steps'
+  // Runs per workflow edition (WT109) and rework per task (WT105).
+  | 'workflow_editions'
+  | 'process_runs'
+  | 'task_rework'
   // A delivered document's own scores (SPEC-EVALUATION FR22): by intent and task type, or with a
   // `channelArn` the documents of one conversation. Both modes; Athena mode carries relevance only.
   | 'document_evaluation'
@@ -152,6 +156,8 @@ export interface AnalyticsResult {
   unsupported?: boolean;
   /** Human-readable reason; pair with `unsupported`. */
   reason?: string;
+  /** True when the window held more rows than one read returns, so `data` holds only part of it (e.g. `process_runs`). */
+  truncated?: boolean;
   /**
    * Server-side pagination (paginated list queries only, e.g. intent_exchanges / task_details):
    * the TOTAL number of matching rows across all pages (from the query's COUNT(*) OVER()), so the
@@ -369,6 +375,8 @@ export interface ExperimentResultRow {
   model_name: string;
   intent: string;
   assistant: string;
+  /** The classifications of the conversations behind this row. Absent from a read that predates it. */
+  classifications?: string[];
   exchange_count: number;
   /** Exchanges an evaluator actually scored. `exchange_count` is traffic, this is the evidence behind
    *  `avg_score`, and the two differ whenever scoring lags: an unscored exchange counts as 0 in the mean. */
@@ -376,6 +384,10 @@ export interface ExperimentResultRow {
   /** Conversations behind this row. Summing across rows overcounts a conversation spanning two intents;
    *  the per-variant figure is `units`. */
   conversation_count?: number;
+  /** Exchanges that recorded a latency: the turns `avg_total_ms` is taken over. */
+  timed_count?: number;
+  /** Exchanges that could be priced: the turns `avg_cost_usd` is taken over. */
+  priced_count?: number;
   avg_score: number;
   avg_total_ms: number;
   p95_total_ms: number;
@@ -605,7 +617,7 @@ export interface DriftEvent {
   new_channel_arn: string | null;
   rival_conversation_arn: string | null;
   drift_score: number; // cosine distance, 0..1
-  outcome: 'declined' | 'rejected_in_new_channel' | 'abandoned' | 'accepted' | null;
+  outcome: 'declined' | 'rejected_in_new_channel' | 'abandoned' | 'accepted' | 'moved_unasked' | 'not_offered' | null;
   intent: string | null;
   confidence: 'low' | 'medium' | 'high' | null;
   detected_at: string; // occurred_at

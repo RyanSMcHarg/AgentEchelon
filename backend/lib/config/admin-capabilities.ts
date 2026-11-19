@@ -104,6 +104,31 @@ const ADMINS: AdminRole[] = ['admins'];
 const BOTH: AdminRole[] = ['admins', 'team-members'];
 
 export const ADMIN_CAPABILITIES: Record<string, AdminCapability> = {
+  // An AWS event starts a workflow in a team's room (WT121). It creates AWS resources, so it is the deployment's admins' alone.
+  // WHAT AN EVENT MAY DO AT ALL (WT122): the allowed event types, the caps and the kill switch. Raising a cap is a different
+  // decision from attaching one trigger, so it is its own capability.
+  'manage-event-policy': {
+    key: 'manage-event-policy',
+    enforcement: 'signOnRole',
+    resources: [
+      { api: 'admin-conversations', method: 'GET', path: 'admin/event-policy' },
+      { api: 'admin-conversations', method: 'POST', path: 'admin/event-policy' },
+    ],
+    roles: ADMINS,
+    wired: true,
+  },
+  'manage-event-triggers': {
+    key: 'manage-event-triggers',
+    enforcement: 'signOnRole',
+    resources: [
+      { api: 'admin-conversations', method: 'GET', path: 'admin/event-types' },
+      { api: 'admin-conversations', method: 'GET', path: 'admin/event-triggers/{typeKey}/{classification}' },
+      { api: 'admin-conversations', method: 'POST', path: 'admin/event-triggers/{typeKey}/{classification}' },
+      { api: 'admin-conversations', method: 'POST', path: 'admin/event-triggers/{typeKey}/{classification}/{ruleId}/remove' },
+    ],
+    roles: ADMINS,
+    wired: true,
+  },
   // ── admin-conversations API (AdminServices stack) ────────────────────────
   'view-conversations': {
     key: 'view-conversations',
@@ -257,8 +282,19 @@ export const ADMIN_CAPABILITIES: Record<string, AdminCapability> = {
   // ── analytics API (Analytics{,Aurora} stack) ──────────────────────────────
   'view-events': {
     key: 'view-events',
+    // CONVERSATION CONTENT: the event log, transcripts and summaries, and every read that returns a
+    // person's message or an assistant's answer (`VIEW_EVENTS_QUERIES` in `admin-capability-map.ts`).
+    // The native GETs that return content are granted here too, so a role holding only
+    // `view-analytics` reaches no content on any route.
     enforcement: 'signOnRole',
-    resources: [{ api: 'analytics', method: 'POST', path: 'events-log' }],
+    resources: [
+      { api: 'analytics', method: 'POST', path: 'events-log' },
+      { api: 'analytics', method: 'GET', path: 'analytics/evaluation/exchanges' },
+      { api: 'analytics', method: 'GET', path: 'analytics/conversations' },
+      { api: 'analytics', method: 'GET', path: 'analytics/context' },
+      // A meeting's transcript, where meetings are declared (`admin-meetings.ts`).
+      { api: 'admin-conversations', method: 'GET', path: 'admin/meetings/{meetingId}/transcript' },
+    ],
     roles: ADMINS,
     wired: true,
   },
@@ -294,11 +330,8 @@ export const ADMIN_CAPABILITIES: Record<string, AdminCapability> = {
       // a role receives is exactly this capability, rather than the whole API.
       { api: 'analytics', method: 'GET', path: 'analytics/queue-health' },
       { api: 'analytics', method: 'GET', path: 'analytics/evaluation' },
-      { api: 'analytics', method: 'GET', path: 'analytics/evaluation/exchanges' },
       { api: 'analytics', method: 'GET', path: 'analytics/evaluation/flows' },
-      { api: 'analytics', method: 'GET', path: 'analytics/conversations' },
       { api: 'analytics', method: 'GET', path: 'analytics/drift' },
-      { api: 'analytics', method: 'GET', path: 'analytics/context' },
       { api: 'analytics', method: 'GET', path: 'analytics/model-effectiveness' },
       // The thumbs-up/down summary the Models tab shows, on the admin feedback API (AdminServices stack).
       // It counts every assistant together, per model and intent, so it has no team route: a team
@@ -356,6 +389,28 @@ export const ADMIN_CAPABILITIES: Record<string, AdminCapability> = {
     roles: ADMINS,
     wired: true,
   },
+  'view-meeting-analytics': {
+    key: 'view-meeting-analytics',
+    // EVERY MEETING FIGURE AND EACH MEETING'S ROSTER (SPEC-ASSISTANT-MEETINGS FR22 to FR26), served where `meetings` is
+    // declared. Admins only: it counts every classification's meetings together, so it has no team route.
+    enforcement: 'signOnRole',
+    resources: [
+      { api: 'admin-conversations', method: 'GET', path: 'admin/meetings' },
+      { api: 'admin-conversations', method: 'GET', path: 'admin/meetings/{meetingId}' },
+    ],
+    roles: ADMINS,
+    wired: true,
+  },
+  'end-meetings': {
+    key: 'end-meetings',
+    // END A RUNNING MEETING FOR EVERYONE from the console (SPEC-ASSISTANT-MEETINGS FR49), its own resource so reading the
+    // figures never carries it. The handler ends only a meeting of a classification the caller's scope reaches, writes
+    // the access log with the stated reason first, and ends it through the meetings function's own end.
+    enforcement: 'signOnRole',
+    resources: [{ api: 'admin-conversations', method: 'POST', path: 'admin/meetings/{meetingId}/end' }],
+    roles: ADMINS,
+    wired: true,
+  },
   'view-security': {
     key: 'view-security',
     enforcement: 'signOnRole',
@@ -398,6 +453,8 @@ export const ADMIN_CAPABILITIES: Record<string, AdminCapability> = {
     resources: [
       { api: 'assistant-admin', method: 'GET', path: 'admin/profiles' },
       { api: 'assistant-admin', method: 'POST', path: 'admin/profiles/export' },
+      // One process as its own manifest, read as an export reads (SPEC-PROCESSES P13).
+      { api: 'assistant-admin', method: 'POST', path: 'admin/profiles/process-export' },
       { api: 'assistant-admin', method: 'POST', path: 'admin/profiles/validate' },
       // Preview run: one draft workflow walked with sample values, writing nothing (ADR-061 decision 7).
       { api: 'assistant-admin', method: 'POST', path: 'admin/profiles/preview-run' },
@@ -414,6 +471,7 @@ export const ADMIN_CAPABILITIES: Record<string, AdminCapability> = {
       { api: 'assistant-admin', method: 'GET', path: 'admin/assistants/{assistant}/profiles' },
       { api: 'assistant-admin', method: 'GET', path: 'admin/assistants/{assistant}/templates' },
       { api: 'assistant-admin', method: 'POST', path: 'admin/assistants/{assistant}/profiles/export' },
+      { api: 'assistant-admin', method: 'POST', path: 'admin/assistants/{assistant}/profiles/process-export' },
       { api: 'assistant-admin', method: 'POST', path: 'admin/assistants/{assistant}/profiles/validate' },
       { api: 'assistant-admin', method: 'POST', path: 'admin/assistants/{assistant}/profiles/preview-run' },
       { api: 'assistant-admin', method: 'POST', path: 'admin/assistants/{assistant}/profiles/golden-gate' },
@@ -431,6 +489,8 @@ export const ADMIN_CAPABILITIES: Record<string, AdminCapability> = {
       // Throwing a draft away is an edit of the draft, so it is this capability's (SPEC-PORTABLE-PROFILES FR18).
       { api: 'assistant-admin', method: 'POST', path: 'admin/profiles/discard' },
       { api: 'assistant-admin', method: 'POST', path: 'admin/profiles/import' },
+      // A process lands in its owner's draft, as an import does (SPEC-PROCESSES P13).
+      { api: 'assistant-admin', method: 'POST', path: 'admin/profiles/process-import' },
       // A battle variant's unlabelled candidate version is a profile write like any other.
       { api: 'assistant-admin', method: 'POST', path: 'admin/profiles/variant-version' },
       // Running a draft against the golden set spends model calls on the draft, so it is the draft's editors' (ADR-065).
@@ -450,6 +510,7 @@ export const ADMIN_CAPABILITIES: Record<string, AdminCapability> = {
       { api: 'assistant-admin', method: 'POST', path: 'admin/assistants/{assistant}/profiles/draft' },
       { api: 'assistant-admin', method: 'POST', path: 'admin/assistants/{assistant}/profiles/discard' },
       { api: 'assistant-admin', method: 'POST', path: 'admin/assistants/{assistant}/profiles/import' },
+      { api: 'assistant-admin', method: 'POST', path: 'admin/assistants/{assistant}/profiles/process-import' },
       { api: 'assistant-admin', method: 'POST', path: 'admin/assistants/{assistant}/profiles/variant-version' },
     ],
     teamScoped: true,
@@ -727,6 +788,38 @@ export function roleExecuteApiResources(
     }
   }
   return out;
+}
+
+/** IAM's match of an execute-api resource: `*` stands for any run of characters, `/` included. */
+function iamResourceMatches(pattern: string, target: string): boolean {
+  return new RegExp(`^${pattern.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`).test(target);
+}
+
+/**
+ * THE ROUTES A ROLE'S GRANT WOULD REACH BEYOND WHAT IT HOLDS. A path parameter is granted as `*`, which IAM matches
+ * across `/`, so a grant on `GET admin/meetings/{meetingId}` also matches `GET admin/meetings/{meetingId}/transcript`,
+ * a route another capability holds. Each such route a role does not hold is named here, exactly, so its grant can
+ * deny it (`grantAdminRolesOnApi`): a role reaches the routes its capabilities name and no sibling beneath them.
+ */
+export function routesReachedBeyondHeld(role: AdminRole, api: AdminApiResource['api']): Array<{ method: string; path: string }> {
+  return routesReachedBeyond(roleExecuteApiResources(role, api), declaredExecuteApiResources(api));
+}
+
+/** The `declared` routes the `heldRoutes` grants' wildcards match and `heldRoutes` does not name. */
+export function routesReachedBeyond(
+  heldRoutes: ReadonlyArray<{ method: string; path: string }>, declared: ReadonlyArray<{ method: string; path: string }>,
+): Array<{ method: string; path: string }> {
+  const asPattern = (r: { method: string; path: string }): string => `${r.method}${r.path.replace(/\{[^}]+\}/g, '*')}`;
+  const sample = (r: { method: string; path: string }): string => `${r.method}${r.path.replace(/\{[^}]+\}/g, 'x')}`;
+  const held = heldRoutes.map(asPattern);
+  const heldSet = new Set(held);
+  const out = new Map<string, { method: string; path: string }>();
+  for (const d of declared) {
+    const pattern = asPattern(d);
+    if (heldSet.has(pattern) || out.has(pattern)) continue;
+    if (held.some((h) => iamResourceMatches(h, sample(d)))) out.set(pattern, { method: d.method, path: d.path });
+  }
+  return [...out.values()];
 }
 
 /** Every resource declared on an API, whoever holds it: what the stack must IAM-authorize. */

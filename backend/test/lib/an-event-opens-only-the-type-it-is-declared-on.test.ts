@@ -67,6 +67,11 @@ describe('a declaration cannot carry a classification or a type, and is refused 
       .toThrow(/a person opens this type/);
   });
 
+  it("refuses an opener on a meeting's own conversation, which only its meeting's start opens", () => {
+    expect(() => resolveEventOpeners({ meeting: { initiation: 'system', meeting: { parentMembersJoin: true }, classifications: ['premium'], openedBy: [{ source: 's', detailType: 'd', fields }] } }))
+      .toThrow(/a meeting's own conversation is opened by its meeting's start/);
+  });
+
   it('a type permitting several classifications names the one its rule is built at, and only one it permits', () => {
     const two = (classification?: string) => ({
       incident: { classifications: ['standard', 'premium'], initiation: 'alert', openedBy: [{ source: 's', detailType: 'd', fields, ...(classification ? { classification } : {}) }] },

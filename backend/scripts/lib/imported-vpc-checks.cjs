@@ -114,8 +114,8 @@ function evaluateEndpointPolicy(policy, request, account) {
 /**
  * Every AWS call an in-VPC handler makes, as one request each. The buckets and keys mirror the stacks:
  *   - the registry copy, every in-VPC handler (`lib/profile-registry.ts` `readRowsFromS3`: List + Get);
- *   - the archive bucket: DocumentIngestion reads `rag/`, the evaluation runner reads `delivered-documents/`,
- *     archival writes `delivered-documents/` (`archive-stack-aurora.ts`);
+ *   - the archive bucket: the evaluation runner reads `delivered-documents/`, archival writes it
+ *     (`archive-stack-aurora.ts`); the RAG corpus is in the company bucket, which DocumentIngestion names (`CORPUS_BUCKET`);
  *   - the attachments bucket (when known): archival reads `generated-docs/`, the evaluation runner reads
  *     `battle-images/`;
  *   - any further bucket an in-VPC function's environment names (`extraBuckets`), read under any key;
@@ -132,7 +132,6 @@ function inVpcRequirements({ resPrefix, account, region, attachmentsBucket, extr
   const out = [
     s3(registry, 's3:ListBucket', null, 'every in-VPC handler (the profile registry copy, AE_PROFILE_REGISTRY_S3)'),
     s3(registry, 's3:GetObject', 'registry/classification/row', 'every in-VPC handler (the profile registry copy, AE_PROFILE_REGISTRY_S3)'),
-    s3(archive, 's3:GetObject', 'rag/doc.md', 'DocumentIngestion (the RAG corpus)'),
     s3(archive, 's3:GetObject', 'delivered-documents/doc', 'the evaluation runner (delivered documents)'),
     s3(archive, 's3:PutObject', 'delivered-documents/doc', 'archival (delivered documents)'),
   ];

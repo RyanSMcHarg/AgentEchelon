@@ -206,7 +206,7 @@ const IMAGE_GEN_MODEL_DISPLAY_NAMES: Record<string, string> = {
   'amazon.nova-canvas-v1:0': 'Amazon Nova Canvas (legacy)',
   'stability.stable-image-core-v1:1': 'Stability Image Core (Bedrock)',
   'stability.stable-image-ultra-v1:1': 'Stability Image Ultra (Bedrock)',
-  'gpt-image-1': 'OpenAI gpt-image-1',
+  'gpt-image-2': 'OpenAI gpt-image-2',
   'fal-ai/flux-pro/v1.1': 'Black Forest Labs FLUX 1.1 Pro (via FAL)',
 };
 

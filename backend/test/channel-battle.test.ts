@@ -61,6 +61,14 @@ jest.mock('@aws-sdk/client-ssm', () => ({
   GetParameterCommand: jest.fn().mockImplementation((args) => ({ __type: 'GetParam', input: args })),
 }), { virtual: true });
 
+// THE CALLER IS CLEARED for the premium conversations this file names: every route here runs the caller's own
+// boundary first (`lib/conversation-access.ts`), whose refusals are proven in
+// `lib/a-person-route-reaches-only-a-conversation-its-caller-reaches.test.ts`.
+jest.mock('../lambda/src/lib/auth', () => ({
+  ...jest.requireActual('../lambda/src/lib/auth'),
+  callerHolderToken: () => 'premium',
+}));
+
 const APP_INSTANCE = 'arn:aws:chime:us-east-1:111:app-instance/i';
 const CHANNEL = `${APP_INSTANCE}/channel/conv-abc-123`;
 const CALLER_SUB = 'user-creator';
@@ -91,9 +99,9 @@ function makeEvent(args: {
   } as unknown as APIGatewayProxyEvent;
 }
 
-// Queue the classification-tag read (ListTagsForResource). The handler resolves
-// the channel's classification from this immutable tag, called AFTER DescribeChannel
-// (createdBy) and BEFORE ListChannelModerators — so queue it in that order.
+// Queue the classification-tag read (ListTagsForResource), AFTER the caller's membership lookup and BEFORE
+// ListChannelModerators. The caller's check and the room's primary read the tags through the container's one
+// memo, so a request reads them once.
 function queueClassificationTag(classification: string) {
   mockMessagingSend.mockResolvedValueOnce({ Tags: [{ Key: 'classification', Value: classification }] });
 }
@@ -185,6 +193,8 @@ describe('OPTIONS preflight', () => {
 
 describe('GET /channels/battle', () => {
   it('returns the config row when enabled', async () => {
+    mockMessagingSend.mockResolvedValueOnce({}); // the caller's membership
+    queueClassificationTag('premium');
     mockDdbSend.mockResolvedValueOnce({
       Item: { channelArn: CHANNEL, enabled: true, experimentId: EXP_ID, challengerAssistant: 'alt-primary-premium', challengerBotArn: ALT_BOT },
     });
@@ -200,6 +210,8 @@ describe('GET /channels/battle', () => {
   });
 
   it('returns enabled:false when no row exists', async () => {
+    mockMessagingSend.mockResolvedValueOnce({}); // the caller's membership
+    queueClassificationTag('premium');
     mockDdbSend.mockResolvedValueOnce({});
     const handler = await loadHandler();
     const res = await handler(makeEvent({
@@ -208,20 +220,45 @@ describe('GET /channels/battle', () => {
       query: { channelArn: CHANNEL },
     }));
     expect(res.statusCode).toBe(200);
-    // `battleEligible` rides along even with no config row, because the UI gates the Battle surfaces
-    // on capability. False here is the FAIL-CLOSED path: no classification tag is queued, so
-    // resolution falls back to the lowest profile, which is not battle-eligible.
-    // `attachmentsReadable` rides the same response for the same reason, and fails closed the same
-    // way: the unresolved tag falls back to the lowest profile, which cannot read attachments. The
-    // composer reads this to say so BEFORE a file is sent to a turn that would answer from the
-    // caption alone - so a fail-closed false here is the safe direction, costing a notice somebody
-    // ignores rather than a document silently unread.
-    expect(JSON.parse(res.body)).toEqual({
-      enabled: false,
-      channelArn: CHANNEL,
-      battleEligible: false,
-      attachmentsReadable: false,
-    });
+    // `battleEligible` and `attachmentsReadable` ride along even with no config row, because the UI
+    // gates the Battle surfaces and the attachment notice on capability.
+    expect(JSON.parse(res.body)).toMatchObject({ enabled: false, channelArn: CHANNEL });
+    expect(JSON.parse(res.body)).toHaveProperty('battleEligible');
+    expect(JSON.parse(res.body)).toHaveProperty('attachmentsReadable');
+  });
+
+  it('answers a member of a conversation with no recognized classification with every such capability absent', async () => {
+    // No tag queued: the read answers with none. The composer is answered rather than blanked, and
+    // nothing that depends on the classification is offered.
+    mockMessagingSend.mockResolvedValueOnce({}); // the caller's membership
+    const handler = await loadHandler();
+    const res = await handler(makeEvent({
+      method: 'GET',
+      path: '/channels/battle',
+      query: { channelArn: CHANNEL },
+    }));
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ enabled: false, channelArn: CHANNEL, battleEligible: false, attachmentsReadable: false });
+  });
+
+  it('answers a proven member with every such capability absent when the tag read fails, rather than blanking the composer', async () => {
+    mockMessagingSend.mockResolvedValueOnce({}); // the caller's membership
+    mockMessagingSend.mockRejectedValueOnce(Object.assign(new Error('slow down'), { name: 'ThrottlingException' }));
+    const handler = await loadHandler();
+    const res = await handler(makeEvent({ method: 'GET', path: '/channels/battle', query: { channelArn: CHANNEL } }));
+    expect(res.statusCode).toBe(200);
+    // A member whose clearance could not be read is not told the battle config: it is never read.
+    expect(JSON.parse(res.body)).toEqual({ enabled: false, channelArn: CHANNEL, battleEligible: false, attachmentsReadable: false });
+    expect(mockDdbSend).not.toHaveBeenCalled();
+  });
+
+  it('answers 503 when the membership of the caller could not be proven', async () => {
+    mockMessagingSend.mockRejectedValueOnce(Object.assign(new Error('slow down'), { name: 'ThrottlingException' }));
+    const handler = await loadHandler();
+    const res = await handler(makeEvent({ method: 'GET', path: '/channels/battle', query: { channelArn: CHANNEL } }));
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body).code).toBe('UNAVAILABLE');
+    expect(mockDdbSend).not.toHaveBeenCalled();
   });
 
   it('reports battleEligible:true for a channel whose profile allows battles', async () => {
@@ -545,7 +582,7 @@ describe('POST /channels/battle/enable', () => {
       mockMessagingSend.mockResolvedValueOnce({
         Channel: { Metadata: JSON.stringify({ modelTier: 'premium', createdBy: CALLER_ARN }) },
       });
-      mockMessagingSend.mockRejectedValueOnce(Object.assign(new Error('denied'), { name: 'ForbiddenException' }));
+      queueClassificationTag('not-a-declared-classification');
       const handler = await loadHandler();
       const res = await handler(makeEvent({
         method: 'POST',
@@ -554,6 +591,33 @@ describe('POST /channels/battle/enable', () => {
       }));
       expect(res.statusCode).toBe(403);
       expect(JSON.parse(res.body).code).toBe('CLASSIFICATION_UNREADABLE');
+    });
+
+    it('refuses a denied tag read as a conversation carrying no classification: this role reads only classified ones', async () => {
+      mockMessagingSend.mockResolvedValueOnce({}); // the caller's membership
+      mockMessagingSend.mockRejectedValueOnce(Object.assign(new Error('denied'), { name: 'AccessDeniedException' }));
+      const handler = await loadHandler();
+      const res = await handler(makeEvent({
+        method: 'POST',
+        path: '/channels/battle/enable',
+        body: { channelArn: CHANNEL, experimentId: EXP_ID },
+      }));
+      expect(res.statusCode).toBe(403);
+      expect(JSON.parse(res.body).code).toBe('CLASSIFICATION_UNREADABLE');
+    });
+
+    it('refuses the enable as retryable when the tag read itself fails', async () => {
+      mockMessagingSend.mockResolvedValueOnce({}); // the caller's membership
+      mockMessagingSend.mockRejectedValueOnce(Object.assign(new Error('slow down'), { name: 'ThrottlingException' }));
+      const handler = await loadHandler();
+      const res = await handler(makeEvent({
+        method: 'POST',
+        path: '/channels/battle/enable',
+        body: { channelArn: CHANNEL, experimentId: EXP_ID },
+      }));
+      expect(res.statusCode).toBe(503);
+      expect(JSON.parse(res.body).code).toBe('UNAVAILABLE');
+      expect(mockMessagingSend.mock.calls.some((c) => c[0]?.__type === 'CreateMembership')).toBe(false);
     });
 
     it('returns 403 NOT_MODERATOR when caller is not a channel moderator (live ListChannelModerators)', async () => {
@@ -589,15 +653,16 @@ describe('POST /channels/battle/enable', () => {
       expect(res.statusCode).toBe(401);
     });
 
-    it('returns 404 when channel metadata cannot be loaded', async () => {
-      mockMessagingSend.mockRejectedValueOnce(new Error('channel not found'));
+    it('returns 403 NOT_A_MEMBER when the membership lookup for the caller fails', async () => {
+      mockMessagingSend.mockRejectedValueOnce(Object.assign(new Error('not a member'), { name: 'NotFoundException' }));
       const handler = await loadHandler();
       const res = await handler(makeEvent({
         method: 'POST',
         path: '/channels/battle/enable',
         body: { channelArn: CHANNEL, experimentId: EXP_ID },
       }));
-      expect(res.statusCode).toBe(404);
+      expect(res.statusCode).toBe(403);
+      expect(JSON.parse(res.body).code).toBe('NOT_A_MEMBER');
     });
   });
 
@@ -670,7 +735,7 @@ describe('POST /channels/battle/enable', () => {
       }));
       expect(res.statusCode).toBe(400);
       expect(JSON.parse(res.body).code).toBe('EXPERIMENT_NO_CHALLENGER');
-      expect(mockMessagingSend.mock.calls.some((c) => c[0]?.input?.MemberArn)).toBe(false);
+      expect(mockMessagingSend.mock.calls.some((c) => c[0]?.__type === 'CreateMembership')).toBe(false);
       // The record read is this room's classification's alt, not a roster.
       const reads = mockSsmSend.mock.calls.map((c) => c[0]?.input?.Name as string);
       expect(reads).toContain('/agent-echelon/assistant-assignments/premium/primary/alt');

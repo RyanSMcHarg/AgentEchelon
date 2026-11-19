@@ -2,8 +2,8 @@
  * Per-assistant guardrail SELECTION at runtime (SPEC-CONFIGURABLE-ASSISTANTS 4.6) + the fail-safe
  * fallback chain. A profile-selected `guardrailId` must override the deployment default and apply its
  * live DRAFT; a SELECTED id that cannot be applied for ANY reason must FALL BACK to the deployment
- * default (never fail open and leave the turn unfiltered); only a genuine outage of the default fails
- * open. Pins the security property a regression could silently erase.
+ * default (never fail open and leave the turn unfiltered); a default that cannot be applied withholds
+ * the turn. Pins the security property a regression could silently erase.
  *
  * "ANY reason" is load-bearing and is why the non-AccessDenied cases below exist. Nothing validates a
  * selected id beyond "non-empty string", and two ordinary situations produce a NON-AccessDenied error:
@@ -127,11 +127,32 @@ describe('guardrail selection + fail-safe fallback (SPEC-CONFIGURABLE-ASSISTANTS
     expect(calls[1].guardrailIdentifier).toBe('gr-env');
   });
 
-  it('a genuine outage of the default fails OPEN (never drops a reply)', async () => {
+  it('a guardrail that cannot be applied withholds the reply, whatever the error', async () => {
     delete process.env.GUARDRAIL_ID; delete process.env.GUARDRAIL_VERSION;
+    const err = jest.spyOn(console, 'error').mockImplementation(() => {});
     mockBedrockSend.mockRejectedValueOnce(Object.assign(new Error('boom'), { name: 'ThrottlingException' }));
     const out = await applyOutputGuardrail('a reply', 'gr-only');
-    expect(out).toBe('a reply');
+    expect(out).not.toBe('a reply');
+    expect(out).toBe('I could not run my safety check just now, so I have not sent a reply. Please try again in a moment.');
+    err.mockRestore();
+  });
+
+  it('the default failing after a bad selection withholds the input, and never reaches the model', async () => {
+    const err = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockBedrockSend
+      .mockRejectedValueOnce(Object.assign(new Error('denied'), { name: 'AccessDeniedException' }))
+      .mockRejectedValueOnce(Object.assign(new Error('denied'), { name: 'AccessDeniedException' }));
+    const res = await applyInputGuardrail('hello', 'gr-profile');
+    expect(res.blocked).toBe(true);
+    expect(res.message).toBe('I could not run my safety check just now, so I have not sent a reply. Please try again in a moment.');
+    expect(applyCalls()).toHaveLength(2);
+    err.mockRestore();
+  });
+
+  it('no guardrail configured at all passes the turn: there is nothing to apply', async () => {
+    delete process.env.GUARDRAIL_ID; delete process.env.GUARDRAIL_VERSION;
+    expect(await applyOutputGuardrail('a reply')).toBe('a reply');
+    expect(applyCalls()).toHaveLength(0);
   });
 
   it('empty text is a no-op (no ApplyGuardrail call at all)', async () => {

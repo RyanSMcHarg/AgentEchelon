@@ -110,6 +110,12 @@ export async function sendPrivateFollowUps(args: {
         // THE WHOLE POINT. Without this the message is in the room, and the confirmation of a private
         // request becomes its publication.
         Target: [{ MemberArn: addressOf(args.appInstanceArn, group.requestorId) }],
+        // WHAT IT IS, declared as every assistant message declares it: a question put to this person
+        // (`interim`, as a clarifying question is), sent to them alone. Without it the message carried no
+        // phase, and a reader of the conversation could not tell it from a bare carrier still being written.
+        Metadata: JSON.stringify({
+          botResponse: true, respPhase: 'interim', targetedSender: addressOf(args.appInstanceArn, group.requestorId),
+        }),
       });
       notified.push(group.requestorId);
     } catch (err) {

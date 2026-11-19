@@ -1,6 +1,6 @@
 /**
  * LIVE image generation-out validation — hits REAL external providers
- * (OpenAI gpt-image-1, FAL FLUX 1.1 Pro) with keys pulled from Secrets
+ * (OpenAI gpt-image-2, FAL FLUX 1.1 Pro) with keys pulled from Secrets
  * Manager, exactly as the deployed processor does.
  *
  * This is the deploy-validation proof for /battle generation-out: it
@@ -22,7 +22,7 @@
  * two different axes, and conflating them is how this header previously claimed that generation-out
  * always runs through these two:
  *
- *   - `hosting: 'external-http'` - OpenAI gpt-image-1 and FAL FLUX 1.1 Pro. Provider's own API, key
+ *   - `hosting: 'external-http'` - OpenAI gpt-image-2 and FAL FLUX 1.1 Pro. Provider's own API, key
  *     from Secrets Manager. THIS FILE.
  *   - `hosting: 'aws-bedrock'` - Stability Image Core and Ultra, `lifecycle: 'active'`, invoked
  *     through Bedrock with IAM auth and no API key. They are `region: 'us-west-2'`, which is a
@@ -74,13 +74,13 @@ d('LIVE generation-out (real external providers via Secrets Manager)', () => {
     expect(result.modelId).toBe('fal-ai/flux-pro/v1.1');
   });
 
-  it('OpenAI gpt-image-1 returns one persistable base64 PNG', async () => {
-    const result = await invokeImageGenModel('gpt-image-1', PROMPT, {
+  it('OpenAI gpt-image-2 returns one persistable base64 PNG', async () => {
+    const result = await invokeImageGenModel('gpt-image-2', PROMPT, {
       count: 1,
       requestTimeoutMs: 110_000,
     });
     expect(result.images.length).toBe(1);
     expect(isPng(result.images[0])).toBe(true);
-    expect(result.modelId).toBe('gpt-image-1');
+    expect(result.modelId).toBe('gpt-image-2');
   });
 });

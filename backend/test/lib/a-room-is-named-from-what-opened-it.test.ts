@@ -18,6 +18,11 @@ const mockSsmSend = jest.fn();
 const mockCreate = jest.fn();
 const mockResolveAllowedSet = jest.fn();
 
+// THE CONCERNED ROOM'S ROW, as the nesting rule reads it (`openIsNestedBy`): a top-level room, which may open a child.
+jest.mock('../../lambda/src/lib/channel-context-client', () => ({
+  ...jest.requireActual('../../lambda/src/lib/channel-context-client'),
+  readChannelContext: async () => null,
+}));
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn(() => ({ send: mockMessagingSend })),
   SendChannelMessageCommand: jest.fn().mockImplementation((input) => ({ __type: 'SendMessage', input })),
@@ -44,7 +49,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import {
   conversationNameFor, conversationNameText, conversationSubjectFor, declaredTypeName, PLACEHOLDER_TITLE, CONVERSATION_NAME_TEMPLATE,
-  CHANNEL_NAME_MAX_UNITS, MAX_CONVERSATION_NAME_LENGTH,
+  CHANNEL_NAME_MAX_UNITS, MAX_CONVERSATION_NAME_LENGTH, identifierWords,
 } from '../../lambda/src/lib/conversation-name';
 import { CONVERSATION_TYPES, conversationNameErrors } from '../../lib/config/conversation-types';
 import { OPENER_FIELDS, PLATFORM_EVENT_FIELDS, openerInput } from '../../lib/config/event-openers';
@@ -97,7 +102,7 @@ describe('the order a room is named in', () => {
   it('then the summary, then the room\'s type: a room an event opened always has a purpose, so never the placeholder', () => {
     expect(conversationNameFor({ kind: 'opened', typeKey: 'ops', values: { summary: 'Report generation is running slow.' } }))
       .toBe('Report generation is running slow.');
-    expect(conversationNameFor({ kind: 'opened', typeKey: 'ops', values: {} })).toBe('Ops Room');
+    expect(conversationNameFor({ kind: 'opened', typeKey: 'ops', values: {} })).toBe('Ops Conversation');
     expect(conversationNameFor({ kind: 'opened', values: {} })).toBe(PLACEHOLDER_TITLE);
   });
 
@@ -246,7 +251,7 @@ describe('the typed creator opens the room with its name', () => {
 
   it('with nothing to go on, it is named and introduced by its type, never the placeholder', async () => {
     expect((await open({})).ok).toBe(true);
-    expect(mockCreate.mock.calls[0][0]).toMatchObject({ name: 'Ops Room', topicLabel: 'Ops' });
+    expect(mockCreate.mock.calls[0][0]).toMatchObject({ name: 'Ops Conversation', topicLabel: 'Ops' });
     expect(mockCreate.mock.calls[0][0].name).not.toBe(PLACEHOLDER_TITLE);
   });
 
@@ -310,7 +315,9 @@ describe('every default name is one style', () => {
   it('a short Title Case noun phrase, its most specific context first and the kind of room last', () => {
     const SAMPLE = { type: 'Ops Team', alarm: 'p99-latency', service: 'AWS/Lambda', date: '2026-10-30', label: 'Checkout latency' };
     const named: Record<string, string> = {
-      opened: conversationNameFor({ kind: 'opened', typeKey: 'ops-team' }),
+      opened: conversationNameFor({ kind: 'opened', typeKey: 'ops' }),
+      // A STANDING TEAM CONVERSATION IS NAMED BY ITS TYPE'S DECLARED NAME.
+      team: conversationNameFor({ kind: 'opened', typeKey: 'ops-team' }),
       alarm: conversationNameFor({ kind: 'opened', typeKey: 'ops', values: { alarm: SAMPLE.alarm } }),
       alarmOnService: conversationNameFor({ kind: 'opened', typeKey: 'ops', values: { alarm: SAMPLE.alarm, service: SAMPLE.service } }),
       visitor: conversationNameFor({ kind: 'visitor', typeKey: 'guest-visitor' }),
@@ -319,7 +326,8 @@ describe('every default name is one style', () => {
       admin: conversationNameFor({ kind: 'adminNotifications' }),
     };
     expect(named).toEqual({
-      opened: 'Ops Team Room',
+      opened: 'Ops Conversation',
+      team: 'Ops Team Main',
       alarm: 'p99-latency Alarm',
       alarmOnService: 'p99-latency Alarm on AWS/Lambda',
       visitor: 'Visitor Chat',
@@ -383,31 +391,25 @@ describe('the room\'s primary assistant manages the channel, including its name'
       const body = creation.slice(creation.indexOf(`export async function ${origin}(`));
       expect(body.slice(0, body.indexOf('\n}\n'))).toMatch(/createConversationCore\(/);
     }
-    // A reopened context conversation seats its assistant as a moderator again.
+    // A retried bind makes its assistant a moderator again.
     expect(creation).toMatch(/for \(const arn of \[input\.botArn, input\.userArn\]\)[\s\S]{0,400}CreateChannelModeratorCommand/);
     const admin = fs.readFileSync(path.join(SRC, 'admin-notification-channel-provision.ts'), 'utf8');
     expect(admin).toMatch(/botArn: ADMIN_AGENT_BOT_ARN,/);
   });
 });
 
-describe('a reopened context room is named from its context by its creator', () => {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { contextRoomName } = require('../../lambda/src/lib/conversation-name');
-  it("follows the host's new title while it still carries the title it was named from", () => {
-    expect(contextRoomName('Q3 plan', 'Q3 plan', 'Q3 plan (revised)')).toBe('Q3 plan (revised)');
+describe('a room named from an identifier, and a meeting named for its room', () => {
+  it('names an alarm in words, never as its hyphenated identifier', () => {
+    expect(identifierWords('AgentEchelon-demo-incident')).toBe('AgentEchelon Demo Incident');
+    expect(identifierWords('api_latency high')).toBe('Api Latency High');
   });
-  it('keeps a name a person or its primary gave it since', () => {
-    expect(contextRoomName('Renewal prep with Acme', 'Q3 plan', 'Q3 plan (revised)')).toBe('Renewal prep with Acme');
+
+  it('the router labels an alarm-opened incident in words, and keeps the alarm itself as the resource', () => {
+    const router = fs.readFileSync(path.join(__dirname, '..', '..', 'lambda', 'src', 'router-agent-handler.ts'), 'utf8');
+    expect(router).toContain("label: (isAlarm ? identifierWords(named) : named) || detailType");
   });
-  it('keeps its name when the title it was named from cannot be read', () => {
-    expect(contextRoomName('Q3 plan', undefined, 'Q3 plan (revised)')).toBe('Q3 plan');
-  });
-  it("takes the host's title when it has no name at all", () => {
-    expect(contextRoomName(undefined, undefined, 'Q3 plan')).toBe('Q3 plan');
-  });
-  it('the creator reads only the title it named the room from, and only that attribute is granted', () => {
-    const creator = fs.readFileSync(path.join(__dirname, '..', '..', 'lib', 'constructs', 'conversation-creator.ts'), 'utf8');
-    expect(creator).toContain("'dynamodb:Attributes': ['topic']");
-    expect(creator).toContain("'dynamodb:Select': 'SPECIFIC_ATTRIBUTES'");
+
+  it("names a meeting's own conversation for its room, through the template", () => {
+    expect(conversationNameFor({ kind: 'meeting', typeKey: 'meeting', values: { label: 'Report Latency' } })).toBe('Meeting in Report Latency');
   });
 });

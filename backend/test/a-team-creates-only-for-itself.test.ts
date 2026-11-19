@@ -61,7 +61,7 @@ function signed(kind: 'team' | 'admin', path: string, method = 'POST', body: unk
     path,
     headers: { origin: 'http://localhost:5173' },
     body: JSON.stringify(body),
-    requestContext: { identity: { userArn: `arn:aws:sts::1:assumed-role/ae-${kind}-console/${session}` } },
+    requestContext: { identity: { userArn: `arn:aws:sts::1:assumed-role/agent-echelon-${kind}-console/${session}` } },
   } as unknown as APIGatewayProxyEvent;
 }
 
@@ -181,10 +181,22 @@ describe('a team member creating an assistant', () => {
   });
 
   it('is refused on the admin routes, which create for any team and retire', async () => {
+    // Refused at the admin check, which admits a team session on a team route only.
     for (const path of ['/admin/roster', '/admin/roster/ops-old/retire']) {
       const res = await handler(signed('team', path, 'POST', { ...good, ownerTeam: 'ops', reason: 'r' })) as any;
       expect(res.statusCode).toBe(403);
-      expect(JSON.parse(res.body).code).toBe('ADMIN_ROUTE');
+    }
+    // And at the handler's own check, with the admin check admitting it.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const spy = jest.spyOn(require('../lambda/src/lib/auth'), 'callerCanManageAssistants').mockReturnValue(true);
+    try {
+      for (const path of ['/admin/roster', '/admin/roster/ops-old/retire']) {
+        const res = await handler(signed('team', path, 'POST', { ...good, ownerTeam: 'ops', reason: 'r' })) as any;
+        expect(res.statusCode).toBe(403);
+        expect(JSON.parse(res.body).code).toBe('ADMIN_ROUTE');
+      }
+    } finally {
+      spy.mockRestore();
     }
     expect(written()).toEqual([]);
   });

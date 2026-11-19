@@ -38,6 +38,7 @@ jest.mock('@aws-sdk/client-cognito-identity-provider', () => ({
     return { send: mockCognitoSend };
   }),
   AdminGetUserCommand: jest.fn().mockImplementation((input) => ({ __type: 'AdminGetUser', input })),
+  AdminListGroupsForUserCommand: jest.fn().mockImplementation((input) => ({ __type: 'AdminListGroups', input })),
 }), { virtual: true });
 
 jest.mock('@aws-sdk/client-sesv2', () => ({
@@ -50,7 +51,8 @@ const CHANNEL = 'arn:aws:chime:us-east-1:1:app-instance/a/channel/c1';
 const BOT = 'arn:aws:chime:us-east-1:1:app-instance/a/bot/atlas';
 const PERSON = 'arn:aws:chime:us-east-1:1:app-instance/a/user/sarah';
 
-const ADMIN_TAG = [{ Key: 'aeChannelKind', Value: 'admin-notifications' }];
+// The admin conversation carries the admin plane's classification, which every recipient's clearance must reach.
+const ADMIN_TAG = [{ Key: 'aeChannelKind', Value: 'admin-notifications' }, { Key: 'classification', Value: 'admin' }];
 const ORDINARY_TAGS = [{ Key: 'classification', Value: 'premium' }];
 
 /** A Chime client that answers the two reads the fan-out makes. */
@@ -98,9 +100,10 @@ async function loadRule(env: Record<string, string | undefined> = {}) {
 beforeEach(() => {
   jest.clearAllMocks();
   cognitoConstructorThrows = false;
-  mockCognitoSend.mockImplementation(async (cmd: { input: { Username: string } }) => ({
+  // Every member here is an admin: their groups clear them for the admin conversation.
+  mockCognitoSend.mockImplementation(async (cmd: { __type: string; input: { Username: string } }) => (cmd.__type === 'AdminListGroups' ? { Groups: [{ GroupName: 'admins' }] } : {
     UserAttributes: [
-      { Name: 'email', Value: `${cmd.input.Username}@example.com` },
+      { Name: 'email', Value: `${cmd.input.Username}@example.com` }, { Name: 'email_verified', Value: 'true' },
       { Name: 'name', Value: cmd.input.Username },
     ],
   }));
@@ -134,6 +137,11 @@ describe('the person waits for the callback and nothing else', () => {
 });
 
 describe('decideNotify: what the record alone settles', () => {
+  it.each(['Target', 'Targets'])('a message carrying %s is private', async (field) => {
+    const { decideNotify } = await loadRule();
+    expect(decideNotify(notifyMessage({ [field]: [{ MemberArn: 'arn:member' }] } as never))).toMatchObject({ notify: true, privateMessage: true });
+  });
+
   it('an assistant message carrying a directive is fanned out, from the stored text', async () => {
     const { decideNotify } = await loadRule();
     const d = decideNotify(notifyMessage());
@@ -235,8 +243,10 @@ describe('the fan-out still happens, and still only where it should', () => {
 
     await notifyOnDelivery(notifyMessage());
 
+    // Both the clearance (groups) and the contact are asked of the pool by the subject, never the person id.
     const asked = mockCognitoSend.mock.calls.map(([c]) => c.input.Username);
-    expect(asked).toEqual(['admin1']);
+    expect([...new Set(asked)]).toEqual(['admin1']);
+    expect(mockCognitoSend.mock.calls.map(([c]) => c.__type).sort()).toEqual(['AdminGetUser', 'AdminListGroups']);
     expect(mockSesSend.mock.calls[0][0].input.Destination.ToAddresses).toEqual([expect.stringContaining('<admin1@example.com>')]);
   });
 

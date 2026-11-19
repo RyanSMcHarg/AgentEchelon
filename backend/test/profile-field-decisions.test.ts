@@ -55,9 +55,13 @@ describe('the assistant page decides every version field', () => {
     expect(PROFILE_FIELD_DECISIONS.eventWorkflows.kind).toBe('control');
     expect(PROFILE_FIELD_DECISIONS.welcome).toEqual({ kind: 'readonly', drivenBy: 'migration', guide: 'welcome' });
     expect(PROFILE_FIELD_DECISIONS.copy.kind).toBe('readonly');
-    for (const k of ['onboarding', 'intentPack', 'machines', 'workflows'] as const) {
+    for (const k of ['onboarding', 'intentPack', 'workflows'] as const) {
       expect(PROFILE_FIELD_DECISIONS[k].kind).toBe('json');
     }
+  });
+
+  it("reads the task machines as the classification's, changed by a deploy, since a version that names one is refused", () => {
+    expect(PROFILE_FIELD_DECISIONS.machines).toEqual({ kind: 'readonly', drivenBy: 'classification-pack', guide: 'globalWorkflows' });
   });
 
   it('names a command and a guide for every JSON field, and what drives every read-only one', () => {

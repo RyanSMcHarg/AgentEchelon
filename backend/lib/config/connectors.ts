@@ -18,7 +18,7 @@
  * pinned to them (P-13). A person with neither is reached by an invitation (M-10); a connector issuing one
  * is **NOT BUILT**, so such a person is recorded as unresolved and nothing more.
  *
- * ── ADMISSION IS THE NARROWER OF TWO LIMITS (K4) ─────────────────────────────────────────────────
+ * ── ADMISSION NEEDS BOTH SETS TO INCLUDE IT (K4) ─────────────────────────────────────────────────
  *
  * A connector that receives events declares the `classification` of the conversations those events
  * concern. A person it resolves is admitted only when what they hold reaches that classification, read

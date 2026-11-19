@@ -229,6 +229,16 @@ describe('classification boundary — the generated SQL', () => {
     expect(lastForce).toBeLessThan(setRole);
   });
 
+  it('lets the writer draw the key of each table it writes, from that table\'s own sequences only', () => {
+    const sql = all();
+    for (const table of BOUNDED_TABLES) {
+      expect(sql).toContain(`WHERE s.relkind = 'S' AND d.refobjid = '${table}'::regclass`);
+    }
+    expect(sql).toContain("EXECUTE format('GRANT USAGE ON SEQUENCE %s TO ae_writer', seq);");
+    // Never a schema-wide sequence grant to the writer.
+    expect(sql).not.toMatch(/ON ALL SEQUENCES IN SCHEMA public TO [^;]*ae_writer/);
+  });
+
   it('is idempotent: every statement converges on a re-run', () => {
     // This runs at Lambda cold start on fresh AND existing clusters, so a second application must
     // be a no-op rather than an error. Postgres has no CREATE ROLE IF NOT EXISTS, hence the guards.

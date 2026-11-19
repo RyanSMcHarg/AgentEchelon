@@ -29,7 +29,7 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
 import { ANALYTICS_PREFIX, ANALYTICS_DB_NAME, ATHENA_WORKGROUP_NAME } from '../stacks/agent-classification-common';
-import { registerArchivePartitions } from './archive-partitions';
+import { ARCHIVE_PARTITION_QUERY, registerArchivePartitions } from './archive-partitions';
 
 
 export interface ConversationArchiveProps {
@@ -58,16 +58,21 @@ export class ConversationArchive extends Construct {
       bucketKeyEnabled: true,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       enforceSSL: true,
+      // THE SYSTEM OF RECORD IS NEVER EXPIRED (tenet D7). `conversations/` is the archive itself: every object
+      // moves to infrequent access at 30 days and stays. Each other family is named and expired on its own
+      // (tenet D15): Firehose's failed deliveries, and Athena's query results, which are read once.
       lifecycleRules: [
         {
+          id: 'InfrequentAccessAfter30Days',
           transitions: [
             {
               storageClass: s3.StorageClass.INFREQUENT_ACCESS,
               transitionAfter: cdk.Duration.days(30),
             },
           ],
-          expiration: cdk.Duration.days(90),
         },
+        { id: 'ExpireDeliveryErrors', prefix: 'errors/', expiration: cdk.Duration.days(90) },
+        { id: 'ExpireAthenaResults', prefix: 'athena-results/', expiration: cdk.Duration.days(7) },
       ],
     });
     this.archiveBucket = archiveBucket;
@@ -121,18 +126,10 @@ export class ConversationArchive extends Construct {
               parameters: [
                 {
                   parameterName: 'MetadataExtractionQuery',
-                  // The `user_type` partition holds the CONVERSATION'S CLASSIFICATION; the name is
-                  // the S3 layout, the source is the turn's `classification`. A nested `.analytics`
-                  // block (an admin alert) first, else the FLAT top-level key
-                  // buildAnalyticsMetadata() emits. `unknown` when absent.
-                  //
-                  // THIS READS THE MESSAGE AND NOTHING ELSE, which is why `classification` has to
-                  // stay in FRONTEND_METADATA_KEYS. Archival compensates for Aurora-mode slimming by
-                  // re-reading the full blob from DynamoDB; Firehose has no such hop, so a key
-                  // slimmed out of the Chime Metadata is simply gone here. It was, and every record
-                  // partitioned as `unknown` until it was put back.
-                  parameterValue:
-                    '{user_type:(if .Payload.Metadata then (.Payload.Metadata | fromjson | .analytics.classification // .classification // "unknown") else "unknown" end)}',
+                  // The `user_type` partition: the classification the platform declared on an
+                  // assistant's record, else `unknown`. Never read from a person's Metadata, and no
+                  // Metadata routes a record out of the table (`ARCHIVE_PARTITION_QUERY`).
+                  parameterValue: ARCHIVE_PARTITION_QUERY,
                 },
                 { parameterName: 'JsonParsingEngine', parameterValue: 'JQ-1.6' },
               ],

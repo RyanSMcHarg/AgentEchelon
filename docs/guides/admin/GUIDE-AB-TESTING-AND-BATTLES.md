@@ -8,15 +8,15 @@ This guide is for operators (an admin running a single AgentEchelon deployment).
 
 ## Why this exists
 
-Administrators require fine-grained control over the assistants interacting with users in order to optimize the experience for performance, quality, and cost. This includes not just what topics assistants can or are willing to engage with users on, but also which models are used throughout the flow for users in different tiers.
+Administrators require fine-grained control over the assistants interacting with users in order to optimize the experience for performance, quality, and cost. This includes not just what topics assistants can or are willing to engage with users on, but also which models are used throughout the flow for users in different classifications.
 
-Administrators can set up tests between two assistants for a given user tier. The test is between the current default assistant and an alternative assistant. The configuration of the alternative, and what needs to change, depends on the goal of the experiment. To understand the levers available, you have to understand the message flow.
+Administrators can set up tests between two assistants in a given classification. The test is between the current default assistant and an alternative assistant. The configuration of the alternative, and what needs to change, depends on the goal of the experiment. To understand the levers available, you have to understand the message flow.
 
 ```
 User message
    │
    ▼
-Channel Flow Processor ──▶ Tier router  (picks the per-tier assistant: Basic / Standard / Premium)
+Channel Flow Processor ──▶ Router  (picks the assistant serving the conversation's classification)
                                 │
                                 ▼
                         Intent classifier  ── one low-cost model (configurable via CLASSIFIER_MODEL_ID; Haiku by default)
@@ -31,7 +31,7 @@ Channel Flow Processor ──▶ Tier router  (picks the per-tier assistant: Bas
 The flow exposes three levers, and each is one of the single-model experiment types in Part 1:
 
 - **Classification** - the single low-cost model that reads a message and routes it to an intent.
-- **Default (base) model** - the fallthrough model that answers any request not pinned to a specific intent. It differs per tier.
+- **Default (base) model** - the fallthrough model that answers any request not pinned to a specific intent. Each classification declares its own.
 - **Intent** - the model used for one specific intent, including a specific sub-step of a multi-step intent (for example, the model that generates the image, distinct from the default model that clarifies what image to generate).
 
 A fourth experiment type, **Profile vs Profile**, sits above these three: instead of moving one lever it swaps the whole assistant (all three levers, plus the tool surface and limits) by pitting two versioned profiles against each other. Part 1 covers when to use each.
@@ -49,14 +49,14 @@ Examples of focused goals:
 - The design team is currently using model X for image generation. There is an emerging model Y they would like to experiment with to compare results.
 - The engineering team is spending a large share of its AI budget on code and security reviews. They are looking at alternative models to perform these reviews in addition to structural and operational changes.
 
-AgentEchelon provides multiple ways to address these goals. Outside of A/B testing there is the option to move more users into a tier whose declared grants include only lower-cost models. You can also put guardrails up to prevent users from engaging with assistants for specific, high-cost intents, or work on operational changes and the way that context is managed. A/B testing provides the tools required to take a more targeted, quantifiable approach.
+AgentEchelon provides multiple ways to address these goals. Outside of A/B testing there is the option to move more users into a classification that selects only lower-cost models. You can also put guardrails up to prevent users from engaging with assistants for specific, high-cost intents, or work on operational changes and the way that context is managed. A/B testing provides the tools required to take a more targeted, quantifiable approach.
 
 ### Broad goals
 
 When looking at cost, you can use the analytics in AgentEchelon to review performance for different intents and see which cost the most per interaction and which cost the most per month, using intent filters. This shows whether specific types of interactions account for a disproportionate cost, so you can optimize just those intents with A/B testing. If there is no obvious culprit, or the issue is genuinely broad (like general feedback about misrouting), you can look at two primary areas:
 
 - **Intent classification** - the low-cost, efficient model used to understand and route user requests. AgentEchelon ships with Anthropic's Haiku, but you may want to try other low-cost alternatives and compare effectiveness and cost against Haiku. Because these are already low-cost, tests at this level are most often for quality or latency.
-- **Default model** - the power of modern AI systems is that they assist with a wide variety of requests. Because of that, it is inconvenient (and, depending on guardrails, sometimes impossible) to match every possible request to a specific workflow or model. To handle requests not tied to a specific model, AgentEchelon uses a default model, which differs per tier. By experimenting with different default models you can optimize a broad set of responses for performance, cost, or quality.
+- **Default model** - the power of modern AI systems is that they assist with a wide variety of requests. Because of that, it is inconvenient (and, depending on guardrails, sometimes impossible) to match every possible request to a specific workflow or model. To handle requests not tied to a specific model, AgentEchelon uses a default model, and each classification declares its own. By experimenting with different default models you can optimize a broad set of responses for performance, cost, or quality.
 
 ### Focused goals
 
@@ -64,7 +64,7 @@ Focused goals are used when you want to optimize a specific intent or process, o
 
 ## Concepts
 
-- **Experiment.** A named comparison with a **control** variant (A) and a **treatment** variant (B), the one tier (classification) it runs in, a traffic split, and a type (below). A battle is the same experiment's two variants compared head to head in a single conversation, instead of each conversation being assigned one of them.
+- **Experiment.** A named comparison with a **control** variant (A) and a **treatment** variant (B), the one classification it runs in, a traffic split, and a type (below). A battle is the same experiment's two variants compared head to head in a single conversation, instead of each conversation being assigned one of them.
 - **Experiment type.** What the experiment swaps. Three types swap a single model at one lever: the **Classification** model, the **Base** (default) model, or the model for one **Intent**. A fourth, **Profile vs Profile**, swaps the whole assistant profile version at once. See Part 1.
 - **Variant.** One side of the comparison. For the single-model types the treatment names a model (plus, for battles, a display name and an optional prompt addendum), and the control is the live assistant's active version, so it names no model. For a Profile experiment each side is a **profile version reference** (a profile name and an optional version) rather than a bare model; a variant is exactly one of the two, never both.
 - **Traffic split.** The percentage of new conversations assigned to each variant. You set the control percentage; the treatment (variant B) gets the rest.
@@ -86,8 +86,8 @@ First choose a **Type** (Intent, Base Model, Classification, or Profile).
 
 The first three are the established, targeted tests: each **swaps one model at one point in the flow** of your *current* assistant and holds everything else constant, so the result isolates that single change. In practice these are the fast, mostly model-and-prompt-driven experiments you reach for to tune an assistant you already run. They differ only in *which* lever they move (the three levers from the flow above):
 
-- **Classification** - swaps only the low-cost intent-classifier model. Everything downstream (base and per-intent models) is unchanged. A classification test cannot run while any other type of test is running on the targeted tier(s), because changing the classifier shifts routing for every intent and would confound the other tests.
-- **Base Model** - swaps only the default (fallthrough) model for a tier, across every intent that is not pinned to its own model. The classifier and any per-intent models are unchanged.
+- **Classification** - swaps only the low-cost intent-classifier model. Everything downstream (base and per-intent models) is unchanged. A classification test cannot run while any other type of test is running on the targeted classification, because changing the classifier shifts routing for every intent and would confound the other tests.
+- **Base Model** - swaps only the default (fallthrough) model for a classification, across every intent that is not pinned to its own model. The classifier and any per-intent models are unchanged.
 - **Intent** - swaps only the model for one specific intent (for example code generation, or the image-generation step): the candidate changes that intent's route primary and keeps its fallback. The classifier, the base model, and every other intent are unchanged. The candidate may name a cheaper model than the base model; a route is served as written.
 
 Whatever the type, the candidate is the live assistant's active version plus that one change, so the two arms differ in nothing else.
@@ -102,7 +102,7 @@ Then fill in the fields. Most are common to every type; the type-specific fields
 
 - **Experiment ID** - a short stable name, for example `exp-codegen-sonnet-vs-opus`.
 - **Control** and **Treatment Model** - for an Intent or Base Model experiment the control is the live assistant's active version, so the form names no control model and shows "Control: the live assistant's active version, pinned when the experiment starts"; you pick only the treatment model. For a Classification experiment you name the control classifier as well, and it must be the classifier the live version uses. Control is variant A; treatment is variant B. The available models come from your deployment's model catalog, which can include Bedrock and external (non-Bedrock) models. See the [Model Strategy guide](../developer/MODEL_STRATEGY.md) for the catalog. Reading the live catalog into the form is **NOT BUILT**: the model list is a fixed set, and admin management of the catalog is design only. For a **Profile vs Profile** experiment these become **Control Profile** and **Treatment Profile** pickers instead: choose a profile name and, for each, a specific version or leave it on the active version. The rest of the form is the same.
-- **Tiers** - the one user tier (classification) the experiment runs in (`basic`, `standard` or `premium`; `standard` preselected). An experiment compares two versions of one assistant, and an assistant acts in one classification, so picking a tier replaces the previous choice; arming an experiment that names any other number is refused (`EXPERIMENT_ONE_CLASSIFICATION`). A model the tier does not select is refused when the experiment is created (`VARIANT_MODEL_NOT_ALLOWED`) and when the candidate is derived, so the experiment never grants more access than the tier already has. The classification's model selection is enforced in two places: the write path refuses a version selecting a model the classification does not select, and the serving Lambda's `bedrock:InvokeModel` grant lists only the model ARNs of its selection (`modelArnsForClassification` in `agent-classification-common.ts`), so a Bedrock model outside it is refused by IAM even if the write path were bypassed. An external (non-Bedrock) model is bounded by the write path and by the classification's selection, since only a classification that selects it holds its provider's key.
+- **Classifications** - the one classification the experiment runs in. The form lists the member conversational classifications the deployment declares and preselects the first. An experiment compares two versions of one assistant, and an assistant acts in one classification, so picking one replaces the previous choice; arming an experiment that names any other number is refused (`EXPERIMENT_ONE_CLASSIFICATION`). A model the classification does not select is refused when the experiment is created (`VARIANT_MODEL_NOT_ALLOWED`) and when the candidate is derived, so the experiment never grants more access than the classification already has. The classification's model selection is enforced in two places: the write path refuses a version selecting a model the classification does not select, and the serving Lambda's `bedrock:InvokeModel` grant lists only the model ARNs of its selection (`modelArnsForClassification` in `agent-classification-common.ts`), so a Bedrock model outside it is refused by IAM even if the write path were bypassed. An external (non-Bedrock) model is bounded by the write path and by the classification's selection, since only a classification that selects it holds its provider's key.
 - **Start date** - the form has no start-date field: an experiment created in the console starts the moment it is saved. A start date is set only through the API (`startDate` on `POST /admin/experiments`, `AWS_IAM`, on `AdminApi`). A future-dated start IS honored: the experiment stores as active but resolves no traffic until the start date passes. It still counts toward the active-experiment cap from the moment it is saved, so a batch of scheduled tests consumes cap while it waits. An unparseable date is refused at save time rather than silently stranding the experiment.
 - **End Date** - optional, when the test ends. Left empty, the experiment is open-ended and runs until it is ended or promoted. Once past the end date the experiment enrolls no new conversations, and conversations already enrolled return to the live assistant's active version from their next turn.
 - **Objective** - a small block that records *what decision the test informs* and *what would make you ship a variant*, so the experiment is a documented decision rather than a set of numbers that moved. It is advisory throughout: it frames the recommendation and never triggers a routing change on its own. It has four parts:
@@ -125,7 +125,7 @@ When the form is complete, choose **Create & Activate**, the form's one save act
 
 - the control names something the live version does not serve (`CONTROL_DIFFERS_FROM_LIVE`): leave the control's model unset, or name the live one;
 - the live assistant has no active version to pin (`CONTROL_HAS_NO_ACTIVE_VERSION`): activate one in the Profiles tab first;
-- the experiment does not name exactly one tier (`EXPERIMENT_ONE_CLASSIFICATION`) or exactly two variants (`EXPERIMENT_TWO_VERSIONS`);
+- the experiment does not name exactly one classification (`EXPERIMENT_ONE_CLASSIFICATION`) or exactly two variants (`EXPERIMENT_TWO_VERSIONS`);
 - the candidate cannot be derived (`DERIVATION_FAILED`, `DERIVATION_UNAVAILABLE`, or the validation error itself), for example because it names a model the classification does not allow.
 
 The console has no edit form: an edit is a `POST /admin/experiments` carrying the same `experimentId`. Editing an armed experiment (weights, end date, objective), running or paused, keeps its pins, so the live assistant moving on does not change what it compares and a paused experiment can still be promoted. An edit that would change what the pins were derived from (the variant models, the type, the intent or the classification) is refused with `EXPERIMENT_LIVE_EDIT_LOCKED`; create a new experiment instead. A **Resume** arms again and pins the live version of that moment; conversations already enrolled keep the version they were given. An experiment armed before experiments pinned two versions is armed this way the first time it is paused and resumed; until then an Intent or Base Model one keeps choosing its variant's model per turn.
@@ -141,7 +141,7 @@ How the split is applied:
 
 Start conservative (for example 90/10) to expose the candidate to a small slice, then widen the split as confidence grows by editing the experiment through the API (Part 1). A changed split applies to conversations not yet enrolled.
 
-Each experiment shows its variants and weights in the **Experiments** table, alongside its type, status, tiers and **Started** date. The table lists every experiment that is not deleted, and its filter buttons (**All**, **Active**, **Paused**, **Draft**, **Completed**) each show a count.
+Each experiment shows its variants and weights in the **Experiments** table, alongside its type, status, classification and **Started** date. The table lists every experiment that is not deleted, and its filter buttons (**All**, **Active**, **Paused**, **Draft**, **Completed**) each show a count.
 
 You can **Pause** an experiment (stops enrolling, returns its conversations to the live version, keeps the data), **Resume** it, or **End** it. While an experiment is live it enrolls new conversations and holds each to its arm; when it is paused or ended it enrolls none, and every conversation it enrolled is served the live assistant's active version from its next turn (see "When a change takes effect").
 
@@ -150,7 +150,7 @@ You can **Pause** an experiment (stops enrolling, returns its conversations to t
 An experiment moves through a small, explicit set of states:
 
 - **Draft** - saved but not live. No traffic is assigned and the experiment is freely editable. A draft is created and activated through the API (Part 1).
-- **Active** - live: new conversations in its tier are enrolled and served their variant's version.
+- **Active** - live: new conversations in its classification are enrolled and served their variant's version.
 - **Paused** - new conversations stop being assigned to it, but the data collected so far is preserved and you can **Resume** it later with that data intact.
 - **Completed** - terminal. The test has stopped collecting data and its results stay in the dashboard. To run it again, create a new experiment with a new ID.
 - **Deleted** - terminal. See the delete behavior below.
@@ -163,7 +163,7 @@ Completing an experiment that ever collected data prompts you to record the **ou
 
 #### Freeing a classification
 
-A classification can host only one test at a time, and a classification test in particular cannot run alongside any other type on the same tier(s), because changing the classifier shifts routing for every intent. When you try to activate or create an experiment that conflicts with one already on the classification, the console does not just show an error: it tells you **which** experiment holds the classification and offers three ways to free it, each behind a confirmation that states the consequence.
+A classification can host only one test at a time, and a classification test in particular cannot run alongside any other type on the same classification, because changing the classifier shifts routing for every intent. When you try to activate or create an experiment that conflicts with one already on the classification, the console does not just show an error: it tells you **which** experiment holds the classification and offers three ways to free it, each behind a confirmation that states the consequence.
 
 - **End the existing test** - completes it (terminal, not resumable). Its results stay in the dashboard, and because it ran, ending it prompts you to record the outcome (with **No decision** as the default, as above).
 - **Pause the existing test** - stops new assignments but preserves the data collected so far, and you can **Resume** it later. Reversible, but still confirmed because it changes a running test's data collection.
@@ -308,7 +308,7 @@ A battle is the visible, hands-on version of the same experiment: the two varian
 
 Battle Mode is a classification's setting, switched from inside the experiment that runs the battle: the **Battle Mode in** *classification* switch sits in the create form's battle card (Part 1) and in the **Settings** section of the experiment's page. Two things decide what you see:
 
-- A classification your deployment **builds** battle for can be switched on. Standard and premium are, out of the box.
+- A classification your deployment **builds** battle for can be switched on. In the sample catalog, those are standard and premium.
 - One it does not build shows as **not available** and cannot be switched on. Basic is that case by default: its assistant is deployed without any battle plumbing, so there is nothing for a switch to turn on. Making it available is a deployment change, not a console one.
 
 The change takes effect within about 30 seconds. Turning it back off stops new battles; a conversation already mid-battle finishes.
@@ -317,7 +317,7 @@ The change takes effect within about 30 seconds. Turning it back off stops new b
 
 Arming a battle takes a few extra fields on the same experiment form.
 
-In the experiment's form, tick **Enable for /battle**. Whether battles can run in a channel at all is two things: the deployment must BUILD battle for that classification (standard and premium out of the box; basic does not), and an operator must TURN IT ON with the **Battle Mode in** *classification* switch in the battle card. It is off by default, and typically only wanted for internal users. The Battle Mode card unfolds with a side-by-side control-versus-treatment layout:
+In the experiment's form, tick **Enable for /battle**. Whether battles can run in a channel at all is two things: the deployment must BUILD battle for that classification (`battleCapable`; in the sample catalog, standard and premium), and an operator must TURN IT ON with the **Battle Mode in** *classification* switch in the battle card. It is off by default, and typically only wanted for internal users. The Battle Mode card unfolds with a side-by-side control-versus-treatment layout:
 
 - **Side names** come from the profiles, not the form: a battle has no alias, and each side is named from its profile. The control takes its pinned version's name, else the live assistant's; the treatment takes its version's name, else the control's. When the two match, the treatment reads as the challenger, by default `{name} (alt)`, which its version's copy can change (`battleAltName`). The live assistant keeps its own name; the challenger's identity wears the treatment's name while the experiment holds it and gets its provisioned name back when the experiment releases it; and each side's placeholder and its rival's rebuttal note use both names. The Battle Mode ON announcement names the challenger the same way, and when its name cannot be read it says "The challenger" (`battleChallengerUnnamed`), never the assistant id. The console's Battles section shows each version by that name with its version number beside it. A profile name names no model, so users read two distinct assistants rather than two model identifiers.
 - **Tested instruction** per variant (`systemPromptAddendum`, optional, up to 500 characters): the one instruction the experiment tests, layered after the assistant's persona in `<persona_addendum>` tags on every turn of that side. Give it a variation under test, such as "Keep every reply under 80 words." on the side that tests whether shorter replies are rated higher. How the assistant answers in general belongs in the persona's How to answer section, not here. It shapes voice, not capability; the models remain the real comparison.
@@ -380,7 +380,7 @@ Battles escalate through increasing capability; run the ones your deployment sup
 4. **Image understanding (vision in)**, both assistants reason over an uploaded image or scanned document.
 5. **Image generation (generation out)**, both assistants produce an image from a prompt.
 
-Image generation needs the classification to be battle-capable and to produce images. A classification produces images when it selects an image model (`models.selected` on its entry; only premium as shipped), which also provisions its image grant and the image-output guardrail (`battle-image-guardrails.ts`). An experiment that names an image model the classification does not select, or a text model as its image model, is refused when it is created (`VARIANT_IMAGE_MODEL_NOT_ALLOWED`), as is a variant model the classification does not select (`VARIANT_MODEL_NOT_ALLOWED`); the image models must be enabled in Bedrock, or an external provider key supplied through the `imageGenKeysSecretArn` context key. See [Image generation providers](IMAGE-GEN-PROVIDERS.md). No extra alt is involved: the classification's one challenger serves image battles too. Run only the types enabled in your environment.
+Image generation needs the classification to be battle-capable and to produce images. A classification produces images when it selects an image model (`models.selected` on its entry; in the sample catalog, only premium), which also provisions its image grant and the image-output guardrail (`battle-image-guardrails.ts`). An experiment that names an image model the classification does not select, or a text model as its image model, is refused when it is created (`VARIANT_IMAGE_MODEL_NOT_ALLOWED`), as is a variant model the classification does not select (`VARIANT_MODEL_NOT_ALLOWED`); the image models must be enabled in Bedrock, or an external provider key supplied through the `imageGenKeysSecretArn` context key. See [Image generation providers](IMAGE-GEN-PROVIDERS.md). No extra alt is involved: the classification's one challenger serves image battles too. Run only the types enabled in your environment.
 
 #### Reading battle results
 
@@ -411,7 +411,7 @@ Quality is captured as an explicit human pick (A, B, or tie) per battle, and in 
 ## Troubleshooting
 
 - **"/battle did nothing or said it is not enabled here."** The channel does not have Battle Mode on. A moderator enables it in the members panel, then try `/battle` again.
-- **"Battle Mode isn't available in this conversation. Reply normally and I'll respond as usual."** Battle cannot run in this channel's classification: either the deployment does not build it there (basic, out of the box) or nobody has turned it on. Turn it on with the **Battle Mode** switch in the experiment's **Settings** (Turn battle on, above); a classification that is not capable cannot be turned on at all and is shown as unavailable.
+- **"Battle Mode isn't available in this conversation. Reply normally and I'll respond as usual."** Battle cannot run in this channel's classification: either the deployment does not build it there (in the sample catalog, basic) or nobody has turned it on. Turn it on with the **Battle Mode** switch in the experiment's **Settings** (Turn battle on, above); a classification that is not capable cannot be turned on at all and is shown as unavailable.
 - **The Enable for /battle option does nothing useful.** The experiment must name exactly one battle-capable classification, two variants, and that classification's challenger, not named by another active battle experiment (the refusal codes are in Part 1 above).
 - **No challenger is offered.** Each classification's stack provisions one alt per role, and a battle names the alt of its classification's `primary` role, so each classification has exactly one challenger and a challenger in another classification does not help this one. The form offers none for a classification whose deployment wires no battle. A challenger another experiment names shows that experiment's id; disable battle on that experiment **in the same classification** to release it. There is no context key that adds challengers.
 - **A variant with hundreds of exchanges reads below the floor or underpowered.** The floor and every test count conversations, and those exchanges came from few of them. Read **Sample (conversations)** beside **Sample (exchanges)**; collect more conversations rather than more turns in the same ones (see *Conversations, not exchanges* above and [TROUBLESHOOTING](../user/TROUBLESHOOTING.md) entry 33).
@@ -419,7 +419,7 @@ Quality is captured as an explicit human pick (A, B, or tie) per battle, and in 
 - **Only one assistant answered a battle.** The treatment may not be a member; turn Battle Mode off and on again to re-add it, and confirm the experiment is still active.
 - **Arming is refused with `CONTROL_DIFFERS_FROM_LIVE`.** The control names a model, addendum or image model the live assistant's active version does not serve. Leave the control's model unset (Intent, Base Model) or name what the live version uses (Classification, image models). To compare two configurations neither of which is live, use a Profile vs Profile experiment.
 - **Arming is refused with `CONTROL_HAS_NO_ACTIVE_VERSION`.** The live assistant serves its compiled seed and has no version to pin. Create and activate a version in the Profiles tab, then arm again.
-- **Arming is refused with `EXPERIMENT_ONE_CLASSIFICATION` or `EXPERIMENT_TWO_VERSIONS`.** An experiment compares two versions of one assistant: pick exactly one tier and two variants.
+- **Arming is refused with `EXPERIMENT_ONE_CLASSIFICATION` or `EXPERIMENT_TWO_VERSIONS`.** An experiment compares two versions of one assistant: pick exactly one classification and two variants.
 - **Promote is refused because the live version moved (`LIVE_VERSION_MOVED`).** Someone activated another version of the live assistant after the experiment was armed. The candidate is a variation of a version that no longer serves; run a new experiment against the current version.
 - **Promote is refused with `PROMOTION_HASH_MISMATCH`.** The copy of the candidate does not hash to the `configId` the experiment measured (the stored candidate is not what was measured). Nothing was written or activated; treat the candidate as untrusted and run a new experiment.
 - **Promote is refused with `PROMOTION_NEEDS_TWO_VERSIONS` or `PROMOTION_CONTROL_NOT_LIVE`.** The experiment was armed before experiments pinned two versions (pause and resume it to pin them), or it is a Profile vs Profile experiment whose control is not the live assistant (it records a decision; promote by hand).

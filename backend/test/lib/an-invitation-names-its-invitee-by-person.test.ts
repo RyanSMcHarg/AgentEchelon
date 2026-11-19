@@ -18,6 +18,7 @@
  *    removes the invitee's membership, by the inviter or a moderator and nobody else; the console's two
  *    operations list and revoke the same way, recording the administrator.
  */
+import { __clearLiveClearance } from '../../lambda/src/lib/conversation-access';
 import { createInvitation, listForMember, revokeForMember, adminOperation, inviteeDirectory, type InvitationsDeps } from '../../lambda/src/invitations';
 import { INVITATION_CHANNEL_ATTRIBUTE, INVITATIONS_BY_CHANNEL } from '../../lambda/src/lib/invitations';
 import { edgeContext } from '../helpers/edge-context';
@@ -92,6 +93,11 @@ function world(opts: { classification?: string; type?: string | null; archived?:
       if (name === 'DescribeChannelCommand') {
         if (!members.has(i.ChimeBearer)) throw Object.assign(new Error('no'), { name: 'ForbiddenException' });
         return { Channel: { ChannelArn: CH, Name: 'Quarterly plan' } };
+      }
+      // A person's own membership, looked up as them (`lib/conversation-access.ts`).
+      if (name === 'DescribeChannelMembershipCommand') {
+        if (i.MemberArn !== i.ChimeBearer || !members.has(i.MemberArn)) throw Object.assign(new Error('no'), { name: 'NotFoundException' });
+        return { ChannelMembership: {} };
       }
       if (name === 'ListTagsForResourceCommand') {
         return { Tags: [{ Key: 'classification', Value: opts.classification ?? 'standard' }, ...(opts.archived ? [{ Key: 'archived', Value: 'true' }] : [])] };
@@ -171,6 +177,36 @@ describe('issuing an invitation: every refusal comes before anything is minted',
     const res = await invite(w, { mode: 'link' });
     expect(parse(res).code).toBe('LINK_NOT_AVAILABLE');
     expect(w.minted).toEqual([]);
+  });
+
+  it('refuses an inviter whose token still claims the classification but whose live clearance no longer does', async () => {
+    __clearLiveClearance();
+    const w = world();
+    const clearedByGroups = jest.fn(async () => ['basic']);
+    w.deps.clearance = { clearedByGroups };
+    const res = await invite(w);
+    expect(res.statusCode).toBe(403);
+    expect(clearedByGroups).toHaveBeenCalled();
+    expect(w.minted).toEqual([]);
+    expect(w.added).toEqual([]);
+    expect(w.rows.size).toBe(0);
+  });
+
+  it('refuses an inviter whose live clearance cannot be read, and mints nothing', async () => {
+    __clearLiveClearance();
+    const w = world();
+    w.deps.clearance = { clearedByGroups: jest.fn(async () => { throw new Error('directory down'); }) };
+    const res = await invite(w);
+    expect(res.statusCode).toBeGreaterThanOrEqual(403);
+    expect(w.minted).toEqual([]);
+  });
+
+  it('issues when the live clearance still reaches the conversation', async () => {
+    __clearLiveClearance();
+    const w = world();
+    w.deps.clearance = { clearedByGroups: jest.fn(async () => ['standard']) };
+    const res = await invite(w);
+    expect(res.statusCode).toBe(201);
   });
 
   it('refuses a guest, and issues nothing with no landing page', async () => {

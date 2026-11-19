@@ -16,6 +16,12 @@ const mockChimeSend = jest.fn();
 const mockLambdaSend = jest.fn();
 const mockSsmSend = jest.fn();
 
+// The sharer is cleared for the premium conversation (`lib/conversation-access.ts`); an uncleared sharer's
+// refusal is proven in `lib/a-person-route-reaches-only-a-conversation-its-caller-reaches.test.ts`.
+jest.mock('../../lambda/src/lib/auth', () => ({
+  ...jest.requireActual('../../lambda/src/lib/auth'),
+  callerHolderToken: () => 'premium',
+}));
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn().mockImplementation(() => ({ send: mockChimeSend })),
   SendChannelMessageCommand: jest.fn().mockImplementation((args) => ({ __type: 'SendMessage', input: args })),
@@ -69,6 +75,8 @@ jest.mock('../../lambda/src/lib/abuse-controls.js', () => {
   };
 }, { virtual: true });
 
+// The conversation's type allows what these cases do; the refusal is `a-type-that-turns-a-capability-off-is-refused`.
+jest.mock('../../lambda/src/lib/type-capability', () => ({ ...jest.requireActual('../../lambda/src/lib/type-capability'), typeAllows: jest.fn(async () => ({ ok: true })) }));
 import * as fs from 'fs';
 import * as path from 'path';
 import { edgeContext } from '../helpers/edge-context';
@@ -237,6 +245,9 @@ describe('the share asks for the recap and writes none', () => {
     jest.doMock('@aws-sdk/client-sesv2', () => ({ SESv2Client: jest.fn(() => ({ send: jest.fn() })), SendEmailCommand: jest.fn() }), { virtual: true });
     jest.doMock('../../lambda/src/lib/conversation-primary', () => ({
       primaryAssistantOf: async () => ({ classification: 'premium', botArn: BOT }),
+      // No tag memo here: every request reads the tags it asks for.
+      memoizedTagReader: (client: unknown) => client,
+      tagMemoHolds: () => false,
     }));
     // The join line is a notice the router says; the share holds no assistant session.
     const say = jest.fn(async (_c: string, n: { kind: string }) => { order.push(`say:${n.kind}`); return { posted: true }; });

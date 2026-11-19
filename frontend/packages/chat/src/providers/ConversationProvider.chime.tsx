@@ -6,10 +6,17 @@ import { useAwsClient } from './AwsClientProvider';
 import { useMessaging } from './MessagingProvider';
 import { sidesWaitingOn, type WaitingSide } from '../utils/battleSideReply';
 import { isUnnamedConversation } from '../utils/conversationTitle';
+import { conversationIsUnread } from '../utils/conversationUnread';
 import i18n from '@ae/shared/i18n';
 import { chimeService, type ShareConversationResult } from '../services/chimeService';
 import { notificationService } from '../services/notificationService';
 import { battleAfterUpdate } from '../services/battleAfterUpdate';
+import { announceConversationRead, onConversationReadElsewhere } from '../services/conversationReadSignal';
+import { meetingWindowRequest } from '../utils/meetingWindow';
+import {
+  cacheSession, keepOnlyPersonsComposerCache, newClientMessageId, outboxEntries, putOutboxEntry, removeOutboxEntry, type OutboxEntry,
+} from '../services/composerCache';
+import { drainOutbox, isOnline, isSendingNow, isUnknownOutcome, sendingNow } from '../services/outbox';
 import { trackEvent } from '@ae/shared';
 import {
   archiveConversation as archiveConversationApi,
@@ -21,6 +28,14 @@ import {
 // as a real Chime message authored by the user caused an unwanted bot
 // reply on every new conversation, and re-appeared at the top of every
 // channel rather than just empty ones.
+
+/** What a send asks for beside its text. */
+export interface SendMessageOptions {
+  targetArn?: string;
+  mentionBotArn?: string;
+  mentionArns?: string[];
+  taskId?: string;
+}
 
 interface ConversationContextType {
   conversations: Conversation[];
@@ -42,11 +57,27 @@ interface ConversationContextType {
   /** Deselect the active conversation (return to the list) without removing it.
    *  Drives the mobile master-detail Back affordance. */
   clearActiveConversation: () => void;
+  /**
+   * Send a message into the active conversation. It is kept in this device's outbox until the service confirms it, so
+   * one sent offline, or whose send was never answered, resolves `{ queued: true }` and is sent once when the person is
+   * back online. A send the service refused rejects, and nothing is kept.
+   */
   sendMessage: (
     content: string,
     attachment?: Attachment,
-    options?: { targetArn?: string; mentionBotArn?: string; mentionArns?: string[]; taskId?: string },
-  ) => Promise<void>;
+    options?: SendMessageOptions,
+    /**
+     * THE CONVERSATION THE MESSAGE WAS WRITTEN IN, captured when the person pressed Send: the message goes there whatever
+     * conversation is open by the time it leaves. Absent, the open conversation.
+     */
+    writtenIn?: { id: string; conversationArn: string },
+  ) => Promise<{ queued: boolean } | void>;
+  /** The active conversation's messages waiting in this device's outbox, oldest first. */
+  queuedMessages: OutboxEntry[];
+  /** Send a queued message the service refused again. */
+  retryQueuedMessage: (id: string) => void;
+  /** Drop a queued message unsent. */
+  discardQueuedMessage: (id: string) => void;
   shareConversation: (recipientEmail: string) => Promise<ShareConversationResult>;
   deleteConversation: (conversationId: string) => void;
   /** Archive a conversation for ALL members (moderator only): the backend marks
@@ -103,6 +134,14 @@ const ConversationContext = createContext<ConversationContextType | undefined>(u
  * never updated OUT when one was opened. `replaceState` keeps conversation switches out of the history
  * stack; a null id clears the param when the detail pane is closed.
  */
+/** The person a messaging ARN names: its last segment, the AppInstanceUser id. */
+/** The pauses before what waits in the outbox is sent again while the browser is online, the last repeated. */
+export const OUTBOX_RETRY_DELAYS_MS = [2000, 5000, 15000, 30000, 60000];
+
+function personIdOf(arn: string | null | undefined): string | undefined {
+  return arn ? arn.split('/').pop() || undefined : undefined;
+}
+
 function reflectConversationInUrl(conversationId: string | null): void {
   try {
     const url = new URL(window.location.href);
@@ -117,7 +156,7 @@ function reflectConversationInUrl(conversationId: string | null): void {
 export function ConversationProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   const { isInitialized, userArn: viewerArn } = useAwsClient();
-  const { setChannelListener, setGlobalListener, sessionVersion } = useMessaging();
+  const { setChannelListener, setGlobalListener, sessionVersion, localTimeOf } = useMessaging();
 
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConversation, setActiveConversation] = useState<Conversation | null>(null);
@@ -129,6 +168,19 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
   const [sendError, setSendError] = useState<string | null>(null);
   const [channelMembers, setChannelMembers] = useState<ChannelMember[]>([]);
   const [stickyTarget, setStickyTarget] = useState<StickyMentionTarget | null>(null);
+  /** This person's outbox, read again whenever it changes here. */
+  const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
+  const refreshQueued = useCallback(() => {
+    const personId = personIdOf(viewerArn);
+    // A message whose send is running now is not waiting, so it is not listed.
+    setOutbox(personId ? outboxEntries(personId).filter((e) => !isSendingNow(e.id)) : []);
+  }, [viewerArn]);
+  useEffect(() => { refreshQueued(); }, [refreshQueued]);
+  // A SIGN-IN KEEPS ONLY ITS OWN PERSON'S UNSENT WORK on this device: what another person's session left behind is removed.
+  useEffect(() => {
+    const personId = personIdOf(viewerArn);
+    if (personId) void keepOnlyPersonsComposerCache(personId);
+  }, [viewerArn]);
 
   // A sticky target belongs to the conversation it was set in. It is set from a mention the user
   // JUST SENT, so carrying it into a different conversation asserts a targeted exchange that never
@@ -149,6 +201,10 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
   // how we flip channels to unread in real time from the WebSocket global
   // listener without waiting for the next listConversations refetch.
   const [unreadTicks, setUnreadTicks] = useState<Record<string, number>>({});
+  /** Whether this window is a meeting window, read once as the app reads it. */
+  const [inMeetingWindow] = useState(() => meetingWindowRequest() !== null);
+  const unreadTicksRef = useRef(unreadTicks);
+  unreadTicksRef.current = unreadTicks;
   const botTypingTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const activeConversationRef = useRef<Conversation | null>(null);
@@ -297,22 +353,59 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
   const isConversationUnread = useCallback((conv: Conversation): boolean => {
     if (!conv) return false;
     if (activeConversationRef.current?.id === conv.id) return false;
+    // The list's times are the server's and the view and arrival times this device's; each is compared on its own clock.
+    return conversationIsUnread({
+      lastMessageAt: conv.lastMessageAt,
+      lastReadAt: conv.lastReadAt,
+      arrivedAt: unreadTicks[conv.conversationArn],
+      viewedAt: viewedAt[conv.conversationArn],
+      localTimeOf,
+    });
+  }, [unreadTicks, viewedAt, localTimeOf]);
 
-    // Derive effective "last activity" — prefer the realtime tick over
-    // the potentially-stale listConversations snapshot.
-    const tick = unreadTicks[conv.conversationArn];
-    const lastMessageMs = Math.max(
-      conv.lastMessageAt ? conv.lastMessageAt.getTime() : 0,
-      tick || 0,
-    );
-    if (!lastMessageMs) return false;
+  /**
+   * THE OPEN CONVERSATION IS READ ONCE THE PERSON IS BACK IN FRONT OF IT. A message that arrives in it while this window
+   * is in the background or behind another (a meeting window, another person's window beside it) is recorded as an
+   * arrival; when the window is focused and visible again the conversation on screen is marked read, here and on the
+   * server, so it carries no unread mark once the person moves on or reloads.
+   */
+  useEffect(() => {
+    const onBack = () => {
+      if (typeof document === 'undefined' || document.hidden || !document.hasFocus()) return;
+      const active = activeConversationRef.current;
+      if (!active) return;
+      const arn = active.conversationArn;
+      // Only a conversation something arrived in while the person was away has anything to mark.
+      if (!(arn in unreadTicksRef.current)) return;
+      setViewedAt((prev) => ({ ...prev, [arn]: Date.now() }));
+      setUnreadTicks((prev) => {
+        if (!(arn in prev)) return prev;
+        const next = { ...prev };
+        delete next[arn];
+        return next;
+      });
+      void chimeService.markConversationRead(arn);
+      announceConversationRead(arn);
+    };
+    window.addEventListener('focus', onBack);
+    document.addEventListener('visibilitychange', onBack);
+    return () => {
+      window.removeEventListener('focus', onBack);
+      document.removeEventListener('visibilitychange', onBack);
+    };
+  }, []);
 
-    const viewed = viewedAt[conv.conversationArn] || 0;
-    const markerMs = conv.lastReadAt ? conv.lastReadAt.getTime() : 0;
-    const effectiveReadMs = Math.max(markerMs, viewed);
-
-    return lastMessageMs > effectiveReadMs;
-  }, [unreadTicks, viewedAt]);
+  // A CONVERSATION ANOTHER WINDOW READ (`conversationReadSignal.ts`) is read here too: a meeting's chat read in the meeting
+  // window leaves no mark on the meeting, or on its room, in the app beside it.
+  useEffect(() => onConversationReadElsewhere((arn) => {
+    setViewedAt((prev) => ({ ...prev, [arn]: Date.now() }));
+    setUnreadTicks((prev) => {
+      if (!(arn in prev)) return prev;
+      const next = { ...prev };
+      delete next[arn];
+      return next;
+    });
+  }), []);
 
   // Request browser notification permission on first mount — silent
   // no-op if the user has already accepted or denied.
@@ -344,6 +437,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
           // Active channel AND tab focused: mark read eagerly
           setViewedAt((prev) => ({ ...prev, [channelArn]: Date.now() }));
           chimeService.markConversationRead(channelArn);
+          announceConversationRead(channelArn);
           return;
         }
 
@@ -362,6 +456,9 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
         // notification is for the case the app cannot cover: the tab is hidden, or the window is
         // behind something else. So it is gated on the document, not on which channel is open.
         if (isDocumentFocused) return;
+        // A MEETING WINDOW NOTIFIES NOTHING: it is one meeting, and the app beside it notifies for every conversation, so a
+        // click opens the conversation there and never takes the meeting window's chat away from its meeting.
+        if (inMeetingWindow) return;
         // Find the conversation so we can show its title and route the click back to it. We don't
         // put the model name in the title/body: the router picks models per-intent within a tier, so
         // "Sonnet replied" can be wrong.
@@ -392,6 +489,16 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
             setConversations((prev) => (prev.some((c) => c.id === fetched.id) ? prev : [fetched, ...prev]));
           })
           .catch((err) => console.warn('[ConversationProvider] could not surface newly-joined channel:', err));
+      },
+      onRemovedFromChannel: (channelArn) => {
+        // Deleted, or the viewer removed from it: it leaves the list, and if it is the one open, it closes,
+        // the same way a conversation the viewer deletes themselves does.
+        setConversations((prev) => prev.filter((c) => c.conversationArn !== channelArn));
+        if (activeConversationRef.current?.conversationArn === channelArn) {
+          setActiveConversationNow(null);
+          reflectConversationInUrl(null);
+          setMessages([]);
+        }
       },
     });
 
@@ -514,6 +621,9 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
         // at all (`battleAfterUpdate`).
         battle: battleAfterUpdate(updated[idx].battle, msg),
         turnKind: msg.turnKind ?? updated[idx].turnKind,
+        // A DASHBOARD MESSAGE IS UPDATED IN PLACE ON EVERY REFRESH: its new time and state replace the old, so an open
+        // dashboard reads again and its card says what the message says.
+        dashboard: msg.dashboard ?? updated[idx].dashboard,
         // battleWaiting is the OPPOSITE of battle: REPLACE, never
         // preserve. The waiting marker rides the placeholder UPDATE
         // (2B-vii); when the bot resumes, 2B-x-e reuses that SAME
@@ -582,30 +692,31 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  /** Apply a channel rename from a Chime UPDATE_CHANNEL event. Updates
-   *  the sidebar entry AND the active-conversation header if this is
-   *  the chat currently open. */
-  const handleChannelUpdate = useCallback((channelArn: string, name: string) => {
+  /** Apply a channel update from a Chime UPDATE_CHANNEL event: its name, and the archive's `archived`
+   *  display mirror in its Metadata (the same mirror `chimeService` reads on a list), so a conversation
+   *  archived while it is open, such as a meeting's own once the meeting ends, turns read-only in front
+   *  of the person. Updates the sidebar entry AND the active conversation if this is the one open. */
+  const handleChannelUpdate = useCallback((channelArn: string, name: string, metadata?: string) => {
+    let archived = false;
+    try { archived = !!metadata && (JSON.parse(metadata) as { archived?: unknown }).archived === true; } catch { /* no mirror */ }
+    const apply = (c: Conversation): Conversation => ({ ...c, title: name, ...(archived ? { archived: true } : {}) });
     setConversations((prev) =>
-      prev.map((c) => (c.conversationArn === channelArn ? { ...c, title: name } : c))
+      prev.map((c) => (c.conversationArn === channelArn ? apply(c) : c))
     );
     if (activeConversationRef.current?.conversationArn === channelArn) {
-      setActiveConversation((prev) => (prev ? { ...prev, title: name } : prev));
+      setActiveConversation((prev) => (prev ? apply(prev) : prev));
     }
   }, []);
 
   /**
    * RE-READ WHAT THE SESSION WOULD HAVE PUSHED, EACH TIME A SESSION STARTS.
    *
-   * The pattern is communication-hub's: its views list `sessionVersion` (or the session itself) as a
-   * dependency and re-read on every (re)connect - `ChannelView` re-lists the channel's messages before
-   * it re-subscribes, `ChannelList` and `MeetingList` re-fetch. A message posted while no session was
-   * running is never pushed again. Measured live 2026-10-05: on a slow page the session endpoint
-   * returned 5 s after the conversation opened, the person sent before the socket was up, and the
-   * assistant's targeted reply landed in that gap - delivered, readable in history, never shown.
+   * Anything that holds data the session would have pushed lists `sessionVersion` as a dependency and re-reads on
+   * every (re)connect, because a message posted while no session was running is never pushed again. On a slow page
+   * the session endpoint can answer about 5 s after the conversation opens, and an assistant's targeted reply that
+   * lands in that gap is delivered and readable in history, and shown only by the re-read.
    *
-   * ONE DIFFERENCE, AND IT IS THIS APP'S SHAPE RATHER THAN A NEW DESIGN. communication-hub replaces
-   * its per-view list; this app has ONE app-level handler and one list, so the open conversation is
+   * THIS APP HAS ONE app-level handler and one list, so the open conversation is
    * MERGED: a message not shown is added, and one shown with different content goes through the same
    * path a live UPDATE takes (most answers arrive as an update to a placeholder, so a missed UPDATE
    * would otherwise leave "One moment..." on screen). Replacing the list would drop an optimistic
@@ -665,7 +776,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       onMessageUpdate: (channelArn, msg) => { if (isActive(channelArn)) handleMessageUpdate(msg); },
       onMessageDelete: (channelArn, msgId) => { if (isActive(channelArn)) handleMessageDelete(msgId); },
       onMembershipChange: (channelArn) => { if (isActive(channelArn)) handleMembershipChange(); },
-      onChannelUpdate: (channelArn, name) => handleChannelUpdate(channelArn, name),
+      onChannelUpdate: (channelArn, name, metadata) => handleChannelUpdate(channelArn, name, metadata),
     });
 
     return () => setChannelListener(null);
@@ -728,6 +839,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
         return next;
       });
       void chimeService.markConversationRead(conversation.conversationArn);
+      announceConversationRead(conversation.conversationArn);
 
       const [conversationMessages, members] = await Promise.all([
         chimeService.listMessages(conversation.conversationArn),
@@ -790,8 +902,12 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
         botTypingTimeoutRef.current = undefined;
       }
 
-      setConversations((prev) => [newConversation, ...prev]);
+      // ONE ROW PER CONVERSATION. The membership event for the new conversation can arrive before this create returns,
+      // and its handler already added the row, so the created copy replaces it rather than standing beside it as a second
+      // active row for the same conversation.
+      setConversations((prev) => [newConversation, ...prev.filter((c) => c.id !== newConversation.id)]);
       setActiveConversationNow(newConversation);
+      reflectConversationInUrl(newConversation.id); // the new conversation is the open one: a reload reopens it
 
       // Greeting is rendered client-side as an empty-state — see
       // utils/greeting.ts and the empty branch in ConversationInterface.
@@ -827,9 +943,45 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
   const sendMessage = useCallback(async (
     content: string,
     attachment?: Attachment,
-    options?: { targetArn?: string; mentionBotArn?: string; mentionArns?: string[]; taskId?: string },
-  ): Promise<void> => {
-    if (!activeConversationRef.current || !user) return;
+    options?: SendMessageOptions,
+    writtenIn?: { id: string; conversationArn: string },
+  ): Promise<{ queued: boolean } | void> => {
+    const { taskId, ...sendOptions } = options ?? {};
+    const conversation = writtenIn ?? activeConversationRef.current;
+    if (!conversation || !user) return;
+    /** The conversation the message goes to is still the one open, so it is shown there as it is sent. */
+    const shownHere = () => activeConversationRef.current?.conversationArn === conversation.conversationArn;
+    const personId = personIdOf(viewerArn);
+    const session = cacheSession();
+    // INTO THE OUTBOX BEFORE THE SEND, out of it on the service's confirmation (`composerCache.ts`).
+    const entry: OutboxEntry = {
+      id: newClientMessageId(),
+      conversationId: conversation.id,
+      channelArn: conversation.conversationArn,
+      content,
+      ...(attachment || taskId ? { metadata: { ...(attachment ? { attachment } : {}), ...(taskId ? { task: { id: taskId } } : {}) } } : {}),
+      ...(Object.keys(sendOptions).length ? { options: sendOptions } : {}),
+      createdAt: Date.now(),
+    };
+    /** A message this device could not keep is never said to be waiting: the person is told, and the field keeps it. */
+    const notKept = () => {
+      const error = new Error(i18n.t('conversation.notKeptToSend'));
+      setSendError(error.message);
+      return error;
+    };
+    if (personId) {
+      // AN EARLIER MESSAGE OF THIS CONVERSATION STILL WAITING GOES FIRST: this one joins the outbox behind it, and the
+      // outbox sends them in order.
+      const earlierWaiting = outboxEntries(personId).some((e) => e.channelArn === conversation.conversationArn && !e.failed);
+      const kept = putOutboxEntry(personId, entry, session);
+      if (!isOnline() || earlierWaiting) {
+        if (!kept) throw notKept();
+        refreshQueued();
+        if (isOnline()) drainSoonRef.current();
+        return { queued: true };
+      }
+      putOutboxEntry(personId, { ...entry, attempted: true }, session);
+    }
 
     try {
       setIsSending(true);
@@ -846,19 +998,21 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       //
       // THE TASK ID AND NOTHING ELSE. The task already records which assistant owns it, so naming
       // one here would be a second source for one fact, free to disagree with the row it describes.
-      const task = options?.taskId ? { task: { id: options.taskId } } : undefined;
-      const metadata = attachment || task ? { ...(attachment ? { attachment } : {}), ...task } : undefined;
-      const userMessage = await chimeService.sendMessage(
-        activeConversationRef.current.conversationArn,
+      const metadata = entry.metadata;
+      const userMessage = await sendingNow(entry.id, () => chimeService.sendMessage(
+        conversation.conversationArn,
         content,
         metadata,
-        options,
-      );
+        { ...sendOptions, ...(taskId ? { taskId } : {}), ...(personId ? { clientMessageId: entry.id } : {}) },
+      ));
+      if (personId) removeOutboxEntry(personId, entry.id);
 
       if (attachment) {
         userMessage.attachment = attachment;
       }
 
+      // Shown where it was sent, and only there: a person who moved to another conversation meanwhile sees it on return.
+      if (!shownHere()) return { queued: false };
       // Optimistic add — bot response arrives via WebSocket
       setMessages((prev) => [...prev, userMessage]);
 
@@ -875,14 +1029,105 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       botTypingTimeoutRef.current = setTimeout(() => {
         setIsBotTyping(false);
       }, 90000);
+      return { queued: false };
     } catch (error) {
+      // NEVER HEARD BACK: the message stays in the outbox and is sent, once, when the person is back online, or after a
+      // short wait where the browser is online now (a server error or throttling).
+      if (personId && isUnknownOutcome(error)) {
+        if (!outboxEntries(personId).some((e) => e.id === entry.id)) throw notKept();
+        console.warn('Message kept to send again: its send was not answered', error);
+        refreshQueued();
+        if (isOnline()) drainSoonRef.current();
+        return { queued: true };
+      }
+      if (personId) removeOutboxEntry(personId, entry.id);
       console.error('Failed to send message:', error);
       setSendError(error instanceof Error ? error.message : 'Failed to send message');
       throw error;
     } finally {
       setIsSending(false);
     }
-  }, [user]);
+  }, [user, viewerArn, refreshQueued]);
+
+  /**
+   * SEND THE OUTBOX WHEN THE PERSON CAN BE HEARD AGAIN: each time a messaging session starts (`sessionVersion`) and each
+   * time the browser comes back online, in order and each message once (`outbox.ts`). A message sent into the open
+   * conversation joins its list as a send from here does.
+   */
+  const drainNow = useCallback(() => {
+    const personId = personIdOf(viewerArn);
+    if (!personId || outboxEntries(personId).length === 0) return;
+    void drainOutbox(personId, {
+      send: (e) => chimeService.sendMessage(e.channelArn, e.content, e.metadata, { ...e.options, clientMessageId: e.id }),
+      sentAlready: (e) => chimeService.sentByClientId(e.channelArn, e.id),
+      onSent: (e, sent) => {
+        const message = sent as Message | undefined;
+        if (!message?.id || activeConversationRef.current?.conversationArn !== e.channelArn) return;
+        const attachment = (e.metadata as { attachment?: Attachment } | undefined)?.attachment;
+        setMessages((prev) => (prev.some((m) => m.id === message.id) ? prev : [...prev, attachment ? { ...message, attachment } : message]));
+      },
+      onChange: refreshQueued,
+    }).then(() => {
+      // WHAT IS STILL WAITING WHILE THE BROWSER IS ONLINE is sent again after a pause that grows with each try, so a server
+      // error or throttling never leaves a message waiting for a reconnect that may not come.
+      const left = outboxEntries(personId).some((e) => !e.failed);
+      if (left && isOnline()) drainSoonRef.current();
+      else drainRetryRef.current = 0;
+    });
+  }, [viewerArn, refreshQueued]);
+  const drainNowRef = useRef(drainNow);
+  drainNowRef.current = drainNow;
+  /** The pause before the next send of what waits, and how many tries it has had. */
+  const drainTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const drainRetryRef = useRef(0);
+  const drainSoonRef = useRef<() => void>(() => undefined);
+  drainSoonRef.current = () => {
+    if (drainTimerRef.current) return;
+    const delay = OUTBOX_RETRY_DELAYS_MS[Math.min(drainRetryRef.current, OUTBOX_RETRY_DELAYS_MS.length - 1)];
+    drainRetryRef.current += 1;
+    drainTimerRef.current = setTimeout(() => {
+      drainTimerRef.current = null;
+      drainNowRef.current();
+    }, delay);
+  };
+  useEffect(() => () => { if (drainTimerRef.current) clearTimeout(drainTimerRef.current); }, []);
+
+  useEffect(() => {
+    if (sessionVersion) drainNow();
+  }, [sessionVersion, drainNow]);
+
+  useEffect(() => {
+    const online = () => drainNow();
+    window.addEventListener('online', online);
+    return () => window.removeEventListener('online', online);
+  }, [drainNow]);
+
+  const retryQueuedMessage = useCallback((id: string) => {
+    const personId = personIdOf(viewerArn);
+    const entry = personId ? outboxEntries(personId).find((e) => e.id === id) : undefined;
+    if (!personId || !entry) return;
+    const { failed: _failed, ...rest } = entry;
+    putOutboxEntry(personId, rest, cacheSession());
+    refreshQueued();
+    drainNow();
+  }, [viewerArn, refreshQueued, drainNow]);
+
+  const discardQueuedMessage = useCallback((id: string) => {
+    const personId = personIdOf(viewerArn);
+    if (!personId) return;
+    removeOutboxEntry(personId, id);
+    refreshQueued();
+  }, [viewerArn, refreshQueued]);
+
+  /**
+   * The open conversation's share of the outbox, and every message the service refused in a conversation the person no
+   * longer has, which no other conversation would ever show, so it can be read and discarded.
+   */
+  const queuedMessages = useMemo(() => {
+    const listed = new Set(conversations.map((c) => c.conversationArn));
+    return outbox.filter((e) => e.channelArn === activeConversation?.conversationArn
+      || (!!e.failed && conversations.length > 0 && !listed.has(e.channelArn)));
+  }, [outbox, activeConversation?.conversationArn, conversations]);
 
   const deleteConversation = useCallback((conversationId: string) => {
     setConversations((prev) => prev.filter((c) => c.id !== conversationId));
@@ -1111,6 +1356,9 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     answeringTaskId,
     answerItem,
     clearAnswering,
+    queuedMessages,
+    retryQueuedMessage,
+    discardQueuedMessage,
   }), [
     conversations, activeConversation, messages, isLoadingMessages,
     isInitializing, isSending, isBotTyping, sendError, channelMembers,
@@ -1127,6 +1375,9 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     answeringTaskId,
     answerItem,
     clearAnswering,
+    queuedMessages,
+    retryQueuedMessage,
+    discardQueuedMessage,
   ]);
 
   return <ConversationContext.Provider value={value}>{children}</ConversationContext.Provider>;

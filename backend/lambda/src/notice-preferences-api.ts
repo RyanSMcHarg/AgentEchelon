@@ -15,7 +15,7 @@
  * `<personId>#notices` items of the user-profile table, and only their `muted`, `personArn` and `updatedAt`
  * attributes (`notification-stack.ts`), so it cannot read or change a profile, a contact copy or a token.
  *
- * A guest, a one-conversation session and a host assertion resolve to nobody here (`callerPerson`): they
+ * A guest and a host assertion resolve to nobody here (`callerPerson`): they
  * have no account whose mail they manage.
  */
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';

@@ -42,6 +42,8 @@ export interface VisibleMessage {
    * the finished text, so for an answer this is when the work finished, which createdAt is not.
    */
   lastUpdatedAt: string;
+  /** The message's `Metadata` as stored, empty when it has none: what kind of message an assistant posted. */
+  metadata: string;
 }
 
 /**
@@ -69,6 +71,7 @@ export function messageRowsVisibleTo(channelArn: string, memberArn: string): Vis
         content,
         createdAt: String(m?.CreatedTimestamp || ''),
         lastUpdatedAt: String(m?.LastUpdatedTimestamp || m?.CreatedTimestamp || ''),
+        metadata: String(m?.Metadata || ''),
       };
     });
   } catch {
@@ -122,6 +125,18 @@ export function assistantsIn(channelArn: string, asArn: string): Array<{ arn: st
     return members
       .filter((m) => (m?.Member?.Arn || '').includes('/bot/'))
       .map((m) => ({ arn: m.Member!.Arn!, name: m.Member?.Name || '' }));
+  } catch {
+    return [];
+  }
+}
+
+/** The people in this conversation, by member ARN, read from its membership as a member of it. */
+export function peopleIn(channelArn: string, asArn: string): string[] {
+  try {
+    const r = aws(['chime-sdk-messaging', 'list-channel-memberships',
+      '--channel-arn', channelArn, '--chime-bearer', asArn, '--max-results', '50']);
+    const members: Array<{ Member?: { Arn?: string } }> = r?.ChannelMemberships || [];
+    return members.map((m) => m?.Member?.Arn || '').filter((arn) => arn.includes('/user/'));
   } catch {
     return [];
   }

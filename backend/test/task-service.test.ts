@@ -99,32 +99,41 @@ describe('a conversation this instance may not serve', () => {
     expect(out.current).toBeNull();
   });
 
-  it('PROCEEDS and alarms when the tag read fails, because this check is not the boundary', async () => {
+  it('is refused, with a security event, when the tag read fails on the conversation the caller named', async () => {
     const CH = nextChannel();
-    // REVERSED DELIBERATELY (maintainer, 2026-08-31). This asserted the opposite, arguing that "an
-    // unreadable tag is not a permissive one" and that an outage must not become a disclosure.
-    // The argument is a fair one and it is not dismissed: this service IS the only guard on the
-    // tasks table, whose grant carries no condition (see this file's header). What it is NOT is the
-    // gate on who may be in this conversation or send into it - those are IAM, tag-gated and
-    // fail-closed, and settled long before anything arrives here.
-    //
-    // A failed tag read is not evidence of a violation; it is evidence that this check cannot run.
-    // Refusing on it let a Chime throttle impersonate a policy decision and silently drop legitimate
-    // work, including fire-and-forget status writes that nothing retries. For an outage to become a
-    // disclosure now, IAM would have to be wrong at the same moment - a compound failure - whereas
-    // the old behavior broke every cold-container task read during any tag-read throttle.
+    // An unreadable tag is not a permissive one. This check is one of the two enforcement layers on
+    // a task operation and holds only when it can establish the classification, so an outage refuses.
     const err = jest.spyOn(console, 'error').mockImplementation(() => {});
     try {
       mockTags.mockRejectedValue(new Error('throttled'));
       const out = await svc.tasksForTurn({ channelArn: CH, senderArn: ALICE });
-      expect(out.here.length).toBeGreaterThan(0);
-      // The alarm is what makes proceeding defensible, so it is asserted rather than assumed.
+      expect(out).toEqual({ current: null, here: [], elsewhere: [] });
+      expect(mockSend).not.toHaveBeenCalled();
       expect(err).toHaveBeenCalledWith(
-        expect.stringContaining('PROCEEDING'),
-        expect.objectContaining({ channelArn: CH }),
+        expect.stringContaining('[SecurityEvent]'),
+        expect.objectContaining({ channelArn: CH, leg: 'here' }),
       );
     } finally {
       err.mockRestore();
+    }
+  });
+
+  it('refuses a write when the tag read fails', async () => {
+    const CH = nextChannel();
+    const err = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      mockTags.mockRejectedValue(new Error('throttled'));
+      const task = await svc.openTask({
+        event: { requestAttributes: { 'x-amz-lex:channel-arn': CH } },
+        deliveryOption: 'inline',
+        taskType: 'report_generation',
+      });
+      expect(task).toBeNull();
+      expect(mockSend).not.toHaveBeenCalled();
+    } finally {
+      err.mockRestore();
+      warn.mockRestore();
     }
   });
 

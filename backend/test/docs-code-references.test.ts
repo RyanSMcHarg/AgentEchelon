@@ -31,6 +31,10 @@ const NOT_YET_BUILT: Record<string, string> = {
   'backend/lambda/src/lib/translation.ts':
     'SPEC-BILINGUAL-CONVERSATIONS level 2 (the inference pivot) is design, not built. The spec marks '
     + 'the path as not existing yet, so a reader is not misled.',
+  'backend/test/every-person-route-declares-its-second-layer.test.ts':
+    'DESIGN-PERSON-ROUTE-AUTHORIZATION section 5.1 specifies this guard; its status line marks it NOT BUILT.',
+  'backend/scripts/deny-test-person-routes.mjs':
+    'DESIGN-PERSON-ROUTE-AUTHORIZATION section 5.2 specifies this deployed deny test; its status line marks it NOT BUILT.',
 };
 
 /**

@@ -45,7 +45,7 @@
  * reported as a derived fact rather than as prose someone has to maintain:
  *
  *   - `analyticsMode` decides which analytics routes are served.
- *   - `issuers` declaring a second issuer (a host app's pool with the one-conversation session) adds no
+ *   - `issuers` declaring a second issuer (a host app's pool) adds no
  *     route: every person route is behind the one edge authorizer for every issuer.
  *   - `sleepMode` adds the paused-deployment probe and the admin sleep and wake routes.
  *
@@ -73,10 +73,10 @@ export const GEN_COMMAND = 'cd backend && npm run gen-api-contract';
 const SYNTH_ACCOUNT = '123456789012';
 const SYNTH_REGION = 'us-east-1';
 
-/** A second issuer: a host app's pool, shaped like a real one, with the one-conversation session. */
-const SYNTH_SECOND_ISSUERS = [
+/** A second issuer: a host app's pool, shaped like a real one, whose context conversations are at `standard`. */
+export const SYNTH_SECOND_ISSUERS = [
   { id: 'deployment', kind: 'cognito-pool', pool: 'self', clearance: { groups: true, classifications: ['basic', 'standard', 'premium', 'admin'] }, admin: true },
-  { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_SecondIssuer', audience: 'second-issuer-client', clearance: { oneChannel: 'standard', classifications: ['standard'] } },
+  { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_SecondIssuer', audience: 'second-issuer-client', clearance: { fixed: ['standard'], classifications: ['standard'] }, contextClassification: 'standard' },
 ];
 
 /**

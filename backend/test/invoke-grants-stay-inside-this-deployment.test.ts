@@ -59,6 +59,10 @@ const classificationProps = {
   appInstanceArn,
   attachmentsBucketName: 'agent-echelon-attachments-test',
   attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
+  companyBucketName: 'agent-echelon-company-test',
+  companyBucketArn: 'arn:aws:s3:::agent-echelon-company-test',
+  profileBucketName: 'agent-echelon-profile-test',
+  profileBucketArn: 'arn:aws:s3:::agent-echelon-profile-test',
 };
 
 /** Every stack that grants an invoke, each synthesized in its own app. */
@@ -75,7 +79,7 @@ function stacksThatGrantInvoke(): Array<{ name: string; template: Template }> {
   add('ChannelFlow', (app) => new ChannelFlowStack(app, 'AgentEchelonChannelFlow', { env, appInstanceArn }));
   add('PostProcessing', (app) => new PostProcessingStack(app, 'AgentEchelonPostProcessing', {
     env, appInstanceArn, messageStream: testMessageStream(app),
-    attachmentsBucketName: 'test-attachments', attachmentsBucketArn: 'arn:aws:s3:::test-attachments',
+    profileBucketName: 'test-profile', profileBucketArn: 'arn:aws:s3:::test-profile',
   }));
   add('Assistants-basic', (app) => assistantsOf('basic')(app, 'AgentEchelonAssistants-basic', classificationProps));
   add('Assistants-standard', (app) => assistantsOf('standard')(app, 'AgentEchelonAssistants-standard', classificationProps));

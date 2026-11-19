@@ -124,11 +124,13 @@ async function main() {
       continue;
     }
     try {
-      await call(api, 'version', { profileName: name }, credentials);
-      await call(api, 'draft', { profileName: name, patch: { welcome: null, eventWorkflows: plan.eventWorkflows } }, credentials);
+      // EACH STEP NAMES THE DRAFT IT ACTS ON (its configId), so a draft somebody else replaced in between is refused
+      // rather than edited or promoted.
+      const cloned = await call(api, 'version', { profileName: name }, credentials);
+      const edited = await call(api, 'draft', { profileName: name, configId: cloned.draftConfigId, patch: { welcome: null, eventWorkflows: plan.eventWorkflows } }, credentials);
       const validation = await call(api, 'validate', { profileName: name }, credentials);
       if (validation.valid === false) throw new Error(`the migrated draft is not valid: ${(validation.errors || []).join('; ')}`);
-      const activated = await call(api, 'activate', { profileName: name }, credentials);
+      const activated = await call(api, 'activate', { profileName: name, configId: edited.draftConfigId }, credentials);
       migrated++;
       console.log(`${name}: activated version ${activated.version} (${activated.configId})`);
     } catch (err) {

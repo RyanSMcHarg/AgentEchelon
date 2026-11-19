@@ -44,6 +44,9 @@ const ShareConversationModal: React.FC<ShareConversationModalProps> = ({ isOpen,
       if (refusal?.code === 'MEMBERSHIP_FROM_SOURCE') {
         // The server's sentence is English; the reason shown is the client's own, localized (tenet D11).
         setError(shareDisabledReason(refusal.membershipSource || 'list', t));
+      } else if (refusal?.code === 'RECIPIENT_NOT_ADDABLE') {
+        // One answer for every recipient who cannot be added, so the sentence names nothing about them.
+        setError(t('share.recipientNotAddable'));
       } else {
         setError(err instanceof Error ? err.message : t('share.failureFallback'));
       }

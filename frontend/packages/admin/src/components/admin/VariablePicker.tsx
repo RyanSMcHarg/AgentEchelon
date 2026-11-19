@@ -13,6 +13,8 @@ import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   buildSourceTable,
+  contextSourceOf,
+  mayDecide,
   tableFromPublished,
   versionLookup,
   type PickableSource,
@@ -57,10 +59,12 @@ export interface PickerRow {
 /** The rows, the version's variables first, then every source the classification publishes. */
 export function pickerRows(published: PublishedVariables | undefined, variables: Readonly<Record<string, VersionVariable>> | undefined): PickerRow[] {
   const sources = published?.sources ?? [];
-  const bySource = new Map(sources.map((s) => [s.source, s]));
-  const named: PickerRow[] = Object.entries(variables ?? {}).flatMap(([name, v]) => {
-    const src = bySource.get(v.source);
-    return src ? [{ name, variable: name, src }] : [];
+  // A VARIABLE IS LISTED AS THE LOOKUP READS IT (`consoleLookup`), so a `fact:` variable, whose key the intake publishes
+  // apart from the sources, is offered as validation admits it.
+  const lookup = consoleLookup(published, variables);
+  const named: PickerRow[] = Object.keys(variables ?? {}).flatMap((name) => {
+    const src = lookup(name);
+    return src ? [{ name, variable: name, src: { ...src, mayDecide: mayDecide(src) } }] : [];
   });
   return [...named, ...sources.map((src) => ({ name: src.source, src }))];
 }
@@ -71,37 +75,58 @@ const VariablePicker: React.FC<{
   purpose: PickPurpose;
   /** Who reads the message the pick decides or enters; absent when the message's reader is decided where it is said. */
   audience?: 'room' | 'addressed';
-  /** Leaves out sources this call site never reads, said in `hiddenNote`. */
-  only?: (src: PickableSource) => boolean;
+  /** Leaves out sources this call site never reads, said in `hiddenNote`. Given the row, a version's variable by its name. */
+  only?: (src: PickableSource, row: PickerRow) => boolean;
+  /** The context sources the version reads: a `ctx:` field of any other is never resolved, and is said so. */
+  contextSources?: readonly string[];
   hiddenNote?: string;
   /** Picking only the version's own variables (a welcome inserts them by name). */
   variablesOnly?: boolean;
   onPick: (name: string, src: PickableSource) => void;
+  /** The fields the call site itself supplies, listed first, each with what it holds. */
+  builtIns?: ReadonlyArray<{ name: string; help: string }>;
+  onPickBuiltIn?: (name: string) => void;
   testId: string;
-}> = ({ published, variables, purpose, audience, only, hiddenNote, variablesOnly, onPick, testId }) => {
+}> = ({ published, variables, purpose, audience, only, hiddenNote, variablesOnly, contextSources, onPick, builtIns = [], onPickBuiltIn, testId }) => {
   const { t: translate } = useTranslation();
   const t = translate as unknown as T;
   const [filter, setFilter] = useState('');
   const rows = pickerRows(published, variables)
-    .filter((r) => (!only || only(r.src)))
+    .filter((r) => (!only || only(r.src, r)))
     .filter((r) => !filter || r.name.toLowerCase().includes(filter.toLowerCase()) || r.src.source.toLowerCase().includes(filter.toLowerCase()));
+  const deciding = purpose === 'decide';
+  const shownBuiltIns = builtIns.filter((b) => !filter || b.name.toLowerCase().includes(filter.toLowerCase()));
   return (
     <details className="admin-variable-picker" data-testid={testId}>
       <summary>{t(purpose === 'decide' ? 'admin.variables.pickDecide' : 'admin.variables.pickInsert')}</summary>
-      <p className="admin-field-hint">{t('admin.variables.help')}</p>
+      <p className="admin-field-hint">{t(deciding ? 'admin.variables.helpDecide' : 'admin.variables.helpInsert')}</p>
       {!published && <p className="admin-field-hint" role="status" data-testid={`${testId}-unread`}>{t('admin.variables.unreadable')}</p>}
-      {hiddenNote && <p className="admin-field-hint">{hiddenNote}</p>}
+      {hiddenNote && deciding && <p className="admin-field-hint">{hiddenNote}</p>}
       <label><span className="admin-field-label">{t('admin.variables.filter')}</span>
         <input type="text" className="input" value={filter} onChange={(e) => setFilter(e.target.value)} data-testid={`${testId}-filter`} />
       </label>
       <table className="admin-mini-table">
         <thead><tr>
           <th>{t('admin.variables.col.name')}</th><th>{t('admin.variables.col.type')}</th>
-          <th>{t('admin.variables.col.trust')}</th><th>{t('admin.variables.col.decides')}</th><th />
+          {deciding && <><th>{t('admin.variables.col.trust')}</th><th>{t('admin.variables.col.decides')}</th></>}<th />
         </tr></thead>
         <tbody>
+          {shownBuiltIns.map((b) => (
+            <tr key={b.name} data-testid={`${testId}-row-${b.name}`}>
+              <td><code>{b.name}</code><div className="admin-field-hint">{b.help}</div></td>
+              <td><code>string</code></td>
+              <td>
+                <button type="button" className="btn-secondary" data-testid={`${testId}-row-${b.name}-pick`}
+                  aria-label={t('admin.variables.pick', { name: b.name })} onClick={() => onPickBuiltIn?.(b.name)}>
+                  {t('admin.variables.pickButton')}
+                </button>
+              </td>
+            </tr>
+          ))}
           {rows.map((r) => {
-            const refusal = pickRefusal(r.src, purpose, audience) ?? (variablesOnly && !r.variable ? 'admin.variables.refused.nameFirst' : undefined);
+            const unread = contextSources && contextSourceOf(r.src.source) && !contextSources.includes(contextSourceOf(r.src.source)!);
+            const refusal = pickRefusal(r.src, purpose, audience) ?? (variablesOnly && !r.variable ? 'admin.variables.refused.nameFirst' : undefined)
+              ?? (unread ? 'admin.variables.refused.sourceNotRead' : undefined);
             const id = `${testId}-row-${r.name}`;
             return (
               <tr key={id} data-testid={id} data-refused={refusal ? 'true' : 'false'}>
@@ -111,8 +136,8 @@ const VariablePicker: React.FC<{
                   <div className="admin-field-hint">{r.src.origin}</div>
                 </td>
                 <td><code>{r.src.type}</code>{r.src.values?.length ? <span className="admin-field-hint"> ({r.src.values.join(', ')})</span> : null}</td>
-                <td>{t(`admin.variables.trust.${r.src.trust}`)}{r.src.describesPerson && <div className="admin-field-hint">{t('admin.variables.describesPerson')}</div>}</td>
-                <td>{t(r.src.mayDecide ? 'admin.variables.decidesYes' : 'admin.variables.decidesNo')}</td>
+                {deciding && <td>{t(`admin.variables.trust.${r.src.trust}`)}{r.src.describesPerson && <div className="admin-field-hint">{t('admin.variables.describesPerson')}</div>}</td>}
+                {deciding && <td>{t(r.src.mayDecide ? 'admin.variables.decidesYes' : 'admin.variables.decidesNo')}</td>}
                 <td>
                   <button type="button" className="btn-secondary" disabled={!!refusal} data-testid={`${id}-pick`}
                     aria-label={t('admin.variables.pick', { name: r.name })} onClick={() => onPick(r.name, r.src)}>

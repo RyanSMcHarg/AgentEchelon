@@ -14,6 +14,7 @@ import DataTable, { type Column } from './DataTable';
 import { queryAnalytics } from '../../services/analyticsService';
 import { modelDisplayName, type AnalyticsDateRange } from '@ae/shared';
 import type { PerformanceFilters } from './PerformanceFilters';
+import WorkflowEditorLink from './WorkflowEditorLink';
 
 type Row = Record<string, unknown>;
 
@@ -37,7 +38,7 @@ export function stepBreakdownParams(intent: string, step: string | undefined, fi
     ...(filters.assistant ? { agentType: filters.assistant } : {}),
     ...(filters.classification ? { conversationClassification: filters.classification } : {}),
     ...(filters.role ? { assistantRole: filters.role } : {}),
-    ...(filters.version ? { profileVersion: String(filters.version) } : {}),
+    ...(filters.version ? { profileVersion: filters.version.join(',') } : {}),
   };
 }
 
@@ -73,9 +74,11 @@ const IntentStepBreakdown: React.FC<{
   step?: string;
   dateRange: AnalyticsDateRange;
   filters: PerformanceFilters;
+  /** The assistant whose definition served the intent's turns, whose workflow editor a task step opens in. */
+  assistant?: string | null;
   /** Narrow to one step, or clear the narrowing with null. */
   onStep: (step: string | null) => void;
-}> = ({ intent, step, dateRange, filters, onStep }) => {
+}> = ({ intent, step, dateRange, filters, assistant, onStep }) => {
   const { t, i18n } = useTranslation();
   const [state, setState] = useState<{ rows: Row[]; loading: boolean; unsupported: boolean }>({ rows: [], loading: true, unsupported: false });
   useEffect(() => {
@@ -121,6 +124,9 @@ const IntentStepBreakdown: React.FC<{
         <>
           {step ? <code>{String(v)}</code>
             : <button type="button" className="btn-link" data-testid={`intent-step-open-${String(v)}`} title={t('admin.effectiveness.steps.open')} onClick={() => onStep(String(v))}><code>{String(v)}</code></button>}
+          {/* THE STEP IN THE EDITOR: the intent's task machine, as the editor resolves it from the intent, with this step selected. */}
+          <WorkflowEditorLink assistant={assistant || filters.assistant} workflow={intent} step={String(v)} linkOnly spaced
+            testId={`intent-step-editor-${String(v)}`}>{t('admin.workflowLink.step')}</WorkflowEditorLink>
           {row.taskStepSummary != null && (
             <span className="admin-muted" data-testid={`intent-task-step-summary-${String(v)}`}>
               {' '}{t('admin.effectiveness.steps.taskStepSummary', {
@@ -143,7 +149,7 @@ const IntentStepBreakdown: React.FC<{
 
   return (
     <div className="admin-section" data-testid="intent-step-breakdown">
-      <h4>{t('admin.effectiveness.steps.title')}</h4>
+      <h3>{t('admin.effectiveness.steps.title')}</h3>
       <p className="admin-tab-description">{t(workflow ? 'admin.effectiveness.steps.helpWorkflow' : 'admin.effectiveness.steps.help')}</p>
       {step && (
         <p className="admin-field-hint" role="status" data-testid="intent-step-filter">
@@ -160,7 +166,7 @@ const IntentStepBreakdown: React.FC<{
                   <DataTable data={turnSteps} pageSize={0} emptyMessage={t('admin.effectiveness.steps.noneRecorded')} columns={columns} />
                 </div>
                 {unpriced > 0 && <p className="admin-field-hint" data-testid="intent-steps-unpriced">{t('admin.effectiveness.steps.unpriced', { count: unpriced })}</p>}
-                <h4>{t('admin.effectiveness.models.title')}</h4>
+                <h3>{t('admin.effectiveness.models.title')}</h3>
                 <p className="admin-tab-description">{t('admin.effectiveness.models.help')}</p>
                 <div data-testid="intent-models-table">
                   <DataTable data={models} pageSize={0} columns={[

@@ -68,7 +68,7 @@ describe('what a client is told', () => {
   it('is each classification\'s name, audience, badge token and grants, and whether a conversation is held at it', () => {
     const shipped = clientClassifications(DEFAULT_PROFILES_CONFIG);
     expect(shipped.find((c) => c.value === 'standard')).toEqual({
-      value: 'standard', displayName: 'Standard', audience: 'members', badgeToken: 'cls-2', grants: ['basic', 'standard'], conversational: true,
+      value: 'standard', displayName: 'Internal', audience: 'members', badgeToken: 'cls-2', grants: ['basic', 'standard'], conversational: true,
       models: { selected: ['haiku', 'sonnet', 'titan', 'gpt_oss_20b', 'deepseek_v3', 'deepseek_r1'], default: 'sonnet' },
     });
     expect(shipped.find((c) => c.value === 'customer')).toMatchObject({ audience: 'outside', displayName: 'Customer', conversational: true });

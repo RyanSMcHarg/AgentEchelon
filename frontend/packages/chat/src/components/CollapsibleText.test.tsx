@@ -3,6 +3,14 @@ import { render, fireEvent } from '@testing-library/react';
 import { CollapsibleText, MESSAGE_COLLAPSE_THRESHOLD } from './CollapsibleText';
 
 describe('CollapsibleText', () => {
+  it('a preview cut at a space after a number keeps the number whole', () => {
+    const lead = 'x'.repeat(MESSAGE_COLLAPSE_THRESHOLD - 40);
+    const amount = '4,500,000';
+    const content = `${lead} ${amount} ${'y'.repeat(300)}`;
+    const { container } = render(<CollapsibleText isBot={false} content={content} />);
+    expect(container.textContent).toContain(`${amount}…`);
+  });
+
   it('renders assistant Markdown as HTML (heading, bold, code, list, link, table)', () => {
     const md = [
       '# Heading',
@@ -110,6 +118,18 @@ describe('CollapsibleText', () => {
     expect(link?.getAttribute('href')).toContain('#message=m1');
   });
 
+  it('opens a conversation link from a meeting window in a new tab of the app, so the meeting stays', () => {
+    sessionStorage.setItem('ae.meeting.window', 'meet-1');
+    try {
+      const { container } = render(<CollapsibleText content={'[the room](?conversation=room-1)'} isBot={true} />);
+      const link = container.querySelector('a');
+      expect(link?.getAttribute('target')).toBe('_blank');
+      expect(link?.getAttribute('rel')).toContain('noopener');
+    } finally {
+      sessionStorage.removeItem('ae.meeting.window');
+    }
+  });
+
   it('does not let a look-alike href escape the same-tab exception', () => {
     // The exception is a SHAPE test, not a trust decision - an injected message can spell it too. So
     // it must admit only a relative query string: anything naming another origin keeps `_blank` and
@@ -154,5 +174,15 @@ describe('CollapsibleText', () => {
   it('does not collapse a short assistant message', () => {
     const { queryByRole } = render(<CollapsibleText content={'short reply'} isBot={true} />);
     expect(queryByRole('button', { name: /show more/i })).toBeNull();
+  });
+
+  it('renders a meeting link whose encoding does not decode as an ordinary link, and the message still shows', () => {
+    for (const href of ['?meeting=%zz', '?meeting=%E0%A4']) {
+      const { container, unmount } = render(<CollapsibleText content={`[join](${href})`} isBot={true} />);
+      const link = container.querySelector('a');
+      expect(link?.textContent).toBe('join');
+      expect(link?.getAttribute('target')).toBe('_blank');
+      unmount();
+    }
   });
 });

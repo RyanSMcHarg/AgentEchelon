@@ -24,9 +24,10 @@ import {
   StartQueryExecutionCommand,
   GetQueryExecutionCommand,
   GetQueryResultsCommand,
+  StopQueryExecutionCommand,
   QueryExecutionState,
 } from '@aws-sdk/client-athena';
-import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
+import { ensureDataPlaneArn } from './event-archive.js';
 import {
   hasDataPlane,
   adminListConversations,
@@ -41,6 +42,7 @@ import type {
 } from '../analytics-aurora/admin-conversations-aurora.js';
 import type { CleanConversation } from '../analytics-aurora/clean-copy.js';
 import { unwrapLexEnvelope } from './lex-envelope.js';
+import { isAssistantSql } from './person-arn.js';
 import { decodeContent } from './chime/history.js';
 
 /** A conversation in the list. The Athena archive derives no lifecycle `state`. */
@@ -77,28 +79,11 @@ export interface ArchiveReader {
 
 // ── Selection ─────────────────────────────────────────────────────────────────────────────────────
 
-const ssm = new SSMClient({});
-
 // The data-plane ARN cannot be passed from the Aurora stack through CDK props: the Aurora stack already
 // depends on the stack this handler deploys in, so a reverse prop would be circular. The Aurora stack
-// publishes the ARN to SSM and it is resolved once per container, into the env the data-plane client
-// reads. An absent parameter (Athena mode) leaves the Athena reader selected.
-let dataPlaneResolved = false;
-async function ensureDataPlaneArn(): Promise<void> {
-  if (dataPlaneResolved || process.env.AURORA_DATA_PLANE_ARN) {
-    dataPlaneResolved = true;
-    return;
-  }
-  const paramName = process.env.AURORA_DATA_PLANE_ARN_PARAM;
-  if (!paramName) { dataPlaneResolved = true; return; }
-  try {
-    const r = await ssm.send(new GetParameterCommand({ Name: paramName }));
-    if (r.Parameter?.Value) process.env.AURORA_DATA_PLANE_ARN = r.Parameter.Value;
-  } catch {
-    // Parameter absent (Athena mode) or unreadable: stay on the Athena reader.
-  }
-  dataPlaneResolved = true;
-}
+// publishes the ARN to SSM and the one resolver (`ensureDataPlaneArn`, `event-archive.ts`) reads it into the
+// env the data-plane client reads. An absent parameter (Athena mode) selects the Athena reader; a parameter
+// that could not be read throws, so the request fails rather than reading the wrong store.
 
 /** The reader for this deployment's analytics mode, chosen once per request. */
 export async function archiveReader(): Promise<ArchiveReader> {
@@ -142,29 +127,83 @@ const athena = new AthenaClient({});
 const ATHENA_WORKGROUP = process.env.ATHENA_WORKGROUP || 'agent-echelon-analytics';
 const ATHENA_DATABASE = process.env.ATHENA_DATABASE || 'agent_echelon';
 
-async function runAthena(query: string): Promise<{ columns: string[]; rows: string[][] }> {
-  const start = await athena.send(
-    new StartQueryExecutionCommand({
-      QueryString: query,
-      WorkGroup: ATHENA_WORKGROUP,
-      QueryExecutionContext: { Database: ATHENA_DATABASE },
-    }),
-  );
+/**
+ * How long an archive read may take when its caller names no deadline: inside the 20 s the admin conversation
+ * function runs for, and so inside the HTTP API's 30 s integration limit every admin route is served under.
+ */
+export const DEFAULT_ARCHIVE_QUERY_MS = 18_000;
+const POLL_MS = 1000;
+
+/** The query did not finish by its caller's deadline. It was stopped, so it scans nothing further. */
+export class ArchiveQueryTimeout extends Error {
+  constructor(public readonly queryExecutionId: string) {
+    super('the archive query did not finish by its deadline');
+    this.name = 'ArchiveQueryTimeout';
+  }
+}
+
+export interface ArchiveQueryOptions {
+  /** The most rows returned; a result that holds more is answered as `truncated`. */
+  maxRows: number;
+  /** When the caller must have its answer, in epoch milliseconds. Defaults to {@link DEFAULT_ARCHIVE_QUERY_MS} from now. */
+  deadlineAt?: number;
+}
+
+/**
+ * THE ONE ARCHIVE QUERY: started in the archive's workgroup and database, polled until it finishes or its caller's
+ * deadline passes, then read page by page up to `maxRows`. Every Athena read of the archive, the conversation family's
+ * and a capability's family in the same bucket (such as `meeting_events`), goes through here.
+ *
+ *  - A query that has not finished by the deadline is stopped and {@link ArchiveQueryTimeout} is thrown, so the caller
+ *    answers inside its own limit and no scan runs on with nobody waiting for it.
+ *  - `truncated` is true when the result held more than `maxRows`, or when the deadline passed while the pages were
+ *    being read, so a caller never mistakes part of the answer for the whole.
+ */
+export async function runArchiveQuery(
+  query: string,
+  opts: ArchiveQueryOptions,
+): Promise<{ columns: string[]; rows: string[][]; truncated: boolean }> {
+  const deadlineAt = opts.deadlineAt ?? Date.now() + DEFAULT_ARCHIVE_QUERY_MS;
+  const start = await athena.send(new StartQueryExecutionCommand({
+    QueryString: query, WorkGroup: ATHENA_WORKGROUP, QueryExecutionContext: { Database: ATHENA_DATABASE },
+  }));
   const qid = start.QueryExecutionId!;
-  // Poll for completion (the admin tab tolerates a few seconds).
-  for (let i = 0; i < 30; i++) {
+  for (;;) {
     const exec = await athena.send(new GetQueryExecutionCommand({ QueryExecutionId: qid }));
     const state = exec.QueryExecution?.Status?.State;
     if (state === QueryExecutionState.SUCCEEDED) break;
     if (state === QueryExecutionState.FAILED || state === QueryExecutionState.CANCELLED) {
       throw new Error(`Athena query ${state}: ${exec.QueryExecution?.Status?.StateChangeReason || ''}`);
     }
-    await new Promise((r) => setTimeout(r, 1000));
+    const left = deadlineAt - Date.now();
+    if (left <= 0) {
+      await athena.send(new StopQueryExecutionCommand({ QueryExecutionId: qid }))
+        .catch((err: unknown) => console.warn('[archive-reader] the late query could not be stopped', { qid, err: (err as Error)?.name }));
+      throw new ArchiveQueryTimeout(qid);
+    }
+    await new Promise((r) => setTimeout(r, Math.min(POLL_MS, left)));
   }
-  const results = await athena.send(new GetQueryResultsCommand({ QueryExecutionId: qid, MaxResults: 1000 }));
-  const rawRows = results.ResultSet?.Rows || [];
-  const columns = (rawRows[0]?.Data || []).map((c) => c.VarCharValue || '');
-  const rows = rawRows.slice(1).map((r) => (r.Data || []).map((c) => c.VarCharValue ?? ''));
+  let columns: string[] = [];
+  const rows: string[][] = [];
+  let next: string | undefined;
+  let first = true;
+  do {
+    if (!first && Date.now() >= deadlineAt) return { columns, rows, truncated: true };
+    const page = await athena.send(new GetQueryResultsCommand({ QueryExecutionId: qid, MaxResults: 1000, NextToken: next }));
+    const raw = page.ResultSet?.Rows || [];
+    if (first) { columns = (raw[0]?.Data || []).map((c) => c.VarCharValue || ''); first = false; raw.shift(); }
+    for (const r of raw) {
+      if (rows.length >= opts.maxRows) return { columns, rows, truncated: true };
+      rows.push((r.Data || []).map((c) => c.VarCharValue ?? ''));
+    }
+    next = page.NextToken;
+  } while (next);
+  return { columns, rows, truncated: false };
+}
+
+/** The conversation archive's reads: one page of at most 1000 rows, inside the default deadline. */
+async function runAthena(query: string): Promise<{ columns: string[]; rows: string[][] }> {
+  const { columns, rows } = await runArchiveQuery(query, { maxRows: 1000 });
   return { columns, rows };
 }
 
@@ -178,6 +217,17 @@ function safeJsonParse(value?: string | null): Record<string, unknown> {
 }
 
 const quoted = (s: string) => s.replace(/'/g, "''");
+
+/**
+ * THE ROW A CHANNEL'S CLASSIFICATION IS READ FROM: an assistant's record in a declared partition.
+ *
+ * The `user_type` partition is set from the platform-written Metadata of an assistant's record
+ * (`ARCHIVE_PARTITION_QUERY`, `lib/constructs/archive-partitions.ts`); every other record is `unknown`. This
+ * predicate reads only those trusted rows, so a person's record never decides a conversation's classification,
+ * including one archived under a partition its member-writable Metadata named.
+ */
+export const TRUSTED_CLASSIFICATION_ROW =
+  `user_type <> 'unknown' AND ${isAssistantSql("json_extract_scalar(line, '$.Payload.Sender.Arn')")}`;
 
 const MEMBERSHIP_ACTION: Record<string, string> = {
   CREATE_CHANNEL_MEMBERSHIP: 'joined',
@@ -228,14 +278,19 @@ const athenaReader: ArchiveReader = {
   projection: false,
   async listConversations(q) {
     // One pass over the archive: group by channel. Channel events carry Name; message events carry
-    // MessageId/CreatedTimestamp. `user_type` is the S3 partition (the classification). The
+    // MessageId/CreatedTimestamp. A channel's classification is the `user_type` partition of its
+    // assistants' records (`TRUSTED_CLASSIFICATION_ROW`); a channel with none is `unknown`. The
     // classification scope goes into the SQL (values come from the profile registry, so this
-    // interpolation is safe) so server-side OFFSET/LIMIT/total match what a scoped admin sees.
-    const clsFilter = q.allowed ? `AND user_type IN (${q.allowed.map((c) => `'${c}'`).join(',')})` : '';
+    // interpolation is safe) so server-side OFFSET/LIMIT/total match what a scoped admin sees, and it
+    // admits a channel by that trusted classification, with all of the channel's rows.
+    const trustedClassification = `arbitrary(user_type) FILTER (WHERE ${TRUSTED_CLASSIFICATION_ROW})`;
+    const clsFilter = !q.allowed ? ''
+      : q.allowed.length ? `HAVING ${trustedClassification} IN (${q.allowed.map((c) => `'${c}'`).join(',')})`
+        : 'HAVING false';
     const result = await runAthena(`
     SELECT
       json_extract_scalar(line, '$.Payload.ChannelArn') AS channel_arn,
-      arbitrary(user_type) AS classification,
+      COALESCE(${trustedClassification}, 'unknown') AS classification,
       -- Channels are created as "New conversation" then auto-titled via
       -- UPDATE_CHANNEL; take the name from the LATEST channel event (rows with a
       -- Name), not the alphabetical MAX.
@@ -250,9 +305,10 @@ const athenaReader: ArchiveReader = {
       MAX(json_extract_scalar(line, '$.Payload.CreatedTimestamp')) AS last_message_at,
       COUNT(*) OVER() AS total_count
     FROM conversations
-    WHERE json_extract_scalar(line, '$.Payload.ChannelArn') IS NOT NULL ${clsFilter}
+    WHERE json_extract_scalar(line, '$.Payload.ChannelArn') IS NOT NULL
       ${q.only ? `AND json_extract_scalar(line, '$.Payload.ChannelArn') = '${quoted(q.only)}'` : ''}
     GROUP BY json_extract_scalar(line, '$.Payload.ChannelArn')
+    ${clsFilter}
     ORDER BY last_message_at DESC
     OFFSET ${q.offset} LIMIT ${q.limit}
   `);
@@ -270,11 +326,15 @@ const athenaReader: ArchiveReader = {
     return { conversations, total };
   },
   async channelClassification(channelArn) {
+    // From the channel's trusted rows only. One classification, or undefined: a channel whose assistants'
+    // records name none, or more than one, does not resolve, and the scope check refuses it.
     const r = await runAthena(
-      `SELECT arbitrary(user_type) AS classification FROM conversations
-         WHERE json_extract_scalar(line, '$.Payload.ChannelArn') = '${quoted(channelArn)}' LIMIT 1`,
+      `SELECT DISTINCT user_type AS classification FROM conversations
+         WHERE json_extract_scalar(line, '$.Payload.ChannelArn') = '${quoted(channelArn)}'
+           AND ${TRUSTED_CLASSIFICATION_ROW}
+         LIMIT 2`,
     );
-    return r.rows[0]?.[r.columns.indexOf('classification')];
+    return r.rows.length === 1 ? r.rows[0][r.columns.indexOf('classification')] || undefined : undefined;
   },
   async messages(channelArn) {
     // This channel's message events. A message can appear as CREATE then UPDATE (placeholder, then

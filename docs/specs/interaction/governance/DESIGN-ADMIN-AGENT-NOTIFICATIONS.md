@@ -115,7 +115,7 @@ flowchart TB
   IDP --> SEND["Send, and account for every recipient:<br/>emailed, skipped, failed"]
 ```
 
-A membership-wide email is sent only in the admin conversation, decided from the immutable `aeChannelKind` tag on the live channel rather than from a copy and never from Metadata. The membership read runs as the service app-instance-admin, which reads across channels without being a member; only the post needs an identity that may speak in the channel. An unresolvable federated member is recorded in the result rather than only logged, because a member of this channel who receives no alert, invisibly, is the one case this bridge exists to make impossible.
+The admin conversation's membership-wide email is decided from the immutable `aeChannelKind` tag on the live channel rather than from a copy and never from Metadata. The membership read runs as the service app-instance-admin, which reads across channels without being a member; only the post needs an identity that may speak in the channel. An unresolvable federated member is recorded in the result rather than only logged, because a member of this channel who receives no alert, invisibly, is the one case this bridge exists to make impossible.
 
 ### 4.4 Fail modes
 

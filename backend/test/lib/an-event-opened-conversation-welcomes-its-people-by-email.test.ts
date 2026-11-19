@@ -18,6 +18,11 @@ const mockFindByAddress = jest.fn();
 const mockDisplayName = jest.fn();
 const mockResolveAllowedSet = jest.fn();
 
+// THE CONCERNED ROOM'S ROW, as the nesting rule reads it (`openIsNestedBy`): a top-level room, which may open a child.
+jest.mock('../../lambda/src/lib/channel-context-client', () => ({
+  ...jest.requireActual('../../lambda/src/lib/channel-context-client'),
+  readChannelContext: async () => null,
+}));
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn(() => ({ send: mockMessagingSend })),
   ListTagsForResourceCommand: jest.fn().mockImplementation((input) => ({ __type: 'ListTags', input })),

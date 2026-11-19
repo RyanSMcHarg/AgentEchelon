@@ -93,7 +93,7 @@ const AssistantInfrastructure: React.FC<{ resolved?: ResolvedInfra; classificati
     <div data-testid="assistant-infrastructure">
       {(['assistant', 'classification', 'deployment'] as const).map((scope) => (
         <div key={scope} data-infra-scope={scope}>
-          <h5>{scopeTitle[scope]}</h5>
+          <h4>{scopeTitle[scope]}</h4>
           <p className="admin-field-hint">{t(`admin.infra.scopeHelp.${scope}`)}</p>
           <dl className="admin-config-list">
             {rows[scope].map((row) => (

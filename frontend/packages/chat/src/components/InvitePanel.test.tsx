@@ -58,6 +58,10 @@ describe('inviting somebody new', () => {
   it.each([
     ['LINK_NOT_AVAILABLE', 'A link alone cannot open this conversation. Invite them to sign in instead.'],
     ['INVITATIONS_NOT_DECLARED', 'Nobody can be invited into a conversation of this kind.'],
+    ['UNAVAILABLE', 'Invitations are not available right now. Try again later.'],
+    ['NOT_CLEARED', 'Your access does not reach this conversation.'],
+    ['CLASSIFICATION_UNREADABLE', 'Nobody can be invited into this conversation until its classification is set.'],
+    ['NOT_A_PERSON_SESSION', 'Invitations are made from your own sign-in, not an administrator session.'],
     ['SOMETHING_NEW', 'The invitation could not be made. Try again.'],
   ])('says why in its own words for %s', async (code, text) => {
     const user = userEvent.setup();

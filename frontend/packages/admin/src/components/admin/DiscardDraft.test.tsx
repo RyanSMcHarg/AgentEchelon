@@ -117,7 +117,7 @@ describe("on the assistant's page", () => {
     const loads = vi.mocked(svc.listProfilesAndTools).mock.calls.length;
     fireEvent.click(screen.getByTestId('draft-discard'));
     fireEvent.click(screen.getByTestId('draft-discard-confirm-button'));
-    expect(await screen.findByTestId('draft-discard-refused')).toHaveTextContent('it was saved again after this page loaded it');
+    expect(await screen.findByTestId('draft-discard-refused')).toHaveTextContent('someone saved a newer draft');
     await waitFor(() => expect(vi.mocked(svc.listProfilesAndTools).mock.calls.length).toBeGreaterThan(loads));
     expect(screen.getByTestId('assistant-draft')).toBeTruthy();
   });

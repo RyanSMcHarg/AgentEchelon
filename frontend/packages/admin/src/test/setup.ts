@@ -13,3 +13,10 @@ import '@testing-library/jest-dom/vitest';
  * asserting on the copy fails - which is the only way the conversion can be checked as it proceeds.
  */
 import '@ae/shared/i18n';
+
+/**
+ * EVERY TEST STARTS AT A BARE ADDRESS. The console keeps each view in the URL (`consoleViewUrl.ts`), and jsdom keeps one address
+ * for a whole file, so a view one test opened would otherwise open again in the next.
+ */
+import { beforeEach } from 'vitest';
+beforeEach(() => { try { window.history.replaceState({}, '', '/'); } catch { /* a non-DOM test has no address */ } });

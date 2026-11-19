@@ -1,10 +1,9 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
-import { ChimeSDKMessagingClient, DescribeChannelMembershipCommand } from '@aws-sdk/client-chime-sdk-messaging';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { randomUUID } from 'crypto';
 import { parseJsonBody, callerIsAdmin, callerPersonId, isAdminConsoleSession, signedAsPerson, isServiceAdminCall } from './lib/auth.js';
-import { userArnFor } from './lib/person-arn.js';
+import { callerReachesConversation, refusalAnswer } from './lib/conversation-access.js';
 import { responder, originsFrom, DEV_ORIGIN } from './lib/http-response.js';
 import { chimeMessagingClient } from './lib/chime/clients.js';
 import { loadProfileRegistry } from '../../lib/profile-registry';
@@ -115,30 +114,13 @@ async function submitFeedback(event: APIGatewayProxyEvent, origin?: string): Pro
     return respond(400, { error: 'feedback must be "up", "down", or "clear"' }, origin);
   }
 
-  // Verify caller is a member of channelArn before recording feedback.
-  // Without this, a signed-in
-  // user can ballot-stuff thumbs-up/down on any other channel's bot
-  // responses, skewing model-effectiveness analytics. Use the caller's
-  // own AppInstanceUser ARN as ChimeBearer — Chime allows a user to
-  // call DescribeChannelMembership for their own membership without
-  // needing admin/moderator privilege.
-  if (APP_INSTANCE_ARN_FB) {
-    const callerUserArn = userArnFor(APP_INSTANCE_ARN_FB, userSub);
-    try {
-      await messagingClientFb.send(new DescribeChannelMembershipCommand({
-        ChannelArn: body.channelArn,
-        MemberArn: callerUserArn,
-        ChimeBearer: callerUserArn,
-      }));
-    } catch (membershipErr) {
-      console.warn('[user-feedback] caller not a member of channel', {
-        userSub, channelArn: body.channelArn, err: (membershipErr as Error).name,
-      });
-      return respond(403, {
-        error: 'Caller is not a member of the conversation',
-        code: 'NOT_A_MEMBER',
-      }, origin);
-    }
+  // A current member cleared for the conversation, before a vote is recorded (`lib/conversation-access.ts`):
+  // a signed-in caller cannot ballot-stuff another conversation's responses and skew the effectiveness
+  // rollup. Anything that cannot be answered, an unset app instance included, refuses.
+  const access = await callerReachesConversation(event, body.channelArn, { appInstanceArn: APP_INSTANCE_ARN_FB, client: messagingClientFb });
+  if (!access.ok) {
+    const { statusCode, body } = refusalAnswer(access);
+    return respond(statusCode, body, origin);
   }
 
   // APPEND every vote — including a change (up→down) or a CLEAR (feedback:'clear')
@@ -150,7 +132,8 @@ async function submitFeedback(event: APIGatewayProxyEvent, origin?: string): Pro
     feedbackId: randomUUID(),
     createdAt: new Date().toISOString(),
     userSub,
-    channelArn: body.channelArn,
+    // The conversation as the check named it: always its full channel ARN, so one conversation's votes group.
+    channelArn: access.channelArn,
     messageId: body.messageId,
     feedback: body.feedback, // 'up' | 'down' | 'clear'
     // Only a 'down' can carry a reason: there is nothing to attribute about approval, and a reason

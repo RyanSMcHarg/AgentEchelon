@@ -46,7 +46,7 @@
   white-space: nowrap;
 }
 
-.admin-header h2 {
+.admin-header h1 {
   font-size: var(--text-lg);
   font-weight: 600;
   color: var(--text-primary);
@@ -181,9 +181,10 @@
   animation: fadeIn var(--duration-slow) var(--ease-out);
 }
 
-/* THE HEADING SCALE. A page title, then section, group and sub-group headings, each one step down in
-   size and all the same weight, so the order of a page is visible before a word of it is read. */
-.admin-tab h3 {
+/* THE HEADING SCALE. The h1 is the console's name in the header; below it a page (h2), a section (h3), a group of
+   fields (h4) and an item within a group (h5), each one clear step down, so the order of a page is visible before a
+   word of it is read. */
+.admin-dashboard h2 {
   font-size: var(--text-xl);
   font-weight: 600;
   line-height: var(--leading-tight);
@@ -192,12 +193,12 @@
   margin: 0;
 }
 
-.admin-tab > h3,
-.admin-tab > .admin-tab-header h3 {
+.admin-tab > h2,
+.admin-tab > .admin-tab-header h2 {
   font-size: var(--text-2xl);
 }
 
-.admin-tab h4 {
+.admin-dashboard h3 {
   font-size: var(--text-lg);
   font-weight: 600;
   line-height: var(--leading-tight);
@@ -205,11 +206,19 @@
   margin: 0;
 }
 
-.admin-tab h5 {
+.admin-dashboard h4 {
   font-size: var(--text-md);
   font-weight: 600;
   line-height: var(--leading-tight);
   color: var(--text-primary);
+  margin: 0;
+}
+
+.admin-dashboard h5 {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  line-height: var(--leading-tight);
+  color: var(--text-secondary);
   margin: 0;
 }
 
@@ -373,6 +382,51 @@
 }
 
 /* The caption before a group of chips. */
+.admin-filter-dropdown {
+  position: relative;
+}
+.admin-filter-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.admin-filter-trigger::after {
+  content: '\25BE';
+  color: var(--text-tertiary);
+}
+.admin-filter-panel {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + var(--space-1));
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 180px;
+  max-height: 280px;
+  overflow-y: auto;
+  padding: var(--space-2);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  background: var(--surface-0);
+  box-shadow: var(--shadow-md, var(--shadow-xs));
+}
+.admin-filter-option {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+  cursor: pointer;
+}
 .admin-filter-label {
   color: var(--text-secondary);
   font-size: var(--text-sm);
@@ -456,8 +510,8 @@
   box-shadow: var(--shadow-sm);
 }
 
-.admin-conversation-header h4,
-.admin-conversation-members h4 {
+.admin-conversation-header h3,
+.admin-conversation-members h3 {
   margin: 0;
   color: var(--text-primary);
   font-size: var(--text-md);
@@ -650,8 +704,8 @@
   margin-bottom: var(--space-3);
 }
 
-.strategy-route-card h4,
-.strategy-model-card h4 {
+.strategy-route-card h3,
+.strategy-model-card h3 {
   font-size: var(--text-md);
   font-weight: 600;
   margin: 0;
@@ -1050,6 +1104,62 @@
   grid-column: 1 / -1;
 }
 
+/* THE CREATE-EXPERIMENT FORM. Fields sit in pairs and keep their column: the grid's full-width last
+   field is for a description, and this form ends on short fields (the end date, the target). */
+.experiment-create-form .admin-form-grid > label:last-child {
+  grid-column: auto;
+}
+
+/* The objective is a bordered group, so its fields sit inside the same inset as the battle box below. */
+.experiment-objective-block {
+  margin: var(--space-4) 0 0;
+  padding: var(--space-3) var(--space-4) var(--space-4);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  min-width: 0;
+}
+.experiment-objective-block > legend {
+  padding: 0 var(--space-2);
+}
+.experiment-objective-statement {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* Guardrails: a heading row with its add action, then one row per guardrail (metric, rule, bound and
+   its remove action on one line). */
+.experiment-guardrails {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.experiment-guardrails-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.experiment-create-form .experiment-guardrail-row {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 0.8fr) auto;
+  gap: var(--space-3);
+}
+.experiment-guardrail-row > .btn-danger {
+  align-self: end;
+  min-height: var(--control-height);
+}
+@media (max-width: 720px) {
+  .experiment-create-form .experiment-guardrail-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.experiment-create-form > .btn-secondary:last-child {
+  align-self: flex-start;
+  margin-top: var(--space-3);
+}
+
 .experiment-battle-toggle {
   margin-top: var(--space-3);
   padding: var(--space-3) var(--space-4);
@@ -1271,10 +1381,10 @@
    session-DAU sibling — it's the truer product signal. Filled
    accent on the left edge echoes the FunnelChart spine. */
 .admin-tab-banner--accented {
-  box-shadow: inset 4px 0 0 0 var(--accent-500, #8b5cf6);
+  box-shadow: inset 4px 0 0 0 var(--accent-500);
   background: linear-gradient(180deg,
-    color-mix(in srgb, var(--accent-50, #faf5ff) 70%, transparent),
-    var(--surface-elevated, #ffffff) 100%);
+    color-mix(in srgb, var(--accent-50) 70%, transparent),
+    var(--surface-0) 100%);
 }
 
 @media (max-width: 960px) {
@@ -1313,7 +1423,7 @@
   padding: 6px var(--space-3);
   border: 1px solid var(--border-subtle, var(--zinc-200, #e4e4e7));
   border-radius: 999px;
-  background: var(--surface-elevated, #ffffff);
+  background: var(--surface-0);
 }
 
 .admin-tab-tier-chip-label {
@@ -1349,7 +1459,7 @@
   padding: var(--space-3) var(--space-4);
   border: 1px solid var(--border-subtle, var(--zinc-200, #e4e4e7));
   border-radius: 10px;
-  background: var(--surface-elevated, #ffffff);
+  background: var(--surface-0);
 }
 
 .admin-pageload-row-head {
@@ -1454,7 +1564,7 @@
   padding: var(--space-4, 16px);
   border-bottom: 1px solid var(--border-subtle, var(--zinc-200, #e4e4e7));
 }
-.admin-drawer-header h4 { margin: 0 0 4px; }
+.admin-drawer-header h3 { margin: 0 0 4px; }
 .admin-drawer-body { padding: var(--space-4, 16px); overflow-y: auto; }
 .admin-drawer-badges { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: var(--space-3, 12px); }
 .admin-drawer-field { margin-bottom: var(--space-4, 16px); }
@@ -1500,7 +1610,7 @@
 .admin-timeline-dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 4px; flex: none; z-index: 1; }
 .admin-timeline-dot--join { background: var(--status-good, #16a34a); }
 .admin-timeline-dot--leave { background: var(--status-bad, #dc2626); }
-.admin-timeline-dot--mod { background: var(--accent-500, #e5a00d); }
+.admin-timeline-dot--mod { background: var(--accent-500); }
 .admin-timeline-body { display: flex; flex-direction: column; gap: 2px; font-size: var(--text-sm); }
 .admin-timeline-action { color: var(--text-muted, var(--zinc-500, #71717a)); }
 .admin-timeline-meta { color: var(--text-muted, var(--zinc-500, #71717a)); font-size: var(--text-sm); }
@@ -1531,10 +1641,10 @@
   cursor: pointer;
   transition: background 120ms ease, color 120ms ease;
 }
-.admin-section-btn:hover { color: var(--text, var(--zinc-900, #18181b)); }
+.admin-section-btn:hover { color: var(--text-primary); }
 .admin-section-btn.active {
   background: var(--surface-0, #fff);
-  color: var(--text, var(--zinc-900, #18181b));
+  color: var(--text-primary);
   box-shadow: var(--shadow-xs, 0 1px 2px rgba(0, 0, 0, 0.06));
 }
 .admin-section-btn.active::after {
@@ -1543,7 +1653,7 @@
   height: 2px;
   margin-top: 6px;
   border-radius: 2px;
-  background: var(--accent-500, #e5a00d);
+  background: var(--accent-500);
 }
 .admin-subtabs {
   display: flex;
@@ -1565,10 +1675,10 @@
   cursor: pointer;
   transition: color 120ms ease, border-color 120ms ease;
 }
-.admin-subtab-btn:hover { color: var(--text, var(--zinc-900, #18181b)); }
+.admin-subtab-btn:hover { color: var(--text-primary); }
 .admin-subtab-btn.active {
-  color: var(--text, var(--zinc-900, #18181b));
-  border-bottom-color: var(--accent-500, #e5a00d);
+  color: var(--text-primary);
+  border-bottom-color: var(--accent-500);
   font-weight: 600;
 }
 
@@ -1614,7 +1724,7 @@
   user-select: none;
   white-space: nowrap;
 }
-.exp-results-toggle input { accent-color: var(--accent-500, #e5a00d); cursor: pointer; }
+.exp-results-toggle input { accent-color: var(--accent-500); cursor: pointer; }
 
 .exp-compare {
   margin-top: var(--space-4, 16px);
@@ -1650,8 +1760,8 @@
   margin-bottom: var(--space-3, 12px);
   padding: 8px 12px;
   border-radius: var(--radius-md, 8px);
-  background: color-mix(in srgb, var(--accent-500, #e5a00d) 10%, transparent);
-  border: 1px solid var(--accent-200, #f1d49a);
+  background: color-mix(in srgb, var(--accent-500) 10%, transparent);
+  border: 1px solid var(--accent-200);
   font-size: var(--text-sm);
   color: var(--text-secondary, var(--zinc-700, #3f3f46));
 }
@@ -1675,8 +1785,8 @@
   background: color-mix(in srgb, var(--success-500, #16a34a) 8%, transparent);
 }
 .exp-objective[data-status='not_met'] {
-  border-color: color-mix(in srgb, var(--accent-500, #e5a00d) 35%, transparent);
-  background: color-mix(in srgb, var(--accent-500, #e5a00d) 8%, transparent);
+  border-color: color-mix(in srgb, var(--accent-500) 35%, transparent);
+  background: color-mix(in srgb, var(--accent-500) 8%, transparent);
 }
 .exp-objective-label { font-weight: 600; color: var(--text-primary, var(--zinc-900, #18181b)); }
 .exp-objective-current { font-family: var(--font-mono, monospace); color: var(--text-secondary, var(--zinc-700, #3f3f46)); }
@@ -1690,7 +1800,7 @@
   color: var(--text-secondary, var(--zinc-700, #3f3f46));
 }
 .exp-objective[data-status='met'] .exp-objective-badge { background: color-mix(in srgb, var(--success-500, #16a34a) 20%, transparent); }
-.exp-objective[data-status='not_met'] .exp-objective-badge { background: color-mix(in srgb, var(--accent-500, #e5a00d) 22%, transparent); }
+.exp-objective[data-status='not_met'] .exp-objective-badge { background: color-mix(in srgb, var(--accent-500) 22%, transparent); }
 .exp-objective-tag {
   margin-left: auto;
   font-size: var(--text-sm);
@@ -1727,7 +1837,7 @@
   font-family: var(--font-mono, monospace);
   font-size: var(--text-xs);
   font-weight: 700;
-  color: var(--accent-500, #e5a00d);
+  color: var(--accent-500);
   letter-spacing: 0.1em;
 }
 
@@ -1756,13 +1866,13 @@
 .exp-metric-val:first-child { justify-content: flex-end; }
 .exp-metric-val:last-child { justify-content: flex-start; }
 .exp-metric-val.is-winner {
-  color: var(--accent-600, #b45309);
+  color: var(--accent-600);
   font-weight: 700;
 }
 .exp-metric-val.is-winner::after {
   content: '▲';
   font-size: 8px;
-  color: var(--accent-500, #e5a00d);
+  color: var(--accent-500);
   transform: translateY(-2px);
 }
 .exp-hint { font-size: var(--text-sm); font-style: normal; color: var(--text-muted, var(--zinc-400, #a1a1aa)); }
@@ -1777,7 +1887,7 @@
   background: var(--surface-50, var(--zinc-50, #fafafa));
 }
 .exp-reco[data-tone="win"]  { border-left-color: #16a34a; }
-.exp-reco[data-tone="hold"] { border-left-color: var(--accent-500, #e5a00d); }
+.exp-reco[data-tone="hold"] { border-left-color: var(--accent-500); }
 .exp-reco[data-tone="wait"] { border-left-color: var(--text-muted, #a1a1aa); }
 .exp-reco-head {
   display: flex;
@@ -2143,8 +2253,8 @@
   background: var(--surface-50, var(--surface-0));
 }
 
-.admin-metric-drill > h4,
-.admin-metric-drill > h5 {
+.admin-metric-drill > h3,
+.admin-metric-drill > h4 {
   margin: 0 0 var(--space-2);
 }
 
@@ -2280,7 +2390,7 @@
   background: var(--surface-50, var(--surface-0));
 }
 
-.admin-panel > h3 {
+.admin-panel > h2 {
   margin: 0;
   font-size: var(--text-lg);
   color: var(--text-primary);
@@ -2327,8 +2437,8 @@
   gap: var(--space-3);
   margin-bottom: var(--space-4);
 }
-.admin-reach h4,
-.admin-reach h5 {
+.admin-reach h3,
+.admin-reach h4 {
   margin: 0;
 }
 .admin-reach-list {
@@ -2502,11 +2612,21 @@
   box-shadow: var(--shadow-xs);
   scroll-margin-top: var(--space-4);
 }
-.admin-config-group > h4,
-.admin-config-group > h5 {
+.admin-config-group > h3,
+.admin-config-group > h4 {
   margin: 0;
 }
-.admin-config-group > h4 + .admin-config-group-help {
+/* A SECTION OF AN ASSISTANT'S PAGE reads a step above the groups inside it, and each group starts on a rule, so where one
+   part ends and the next begins is visible at a glance. */
+.admin-config-group > h3 {
+  font-size: var(--text-xl);
+}
+.admin-config-group h4:not(:first-child):not(.admin-callout > h4, .admin-edit-card-head > h4, .admin-edit-diff > h4, .admin-wizard-preview > h4, .admin-reach h4, .admin-metric-drill > h4, .admin-workflow-item-head h4) {
+  margin-top: var(--space-3);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--surface-200);
+}
+.admin-config-group > h3 + .admin-config-group-help {
   margin-top: calc(-1 * var(--space-3));
 }
 .admin-config-group-help {
@@ -2530,6 +2650,19 @@
   border-top: 1px solid var(--surface-200);
 }
 
+/* A process's actions: Edit and Remove at the row's start, Export alone at its far end, apart from them. */
+.admin-process-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-4);
+  padding-top: var(--space-2);
+}
+.admin-process-export {
+  margin-left: auto;
+  padding-left: var(--space-6);
+}
+
 /* Export and import of one assistant's versions: the two controls in a row, and the preview of a chosen
    manifest as an inset card under them, confirmed or cancelled before anything is written. */
 .admin-import-version {
@@ -2549,7 +2682,7 @@
   border-radius: var(--radius-md);
   background: var(--surface-50);
 }
-.admin-import-preview > h5,
+.admin-import-preview > h4,
 .admin-import-preview > p {
   margin: 0;
 }
@@ -2594,7 +2727,7 @@
   background: var(--info-bg);
   color: var(--text-primary);
 }
-.admin-callout > h5 {
+.admin-callout > h4 {
   margin: 0;
 }
 .admin-callout > p {
@@ -2624,7 +2757,10 @@
 
 /* A field caption that carries an info tip: the caption and its tip on one line, in the label look
    rather than the monospace readout look the direct-span rule above gives a traffic-split value. */
-.admin-form-grid > label > span.admin-field-label {
+.admin-form-grid > label > span.admin-field-label,
+.admin-form-grid > div > span.admin-field-label,
+.experiment-objective-statement > span.admin-field-label,
+legend.admin-field-label {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
@@ -2706,7 +2842,7 @@
   flex-direction: column;
   gap: var(--space-3);
 }
-.admin-workflow-groups h6 {
+.admin-workflow-groups h5 {
   margin: 0 0 var(--space-1);
   font-size: var(--text-sm);
   font-weight: 600;
@@ -2722,7 +2858,7 @@
   gap: var(--space-2);
   margin-top: var(--space-2);
 }
-.admin-welcome-guide h6 {
+.admin-welcome-guide h5 {
   margin: var(--space-2) 0 0;
   font-size: var(--text-sm);
   font-weight: 600;
@@ -2748,7 +2884,7 @@
   display: flex; flex-direction: column; gap: 2px;
   background: var(--surface-0); border: 1px solid var(--surface-200); border-radius: 10px; padding: 12px 14px;
 }
-.perf-card:hover, .perf-card:focus-visible { border-color: var(--accent-500, #6D28D9); }
+.perf-card:hover, .perf-card:focus-visible { border-color: var(--accent-500); }
 .perf-stat-label { display: inline-flex; align-items: center; gap: 4px; }
 .perf-card-wrap { position: relative; display: flex; }
 .perf-card-wrap > .perf-card { flex: 1; padding-right: 32px; }
@@ -2765,7 +2901,7 @@
   position: absolute; font: inherit; color: var(--text-primary); cursor: pointer; min-height: 44px; padding: 3px 6px;
   background: color-mix(in srgb, var(--surface-0) 90%, transparent); border: 1px solid transparent; border-radius: 6px;
 }
-.perf-flow-node[aria-pressed="true"] { border-color: var(--accent-500, #6D28D9); background: var(--surface-50); }
+.perf-flow-node[aria-pressed="true"] { border-color: var(--accent-500); background: var(--surface-50); }
 .perf-flow-node-label { display: block; font-size: var(--text-sm); font-weight: 600; }
 .perf-flow-node-sub { display: block; font-size: var(--text-xs); color: var(--text-secondary); }
 .perf-flow-legend, .perf-bar-legend { display: flex; flex-wrap: wrap; gap: var(--space-3); font-size: var(--text-xs); color: var(--text-secondary); padding-top: var(--space-2); }
@@ -2784,7 +2920,7 @@
 .perf-steps { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
 .perf-steps th { text-align: left; color: var(--text-secondary); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--surface-200); }
 .perf-steps td { padding: 6px 8px; border-bottom: 1px solid var(--surface-100); }
-.perf-closes { font-weight: 600; color: var(--accent-700, #4C1D95); }
+.perf-closes { font-weight: 600; color: var(--accent-700); }
 .perf-turn-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--space-3); }
 .perf-kv { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: var(--text-sm); }
 .perf-kv li { display: flex; justify-content: space-between; gap: var(--space-3); border-bottom: 1px solid var(--surface-100); padding-bottom: 4px; }
@@ -2864,8 +3000,8 @@
   align-items: center;
   gap: var(--space-2);
 }
-.admin-edit-card-head > h4,
-.admin-edit-card-head > h5 {
+.admin-edit-card-head > h3,
+.admin-edit-card-head > h4 {
   margin: 0;
 }
 .admin-edit-card-summary {
@@ -2896,7 +3032,7 @@
   padding-top: var(--space-4);
   border-top: 1px solid var(--surface-200);
 }
-.admin-edit-diff > h5 {
+.admin-edit-diff > h4 {
   margin: 0;
 }
 .admin-edit-diff ul {
@@ -2929,7 +3065,7 @@
   background: var(--surface-50);
   font-size: var(--text-sm);
 }
-.admin-wizard-preview > h5 {
+.admin-wizard-preview > h4 {
   margin: 0;
 }
 @media (max-width: 900px) {
@@ -2972,7 +3108,7 @@
   align-items: center;
   gap: var(--space-3);
 }
-.admin-assistant-name > h3 {
+.admin-assistant-name > h2 {
   margin: 0;
   font-size: var(--text-2xl);
 }
@@ -3114,9 +3250,40 @@
 .admin-assistant-menu-btn:hover {
   background: var(--surface-100);
 }
-.admin-assistant-menu-btn.active {
-  background: var(--text-primary);
-  color: var(--text-inverse);
+.admin-assistant-menu-btn.active,
+.admin-assistant-menu-btn.active:hover {
+  background: var(--surface-200);
+  color: var(--text-primary);
+  font-weight: 600;
+  box-shadow: inset 3px 0 0 var(--accent-500, var(--focus-ring));
+}
+.admin-assistant-menu-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+/* ON A NARROW SCREEN THE SECTIONS ARE A TAB ROW above the content, not a list that pushes it below the fold: one line,
+   scrolled sideways, kept in view while the section scrolls, with each section's note left to the section itself. */
+@media (max-width: 720px) {
+  /* The console's bars share the content's side inset, so every row starts on one line. */
+  .admin-header { padding-left: var(--space-4); padding-right: var(--space-4); }
+  .admin-section-rail, .admin-subtabs { margin-left: var(--space-4); margin-right: var(--space-4); }
+  /* The tab row sticks flush to the top of the scrolling area: the page's top space lives inside the page. */
+  .admin-content:has(.admin-assistant-menu) { padding-top: 0; }
+  .admin-assistant-page:has(.admin-assistant-menu) { padding-top: var(--space-5); }
+  .admin-assistant-layout { flex-direction: column; flex-wrap: nowrap; gap: var(--space-3); }
+  .admin-assistant-menu {
+    flex: none; max-width: none; width: 100%;
+    position: sticky; top: 0; z-index: 5;
+    background: var(--surface-0);
+    border-bottom: 1px solid var(--surface-200);
+    overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: thin;
+  }
+  .admin-assistant-menu ul { flex-direction: row; gap: var(--space-1); padding: var(--space-1) 0; }
+  .admin-assistant-menu li { flex: none; }
+  .admin-assistant-menu-btn { width: auto; white-space: nowrap; padding: 0 var(--space-3); }
+  .admin-assistant-menu-btn.active, .admin-assistant-menu-btn.active:hover { box-shadow: inset 0 -3px 0 var(--accent-500, var(--focus-ring)); }
+  .admin-assistant-menu-note { display: none; }
+  .admin-assistant-main { flex: none; width: 100%; }
 }
 .admin-assistant-menu-note {
   margin: 0;
@@ -3207,13 +3374,19 @@
   border-style: dashed;
   background: var(--surface-50);
 }
+/* The entry an intent card's link opened. */
+.admin-workflow-item-focus {
+  border-style: solid;
+  border-color: var(--accent-500);
+  box-shadow: 0 0 0 1px var(--accent-500);
+}
 .admin-workflow-item-head {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
 }
-.admin-workflow-item-head > h4 {
+.admin-workflow-item-head > h3 {
   margin: 0;
 }
 .admin-workflow-item-head code {
@@ -3222,6 +3395,30 @@
 }
 .admin-workflow-item-head .btn-sm {
   margin-left: auto;
+}
+.admin-workflow-item-actions {
+  display: inline-flex;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+/* What a template says, on its row: the words themselves, set apart from the description of them. */
+.admin-message-said {
+  margin: 0;
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--surface-200);
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.admin-message-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
 }
 /* An event workflow's steps, one line in the order a run reaches them. */
 .admin-workflow-steps {
@@ -3291,6 +3488,12 @@
   flex: 1 1 12rem;
   min-width: 0;
 }
+/* A step's model and, once it has one, its fallback, side by side (`StepModelControl`). */
+.admin-step-model {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
 /* An intent's workflow steps on its card, each with what it produces and the model it runs on (ADR-064). */
 .admin-intent-steps {
   display: flex;
@@ -3299,3 +3502,165 @@
   margin-top: var(--space-2);
   min-width: 0;
 }
+
+/* ADR-067 stage 1: the Workflows list's read-only Platform section, and the welcome's edit form. */
+.admin-workflow-platform {
+  margin-top: var(--space-6);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--surface-200);
+}
+
+.admin-welcome-mode {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.admin-welcome-mode-choice {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+}
+
+/* A plain nested list under a workflow or an intent: its assigned tasks, each with its states. */
+.admin-plain-list {
+  list-style: none;
+  margin: var(--space-1, 4px) 0 0;
+  padding-left: var(--space-3, 12px);
+}
+
+/* WHAT STARTS A WORKFLOW: a stacked form, each trigger a card naming its event, resource, state and rule. */
+.admin-event-trigger {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-3);
+  border: 1px solid var(--border-subtle, var(--zinc-200, #e4e4e7));
+  border-radius: var(--radius-md, 8px);
+  padding: var(--space-4);
+  max-width: 720px;
+}
+.admin-event-trigger-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.admin-event-trigger-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  border: 1px solid var(--border-subtle, var(--zinc-200, #e4e4e7));
+  border-radius: var(--radius-md, 8px);
+  padding: var(--space-3);
+}
+.admin-event-trigger-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+.admin-event-trigger-row .input { flex: 1; }
+.admin-event-trigger-pattern {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: var(--space-2) 0 0;
+}
+/* Why the trigger runs where it does: the target, and the reason the event gives for it. */
+.admin-event-trigger-why {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  border-left: 3px solid var(--border-subtle, var(--zinc-200, #e4e4e7));
+  padding-left: var(--space-3);
+}
+
+/* A SETTING'S OWN CHECKBOX, WRITTEN BESIDE ITS NAME (Battle Mode in a classification, wherever it is shown): the same
+   control size and accent as the form's other toggles, with room between it and the help above. */
+.admin-inline-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+}
+.admin-inline-label input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent-500);
+  cursor: pointer;
+}
+.admin-inline-label input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+}
+.experiment-battle-card [data-testid="battle-settings"] {
+  margin: var(--space-3) 0;
+}
+
+/* THE PROCESS FORM: one column, each group full width, the workflows listed under what starts them. */
+.admin-process-form { grid-template-columns: minmax(0, 1fr); max-width: 760px; }
+.admin-process-form > * { grid-column: 1 / -1; }
+.admin-process-form-group { display: flex; flex-direction: column; align-items: stretch; gap: var(--space-2); margin: 0; padding: 0; border: 0; min-width: 0; }
+.admin-process-form-group > legend { padding: 0; margin-bottom: var(--space-1); }
+.admin-process-form-wfgroup { display: flex; flex-direction: column; gap: var(--space-1); padding: var(--space-2) 0; border-top: 1px solid var(--surface-200); }
+.admin-process-form-wfhead { font-size: var(--text-sm); font-weight: 600; color: var(--text-secondary); }
+.admin-process-form-wf { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--space-2); align-items: start; font-weight: 400; }
+.admin-process-form-wf > input { margin-top: 3px; }
+.admin-process-form-wf > span { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+
+/* THE PROCESS WIZARD: its step list, each phase as a card, and each hand-off between two phases in the hand-off tone. */
+.admin-process-steps { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.admin-process-phases { display: flex; flex-direction: column; gap: var(--space-3); font-weight: 400; }
+.admin-process-phase { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3); border: 1px solid var(--surface-200); border-radius: 8px; background: var(--surface-0); }
+.admin-process-phase-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: var(--space-2); font-weight: 600; }
+.admin-process-phase-stages { margin: 0; padding-left: var(--space-5); display: flex; flex-direction: column; gap: var(--space-1); font-size: var(--text-sm); }
+.admin-process-handoff { display: flex; flex-direction: column; gap: var(--space-2); margin: 0 var(--space-4); padding: var(--space-3); border: 2px solid var(--warning); border-radius: 8px; background: color-mix(in srgb, var(--warning) 10%, var(--surface-0)); font-size: var(--text-sm); }
+.admin-process-handoff dl, .admin-process-review { display: grid; grid-template-columns: minmax(90px, max-content) minmax(0, 1fr); gap: var(--space-1) var(--space-3); margin: 0; font-weight: 400; }
+.admin-process-handoff dt, .admin-process-review dt { font-weight: 600; color: var(--text-secondary); }
+.admin-process-handoff dd, .admin-process-review dd { margin: 0; }
+/* THE PHASES IN ORDERED STEPS: a step holds one phase, or several side by side that run in parallel. */
+.admin-process-step { display: flex; flex-direction: column; gap: var(--space-2); }
+.admin-process-step-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2); }
+.admin-process-step-phases { display: flex; flex-direction: column; gap: var(--space-3); }
+.admin-process-step-parallel { padding: var(--space-2); border: 1px dashed var(--surface-300); border-radius: 8px; }
+.admin-process-step-parallel > .admin-process-step-phases { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); align-items: start; }
+.admin-process-step-phase { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
+.admin-process-fork, .admin-process-alongside, .admin-process-join { margin: 0; padding: var(--space-1) var(--space-2); border-radius: 6px; font-size: var(--text-sm); width: fit-content; }
+.admin-process-fork { background: color-mix(in srgb, var(--warning) 14%, var(--surface-0)); }
+.admin-process-alongside { background: var(--surface-50); border: 1px solid var(--surface-200); }
+.admin-process-join { border: 2px solid var(--accent-500); background: var(--surface-0); font-weight: 600; }
+.admin-process-flow-alongside, .admin-process-flow-join { font-size: var(--text-xs); border-radius: 4px; padding: 1px 6px; width: fit-content; }
+.admin-process-flow-alongside { background: var(--surface-100); color: var(--text-primary); }
+.admin-process-flow-join { border: 1px solid var(--accent-500); color: var(--text-primary); }
+.admin-process-drill-join { margin: var(--space-1) 0 0; font-size: var(--text-sm); }
+@media (max-width: 640px) {
+  .admin-process-handoff { margin: 0; }
+  .admin-process-handoff dl, .admin-process-review { grid-template-columns: 1fr; }
+  .admin-process-step-parallel > .admin-process-step-phases { grid-template-columns: 1fr; }
+}
+
+/* A PROCESS AS A FLOW: steps top to bottom, each phase a card with its stages down it; hand-offs listed beneath. Nothing scrolls sideways. */
+.admin-process-flow { display: flex; flex-direction: column; gap: var(--space-3); margin-top: var(--space-2); font-weight: 400; }
+.admin-process-flow-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-3); }
+.admin-process-flow-step { display: flex; flex-direction: column; gap: var(--space-2); }
+.admin-process-flow-step-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2); }
+.admin-process-flow-step-phases { display: flex; flex-direction: column; gap: var(--space-3); }
+.admin-process-flow-step-parallel { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); align-items: start; padding: var(--space-2); border: 1px dashed var(--surface-300); border-radius: 8px; }
+.admin-process-flow-phase { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; padding: var(--space-3); border: 1px solid var(--surface-200); border-radius: 8px; background: var(--surface-0); }
+.admin-process-flow-phase-head { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+.admin-process-flow-stages { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-1); font-size: var(--text-sm); }
+.admin-process-flow-stage { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; padding: var(--space-1) var(--space-2); text-align: left; font: inherit; color: var(--text-primary); background: var(--surface-0); border: 1px solid var(--surface-300); border-radius: 6px; cursor: pointer; }
+.admin-process-flow-stage-on { border: 2px solid var(--accent-500); }
+.admin-process-flow-handin { font-size: var(--text-xs); font-weight: 600; color: var(--text-primary); background: color-mix(in srgb, var(--warning) 18%, var(--surface-0)); border-radius: 4px; padding: 1px 6px; width: fit-content; }
+.admin-process-flow-detail { padding: var(--space-3); border: 1px solid var(--surface-200); border-radius: 8px; background: var(--surface-0); }
+.admin-process-flow-detail dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: var(--space-1) var(--space-3); margin: var(--space-2) 0 0; }
+.admin-process-flow-detail dt { font-weight: 600; color: var(--text-secondary); }
+.admin-process-flow-detail dd { margin: 0; }
+.admin-process-flow-handoffs { margin: 0; padding-left: var(--space-5); display: flex; flex-direction: column; gap: var(--space-1); font-size: var(--text-sm); }

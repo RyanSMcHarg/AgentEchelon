@@ -23,5 +23,9 @@
     "react-markdown": "10.1.0",
     "remark-gfm": "4.0.1",
     "web-vitals": "^5.2.0"
+  },
+  "devDependencies": {
+    "@aws-crypto/sha256-js": "2.0.2",
+    "@smithy/signature-v4": "5.7.5"
   }
 }

@@ -20,14 +20,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import {
   arrivalWelcomeOwner,
-  eventNaturalKey,
   eventRunKey,
   runEventWorkflow,
-  PLATFORM_EVENT_WORKFLOWS,
+  SHIPPED_EVENT_WORKFLOWS,
   type EventRunContext,
   type EventRunDeps,
   type EventWorkflow,
 } from '../../lambda/src/lib/event-workflow';
+import { eventNaturalKey } from '../../lambda/src/lib/event-natural-key';
 import { peopleJoiningAfterOpening, welcomeIntoOpenedConversation } from '../../lambda/src/lib/typed-conversation-notice';
 import { CONVERSATION_TYPES } from '../../lib/config/conversation-types';
 
@@ -52,8 +52,8 @@ const JOINED: EventWorkflow = {
     done: { disposition: 'success' },
   },
 };
-const OPS_ROOM = PLATFORM_EVENT_WORKFLOWS['ops-room'];
-const OPENING_AND_SUBJECT = PLATFORM_EVENT_WORKFLOWS['opening-and-subject'];
+const OPS_ROOM = SHIPPED_EVENT_WORKFLOWS['ops-room'];
+const OPENING_AND_SUBJECT = SHIPPED_EVENT_WORKFLOWS['opening-and-subject'];
 
 describe('which run owns the welcome of the people a room was opened for, mode by mode', () => {
   it('the shipped types include one an event opens and one none does', () => {
@@ -102,6 +102,8 @@ describe('the lead is welcomed once (run level)', () => {
         return true;
       },
       dispatchAgent: async () => true,
+      // The ops room's first look opens a task the ops assistant holds, and the run waits on it.
+      openTask: async () => 'opened',
     });
     return { addressed, room, deps };
   }

@@ -5,7 +5,6 @@
  * through `Identities`, and the answer is an IAM policy naming the routes it may call:
  *
  *  - a person: every route, with the person in the context;
- *  - a one-conversation person: `ONE_CHANNEL_ROUTES` only;
  *  - a first sign-in (no row yet): the credential exchange only, with no person in the context;
  *  - a subject whose row is not active, or a revoked one: no route. Whether the account is disabled at
  *    its issuer is the credential exchange's live question, never the edge's.
@@ -19,7 +18,6 @@ import { __setFetcherForTests, verifyToken } from '../../lambda/src/lib/token-ve
 import { clearPersonCache, identityStateOf, revokedMarkerKey, type IdentityState } from '../../lambda/src/lib/person-identity';
 import { edgeIssuers, type EdgeIssuer } from '../../lib/config/edge-verification';
 import { expandIssuer, groupsOf, issuerRegistry } from '../../lib/config/issuers';
-import { ONE_CHANNEL_ROUTES } from '../../lib/constructs/trusted-issuers';
 import { EXCHANGE_ROUTE } from '../../lib/constructs/edge-authorizer';
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
 import { StubFetcher, jwks, nowSeconds, rsaKey, signToken } from '../helpers/jwt-fixtures';
@@ -35,7 +33,7 @@ const iss = (pool: string) => `https://cognito-idp.${REGION}.amazonaws.com/${poo
 
 const REGISTRY = [
   { id: 'deployment', kind: 'cognito-pool', pool: 'self', clearance: { groups: true, classifications: ALL }, admin: true },
-  { id: 'host', kind: 'cognito-pool', pool: HOST_POOL, audience: 'host-client', clearance: { oneChannel: 'basic', classifications: ['basic'] } },
+  { id: 'host', kind: 'cognito-pool', pool: HOST_POOL, audience: 'host-client', clearance: { fixed: ['basic'], classifications: ['basic'] } },
   { id: 'corp-sso', kind: 'cognito-federated', pool: 'self', providerName: 'CorpSAML',
     clearance: { groups: { map: { 'AE Standard': 'standard' }, emptyGroupsSent: true }, classifications: ['basic', 'standard'] } },
 ];
@@ -60,7 +58,7 @@ const selfToken = (over: Record<string, unknown> = {}) => signToken(selfKey, {
 });
 const hostToken = () => signToken(hostKey, { iss: iss(HOST_POOL), aud: 'host-client', token_use: 'id', sub: 'sub-host', ...life() });
 
-const ROUTES: EdgeRoutes = { exchange: [EXCHANGE_ROUTE], oneChannel: [...ONE_CHANNEL_ROUTES] };
+const ROUTES: EdgeRoutes = { exchange: [EXCHANGE_ROUTE] };
 const API = 'arn:aws:execute-api:us-east-1:111122223333:abc123/$default';
 const arnOf = (routeKey: string, concretePath?: string) => {
   const [method, p] = routeKey.split(' ');
@@ -99,11 +97,11 @@ describe('which routes a verified token is admitted to', () => {
   it.each<[string, () => string, IdentityState, string[]]>([
     ['a person', () => selfToken(), { state: 'active', personArn: PERSON_ARN }, EVERY_ROUTE],
     ['a first sign-in (no Identities row)', () => selfToken(), { state: 'unbound' }, [EXCHANGE_ROUTE]],
-    ['a one-conversation person', () => hostToken(), { state: 'active', personArn: PERSON_ARN }, [...ONE_CHANNEL_ROUTES]],
-    ['a one-conversation first sign-in', () => hostToken(), { state: 'unbound' }, [EXCHANGE_ROUTE]],
+    ['a host pool person', () => hostToken(), { state: 'active', personArn: PERSON_ARN }, EVERY_ROUTE],
+    ['a host pool first sign-in', () => hostToken(), { state: 'unbound' }, [EXCHANGE_ROUTE]],
     ['a subject whose row is not active', () => selfToken(), { state: 'refused', status: 'pending' }, []],
     ['a revoked subject', () => selfToken(), { state: 'refused', status: 'revoked' }, []],
-    ['a one-conversation subject whose row is not active', () => hostToken(), { state: 'refused', status: 'pending' }, []],
+    ['a host pool subject whose row is not active', () => hostToken(), { state: 'refused', status: 'pending' }, []],
   ])('%s', async (_name, token, state, reachable) => {
     // Decided on the first route, as the gateway would before caching the answer for this token.
     for (const asked of EVERY_ROUTE) {
@@ -113,15 +111,6 @@ describe('which routes a verified token is admitted to', () => {
         expect({ asked, route, admitted: admits(policy, arnOf(route, concrete)) })
           .toEqual({ asked, route, admitted: reachable.includes(route) });
       }
-    }
-  });
-
-  it('a one-conversation token cached on conversation creation is not reused on any other route', async () => {
-    const policy = await authorize(request(hostToken(), 'POST /create-conversation'), deps({ state: 'active', personArn: PERSON_ARN }));
-    expect(admits(policy, arnOf('POST /create-conversation'))).toBe(true);
-    for (const route of EVERY_ROUTE.filter((r) => !ONE_CHANNEL_ROUTES.includes(r))) {
-      expect({ route, admitted: admits(policy, arnOf(route, route.includes('{id}') ? '/conversations/c-1/members' : undefined)) })
-        .toEqual({ route, admitted: false });
     }
   });
 
@@ -215,17 +204,15 @@ describe('refusals', () => {
     for (const route of EVERY_ROUTE) expect(admits(policy, arnOf(route, route.includes('{id}') ? '/c/x' : undefined))).toBe(false);
   });
 
-  it('unreadable route data admits a first sign-in and a one-conversation person nowhere', async () => {
+  it('unreadable route data admits a first sign-in nowhere', async () => {
     const quiet = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const routes = edgeRoutesFromEnv('{oops');
     quiet.mockRestore();
-    expect(routes).toEqual({ exchange: [], oneChannel: [] });
-    expect(edgeRoutesFromEnv(undefined)).toEqual({ exchange: [], oneChannel: [] });
+    expect(routes).toEqual({ exchange: [] });
+    expect(edgeRoutesFromEnv(undefined)).toEqual({ exchange: [] });
     expect(edgeRoutesFromEnv(JSON.stringify({ exchange: ['POST /exchange-credentials', 'not a route', 7] })).exchange).toEqual(['POST /exchange-credentials']);
     const first = await authorize(request(selfToken(), EXCHANGE_ROUTE), deps({ state: 'unbound' }, routes));
     expect(admits(first, arnOf(EXCHANGE_ROUTE))).toBe(false);
-    const host = await authorize(request(hostToken(), 'POST /create-conversation'), deps({ state: 'active', personArn: PERSON_ARN }, routes));
-    expect(admits(host, arnOf('POST /create-conversation'))).toBe(false);
   });
 
   it('a route ARN the policy cannot be scoped to admits nothing', () => {

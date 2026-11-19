@@ -11,7 +11,7 @@
  * reads), so a fact about a person chooses only a message addressed to that person. The draft's validation checks each
  * named template is active in the assistant's family and fits its message.
  */
-import React from 'react';
+import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { MessageChoice, MessageEntry } from '../../../../../../backend/lambda/src/lib/message-template.ts';
 import { messageAudience } from '../../../../../../backend/lambda/src/lib/shipped-message-templates.ts';
@@ -57,15 +57,24 @@ const MessageChoicesEditor: React.FC<{
   /** The new entry, or undefined to let the selection order decide. Absent, the choice is shown read-only. */
   onChange?: (next: MessageEntry | undefined) => void;
   options: TemplateOption[];
+  /** Why the choice is read-only here, where that is not the capability. */
+  readOnlyNote?: string;
   published?: PublishedVariables;
   variables?: Readonly<Record<string, VersionVariable>>;
-}> = ({ message, entry, onChange, options, published, variables }) => {
+}> = ({ message, entry, onChange, options, readOnlyNote, published, variables }) => {
   const { t: translate } = useTranslation();
   const t = translate as unknown as T;
-  const choices = entry === undefined ? [] : choicesOf(entry);
+  /** Alternatives being written: held here until each but the last has a condition, which the save requires. */
+  const [pending, setPending] = useState<MessageChoice[] | null>(null);
+  const choices = pending ?? (entry === undefined ? [] : choicesOf(entry));
   const selects = messageAudience(message);
   const readOnly = !onChange;
-  const set = (next: MessageChoice[]) => onChange?.(entryOf(next));
+  const complete = (next: MessageChoice[]) => next.every((c, i) => i === next.length - 1 || c.when !== undefined);
+  const set = (next: MessageChoice[]) => {
+    if (!complete(next)) { setPending(next); return; }
+    setPending(null);
+    onChange?.(entryOf(next));
+  };
   const templateSelect = (current: string, onPick: (v: string) => void, testId: string, withOrder = false) => {
     // A name the version holds that is not offered (a template since rolled back) is still shown, so it is not lost.
     const known = current === ORDER_CHOICE ? withOrder : options.some((o) => o.value === current);
@@ -81,7 +90,7 @@ const MessageChoicesEditor: React.FC<{
 
   return (
     <div className="profiles-persona-field" data-testid="message-choice">
-      <h6>{t('admin.messageChoices.title')}</h6>
+      <h5>{t('admin.messageChoices.title')}</h5>
       <span className="admin-field-hint">{t('admin.messageChoices.help')}</span>
       {choices.length <= 1 && choices.every((c) => c.when === undefined) ? (
         <label><span className="admin-field-label">{t('admin.messageChoices.usedIn')}</span>
@@ -100,6 +109,9 @@ const MessageChoicesEditor: React.FC<{
                   <>
                     <ConditionBuilder value={c.when} selects={selects} published={published} variables={variables} testId={`message-choice-alt-${i}-when`}
                       onChange={(when) => put(when === undefined ? { template: c.template } : { template: c.template, when })} />
+                    {c.when === undefined && (
+                      <span role="alert" className="admin-field-hint" data-testid={`message-choice-alt-${i}-needs-when`}>{t('admin.messageChoices.needsWhen')}</span>
+                    )}
                     {!readOnly && (
                       <button type="button" className="btn-secondary" data-testid={`message-choice-alt-${i}-remove`} onClick={() => put(undefined)}>
                         {t('admin.messageChoices.removeAlternative')}
@@ -129,7 +141,7 @@ const MessageChoicesEditor: React.FC<{
           )}
         </div>
       )}
-      {readOnly && <span className="admin-field-hint" data-testid="message-choice-read-only">{t('admin.messageChoices.readOnly')}</span>}
+      {readOnly && <span className="admin-field-hint" data-testid="message-choice-read-only">{readOnlyNote ?? t('admin.messageChoices.readOnly')}</span>}
     </div>
   );
 };

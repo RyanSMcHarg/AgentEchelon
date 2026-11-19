@@ -1,6 +1,6 @@
 ---
 title: "ADR-030: A message is answered by the assistant whose work it answers"
-status: Accepted 2026-08-14 (maintainer). Built and deployed; the handover half is not exercised live.
+status: Accepted 2026-08-14 (maintainer). Built and deployed.
 date: 2026-08-14
 related:
   - "../../guides/developer/MESSAGE-FLOW.md"
@@ -16,10 +16,10 @@ related:
 tracking: |
   Replaces targeting as a routing input. The channel flow's `Target`-based battle continuation is
   measurably dead (the flow callback carries no `Target`) and is superseded rather than repaired.
-  The handover is a Lambda invoke because ADR-023 measured that a bot-authored message never reaches
-  another bot's Lex. B-proxy is NOT the route it moves onto: assistant-to-assistant traffic rides the
-  Kinesis stream with post-processing delivering or dispatching, which is a consumer that can see a
-  bot-authored message because it reads the stream rather than waiting on Lex.
+  The handover is a message targeted at the receiving assistant (`lib/assistant-handover.ts`): the
+  channel flow routes it from the address token, post-processing (`lib/handover-backstop.ts`) routes
+  one the flow could not, and the receiving router verifies it by reading it back. It never relies on
+  Lex, which ADR-023 measured does not deliver a bot-authored message to another bot's Lex.
 ---
 
 # ADR-030: A message is answered by the assistant whose work it answers
@@ -28,13 +28,11 @@ tracking: |
 
 **Accepted (maintainer, 2026-08-14). Built and deployed to the dev deployment.**
 
-Verification is uneven and is stated per part rather than as a single claim:
-
 | Part | State |
 |---|---|
-| The normalized delivery pair | Built. `Verified by:` `test/lib/resumed-chain-delivery.test.ts`; the live half is B-E7's receipt-stays-private assertion |
-| A duel side resumes on the path a duel takes | Built. `Verified by:` `test/lib/handover-follows-the-task.test.ts`; live verification is B-E7's positive control |
-| The handover | Built. `Verified by:` `test/lib/handover-follows-the-task.test.ts`. **No live exercise exists**: it needs two assistants where the one addressed does not own the chain, which no e2e sets up |
+| The normalized delivery pair | Built. `Verified by:` `test/lib/resumed-chain-delivery.test.ts`; live, B-E7 in `tests/e2e/battle.spec.ts` (passed 2026-10-07 on an earlier version of the spec; not rerun since) |
+| A duel side resumes on the path a duel takes | Built. `Verified by:` `test/lib/handover-follows-the-task.test.ts`; live, B-E7's positive control (passed 2026-10-07 on an earlier version of the spec; not rerun since) |
+| The handover | Built. `Verified by:` `test/lib/handover-follows-the-task.test.ts` and `test/lib/a-handover-is-a-message-not-an-invoke.test.ts`. The deployed path, `tests/e2e/an-assistant-passes-a-question-to-its-ops-roommate.spec.ts`, passed on dev, 2026-11-05 (`node scripts/validate.mjs --only=ops-role` from backend/): a telemetry question is handed to the ops roommate, and a business question is answered by the primary |
 
 ## Problem and who it's for
 
@@ -100,11 +98,9 @@ Nothing is parsed out of the message and nothing is carried on it. That is the d
 
 **Carrying the target to the server.** Two candidates were weighed and both are discarded by the decision above rather than by their costs: putting the `Target` in message `Metadata`, and reading it back with `GetChannelMessage` from the channel flow. Both answer "who was this addressed to", which is not the question. The `Target`-based continuation in the channel flow is superseded by this ADR, not repaired.
 
-**A handover sent as a message THROUGH LEX.** [ADR-023](./023-battle-round-coordination.md) measured that Amazon Chime SDK does not deliver a bot-authored message to another bot's Lex: bot to bot produced zero handler invocations against a control of one. A handover routed that way would reach nobody at all. It is therefore a Lambda invoke over the existing handler bypass, the same seam the round-2 dispatch runs on.
+**A handover sent as a message THROUGH LEX.** [ADR-023](./023-battle-round-coordination.md) measured that Amazon Chime SDK does not deliver a bot-authored message to another bot's Lex: bot to bot produced zero handler invocations against a control of one. A handover routed that way would reach nobody at all.
 
-**That rejection is about the ROUTE, not about messages**, and the distinction matters now that assistant-to-assistant traffic has a decided shape. Bot-to-bot messages ride the Kinesis stream, and POST-PROCESSING delivers them or dispatches on them per use case - a consumer that sees a bot-authored message perfectly well, because it is reading the stream rather than waiting for Lex to route. So a hand-over MAY be expressed as a message on that path; what it may not be is a message expected to arrive by the Lex route this ADR measured as dead.
-
-An earlier version of this note said the handover could move onto ADR-023's B-proxy identities once they landed. That is superseded: B-proxy was not the shape chosen, and the stream plus post-processing is.
+**That rejection is about the ROUTE, not about messages.** The handover is a message targeted at the receiving assistant, carrying a reference to the person's message in its `Metadata` (`lib/assistant-handover.ts`). The channel flow routes it from the receiver's address token, post-processing routes one the flow could not (`lib/handover-backstop.ts`), and the receiving router acts only after reading that message back. Because it is a stored message, the sender's bearer is pinned to its own assistant identity, and no assistant can start another's turn by naming it in an invoke payload (DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION §3.4).
 
 ## How the hop is bounded
 

@@ -10,6 +10,7 @@
  * turn, and a channel created before the move is reported rather than silently served (see the legacy
  * block at the end of `assembleHostGrounding`).
  */
+import { threadRelatives } from './related-conversations.js';
 import { getChannelContext } from './channel-context-client.js';
 import { resolvePerson } from './person-identity.js';
 import { issuerIdOf } from './trusted-issuers.js';
@@ -114,6 +115,13 @@ export async function assembleHostGrounding(
     // The conversation's type as the row records it (ADR-053), which a turn's conditions read as `conversation:type`
     // (ADR-060). Never the member-writable tag.
     if (typeof priv.conversationType === 'string' && priv.conversationType) domainGrounding.conversationType = priv.conversationType;
+    // THE ALARM THE ROOM WATCHES (the incident watch, an incident), which the creator recorded: its ops assistant reads that
+    // alarm's state beside the deployment's own (`read_deployment_health`). A name, never the alarm's text.
+    if (typeof priv.watchedAlarm === 'string' && priv.watchedAlarm) domainGrounding.watchedAlarm = priv.watchedAlarm;
+    // THE CONVERSATIONS THIS ONE THREADS WITH, as references, unchecked (DESIGN-WORKFLOWS-AND-TASKS section 6): the processor
+    // reads each one's members as the turn's assistant before any summary is read.
+    const relatives = threadRelatives(channelArn, priv);
+    if (relatives.length) domainGrounding.threadRelatives = relatives;
   }
 
   // WHO is in the conversation: CHANNEL MEMBERSHIP, resolved live, never a stored copy.

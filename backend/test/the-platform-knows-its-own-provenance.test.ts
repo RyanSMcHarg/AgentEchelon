@@ -23,8 +23,8 @@ import * as path from 'path';
 
 const ROOT = path.resolve(__dirname, '..');
 const REPO = path.resolve(ROOT, '..');
-const ABOUT = path.join(ROOT, 'demo', 'platform-knowledge', 'standard', 'agentechelon-about.json');
-const PUBLIC_ABOUT = path.join(ROOT, 'demo', 'platform-knowledge', 'basic', 'agentechelon-about.json');
+const ABOUT = path.join(REPO, 'demo', 'stratum-company', 'platform-knowledge', 'standard', 'agentechelon-about.json');
+const PUBLIC_ABOUT = path.join(REPO, 'demo', 'stratum-company', 'platform-knowledge', 'basic', 'agentechelon-about.json');
 
 // THE EXTERNAL CLASSIFICATION GETS THE OVERVIEW AND NOTHING OF HOW IT IS BUILT.
 describe('the public overview carries no internal documentation', () => {
@@ -35,7 +35,7 @@ describe('the public overview carries no internal documentation', () => {
     expect(JSON.stringify(pub)).not.toContain('docs/');
   });
   it('no unscoped file every classification could read is left beside the scoped ones', () => {
-    expect(fs.existsSync(path.join(ROOT, 'demo', 'platform-knowledge', 'agentechelon-about.json'))).toBe(false);
+    expect(fs.existsSync(path.join(REPO, 'demo', 'stratum-company', 'platform-knowledge', 'agentechelon-about.json'))).toBe(false);
   });
 });
 
@@ -60,7 +60,7 @@ describe('the curated self-knowledge names its own provenance', () => {
   });
 
   it('names where the source lives, as a URL somebody could open', () => {
-    // An SSH host alias (`git@github-mcharg:owner/repo.git`) resolves on one machine and nowhere
+    // An SSH host alias (`git@github-work:owner/repo.git`) resolves on one machine and nowhere
     // else, so publishing one as a URL hands somebody an address that does not exist.
     expect(about.repository).toMatch(/^https:\/\/[a-z0-9.-]+\.[a-z]{2,}\/[^/]+\/[^/]+$/i);
     expect(about.repository).not.toMatch(/\.git$/);

@@ -186,7 +186,7 @@ export function legacyWelcomePlan(welcome: unknown, own: Record<string, EventWor
       const name = c.workflow!;
       const wf = workflowFor(own, name);
       if (!wf) {
-        refused.push({ at: `${at}.workflow`, reason: `names "${name}", which the version does not declare and the platform does not ship; the room greets with its opening instead` });
+        refused.push({ at: `${at}.workflow`, reason: `names "${name}", which the version does not declare and the platform does not ship; the conversation greets with its opening instead` });
         if (!isPlatformDefault({ ...c, mode: 'structured' })) {
           const wfName = freeName(type ? `welcome-${type}` : 'welcome');
           eventWorkflows[wfName] = saidWorkflow({ ...c, mode: 'structured' }, type ? [type] : undefined);
@@ -218,7 +218,7 @@ export function legacyWelcomePlan(welcome: unknown, own: Record<string, EventWor
         refused.push({
           at,
           reason: `carries ${Object.keys(openingStepOf(c.opening)).join(', ')} beside workflow "${name}", which has no opening step; `
-            + 'they opened only a drift-spawned room, which the deployment\'s orientation opens now',
+            + 'they opened only a drift-spawned conversation, which the deployment\'s orientation opens now',
         });
       }
       continue;

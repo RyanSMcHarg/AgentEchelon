@@ -216,6 +216,42 @@ function sameWork(turnKey: string, keptHereAs: string | undefined, taskType: str
   return turnKey === taskType || (!!keptHereAs && keptHereAs === taskType);
 }
 
+/** The classifier's decision on the open work, as `classifyIntent` returns it. */
+export interface WaitingWorkDecision {
+  continuesTask?: { taskId: string; taskType: string };
+  waitingWorkDecided?: string[];
+}
+
+/**
+ * WHERE THE CLASSIFIER PLACED THE MESSAGE, FOR ONE OPEN TASK (ADR-064, amended 2026-11-12).
+ *
+ * A message is routed on its content read with the conversation's task state: the classifier was offered each open
+ * task as a place the message may belong and decided once. `continues` when it placed the message in this task,
+ * `elsewhere` when it was offered this task and placed the message somewhere else (the task stays open and the
+ * message is routed on its own intent), undefined when no model decided about this task, where the structural rule
+ * (`opensOtherWorkThan`) decides.
+ */
+export function classifierPlacement(
+  decision: WaitingWorkDecision,
+  taskId: string | undefined,
+): 'continues' | 'elsewhere' | undefined {
+  if (!taskId || !decision.waitingWorkDecided?.includes(taskId)) return undefined;
+  return decision.continuesTask?.taskId === taskId ? 'continues' : 'elsewhere';
+}
+
+/**
+ * HOW THE TURN WAS ROUTED AGAINST THE OPEN WORK, recorded on the turn (`routedAs`): `continues_task` when the
+ * classifier placed the message in an open task, `own_intent` when it was offered open work and read the message as
+ * a request of its own. Absent when no open work was offered, so the classifier's decision is measured as what it
+ * decided rather than as a label it was made to give.
+ */
+export type RoutedAs = 'continues_task' | 'own_intent';
+
+export function routedAsOf(decision: WaitingWorkDecision): RoutedAs | undefined {
+  if (!decision.waitingWorkDecided?.length) return undefined;
+  return decision.continuesTask ? 'continues_task' : 'own_intent';
+}
+
 /**
  * A STALLED STEP OF THE SPEAKER'S OWN WORK RESUMES, RATHER THAN BEING DECLINED.
  *
@@ -273,10 +309,16 @@ export function isStalledStepCandidate(input: {
   /** The task type this turn's intent opens, and what the intent reads back to here. */
   turnOpensTaskType: string | undefined;
   keptHereAs: string | undefined;
+  /**
+   * The classifier read the message as an acknowledgment ("go ahead", "ok"): on a step this assistant holds of the
+   * speaker's own work, that is consent to carry on, so it is the same work. The classifier's label decides, never the
+   * words (tenet D11), and `resumesAStalledStep` still requires that nothing is running or delivered.
+   */
+  turnIsAcknowledgment?: boolean;
 }): boolean {
   const { task } = input;
   if (!task?.taskType || input.awaitsAParty) return false;
   if (task.assistantId && task.assistantId !== input.selfAssistantId) return false;
   if (!input.speakerPersonId || task.ownerPersonId !== input.speakerPersonId) return false;
-  return task.taskType === input.turnOpensTaskType || task.taskType === input.keptHereAs;
+  return task.taskType === input.turnOpensTaskType || task.taskType === input.keptHereAs || !!input.turnIsAcknowledgment;
 }

@@ -8,7 +8,7 @@
  *
  * Identity comes from the edge authorizer's context (`edgeCallerOf`, lib/auth.ts), NEVER from the request
  * body (IDOR guard). The edge matched the token's issuer to the trusted-issuer registry, which
- * decides the subject, the clearance and the classifications it may grant, and whether the person is vended one conversation.
+ * decides the subject, the clearance and the classifications it may grant.
  *
  * THE GUEST'S ENTRY POINTS ARE HERE TOO (`guest-session.ts`): guest start, which mints an anonymous
  * visitor, opens their conversation and vends their first session, and guest refresh, which rotates their
@@ -36,8 +36,14 @@
  * (`bindInvitation`), which binds the subject to the invitee instead of minting.
  *
  * A DISABLED ACCOUNT IS REFUSED AT EVERY VEND (`refuseInactiveAccount`, lib/vend.ts): the issuer is asked
- * whether the account may still sign in before anything is minted or recorded, at the first sign-in and
+ * whether the account may still sign in before anything is minted or granted, at the first sign-in and
  * at each refresh, and a directory that cannot be read vends nothing (SPEC-CREDENTIAL-EXCHANGE §4b).
+ *
+ * EVERY REFUSAL IS RECORDED (`refusalsRecorded`, lib/vend.ts): an answer that vends nothing is written to the
+ * access log as a refusal, naming who asked, what they asked for and the refusal's code, before it is
+ * returned. The four routes that take no token (guest start and refresh, the invitation landing page's
+ * peek and link redemption) run their own abuse controls and are answered without a record, so an
+ * anonymous caller cannot write to the access log at the rate it sends requests.
  *
  * ONLY THE PERSON PLANE IS HERE. A console session, a per-conversation admin credential and a team
  * attachment read are the admin credential exchange's (`admin-credential-exchange.ts`, in the
@@ -45,17 +51,22 @@
  * holds no role that could.
  */
 import { AssumeRoleCommand } from '@aws-sdk/client-sts';
+import { bucketNameOf, resolveAttachmentsBucketArn } from './lib/attachments-bucket.js';
+import { conversationIdOf, dashboardKey } from './lib/dashboard-keys.js';
+import { callerReachesConversation } from './lib/conversation-access.js';
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
 import { userArnFor } from './lib/person-arn.js';
 import { resolveExchangeRoleArn } from './lib/exchange-role-arn.js';
 import { ADMIN_PLANE_SESSION_TAG } from '../../lib/profile-registry';
 import { bindProvisionedPerson, mintOrResolvePerson, PersonNotActive, PersonNotProvisioned, recordClearanceDecision } from './lib/person-identity.js';
-import { clearanceBasisOf, isGuestIssuer, isProvisionedOnly, oneChannelOf, type TrustedIssuer } from '../../lib/config/issuers.js';
+import { clearanceBasisOf, isGuestIssuer, isProvisionedOnly, type TrustedIssuer } from '../../lib/config/issuers.js';
 import { countExchangeRefusal, spendHostAssertion } from './lib/host-assertion-exchange.js';
 import { guestConfigFromEnv, guestRefresh, guestStart, vendGuestSession } from './guest-session.js';
 import type { HttpResult } from './lib/http-response.js';
 import { defaultContactCopyStore, writeContactCopy } from './lib/claims-directory.js';
+
 import { edgeCallerOf } from './lib/auth.js';
+import { verifiedAddress } from './lib/issuer-seams.js';
 import { bindGuestPerson, bindRequestOf, BindRefused, boundVisitOf, continueBoundVisit } from './lib/guest-bind.js';
 import { linkRequestOf, linkSecondIssuer, LinkRefused } from './lib/issuer-link.js';
 import {
@@ -82,8 +93,10 @@ import {
   displayNameOf,
   isRefusal,
   literalChannelId,
+  noteRefusalFacts,
   parseGroups,
   refuseInactiveAccount,
+  refusalsRecorded,
   reply,
   resolveRoleKey,
   sts,
@@ -92,22 +105,29 @@ import {
 } from './lib/vend.js';
 import { loadProfileRegistry } from '../../lib/profile-registry';
 
+
 export { parseGroups, resolveRoleKey, consoleRoleFor };
 
 /** The person the edge resolved the token to, when it resolved one. */
 const edgePersonIdOf = (event: any): string | undefined => edgeCallerOf(event)?.personId ?? undefined;
 
-/**
- * THE ROLE A ONE-CONVERSATION PERSON IS VENDED ON: the `restricted` role, bounded by the session policy
- * to one channel and by membership, never by a classification tag (SPEC-CONVERSATION-SECURITY 4a).
- */
-const EXCHANGE_ROLE_RESTRICTED = process.env.EXCHANGE_ROLE_RESTRICTED || '';
-/** How long a one-conversation credential lasts. */
-const ONE_CHANNEL_SESSION_SECONDS = 3600;
 const SESSION_DURATION_SECONDS = Number(process.env.EXCHANGE_SESSION_SECONDS || '3600');
 
-/** The capabilities this exchange vends: the chat set, and an owner's rename. */
-const PERSON_CAPABILITIES = new Set(['view', 'participate', 'rename']);
+/**
+ * READ ONE CONVERSATION'S DASHBOARD (DESIGN-CONVERSATION-DASHBOARDS section 4): a session whose policy reads that conversation's
+ * `snapshot.json` and nothing else, vended only after the caller's membership and clearance are checked as the presigner
+ * checks them. The vend role allows its own classification's dashboards; this narrows it to one.
+ */
+export const DASHBOARD_CAPABILITY = 'dashboard';
+
+/** The one object a dashboard session reads, in the bucket the conversation record keeps: its snapshot, under its classification. */
+export function dashboardObjectOf(bucketArn: string, classification: string, channelArn: string): { arn: string; bucket: string; key: string } | null {
+  const key = bucketArn ? dashboardKey(classification, conversationIdOf(channelArn), 'snapshot') : null;
+  return key ? { arn: `${bucketArn}/${key}`, bucket: bucketNameOf(bucketArn), key } : null;
+}
+
+/** What the person may ask the exchange for: the chat set, a rename, and one conversation's dashboard read. */
+const PERSON_CAPABILITIES = new Set(['view', 'participate', 'rename', DASHBOARD_CAPABILITY]);
 
 /**
  * THE CONTACT COPY (C5), for an issuer whose directory is `claims`: the contact claims of THIS sign-in
@@ -117,101 +137,9 @@ const PERSON_CAPABILITIES = new Set(['view', 'participate', 'rename']);
 async function keepContactCopy(issuer: TrustedIssuer, personId: string, claims: Record<string, unknown>): Promise<void> {
   if (issuer.directory !== 'claims') return;
   try {
-    await writeContactCopy({ personId, issuerId: issuer.id, contact: { email: claims.email, name: claims.name } }, defaultContactCopyStore());
+    await writeContactCopy({ personId, issuerId: issuer.id, contact: { email: verifiedAddress(claims.email, claims.email_verified), name: claims.name } }, defaultContactCopyStore());
   } catch (err) {
     console.warn('[CredentialExchange] the contact copy could not be kept (non-fatal)', { issuer: issuer.id, err: (err as Error)?.name });
-  }
-}
-
-/**
- * THE ONE-CONVERSATION VEND, for a person whose issuer declares `clearance: { oneChannel }` (Q5).
- *
- * The least-trusted caller in the system, a person a host app embedded into one conversation, gets the
- * narrowest credential: read and participate, on the one channel they name, as their own AppInstanceUser,
- * for an hour, on the `restricted` role. The session policy names the channel; Amazon Chime SDK
- * membership is the second layer, so naming somebody else's conversation yields a credential that is
- * refused there.
- */
-async function oneChannelVend(
-  event: any,
-  issuer: TrustedIssuer,
-  subject: string,
-  claims: Record<string, unknown>,
-): Promise<HttpResult> {
-  let body: { channelArn?: unknown; identity?: unknown; capabilities?: unknown };
-  try {
-    body = event?.body ? JSON.parse(event.body) : {};
-  } catch {
-    return reply(event, 400, { error: 'Malformed body' });
-  }
-  if (body?.identity === 'console' || body?.identity === 'admin' || (Array.isArray(body?.capabilities) && body.capabilities.length)) {
-    return reply(event, 403, { error: 'a one-conversation sign-in is vended its one conversation and nothing else', code: 'ONE_CONVERSATION_ONLY' });
-  }
-  // REQUIRED, not optional: defaulting to `channel/*` when the field is missing would leave that grant
-  // reachable by simply omitting it. Anchored to this app instance, with no wildcard and no path
-  // traversal, so the policy resource cannot be widened by a crafted string.
-  const channelArn = String(body?.channelArn || '');
-  if (!APP_INSTANCE_ARN || !channelArn.startsWith(CHANNEL_PREFIX) || channelArn.includes('*') || channelArn.length > 512
-    || channelArn.slice(CHANNEL_PREFIX.length).includes('/') || !channelArn.slice(CHANNEL_PREFIX.length)) {
-    return reply(event, 400, { error: 'channelArn is required and must name one channel in this app instance' });
-  }
-  if (!EXCHANGE_ROLE_RESTRICTED) {
-    console.error('[CredentialExchange] no restricted classification role is configured for a one-conversation vend');
-    return reply(event, 500, { error: 'Exchange misconfigured' });
-  }
-
-  const displayName = String(claims.name || claims['cognito:username'] || '');
-  let personId: string;
-  try {
-    personId = (await mintOrResolvePerson({ issuer: issuer.id, subject, name: displayName })).personId;
-  } catch (err) {
-    if (err instanceof PersonNotActive) return reply(event, 403, { error: 'this sign-in is not active', code: 'PERSON_NOT_ACTIVE' });
-    console.error('[CredentialExchange] could not resolve the one-conversation person:', err);
-    return reply(event, 500, { error: 'Credential exchange failed' });
-  }
-  await keepContactCopy(issuer, personId, claims);
-  const userArn = userArnFor(APP_INSTANCE_ARN, personId);
-  try {
-    const sessionPolicy = JSON.stringify({
-      Version: '2012-10-17',
-      Statement: [
-        { Sid: 'SessionAndConnect', Effect: 'Allow', Action: ['chime:GetMessagingSessionEndpoint', 'chime:Connect'], Resource: '*' },
-        {
-          Sid: 'OneConversation',
-          Effect: 'Allow',
-          // The read + participate set only. This person never moderates, never manages membership and
-          // never renames: neither the list nor the role carries those.
-          Action: [
-            'chime:GetChannelMessage', 'chime:ListChannelMessages',
-            'chime:DescribeChannel', 'chime:ListChannelMemberships',
-            'chime:SendChannelMessage', 'chime:UpdateChannelReadMarker',
-          ],
-          Resource: [channelArn, userArn],
-        },
-      ],
-    });
-    const assumed = await sts.send(new AssumeRoleCommand({
-      RoleArn: EXCHANGE_ROLE_RESTRICTED,
-      RoleSessionName: `one-${personId}`.slice(0, 64),
-      DurationSeconds: ONE_CHANNEL_SESSION_SECONDS,
-      Policy: sessionPolicy,
-      // BOTH ASSERTIONS, because the classification role's trust policy requires both: `person` pins the bearer,
-      // and `classification` must equal the role's own, `restricted`.
-      Tags: [
-        { Key: 'person', Value: personId },
-        { Key: 'classification', Value: 'restricted' },
-      ],
-    }));
-    return reply(event, 200, {
-      credentials: credentialsOf(assumed),
-      userArn,
-      tier: 'restricted',
-      identity: 'chat',
-      scopedTo: channelArn,
-    });
-  } catch (err) {
-    console.error('[CredentialExchange] one-conversation vend failed:', err);
-    return reply(event, 500, { error: 'Credential exchange failed' });
   }
 }
 
@@ -295,7 +223,10 @@ function routeOf(event: any): string {
   return String(event?.resource || event?.path || '');
 }
 
-export const handler = async (event: any): Promise<HttpResult> => {
+/** The routes that take no token, whose refusals are their own abuse controls' to count. */
+const UNAUTHENTICATED_ROUTES = new Set(['/guest/start', '/guest/refresh', '/invitations/peek', '/invitations/redeem']);
+
+const exchange = async (event: any): Promise<HttpResult> => {
   // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
   await loadProfileRegistry();
   // THE INVITATIONS FUNCTION'S ONE INVOCATION: mint an invitee. No gateway request carries an `op` and no
@@ -322,10 +253,6 @@ export const handler = async (event: any): Promise<HttpResult> => {
   // or records: a disabled or gone account is refused, and an unreadable directory vends nothing.
   const inactive = await refuseInactiveAccount(event, caller);
   if (inactive) return inactive;
-
-  // A ONE-CONVERSATION ISSUER (`clearance: { oneChannel }`) is vended one conversation, on its own path,
-  // and reaches nothing else this handler vends.
-  if (oneChannelOf(issuer)) return oneChannelVend(event, issuer, subject, claims);
 
   // B7 AND PATH A ARE ASKED FOR IN THE BODY, and a malformed ask is refused rather than ignored: ignored,
   // a bind would silently mint a second person for the visitor.
@@ -441,6 +368,7 @@ export const handler = async (event: any): Promise<HttpResult> => {
       ? await bindProvisionedPerson({ issuer: issuer.id, subject, name: displayNameOf(claims) })
       : await mintOrResolvePerson({ issuer: issuer.id, subject, name: displayNameOf(claims) });
     personId = person.personId;
+    noteRefusalFacts(event, { personId });
     personCreated = person.created;
     if ('guestChannelArn' in person && typeof person.guestChannelArn === 'string') boundFromChannel = person.guestChannelArn;
     if (boundReplay) boundFromChannel = boundReplay;
@@ -469,8 +397,7 @@ export const handler = async (event: any): Promise<HttpResult> => {
   await keepContactCopy(issuer, personId, claims);
   // THE DECISION, RECORDED (C3): the classification this sign-in is vended, the issuer, the rule and what it
   // matched, on the subject's own row. Evidence for the readers with no token; nothing grants from it.
-  const basis = clearanceBasisOf(issuer, claims);
-  if (basis) await recordClearanceDecision({ issuer: issuer.id, subject, classification: roleKey, ...basis });
+  await recordClearanceDecision({ issuer: issuer.id, subject, classification: roleKey, ...clearanceBasisOf(issuer, claims) });
 
   try {
     // The minter created the identity (or found it); here it is classified with the same token the role
@@ -495,13 +422,23 @@ export const handler = async (event: any): Promise<HttpResult> => {
     // A session policy scoped to exactly the requested capabilities on the requested resource. The role
     // role is the BOUNDARY, so this only narrows. The default (view + participate) is the chat set.
     const caps = requestedCaps.length ? requestedCaps : ['view', 'participate'];
-    const requestedActions = [...new Set(caps.flatMap((c) => CAPABILITY_ACTIONS[c]))];
+    const requestedActions = [...new Set(caps.flatMap((c) => CAPABILITY_ACTIONS[c] ?? []))];
     const channelResource = scopeChannelArn || `${CHANNEL_PREFIX}*`;
+    // A DASHBOARD READ IS FOR ONE CONVERSATION THE CALLER IS IN NOW, checked before anything is minted.
+    let dashboardObject: { arn: string; bucket: string; key: string } | null = null;
+    if (caps.includes(DASHBOARD_CAPABILITY)) {
+      if (!scopeChannelArn) return reply(event, 400, { error: 'a dashboard is read for one conversation: name its channelArn' });
+      const access = await callerReachesConversation(event, scopeChannelArn);
+      if (!access.ok) return reply(event, access.status, { error: 'this conversation\'s dashboard is not yours to read', code: access.code });
+      dashboardObject = dashboardObjectOf(await resolveAttachmentsBucketArn('[CredentialExchange]'), access.classification, scopeChannelArn);
+      if (!dashboardObject) return reply(event, 503, { error: 'dashboards are not available on this deployment' });
+    }
     const sessionPolicy = JSON.stringify({
       Version: '2012-10-17',
       Statement: [
         { Sid: 'SessionAndConnect', Effect: 'Allow', Action: ['chime:GetMessagingSessionEndpoint', 'chime:Connect'], Resource: '*' },
-        { Sid: 'RequestedActions', Effect: 'Allow', Action: requestedActions, Resource: [channelResource, bearerArn] },
+        ...(requestedActions.length ? [{ Sid: 'RequestedActions', Effect: 'Allow', Action: requestedActions, Resource: [channelResource, bearerArn] }] : []),
+        ...(dashboardObject ? [{ Sid: 'DashboardRead', Effect: 'Allow', Action: ['s3:GetObject'], Resource: [dashboardObject.arn] }] : []),
       ],
     });
     const assumed = await sts.send(new AssumeRoleCommand({
@@ -534,6 +471,8 @@ export const handler = async (event: any): Promise<HttpResult> => {
       consoleRole: consoleRoleFor(issuer, groups),
       ...(bound ? { bound } : {}),
       ...(invitedTo ? { invitation: { channelArn: invitedTo } } : {}),
+      // WHERE THE ONE DASHBOARD THIS SESSION READS IS, so the client names no bucket of its own.
+      ...(dashboardObject ? { dashboard: { bucket: dashboardObject.bucket, key: dashboardObject.key, region: process.env.AWS_REGION || 'us-east-1' } } : {}),
     };
     return reply(event, 200, result);
   } catch (err) {
@@ -541,3 +480,7 @@ export const handler = async (event: any): Promise<HttpResult> => {
     return reply(event, 500, { error: 'Credential exchange failed' });
   }
 };
+
+export const handler = refusalsRecorded('person', exchange, {
+  recorded: (event) => !UNAUTHENTICATED_ROUTES.has(routeOf(event)),
+});

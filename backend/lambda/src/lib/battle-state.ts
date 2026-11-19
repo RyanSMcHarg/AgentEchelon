@@ -127,6 +127,13 @@ const TTL_GRACE_SECONDS = 300;
 const ROW_LIFETIME_MS = Math.max(DUEL_MAX_LIFETIME_MS, USER_WAIT_MS, MACHINE_DEADLINE_MS);
 
 /**
+ * How long after a duel its scorecard takes a pick. The scorecard stays in the conversation, and a pick
+ * proves its channel binding from the round-1 sentinel and is refused on the `__abandoned__` one, so
+ * those two rows outlive the rest by this much.
+ */
+const BATTLE_PICK_WINDOW_SECONDS = 30 * 24 * 60 * 60;
+
+/**
  * The TTL (epoch SECONDS) for any `BattleState` row written at `nowMs`.
  *
  * Exported so the orchestrator's own sentinel writer takes the bound from here instead of keeping a
@@ -480,7 +487,7 @@ export interface BattleStateRow {
   state: BattleBotStatus;
   /**
    * The channel this duel ran in. Written ONLY on the `__round1__` sentinel, by
-   * `tryClaimRound1Fanout`, and read by `readBattleChannel`.
+   * `tryClaimRound1Fanout`, and read by `battleChannelFrom`.
    *
    * Deliberately not on the per-bot rows: those are replaced wholesale by `transitionBotState`, so a
    * field parked on them survives only until the side it describes finishes.
@@ -870,8 +877,11 @@ export async function resumeBotFromWaiting(args: {
   }
 }
 
-/** Read all bot rows for a battle. Used by the orchestrator's "all terminal?" check. */
-export async function readBattleRows(battleId: string): Promise<BattleStateRow[]> {
+/**
+ * Read all bot rows for a battle. Used by the orchestrator's "all terminal?" check. A failed read answers
+ * as no rows, unless the caller decides access from them and asks for the failure (`throwOnFailure`).
+ */
+export async function readBattleRows(battleId: string, opts: { throwOnFailure?: boolean } = {}): Promise<BattleStateRow[]> {
   if (!BATTLE_STATE_TABLE) return [];
   try {
     const result = await ddb.send(
@@ -883,6 +893,7 @@ export async function readBattleRows(battleId: string): Promise<BattleStateRow[]
     );
     return (result.Items as BattleStateRow[]) ?? [];
   } catch (err) {
+    if (opts.throwOnFailure) throw err;
     console.warn('[battle-state] readBattleRows failed:', err);
     return [];
   }
@@ -987,14 +998,15 @@ export async function tryClaimOrchestratorFire(battleId: string): Promise<boolea
  * the same message always claims the same battleId.
  *
  * It also RECORDS THE DUEL'S CHANNEL (see the item below), because this is the one write per battle
- * that happens once and is never replaced. `readBattleChannel` is the reader.
+ * that happens once and is never replaced. `battleChannelFrom` is the reader.
  */
 export async function tryClaimRound1Fanout(battleId: string, channelArn?: string): Promise<boolean> {
   if (!BATTLE_STATE_TABLE) return true; // no state table: cannot dedupe, fan out (dev/athena)
   // Outlives the DUEL, not one leg. This sentinel is the only thing stopping a redelivered `/battle`
   // fanning out twice, and a duel that now legitimately runs for an hour would otherwise outlive its own
-  // dedup claim and could be fanned out again on top of itself.
-  const ttl = battleRowTtl();
+  // dedup claim and could be fanned out again on top of itself. It also holds the channel binding a pick
+  // must prove, so it stands for the pick window (`BATTLE_PICK_WINDOW_SECONDS`) after the duel.
+  const ttl = battleRowTtl() + BATTLE_PICK_WINDOW_SECONDS;
   try {
     await ddb.send(
       new PutCommand({
@@ -1142,7 +1154,8 @@ export async function markBattleAbandoned(battleId: string, reason: string): Pro
           state: 'ABANDONED',
           completeReason: reason,
           enteredStateAt: new Date().toISOString(),
-          ttl: battleRowTtl(),
+          // AS LONG AS THE PICK WINDOW, so an ended duel stays refused for as long as its scorecard could take a pick.
+          ttl: battleRowTtl() + BATTLE_PICK_WINDOW_SECONDS,
         },
         ConditionExpression: 'attribute_not_exists(botArn)',
       }),

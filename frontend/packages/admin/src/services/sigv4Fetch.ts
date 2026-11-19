@@ -286,11 +286,18 @@ export async function vendAdminCapability(
 }
 
 /**
+ * The RFC 3986 encoding SigV4 canonicalizes a query with: `encodeURIComponent`, plus the five characters it leaves
+ * as they are (`!'()*`) percent-encoded.
+ */
+export function sigv4Escape(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+/**
  * SigV4-sign a GET to an `execute-api` URL with the given credentials and fetch it,
- * returning the parsed JSON. Query params are signed and re-serialized with the SAME
- * RFC3986 encoding SigV4 canonicalizes with (`encodeURIComponent`), so the signature
- * matches the sent request — AE's params (a Chime channel ARN, an integer limit) carry
- * no characters where `encodeURIComponent` diverges from SigV4.
+ * returning the parsed JSON. Query params are signed and sent with the SAME RFC 3986
+ * encoding (`sigv4Escape`), so the signature matches the sent request whatever a
+ * value carries, an operator's free-text reason included.
  *
  * A query written into `url` is sent and signed with the rest; a key in `query` takes its place.
  */
@@ -323,7 +330,7 @@ export async function sigv4GetJson<T>(
   });
 
   const qs = Object.entries(cleanQuery)
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .map(([k, v]) => `${sigv4Escape(k)}=${sigv4Escape(v)}`)
     .join('&');
   const fetchUrl = qs ? `${u.origin}${u.pathname}?${qs}` : `${u.origin}${u.pathname}`;
 

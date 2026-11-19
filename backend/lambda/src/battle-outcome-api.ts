@@ -23,19 +23,16 @@
  *     not do. Both values arrive from the client and describe different
  *     things, so checking one said nothing about the other: a member of
  *     any channel could pick in a duel that ran somewhere they cannot see.
- *     `readBattleChannel` is the join, recorded at fan-out on the one row
- *     per battle that is written once and never replaced. It is checked
- *     only when recorded - see the call site for why unknown is allowed.
+ *     `battleChannelFrom` is the join, recorded at fan-out on the one row
+ *     per battle that is written once and never replaced, and kept for
+ *     the pick window. A pick whose binding cannot be established is
+ *     refused.
  *
  * Storage semantics (last-write-wins, server-stamped chosenAt) live in
  * lib/battle-outcome.ts; this file is transport + auth + validation.
  */
 
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import {
-  ChimeSDKMessagingClient,
-  DescribeChannelMembershipCommand,
-} from '@aws-sdk/client-chime-sdk-messaging';
 import {
   recordBattleOutcome,
   readUserBattleOutcome,
@@ -49,9 +46,9 @@ import {
 import type { BattleStateRow } from './lib/battle-state.js';
 import type { BattleOutcome } from './lib/analytics-metadata.js';
 import { parseJsonBody, callerPersonId } from './lib/auth.js';
+import { callerReachesConversation, refusalAnswer } from './lib/conversation-access.js';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
-import { userArnFor } from './lib/person-arn.js';
 import { responder, originsFrom, DEV_ORIGIN } from './lib/http-response.js';
 import { chimeMessagingClient } from './lib/chime/clients.js';
 import { loadProfileRegistry } from '../../lib/profile-registry';
@@ -148,59 +145,44 @@ async function handlePost(
       code: 'INVALID_CHANNEL_ARN',
     }, origin);
   }
-  if (APP_INSTANCE_ARN) {
-    const callerUserArn = userArnFor(APP_INSTANCE_ARN, personId);
-    try {
-      await messagingClient.send(new DescribeChannelMembershipCommand({
-        ChannelArn: channelArn,
-        MemberArn: callerUserArn,
-        ChimeBearer: callerUserArn,
-      }));
-    } catch (membershipErr) {
-      console.warn('[battle-outcome] caller not a member of channel', {
-        personId, channelArn, err: (membershipErr as Error).name,
-      });
-      return respond(403, {
-        error: 'Caller is not a member of the battle\'s channel',
-        code: 'NOT_A_MEMBER',
-      }, origin);
-    }
+  // A current member cleared for the conversation (`lib/conversation-access.ts`); anything that cannot be
+  // answered, an unset app instance included, refuses before a pick is recorded.
+  const access = await callerReachesConversation(event, channelArn, { appInstanceArn: APP_INSTANCE_ARN, client: messagingClient });
+  if (!access.ok) {
+    const { statusCode, body } = refusalAnswer(access);
+    return respond(statusCode, body, origin);
   }
 
-  // THE DUEL'S OWN ROWS, read once and used for both checks below. Two reads of the same rows would
-  // cost a second round-trip to say the same thing.
-  let rows: BattleStateRow[] = [];
+  // THE DUEL'S OWN ROWS, read once and used for both checks below. A read that fails is answered as
+  // the store being unavailable: the binding is unknown, so no pick is recorded.
+  let rows: BattleStateRow[];
   try {
-    rows = await readBattleRows(battleId);
+    rows = await readBattleRows(battleId, { throwOnFailure: true });
   } catch (stateErr) {
-    console.warn('[battle-outcome] could not read battle state', {
+    console.warn('[battle-outcome] could not read battle state; refusing the pick', {
       battleId, err: (stateErr as Error).name,
     });
+    return respond(503, {
+      error: 'Battle state unavailable; pick not recorded',
+      code: 'OUTCOME_STORE_UNAVAILABLE',
+    }, origin);
   }
 
-  // THE BATTLE MUST BE THE ONE THAT RAN IN THAT CHANNEL, and until this check the two halves of the
-  // request were never joined.
+  // THE BATTLE MUST BE THE ONE THAT RAN IN THAT CHANNEL.
   //
   // The membership gate above proves the caller belongs in `channelArn`. It proves nothing about
-  // `battleId`, which arrives separately and was recorded as given. So a member of any channel could
-  // cast a pick into a duel that ran somewhere they cannot see, given its id: last-write-wins per
-  // user, and the experiment attribution below is resolved from the channel THEY named, so the vote
-  // also lands under the wrong experiment.
-  //
-  // UNKNOWN IS NOT MISMATCH. `battleChannelFrom` yields null for a duel that predates the binding,
-  // one whose rows have aged out, and a deployment with no state table. Refusing on null would
-  // discard real judgements from people who did see the comparison, and would make the endpoint's
-  // behavior depend on a TTL. Only a recorded channel that DIFFERS is refused.
+  // `battleId`, which arrives separately. The join is the channel recorded at fan-out, and a pick
+  // is recorded only when that channel is the one named: a recorded channel that differs, and a
+  // duel with no recorded channel (no rows, or past the pick window), are both refused.
   const battleChannel = battleChannelFrom(rows);
-  if (battleChannel && battleChannel !== channelArn) {
-    console.warn('[battle-outcome] refusing a pick for a battle from another channel', {
-      personId, battleId, claimedChannel: channelArn,
+  if (battleChannel !== channelArn) {
+    console.warn('[battle-outcome] refusing a pick whose battle is not bound to the channel named', {
+      personId, battleId, claimedChannel: channelArn, bindingRecorded: Boolean(battleChannel),
     });
-    // The same 403 the membership gate returns, and deliberately not a more specific one: a distinct
-    // code would confirm that the battleId exists and belongs elsewhere, to a caller who has just
-    // demonstrated they are not entitled to know that.
+    // One answer for both, in neutral words: the caller is a member of the channel they named, and a distinct message
+    // would confirm that a battleId exists and belongs elsewhere, which they are not entitled to know.
     return respond(403, {
-      error: 'Caller is not a member of the battle\'s channel',
+      error: 'That battle has no result to judge in this conversation',
       code: 'NOT_A_MEMBER',
     }, origin);
   }
@@ -216,19 +198,12 @@ async function handlePost(
   // ORDERED AFTER THE MEMBERSHIP CHECK, deliberately. This response distinguishes battle ids that exist
   // from ones that do not, so it must sit behind the gate that establishes the caller belongs here;
   // in front of it, it would answer that question for anyone who asked.
-  //
-  // THE FAIL-OPEN IS `rows.length > 0` - an empty result means either "this duel has no rows" or "the
-  // read did not work", the two are indistinguishable from here, and neither is evidence that a duel
-  // was abandoned. Refusing on silence would discard a real judgement from someone who did see the
-  // comparison, which is the worse error of the two.
-  {
-    if (rows.length > 0 && duelWasAbandoned(rows)) {
-      console.log('[battle-outcome] refusing a pick for an abandoned battle', { battleId });
-      return respond(409, {
-        error: 'That battle was ended before it finished, so there is no result to judge',
-        code: 'BATTLE_ABANDONED',
-      }, origin);
-    }
+  if (duelWasAbandoned(rows)) {
+    console.log('[battle-outcome] refusing a pick for an abandoned battle', { battleId });
+    return respond(409, {
+      error: 'That battle was ended before it finished, so there is no result to judge',
+      code: 'BATTLE_ABANDONED',
+    }, origin);
   }
 
   // Feedback join: resolve the experiment from the channel's battle config

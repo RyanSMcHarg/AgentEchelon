@@ -180,7 +180,7 @@ const OverviewTab: React.FC<OverviewTabProps> = ({
 
       {volumeData && volumeData.data.length > 0 && (
         <div className="admin-section">
-          <h3>{t('admin.overview.messageVolumeByDate')}</h3>
+          <h2>{t('admin.overview.messageVolumeByDate')}</h2>
           <DataTable
             columns={[
               { key: 'date', label: 'Date' },
@@ -194,12 +194,14 @@ const OverviewTab: React.FC<OverviewTabProps> = ({
 
       {intentData && intentData.data.length > 0 && (
         <div className="admin-section">
-          <h3>{t('admin.overview.intentDistribution')}</h3>
+          <h2>{t('admin.overview.intentDistribution')}</h2>
           <DataTable
             columns={[
-              { key: 'intent', label: 'Intent' },
-              { key: 'count', label: 'Count' },
-              { key: 'percentage', label: 'Percentage', render: (v) => `${Number(v).toFixed(1)}%` },
+              // The classifier's label for each message, not the work it became: a task turn counts here under
+              // what its message was classified as, and under its task's type on Effectiveness and Performance.
+              { key: 'intent', label: t('admin.overview.classifiedAs') },
+              { key: 'count', label: t('admin.overview.messages') },
+              { key: 'percentage', label: t('admin.overview.share'), render: (v) => `${Number(v).toFixed(1)}%` },
             ]}
             data={intentTable}
           />

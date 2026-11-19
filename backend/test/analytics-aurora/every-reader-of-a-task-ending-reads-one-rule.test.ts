@@ -104,9 +104,11 @@ describe('the turn-events ledger records a machine ending', () => {
 });
 
 describe('the declaration travels from the runtime to the ledger', () => {
-  it('is read against the pack-merged machines the processor holds', () => {
+  it('is read against the machines the processor ran the task under', () => {
     const core = flat(read('lambda/src/lib/async-processor-core.ts'));
-    expect(core).toContain('taskTerminal: machineTerminalKind( activeTaskInfo?.type ?? event.taskType, params.taskContext?.task.taskState, taskStateMachines(), ) ?? undefined,');
+    // The task's own version's machines (ADR-066 decision 5), else the pack-merged set.
+    expect(core).toContain('const turnTaskMachines = params.taskContext?.machines ?? taskStateMachines();');
+    expect(core).toContain('taskTerminal: machineTerminalKind( activeTaskInfo?.type ?? event.taskType, params.taskContext?.task.taskState, turnTaskMachines, ) ?? undefined,');
     expect(core).toContain('...(taskAnalytics.taskTerminal && { taskTerminal: taskAnalytics.taskTerminal }),');
   });
 

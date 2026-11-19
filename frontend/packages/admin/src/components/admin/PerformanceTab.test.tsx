@@ -32,12 +32,19 @@ const EFF = [
 
 const WELCOME = result([{ kind: 'greeting', welcomes: 12, measured: 10, avg_ms: 1800, p95_ms: 3100 }]);
 
-function Harness({ initial = { view: 'overview' } as PerfView }) {
+/** The Latency section's rows (`latency_metrics`): replies by each entry, and a multi-step task turn the default leaves out. */
+const LATENCY_ROWS = [
+  { turn_entry: 'flow', delivery_option: 'PLACEHOLDER_UPDATE', avg_ttff_ms: 1100, assistant_turn_count: 10 },
+  { turn_entry: 'lex', delivery_option: 'PLACEHOLDER_UPDATE', avg_ttff_ms: 2400, assistant_turn_count: 4 },
+  { turn_entry: 'flow', delivery_option: 'TASK_MULTI_STEP', avg_ttff_ms: 5000, assistant_turn_count: 5 },
+];
+
+function Harness({ initial = { view: 'overview' } as PerfView, includeTasks = false, rows = LATENCY_ROWS }: { initial?: PerfView; includeTasks?: boolean; rows?: Record<string, unknown>[] }) {
   const [view, setView] = useState<PerfView>(initial);
   return (
     <PerformanceTab
       flowData={result(FLOW)} welcomeData={WELCOME} effectivenessData={result(EFF)} dateRange={range} isLoading={false}
-      filters={EMPTY_FILTERS} onFiltersChange={() => {}} filterRows={[]}
+      filters={EMPTY_FILTERS} onFiltersChange={() => {}} filterRows={rows} includeTasks={includeTasks}
       view={view} onViewChange={setView}
       renderLatency={(openTtff) => <div>{openTtff ? 'LATENCY-AT-TTFF' : 'LATENCY-ALL'}</div>}
       renderEffectiveness={() => <div>EFFECTIVENESS-DRILL</div>}
@@ -68,12 +75,31 @@ describe('the arithmetic', () => {
 });
 
 describe('the overview', () => {
+  it('opened on one intent, the page says so, shows only that intent, and clears back to all', () => {
+    render(<Harness initial={{ view: 'intent', key: 'report_request' } as PerfView} />);
+    expect(screen.getByTestId('perf-intent-scope')).toHaveTextContent('report_request');
+    expect(screen.getByRole('region', { name: /flow/i })).not.toHaveTextContent('image_generation');
+    fireEvent.click(screen.getByTestId('perf-intent-clear'));
+    expect(screen.queryByTestId('perf-intent-scope')).toBeNull();
+    expect(screen.getByRole('region', { name: /flow/i })).toHaveTextContent('image_generation');
+  });
+
   it('shows the cards and the flow, and no detail until something is clicked', () => {
     render(<Harness />);
     expect(screen.getByText('Message flow')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /^First update \(TTFF\) 1\.1 s/ })).toBeInTheDocument();
     expect(screen.queryByRole('region', { name: 'Detail' })).toBeNull();
     expect(screen.queryByText('LATENCY-ALL')).toBeNull();
+  });
+
+  it('shows the Latency section\'s own TTFF: the same rows and the same turns, task turns by the one shared choice', () => {
+    const { unmount } = render(<Harness />);
+    // Replies on the standard path alone, as the section below leads with: the task turn is left out by default.
+    expect(screen.getByRole('button', { name: /^First update \(TTFF\) 1\.1 s/ })).toBeInTheDocument();
+    unmount();
+    render(<Harness includeTasks />);
+    // (1100 x 10 + 5000 x 5) / 15 = 2400 ms, once task turns count.
+    expect(screen.getByRole('button', { name: /^First update \(TTFF\) 2\.4 s/ })).toBeInTheDocument();
   });
 
   it('opens the first-update detail from the TTFF card, and the full latency from E2E', () => {
@@ -103,7 +129,8 @@ describe('the overview', () => {
         router_steps: [{ step_name: 'classified', step_ms: 520 }, { step_name: 'dispatched', step_ms: 40 }],
         verdict: { relevance_score: 81, classification: 'good', is_grounded: null, is_compliant: true }, tool_verdicts: [],
       }])));
-    render(<Harness />);
+    // NO LATENCY ROWS, so the filter bar offers no entry of its own beside the flow's Amazon Lex node.
+    render(<Harness rows={[]} />);
     fireEvent.click(screen.getByRole('button', { name: /^Amazon Lex/ }));
     fireEvent.click(await screen.findByRole('button', { name: 'Open turn' }));
     expect(await screen.findByText('Classifier')).toBeInTheDocument();
@@ -113,6 +140,64 @@ describe('the overview', () => {
     expect(screen.getByText('Worker compute 6.2 s')).toBeInTheDocument();
     expect(screen.getByText('E2E 9.0 s')).toBeInTheDocument();
     expect(mockQuery).toHaveBeenCalledWith('flow_turn', range, expect.objectContaining({ messageId: 'm-1' }));
+    // EVERY STEP SAYS WHAT IT IS: each row of the step table carries its own description.
+    const rows = document.querySelectorAll('table.perf-steps tbody tr');
+    expect(rows.length).toBeGreaterThan(0);
+    rows.forEach((row) => expect(row.querySelector('[aria-label^="About "]')).not.toBeNull());
+    expect(screen.getByRole('button', { name: 'About Guardrails and loop glue' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'About Intent classification' })).toBeInTheDocument();
+  });
+
+  it('names beside the model the rule that chose it, and the step the turn ran in', async () => {
+    const turnRow = (model: string, from: string, step: string, state: string) => ({
+      message_id: 'm-1', created_at: '2026-10-20T10:00:00Z', path: 'flow', intent: 'report_generation', outcome: 'task', assistant: 'advisor',
+      conversation_classification: 'premium', ttff_ms: 900, e2e_ms: 9000, total_ms: 6200, latency_ms: 4000, model_ms: 3500,
+      bedrock_model: model, model_from: from, task_step: step, task_state: state, task_id: 'task-1234567890',
+      router_steps: [], verdict: null, tool_verdicts: [],
+    });
+    let row = turnRow('us.anthropic.claude-sonnet', 'route', 'drafting_outline', 'drafting_outline');
+    mockQuery.mockImplementation(async (q) => (q === 'flow_turns'
+      ? result([{ message_id: 'm-1', created_at: '2026-10-20T10:00:00Z', path: 'flow', intent: 'report_generation', outcome: 'task', ttff_ms: 900, e2e_ms: 9000 }])
+      : result([row])));
+    const { unmount } = render(<Harness initial={{ view: 'path', key: 'flow' }} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Open turn' }));
+    expect(await screen.findByTestId('turn-model-from')).toHaveTextContent("the intent's route");
+    expect(screen.getByText('drafting_outline')).toBeInTheDocument();
+    unmount();
+    row = turnRow('us.anthropic.claude-opus', 'step', 'drafting_outline', 'generating');
+    render(<Harness initial={{ view: 'path', key: 'flow' }} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Open turn' }));
+    expect(await screen.findByTestId('turn-model-from')).toHaveTextContent('its step');
+    expect(screen.getByText('drafting_outline to generating')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'About Chosen by' })).toBeInTheDocument();
+  });
+
+  it('says how the classifier placed the message against the open work, and nothing when none was open', async () => {
+    const turnRow = (routedAs: string | null) => ({
+      message_id: 'm-1', created_at: '2026-10-20T10:00:00Z', path: 'flow', intent: 'report_generation', outcome: 'task', assistant: 'advisor',
+      conversation_classification: 'premium', ttff_ms: 900, e2e_ms: 9000, total_ms: 6200, latency_ms: 4000, model_ms: 3500,
+      bedrock_model: 'us.anthropic.claude-sonnet', model_from: 'route', routed_as: routedAs, task_id: 'task-1234567890',
+      router_steps: [], verdict: null, tool_verdicts: [],
+    });
+    let row = turnRow('continues_task');
+    mockQuery.mockImplementation(async (q) => (q === 'flow_turns'
+      ? result([{ message_id: 'm-1', created_at: '2026-10-20T10:00:00Z', path: 'flow', intent: 'report_generation', outcome: 'task', ttff_ms: 900, e2e_ms: 9000 }])
+      : result([row])));
+    const { unmount } = render(<Harness initial={{ view: 'path', key: 'flow' }} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Open turn' }));
+    expect(await screen.findByTestId('turn-routed-as')).toHaveTextContent('continues its open task');
+    expect(screen.getByRole('button', { name: 'About Routed as' })).toBeInTheDocument();
+    unmount();
+    row = turnRow('own_intent');
+    const second = render(<Harness initial={{ view: 'path', key: 'flow' }} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Open turn' }));
+    expect(await screen.findByTestId('turn-routed-as')).toHaveTextContent('a request of its own');
+    second.unmount();
+    row = turnRow(null);
+    render(<Harness initial={{ view: 'path', key: 'flow' }} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Open turn' }));
+    await screen.findByTestId('turn-model-from');
+    expect(screen.queryByTestId('turn-routed-as')).toBeNull();
   });
 
   it('shows the Welcome lane in the first-update detail, timed from the join, with what it could not time', () => {

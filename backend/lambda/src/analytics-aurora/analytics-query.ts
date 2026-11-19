@@ -24,19 +24,29 @@ import { DynamoDBDocumentClient, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { stripMessageMarkers } from '../lib/message-markers.js';
 import { query, ensureSchema } from './db-client.js';
 import { updateJoinSql, ARCHIVAL_SUFFIX_SQL } from './update-events.js';
-import { goldenSourceOf, precedingTurnsOf, GOLDEN_PRECEDING_TURNS } from '../lib/golden-entry.js';
+import { IS_A_DRIFT_OFFER } from './drift-offers.js';
+import { goldenSourceOf, precedingTurnsOf, walkExchangeOf, GOLDEN_PRECEDING_TURNS, WALK_EXCHANGE_MAX_TURNS, type WalkExchange, type WalkSourceRow } from '../lib/golden-entry.js';
+import { deIdentifyTexts } from '../lib/de-identify.js';
+import { guardrailDetector } from '../lib/pii-detector.js';
 import { withReaderRole, withWriterRole } from './classification-boundary.js';
 import { defaultProfileRegistry } from '../../../lib/profile-registry';
 import { estimateStepCostUsd, bedrockModelIdToKey } from '../lib/model-rate-table.js';
 import { imageGenModelIdToKey } from '../lib/image-gen-models.js';
 import { successTerminalStates } from '../lib/task-state-machines.js';
 import { callerIsAdmin, callerCanReadArchive, isAdminIamEnforcedCall, callerPerson, callerPersonId } from '../lib/auth.js';
-import { queryTypeAllowedOnPath } from '../lib/admin-capability-map.js';
+import { AccessReaderUnidentified, recordAccess, signingPrincipalArn, type AccessAuditLine } from '../lib/access-log.js';
+import {
+  queryTypeAllowedOnPath,
+  capabilityForPath,
+  isContentQuery,
+  isContentGetPath,
+  DEFAULT_ANALYTICS_CAPABILITY,
+} from '../lib/admin-capability-map.js';
 import { scopeForRequest, scopeAnalyticsRows, classificationAllowed, type ClassificationScope } from '../lib/caller-scope.js';
 
 // A14 Scoped: the pool the caller's classification scope is resolved against.
 const USER_POOL_ID = process.env.USER_POOL_ID || '';
-import { recordModerationAction, adminListEvents } from './admin-conversations-aurora.js';
+import { recordModerationAction, adminListEvents, moderationStateOf } from './admin-conversations-aurora.js';
 import { botIdSql, personIdSql } from '../lib/person-arn.js';
 import {
   aggregateVariantFeedback,
@@ -281,7 +291,14 @@ export async function handler(
       // (a flag, a label, an adjudication) is decided by its `action` as well as its queryType.
       {
         const { queryType: qt, action } = parsePostQueryTypeAndAction(event.body);
-        if (!queryTypeAllowedOnPath(qt, event.path || '', action)) {
+        // A team's list of its assistant's flagged, labelled or queued responses is content read on the
+        // team's own query route: bound to that assistant and its clearance in SQL, and served only
+        // with a stated reason (`handlePostQuery`, `ASSISTANT_BOUND_QUALITY`).
+        const teamBoundRead = Boolean(event.pathParameters?.assistant)
+          && ASSISTANT_BOUND_QUALITY.has(qt)
+          && isContentQuery(qt, action)
+          && capabilityForPath(event.path || '') === DEFAULT_ANALYTICS_CAPABILITY;
+        if (!queryTypeAllowedOnPath(qt, event.path || '', action) && !teamBoundRead) {
           return error(403, 'queryType not permitted on this resource');
         }
       }
@@ -296,31 +313,40 @@ export async function handler(
         return error(403, 'Archive-view permission required');
       }
       // A14 Scoped: resolve the caller's classification scope and narrow the
-      // result rows. Full (null) only on a Cognito-JWT call; an enforced call fails
-      // closed to the floor if the caller cannot be identified (scopeForRequest).
-      const callerScope: ClassificationScope = isAdminIamEnforcedCall(event)
-        ? await scopeForRequest(event, USER_POOL_ID)
-        : null;
+      // result rows. Full (null) only on a Cognito-JWT call; an enforced call that cannot be
+      // identified resolves no scope and sees nothing (scopeForRequest).
+      const callerScope = callerScopeOf(event);
       // A TEAM MEMBER'S ROUTE NAMES ONE ASSISTANT (`/analytics/assistants/{assistant}/query`). IAM admitted
       // the caller to that path only because the credential exchange named it in their session, after
       // checking their team owns the assistant and their clearance reaches it; this handler runs in a
       // VPC with no route to Cognito or the Amazon Chime SDK to read that again, so what it does instead
       // is bind every row it returns to the assistant in the path.
       const assistant = event.pathParameters?.assistant ? decodeURIComponent(event.pathParameters.assistant) : undefined;
-      return handlePostQuery(event.body, callerScope, callerSub, assistant);
+      return handlePostQuery(event.body, callerScope, callerSub, assistant, signingPrincipalArn(event));
     }
 
     const path = event.path || '';
+    // A content read's stated reason rides the query string as `accessReason`.
     const params = event.queryStringParameters || {};
+    // THE GET ROUTES ARE SCOPED AS THE POST IS: the same caller scope, the same row narrowing, and the
+    // same stated reason and audit line on every route that returns conversation content.
+    const callerScope = callerScopeOf(event);
+    const content = isContentGetPath(path);
 
     // /context is the only endpoint that allows non-admin self-lookup.
     // Every other endpoint requires admin.
     if (path.endsWith('/context')) {
       const requestedPersonId = params.personId;
-      if (!isAdmin && requestedPersonId !== callerSub) {
+      const selfLookup = Boolean(callerSub) && requestedPersonId === callerSub;
+      if (!isAdmin && !selfLookup) {
         return error(403, 'Cannot read another user\'s context');
       }
-      return getConversationContext(params);
+      // A person reading their own context states no reason; an administrator reading anyone's does.
+      if (!selfLookup) {
+        const refused = await requireContentReason(params.accessReason, { sub: callerSub, principal: signingPrincipalArn(event), path, personId: requestedPersonId, scope: callerScope });
+        if (refused) return refused;
+      }
+      return scopeGetResponse(await getConversationContext(params), callerScope, true);
     }
 
     if (!isAdmin) {
@@ -328,43 +354,161 @@ export async function handler(
       return error(403, 'Admin access required');
     }
 
-    // Route requests (all admin-only below)
-    if (path.endsWith('/evaluation/exchanges')) {
-      return getExchanges(params);
-    }
-    if (path.endsWith('/execution-steps')) {
-      return getExecutionSteps(params);
-    }
-    if (path.endsWith('/evaluation/flows')) {
-      return getFlows(params);
-    }
-    if (path.endsWith('/evaluation')) {
-      return getEvaluationMetrics(params);
-    }
-    if (path.endsWith('/conversations')) {
-      return getConversations(params);
-    }
-    if (path.endsWith('/drift')) {
-      return getDriftEvents(params);
-    }
-    if (path.endsWith('/latency')) {
-      return getLatencyMetrics(params);
-    }
-    if (path.endsWith('/model-effectiveness')) {
-      return getModelEffectiveness(params);
-    }
-    if (path.endsWith('/experiments/recommendation')) {
-      return getExperimentRecommendation(params);
-    }
-    if (path.endsWith('/experiments')) {
-      return getExperimentResults(params);
+    if (content) {
+      const refused = await requireContentReason(params.accessReason, { sub: callerSub, principal: signingPrincipalArn(event), path, channelArn: params.channelArn, scope: callerScope });
+      if (refused) return refused;
     }
 
-    return error(404, `Unknown endpoint: ${path}`);
+    // Route requests (all admin-only below)
+    const routed = await routeGet(path, params);
+    if (!routed) return error(404, `Unknown endpoint: ${path}`);
+    return scopeGetResponse(routed, callerScope, content);
   } catch (err) {
+    // A window that cannot be served is the caller's to correct, and says what was wrong.
+    if (err instanceof WindowError) return error(400, err.message);
     console.error('Analytics query error:', err);
     return error(500, 'Internal server error');
   }
+}
+
+/** The native GET routes, by the path's ending. Null for a path none of them serves. */
+async function routeGet(
+  path: string,
+  params: Record<string, string | undefined>,
+): Promise<APIGatewayProxyResult | null> {
+  if (path.endsWith('/evaluation/exchanges')) return getExchanges(params);
+  if (path.endsWith('/execution-steps')) return getExecutionSteps(params);
+  if (path.endsWith('/evaluation/flows')) return getFlows(params);
+  if (path.endsWith('/evaluation')) return getEvaluationMetrics(params);
+  if (path.endsWith('/conversations')) return getConversations(params);
+  if (path.endsWith('/drift')) return getDriftEvents(params);
+  if (path.endsWith('/latency')) return getLatencyMetrics(params);
+  if (path.endsWith('/model-effectiveness')) return getModelEffectiveness(params);
+  if (path.endsWith('/experiments/recommendation')) return getExperimentRecommendation(params);
+  if (path.endsWith('/experiments')) return getExperimentResults(params);
+  return null;
+}
+
+/**
+ * The classification scope a request is narrowed to: Full (null) on a call that is not IAM-enforced,
+ * and on an enforced call the scope its role resolves to, which is none (sees nothing) when the
+ * caller cannot be identified.
+ */
+function callerScopeOf(event: APIGatewayProxyEvent): ClassificationScope {
+  return isAdminIamEnforcedCall(event) ? scopeForRequest(event, USER_POOL_ID) : null;
+}
+
+/** A stated reason, trimmed and bounded, or '' when none was given. */
+function statedReason(value: unknown): string {
+  return typeof value === 'string' ? value.trim().slice(0, 500) : '';
+}
+
+/**
+ * A CONTENT READ IS IN THE ACCESS LOG BEFORE ITS CONTENT IS RETURNED, with the reason it was read for
+ * (ADR-052). The rule the credential exchange and the admin conversations surface apply: a read whose
+ * record cannot be written is refused with 503, never served unrecorded. The CloudWatch line stays.
+ */
+async function contentReadRecorded(line: AccessAuditLine): Promise<APIGatewayProxyResult | null> {
+  console.log(JSON.stringify(line));
+  try {
+    await recordContentRead(line);
+    return null;
+  } catch (err) {
+    if (err instanceof AccessReaderUnidentified) return readerUnidentified();
+    console.error('[analytics-aurora][SecurityEvent] a content read could not be recorded; refusing it', { err: (err as Error)?.message });
+    return {
+      statusCode: 503,
+      headers: corsHeaders,
+      body: JSON.stringify({ error: 'This read cannot be recorded right now, so it is not served', code: 'ACCESS_LOG_UNAVAILABLE' }),
+    };
+  }
+}
+
+/** A content read whose reader is neither a person nor a signing principal: nobody could be found for it later. */
+function readerUnidentified(): APIGatewayProxyResult {
+  return {
+    statusCode: 403,
+    headers: corsHeaders,
+    body: JSON.stringify({ error: 'This read names no person and no signing principal, so it is not served', code: 'READER_UNIDENTIFIED' }),
+  };
+}
+
+/** Where a content read's record is written; a test substitutes the writer. */
+let recordContentRead: (line: AccessAuditLine) => Promise<unknown> = (line) => recordAccess(line);
+export function __setContentReadRecorder(next: (line: AccessAuditLine) => Promise<unknown>): void {
+  recordContentRead = next;
+}
+
+/**
+ * EVERY CONTENT READ STATES WHY, AND THE REASON IS RECORDED. Returns the refusal when no reason was
+ * given or the read cannot be recorded; otherwise the access log holds who read what (the query, the
+ * route, the conversation or person read about), why, and under which classification scope, and the
+ * read proceeds. The same contract a conversation read has on the admin conversations surface, and a
+ * team's quality read has on its assistant's route.
+ */
+async function requireContentReason(
+  reason: unknown,
+  read: { sub: string; principal?: string | null; queryType?: string; path?: string; channelArn?: string; personId?: string; scope: ClassificationScope },
+): Promise<APIGatewayProxyResult | null> {
+  // THE READER IS A PERSON, OR THE IAM PRINCIPAL THAT SIGNED THE REQUEST (`signingPrincipalArn`); neither is refused.
+  if (!read.sub && !read.principal) return readerUnidentified();
+  const accessReason = statedReason(reason);
+  if (!accessReason) {
+    return {
+      statusCode: 400,
+      headers: corsHeaders,
+      body: JSON.stringify({ error: 'a reason is required to read conversation content', code: 'REASON_REQUIRED' }),
+    };
+  }
+  return contentReadRecorded({
+    _auditEvent: 'analytics_content_read',
+    timestamp: new Date().toISOString(),
+    // The reader. The person a context read is about is `subjectPersonId`.
+    ...(read.sub ? { personId: read.sub } : read.principal ? { actorPrincipalArn: read.principal } : {}),
+    capabilities: ['view-events'],
+    queryType: read.queryType ?? null,
+    path: read.path ?? null,
+    channelArn: read.channelArn ?? null,
+    subjectPersonId: read.personId ?? null,
+    scope: scopeLabel(read.scope),
+    reason: accessReason,
+  });
+}
+
+/** A classification scope as the access log states it: `full`, `none`, or the scope's own value. */
+function scopeLabel(scope: ClassificationScope): string {
+  if (scope === null) return 'full';
+  return scope || 'none';
+}
+
+/**
+ * The array fields a GET response carries rows in, each narrowed to the caller's scope. A content
+ * route keeps a row only when its classification is established and in reach.
+ */
+const GET_ROW_KEYS = ['data', 'exchanges', 'flows', 'dailyBreakdown', 'conversations', 'events', 'contexts', 'variants'] as const;
+
+function scopeGetResponse(res: APIGatewayProxyResult, scope: ClassificationScope, content: boolean): APIGatewayProxyResult {
+  if (scope === null || res.statusCode !== 200) return res;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(res.body || '{}');
+  } catch {
+    return error(500, 'Malformed analytics result');
+  }
+  for (const key of GET_ROW_KEYS) {
+    if (Array.isArray(parsed[key])) parsed[key] = scopeAnalyticsRows(parsed[key] as unknown[], scope, { requireClassification: content });
+  }
+  // A transcript is content on whichever route carries it.
+  for (const key of CONTENT_ROW_KEYS) {
+    if (Array.isArray(parsed[key])) parsed[key] = scopeAnalyticsRows(parsed[key] as unknown[], scope, { requireClassification: true });
+  }
+  for (const key of ROW_BEARING_SIBLING_KEYS) {
+    const sibling = parsed[key] as { data?: unknown[] } | undefined;
+    if (sibling && Array.isArray(sibling.data)) {
+      parsed[key] = { ...sibling, data: scopeAnalyticsRows(sibling.data, scope, { requireClassification: content }) };
+    }
+  }
+  return { ...res, body: JSON.stringify(parsed) };
 }
 
 /**
@@ -774,6 +918,8 @@ async function getFlaggedResponses(
         GROUP BY exchange_id
      )
      SELECT e.id AS exchange_id, e.channel_arn,
+            -- The room's classification, so each row is narrowed to the caller's scope.
+            e.conversation_classification,
             -- Legacy exchanges (DIRECT/pre-attribution) archived with a null agent_type; fall back
             -- to the conversation's tier at query time so the 'assistant' column is not empty. New
             -- rows already carry it (kinesis-archival COALESCE). Intent is per-turn and cannot be
@@ -1055,7 +1201,8 @@ async function getGroundTruth(
   }
   const limit = Math.min(parseInt(params.limit || '100', 10), 500);
   const result = await query(
-    `SELECT gt.id, gt.exchange_id, e.channel_arn, gt.human_score, gt.classification, gt.reasoning,
+    `SELECT gt.id, gt.exchange_id, e.channel_arn, e.conversation_classification,
+            gt.human_score, gt.classification, gt.reasoning,
             gt.scorer_id, gt.scored_at,
             er.relevance_score AS automated_score,
             (gt.human_score - er.relevance_score) AS score_delta,
@@ -1144,6 +1291,10 @@ async function getTaskDetails(
             -- decided the task type, so it is the one that names the flow.
             COALESCE((ARRAY_AGG(task_type ORDER BY created_at ASC) FILTER (WHERE task_type IS NOT NULL))[1],
                      (ARRAY_AGG(intent ORDER BY created_at ASC))[1], 'unknown') AS type,
+            -- THE MACHINE THE TASK RAN UNDER (its task type, absent for a turn bound to none) and the assistant whose turns
+            -- worked it, so a row links to that assistant's workflow editor on that machine whatever the view is narrowed to.
+            (ARRAY_AGG(task_type ORDER BY created_at ASC) FILTER (WHERE task_type IS NOT NULL))[1] AS task_type,
+            (ARRAY_AGG(assistant ORDER BY created_at ASC) FILTER (WHERE assistant IS NOT NULL))[1] AS assistant,
             -- THE LATEST lifecycle status, for the same reason the state below takes the latest.
             -- Alphabetical MAX is as meaningless here as it is for a state, and worse in effect: of
             -- pending, in_progress, completed, failed, cancelled, abandoned,
@@ -1254,6 +1405,11 @@ const POST_DISPATCH: Record<
   intent_exchanges: { fn: getIntentExchanges, dataKey: 'data' },
   // An intent's turns by the step they started in and by the model that served them (ADR-064). See `getIntentSteps`.
   intent_steps: { fn: getIntentSteps, dataKey: 'data' },
+  // Runs per workflow edition (WT109) and rework per task (WT105), over the archive's run and task columns.
+  workflow_editions: { fn: getWorkflowEditions, dataKey: 'data' },
+  // Every run of a process, grouped by process, workflow and team (SPEC-PROCESSES P9). See `getProcessRuns`.
+  process_runs: { fn: getProcessRuns, dataKey: 'data' },
+  task_rework: { fn: getTaskRework, dataKey: 'data' },
   // A delivered document's own scores, by intent and task type or per conversation (FR22). See
   // `getDocumentEvaluation`.
   document_evaluation: { fn: getDocumentEvaluation, dataKey: 'data' },
@@ -1534,6 +1690,13 @@ const LATENCY_TURN_JOINS_SQL = `
      ) lbl ON TRUE`;
 
 /**
+ * HOW THE CLASSIFIER PLACED THE TURN'S MESSAGE AGAINST THE OPEN WORK (`routedAs`, ADR-064 amended 2026-11-12):
+ * `continues_task` or `own_intent`, NULL when no open work was offered. The turn's analytics record is merged onto every
+ * row of its message, so the latest update is read first and the CREATE second. Needs LATENCY_TURN_JOINS_SQL (`upd`).
+ */
+const ROUTED_AS_SQL = `COALESCE(upd.metadata->>'routedAs', m.metadata->>'routedAs')`;
+
+/**
  * WHICH ROWS ARE ASSISTANT TURNS IN THE WINDOW ($1): the canonical CREATE (never one of its update rows,
  * which would count every turn more than once), of an assistant turn (ASSISTANT_TURN_SQL).
  */
@@ -1592,7 +1755,25 @@ const LATENCY_DIM = {
  * is NULL, and `col < NULL` would exclude every row.
  *
  * `maxDays` keeps each query's existing span cap: a wider window keeps its end and loses its oldest days.
+ *
+ * EVERY WINDOW IS VALIDATED AND BOUNDED HERE, the one place every query reads its window from:
+ *   - no window spans more than `MAX_WINDOW_DAYS`, which is the cap of a query that states none of its
+ *     own (a wider window keeps its end and loses its oldest days, as above);
+ *   - `days` is a whole number of days from 1 up; anything else is refused;
+ *   - a named window has both bounds, each a parseable instant, with the end after the start;
+ *     anything else is refused.
+ * A refusal is a `WindowError`, which the handler answers with a 400 naming what was wrong.
  */
+export const MAX_WINDOW_DAYS = 366;
+
+/** A window the caller asked for that cannot be served. Answered with a 400. */
+export class WindowError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'WindowError';
+  }
+}
+
 interface QueryWindow {
   /** The `tstzrange` literal bound to the query, half-open: `[start,end)`. */
   range: string;
@@ -1610,11 +1791,16 @@ function queryWindow(
   defaultDays: number,
   maxDays?: number,
 ): QueryWindow {
-  const namedStart = params.windowStart ? Date.parse(params.windowStart) : NaN;
-  const namedEnd = params.windowEnd ? Date.parse(params.windowEnd) : NaN;
-  if (Number.isFinite(namedStart) && Number.isFinite(namedEnd)) {
+  const cap = Math.min(maxDays ?? MAX_WINDOW_DAYS, MAX_WINDOW_DAYS);
+  if (params.windowStart !== undefined || params.windowEnd !== undefined) {
+    const namedStart = params.windowStart ? Date.parse(params.windowStart) : NaN;
+    const namedEnd = params.windowEnd ? Date.parse(params.windowEnd) : NaN;
+    if (!Number.isFinite(namedStart) || !Number.isFinite(namedEnd)) {
+      throw new WindowError('windowStart and windowEnd must both be ISO timestamps');
+    }
+    if (namedEnd <= namedStart) throw new WindowError('windowEnd must be after windowStart');
     let startMs = namedStart;
-    if (maxDays !== undefined && namedEnd - startMs > maxDays * DAY_MS) startMs = namedEnd - maxDays * DAY_MS;
+    if (namedEnd - startMs > cap * DAY_MS) startMs = namedEnd - cap * DAY_MS;
     const lo = new Date(startMs).toISOString();
     const hi = new Date(namedEnd).toISOString();
     return {
@@ -1625,8 +1811,11 @@ function queryWindow(
       key: `${lo}..${hi}`,
     };
   }
-  const parsed = parseInt(params.days || String(defaultDays), 10);
-  const days = maxDays !== undefined ? Math.min(parsed, maxDays) : parsed;
+  const asked = params.days === undefined || params.days === '' ? String(defaultDays) : params.days.trim();
+  if (!/^\d{1,6}$/.test(asked) || Number(asked) < 1) {
+    throw new WindowError(`days must be a whole number, 1 or more (a window spans at most ${MAX_WINDOW_DAYS} days)`);
+  }
+  const days = Math.min(Number(asked), cap);
   const startMs = Date.now() - days * DAY_MS;
   return {
     range: `[${new Date(startMs).toISOString()},infinity)`,
@@ -1683,6 +1872,10 @@ function buildParamsFromBody(body: Record<string, unknown>): BodyParams {
     'limit', 'offset', 'channelArn', 'personId', 'experimentId', 'unresolved', 'agentType', 'includeBattle', 'taskId', 'intent',
     // The task state an Effectiveness breakdown is narrowed to (`?step=`, ADR-064).
     'step',
+    // The workflow a per-edition read is narrowed to (`?workflow=`, WT109).
+    'workflow',
+    // The process, and one process's runs, a process read is narrowed to (`?process=`, `?processId=`, SPEC-PROCESSES P9).
+    'process', 'processId',
     // The ROOM's classification, which became a separate question when `agent_type` stopped carrying
     // it and started carrying the assistant that answered.
     'conversationClassification',
@@ -1742,6 +1935,11 @@ function buildParamsFromBody(body: Record<string, unknown>): BodyParams {
  * Moderation audit write: POST { queryType: 'record_moderation', channelArn, messageId, moderation }.
  * The actor is the resolved caller (actorSub, plus the token's display attributes), NEVER the body,
  * so it can't be spoofed. Returns null when the body isn't a record_moderation request (normal dispatch continues).
+ *
+ * AN AUDIT ROW NAMES A MODERATION THAT HAPPENED. The message must be in the archive for that channel
+ * (404 otherwise), and the archive must hold the moderation event the row attributes - the message's
+ * `-RED` sibling for a redaction, its `-DEL` sibling for a deletion (409 `MODERATION_NOT_RECORDED`
+ * otherwise, which the console retries while the event is archived).
  */
 async function maybeRecordModeration(
   rawBody: string | null,
@@ -1761,6 +1959,15 @@ async function maybeRecordModeration(
   if (!channelArn || !messageId) return error(400, 'channelArn and messageId are required');
   const actorName = contact.name || contact.email || undefined;
   try {
+    const state = await moderationStateOf(channelArn, messageId, action);
+    if (!state.archived) return error(404, 'No such message in this conversation\'s archive');
+    if (!state.moderated) {
+      return {
+        statusCode: 409,
+        headers: corsHeaders,
+        body: JSON.stringify({ error: `The archive holds no ${action} of this message`, code: 'MODERATION_NOT_RECORDED' }),
+      };
+    }
     await recordModerationAction({ channelArn, messageId, action, actorSub, actorName });
   } catch (e) {
     console.error('[analytics-aurora] record_moderation failed', e);
@@ -1808,6 +2015,8 @@ async function handlePostQuery(
   callerSub?: string,
   /** A team-scoped route's assistant: every row returned is that assistant's (SPEC-ADMIN-CONSOLE FR48). */
   assistant?: string,
+  /** The IAM principal that signed the request, from the request context API Gateway set; a reader no person names. */
+  principal?: string | null,
 ): Promise<APIGatewayProxyResult> {
   let body: Record<string, unknown>;
   try {
@@ -1853,14 +2062,17 @@ async function handlePostQuery(
       // A list returns what was said, so like a conversation read it requires a stated reason.
       const accessReason = (params.accessReason || '').trim().slice(0, 500);
       if (!accessReason) return error(400, 'a reason is required to read responses (REASON_REQUIRED)');
-      console.log(JSON.stringify({
+      const unrecorded = await contentReadRecorded({
         _auditEvent: 'team_quality_read',
         timestamp: new Date().toISOString(),
-        sub: callerSub || null,
+        ...(callerSub ? { personId: callerSub } : principal ? { actorPrincipalArn: principal } : {}),
         assistant,
+        capabilities: ['view-analytics'],
         queryType,
+        scope: scopeLabel(callerScope),
         reason: accessReason,
-      }));
+      });
+      if (unrecorded) return unrecorded;
     }
   } else if (assistant) {
     // Only a query that can be bound to one assistant AND to the holder's clearance runs here, and it is
@@ -1873,6 +2085,15 @@ async function handlePostQuery(
     // Set server-side only: `buildParamsFromBody` copies no such key, so a body cannot name it.
     (params as Record<string, unknown>).conversationClassifications = teamReach ?? [];
   }
+  // CONVERSATION CONTENT IS READ WITH A STATED REASON, AND THE READ IS RECORDED. A team's bound quality
+  // read stated and recorded its reason above; every other content read does so here.
+  const content = isContentQuery(queryType, params.action);
+  if (content && !assistant) {
+    const refused = await requireContentReason(params.accessReason, {
+      sub: callerSub || '', principal, queryType, channelArn: params.channelArn, personId: params.personId, scope: callerScope,
+    });
+    if (refused) return refused;
+  }
   const res = await entry.fn(params);
   if (res.statusCode !== 200) return res;
   let parsed: Record<string, unknown>;
@@ -1882,8 +2103,10 @@ async function handlePostQuery(
     return error(500, 'Malformed analytics result');
   }
   const arr = Array.isArray(parsed[entry.dataKey]) ? parsed[entry.dataKey] : [];
-  // A14 Scoped: narrow rows with a classification dimension to the caller's scope.
-  const scoped = scopeAnalyticsRows(arr as unknown[], callerScope);
+  // A14 Scoped: narrow rows to the caller's scope. Content reaches a scoped caller only on a row whose
+  // classification is established and in reach.
+  const rowOptions = { requireClassification: content };
+  const scoped = scopeAnalyticsRows(arr as unknown[], callerScope, rowOptions);
 
   // A row-attributed query is filtered to the assistant's rows and returned as rows alone: any total
   // beside them was computed across every assistant and is not this team's to read.
@@ -1913,13 +2136,27 @@ async function handlePostQuery(
   for (const key of ROW_BEARING_SIBLING_KEYS) {
     const sibling = parsed[key] as { data?: unknown[] } | undefined;
     if (sibling && Array.isArray(sibling.data)) {
-      sideChannels[key] = { ...sibling, data: scopeAnalyticsRows(sibling.data, callerScope) };
+      sideChannels[key] = { ...sibling, data: scopeAnalyticsRows(sibling.data, callerScope, rowOptions) };
+    }
+  }
+  // A transcript (`messages`, one conversation's detail) is content whichever query carries it.
+  for (const key of CONTENT_ROW_KEYS) {
+    if (Array.isArray(parsed[key])) {
+      sideChannels[key] = scopeAnalyticsRows(parsed[key] as unknown[], callerScope, { requireClassification: true });
     }
   }
 
-  // Normalize to { data: [...] }; keep the rest (stats/pagination/totals) at top level.
-  return success({ ...parsed, ...sideChannels, data: scoped });
+  // Normalize to { data: [...] }; keep the rest (stats/pagination/totals) at top level. The query's own
+  // row key carries the scoped rows too, so no field of the response holds rows the scope withheld.
+  const ownKey = Array.isArray(parsed[entry.dataKey]) ? { [entry.dataKey]: scoped } : {};
+  return success({ ...parsed, ...sideChannels, ...ownKey, data: scoped });
 }
+
+/**
+ * Top-level response fields that carry conversation content as rows: a scoped caller receives a row
+ * only when its classification is established and in reach.
+ */
+const CONTENT_ROW_KEYS = ['messages'] as const;
 
 /**
  * Response fields OTHER than `data` that carry rows a classification scope must narrow.
@@ -1945,6 +2182,11 @@ export const ASSISTANT_FILTERED_QUERIES: ReadonlySet<string> = new Set([
   'intent_effectiveness',
   // The step and model breakdown of one intent's row, over the same filters.
   'intent_steps',
+  // Runs per workflow edition and rework per task, over messages filtered by assistant and classification.
+  'workflow_editions',
+  'task_rework',
+  // A process's runs, over its messages and run-end records filtered by assistant (its run key) and classification.
+  'process_runs',
   'latency_exchanges',
   // Attributed per turn through `exchanges` (Phase 6), so a room with several assistants splits by
   // who answered, and a row no exchange claims - including one migration 055 could not backfill - is no
@@ -2150,7 +2392,8 @@ async function getEvaluationMetrics(
     `SELECT
        TO_CHAR(DATE(e.created_at), 'YYYY-MM-DD') AS date,
        e.assistant,
-       COALESCE(e.intent, 'unknown') AS intent_type,
+       -- The intent the turn's work counts under, as the Effectiveness rows count it (ADR-064 decision I).
+       COALESCE(${WORK_INTENT_SQL('e')}, 'unknown') AS intent_type,
        COUNT(*) AS count,
        ROUND(AVG(er.relevance_score)::numeric, 1) AS avg_relevance_score,
        -- A VIOLATION IS A RECORDED false, never an absent verdict. NOT COALESCE(..., true) read
@@ -2197,7 +2440,7 @@ async function getEvaluationMetrics(
        -- than the sum of its own daily chart and an average that did not match the series - with
        -- nothing to say which was right.
        AND e.queued_as IS NULL
-     GROUP BY DATE(e.created_at), e.assistant, COALESCE(e.intent, 'unknown')
+     GROUP BY DATE(e.created_at), e.assistant, COALESCE(${WORK_INTENT_SQL('e')}, 'unknown')
      ORDER BY date DESC`,
     [win.range, BLOCKING_RULE_IDS]
   );
@@ -2378,9 +2621,10 @@ async function getExecutionSteps(
     queryParams.push(value);
     where += ` AND ${column} = $${queryParams.length}`;
   }
-  if (params.profileVersion) {
-    queryParams.push(parseInt(params.profileVersion, 10));
-    where += ` AND m.profile_version = $${queryParams.length}`;
+  const versions = profileVersionsParam(params);
+  if (versions) {
+    queryParams.push(versions);
+    where += ` AND m.profile_version = ANY($${queryParams.length}::int[])`;
   }
 
   const result = await query(
@@ -2457,10 +2701,18 @@ async function getConversations(
   const offset = parseInt(params.offset || '0', 10);
   const channelArn = params.channelArn;
 
-  // Single conversation detail
+  // Single conversation detail. Each message carries the ROOM's classification - the one the
+  // conversation list resolves, its turns' own value or the deprecated user_type for a room archived
+  // before that column - so the transcript is narrowed to the caller's scope like every other row.
   if (channelArn) {
     const messagesResult = await query(
-      `SELECT
+      `WITH room AS (
+         SELECT COALESCE(MAX(conversation_classification), MAX(NULLIF(user_type, 'unknown'))) AS classification
+           FROM messages
+          WHERE channel_arn = $1
+       )
+       SELECT
+         room.classification AS conversation_classification,
          m.message_id,
          COALESCE(m.updated_content, m.content) AS content,
          m.created_at AS timestamp,
@@ -2474,6 +2726,7 @@ async function getConversations(
          m.output_tokens,
          m.bedrock_model
        FROM messages m
+       CROSS JOIN room
        WHERE m.channel_arn = $1
          AND m.event_type = 'CREATE_CHANNEL_MESSAGE'
        ORDER BY m.created_at ASC
@@ -3022,6 +3275,8 @@ async function getUnservedSubjects(
        SELECT d.parent_channel_arn, lower(d.intent)
          FROM drift_events d
         WHERE COALESCE(d.source, 'live') = 'live'
+          -- A CHANGE NO WORKFLOW OFFERED WAS ANSWERED AS A TURN, so it is already among the exchanges above (migration 101).
+          AND d.outcome IS DISTINCT FROM 'not_offered'
           AND lower(d.intent) IN ('general', 'off_topic')
           AND d.occurred_at >= lower($1::tstzrange) AND d.occurred_at < upper($1::tstzrange)
      ),
@@ -3103,21 +3358,28 @@ async function getDriftEvents(
   // a floor while offers are in flight.
   const statsResult = await query(
     `SELECT
-       COUNT(*) FILTER (WHERE source = 'live') AS total_events,
-       -- source = 'live' HERE TOO: every sibling stat filters to the live population, and a count
-       -- over a different population beside them cannot be ratioed. Pre-migration-016 rows have
-       -- source NULL but can be outcome = 'abandoned', so without this filter a window covering
-       -- them returns unresolved_count > total_events and a client-side rate over 100%.
-       COUNT(*) FILTER (WHERE source = 'live' AND outcome = 'abandoned') AS unresolved_count,
+       -- ONE POPULATION, THE OFFERS: a change nobody was asked about (migration 101: moved unasked, or offered nothing) is in none
+       -- of these counts, so every rate beside them is a share of offers somebody was shown.
+       COUNT(*) FILTER (WHERE source = 'live' AND ${IS_A_DRIFT_OFFER('d')}) AS total_events,
+       -- WHERE EACH OFFER ENDED, every count of the live population so they can be ratioed: pre-migration-016 rows have source
+       -- NULL and can be 'abandoned'. A yes is any offer that made a move, whatever became of the new conversation. 'abandoned'
+       -- is two endings, told apart by whether a conversation was made: a move nobody used, and an offer nobody answered.
+       COUNT(*) FILTER (WHERE source = 'live' AND (outcome = 'move_failed' OR (outcome IN ('accepted', 'abandoned', 'rejected_in_new_channel') AND new_channel_arn IS NOT NULL))) AS moved_count,
+       -- CARRIED ON ONCE THE ENGAGEMENT SWEEP SAYS SO: a move it has not judged is neither used nor unused yet.
+       COUNT(*) FILTER (WHERE source = 'live' AND outcome = 'accepted' AND engagement_settled) AS carried_on_count,
+       COUNT(*) FILTER (WHERE source = 'live' AND outcome = 'move_failed') AS move_failed_count,
+       COUNT(*) FILTER (WHERE source = 'live' AND outcome = 'abandoned' AND new_channel_arn IS NOT NULL) AS moved_unused_count,
+       COUNT(*) FILTER (WHERE source = 'live' AND outcome = 'abandoned' AND new_channel_arn IS NULL) AS unanswered_count,
+       COUNT(*) FILTER (WHERE source = 'live' AND outcome IN ('declined', 'rejected_in_new_channel')) AS declined_count,
        -- FILTERED TO live, like every count beside it. Unfiltered, this averaged over archival rows
        -- (processDriftDetection writes source='archival' in Aurora mode) and pre-migration-016 rows
        -- as well, so the console showed a small live total_events next to a mean drawn from hundreds
        -- of other events - the mismatched-population reading the filters above exist to prevent.
-       ROUND(AVG(cosine_distance) FILTER (WHERE source = 'live')::numeric, 4) AS avg_drift_score,
+       ROUND(AVG(cosine_distance) FILTER (WHERE source = 'live' AND ${IS_A_DRIFT_OFFER('d')})::numeric, 4) AS avg_drift_score,
        COUNT(*) FILTER (WHERE source = 'live' AND outcome = 'accepted') AS accepted_count,
        COUNT(*) FILTER (WHERE source = 'live' AND outcome IS NULL) AS pending_count,
-       COUNT(*) FILTER (WHERE source = 'live' AND evaluated_at IS NOT NULL) AS evaluated_count,
-       COUNT(*) FILTER (WHERE source = 'live' AND evaluated_correct IS TRUE) AS evaluated_correct_count
+       COUNT(*) FILTER (WHERE source = 'live' AND ${IS_A_DRIFT_OFFER('d')} AND evaluated_at IS NOT NULL) AS evaluated_count,
+       COUNT(*) FILTER (WHERE source = 'live' AND ${IS_A_DRIFT_OFFER('d')} AND evaluated_correct IS TRUE) AS evaluated_correct_count
      FROM drift_events d
      WHERE occurred_at >= lower($1::tstzrange) AND occurred_at < upper($1::tstzrange)
        AND ${DRIFT_BY_ASSISTANT('d', 2, 3)}`,
@@ -4801,6 +5063,58 @@ async function getLabelQueue(
 }
 
 /**
+ * THE EXCHANGE A TASK HELD, as a multi-step golden entry carries it (ADR-066 decision 7): the task's turns in this
+ * conversation, oldest first, each person turn from the de-identified copy and each recorded tool call with its
+ * arguments and result passed through the copy's own detector (`DEIDENTIFY_GUARDRAIL_ID`). Refused, with the reason,
+ * when the detector is not wired or fails, or a person turn has no de-identified copy yet: the entry is never made from
+ * raw text.
+ */
+async function taskExchangeOf(
+  channelArn: string,
+  taskId: string,
+  taskType: string | null,
+): Promise<{ exchange: WalkExchange } | { refused: string }> {
+  const turns = await query<WalkSourceRow>(
+    `SELECT mu.message_id AS user_mid, e.task_step,
+            COALESCE(ma.metadata, '{}'::jsonb) || COALESCE(ma_upd.metadata, '{}'::jsonb) AS agent_metadata
+       FROM exchanges e
+       JOIN messages mu ON e.user_message_id = mu.id
+       JOIN messages ma ON e.agent_message_id = ma.id
+       ${updateJoinSql({ alias: 'ma_upd', create: 'ma', pick: 'latest' })}
+      WHERE e.channel_arn = $1 AND e.task_id = $2 AND e.queued_as IS NULL
+      ORDER BY e.created_at
+      LIMIT $3`,
+    [channelArn, taskId, WALK_EXCHANGE_MAX_TURNS],
+  );
+  const mids = turns.rows.map((r) => r.user_mid);
+  const clean = mids.length
+    ? await query<{ source_message_id: string; text: string | null }>(
+      `SELECT source_message_id, text FROM clean_conversation_rows
+        WHERE channel_arn = $1 AND source_message_id = ANY($2::text[]) AND kind = 'message' AND state = 'present'`,
+      [channelArn, mids],
+    )
+    : { rows: [] };
+  const cleanByMid = new Map(clean.rows.map((r) => [r.source_message_id, r.text ?? '']));
+  const id = (process.env.DEIDENTIFY_GUARDRAIL_ID || '').trim();
+  const version = (process.env.DEIDENTIFY_GUARDRAIL_VERSION || '').trim();
+  const detector = id && version ? guardrailDetector(id, version) : null;
+  let unavailable = false;
+  try {
+    const exchange = await walkExchangeOf(turns.rows, cleanByMid, taskType, async (texts) => {
+      if (!texts.length) return [];
+      if (!detector) { unavailable = true; throw new Error('no detector'); }
+      return deIdentifyTexts(texts, detector.anonymize);
+    });
+    if (!exchange) return { refused: 'The de-identified copy of this task\'s turns is not ready yet, so no entry can be made from it' };
+    return { exchange };
+  } catch (err) {
+    if (unavailable) return { refused: 'The de-identification detector is not available, so the task\'s tool results cannot be copied into the set' };
+    console.warn('[golden-set] the detector could not de-identify the task\'s tool calls', { name: (err as Error)?.name });
+    return { refused: 'The task\'s tool results could not be de-identified, so no entry can be made from it' };
+  }
+}
+
+/**
  * THE GOLDEN SET, PER CLASSIFICATION (SPEC-EVALUATION FR16, Appendix C1).
  *
  *  - list (no action): the live entries, read under EACH classification's own reader role, so the
@@ -4809,7 +5123,8 @@ async function getLabelQueue(
  *    entry its de-identified answer, from the conversation's de-identified copy. A regression entry needs
  *    a person's label that passed (50 or more): it is a case the active version must keep passing. A
  *    capability entry may come from a failed answer and carries no reference. The copy must exist: an
- *    entry is never made from the raw exchange.
+ *    entry is never made from the raw exchange. An answer that belongs to a task also carries the
+ *    task's exchange, de-identified (`taskExchangeOf`, ADR-066 decision 7), which a run walks.
  *  - `retire` (entryId): the entry stops counting; the row stays, so a gate result that used it still
  *    names it.
  *  - `promote` (entryId): a capability entry the version now passes reliably becomes a regression entry.
@@ -4827,8 +5142,9 @@ async function getGoldenSet(
     const ex = await query<{
       assistant: string | null; conversation_classification: string | null; intent: string | null; channel_arn: string;
       user_mid: string; agent_mid: string; human_score: number | null; agent_metadata: Record<string, unknown> | null;
+      task_id?: string | null; task_type?: string | null;
     }>(
-      `SELECT e.assistant, e.conversation_classification, e.intent, e.channel_arn,
+      `SELECT e.assistant, e.conversation_classification, e.intent, e.channel_arn, e.task_id, e.task_type,
               mu.message_id AS user_mid, ma.message_id AS agent_mid,
               (SELECT g.human_score FROM ground_truth_scores g WHERE g.exchange_id = e.id ORDER BY g.scored_at DESC LIMIT 1) AS human_score,
               COALESCE(ma.metadata, '{}'::jsonb) || COALESCE(ma_upd.metadata, '{}'::jsonb) AS agent_metadata
@@ -4871,19 +5187,28 @@ async function getGoldenSet(
       [row.channel_arn, row.user_mid, GOLDEN_PRECEDING_TURNS],
     );
     const precedingTurns = precedingTurnsOf(before.rows);
+    // THE EXCHANGE ITS TASK HELD, for an answer that belongs to a multi-step task (ADR-066 decision 7): every person turn
+    // from the same de-identified copy, and every tool call with its result through the copy's own detector.
+    let walkExchange: WalkExchange | null = null;
+    if (row.task_id) {
+      const copied = await taskExchangeOf(row.channel_arn, row.task_id, row.task_type ?? null);
+      if ('refused' in copied) return success({ submitted: false, error: copied.refused });
+      walkExchange = copied.exchange;
+    }
     await withWriterRole((client) => client.query(
       `INSERT INTO golden_set_entries
          (classification, purpose, assistant, intent, request_text, reference_text, human_score, source_exchange_id, nominated_by,
-          used_tools, reply_preferences, preceding_turns)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+          used_tools, reply_preferences, preceding_turns, walk_exchange)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        ON CONFLICT (source_exchange_id) WHERE retired_at IS NULL AND source_exchange_id IS NOT NULL DO NOTHING`,
       [row.conversation_classification, purpose, row.assistant, row.intent, request,
        passed ? (answer ?? null) : null, row.human_score, params.exchangeId, params.callerSub,
        source.usedTools.length ? source.usedTools : null,
        source.replyPreferences ? JSON.stringify(source.replyPreferences) : null,
-       precedingTurns.length ? JSON.stringify(precedingTurns) : null],
+       precedingTurns.length ? JSON.stringify(precedingTurns) : null,
+       walkExchange ? JSON.stringify(walkExchange) : null],
     ));
-    return success({ submitted: true });
+    return success({ submitted: true, ...(walkExchange ? { carriesExchange: true } : {}) });
   }
   if (action === 'retire' || action === 'promote') {
     if (!params.entryId) return success({ submitted: false, error: 'entryId is required' });
@@ -4933,7 +5258,9 @@ async function getGoldenSet(
  * started. Round two of a duel is held out, as the Latency headline holds it out.
  *
  *   path      how the turn arrived (`turn_entry`): `flow` (standard), `lex` (targeted), or `unknown`.
- *   intent    the exchange's intent, else the one the refusal recorded.
+ *   intent    the intent the turn counts under in Effectiveness (`WORK_INTENT_SQL`: a task turn under its task's
+ *             type, any other under its classified intent), else the one the refusal recorded, so an intent's
+ *             node and its Effectiveness row count the same turns.
  *   outcome   one of, in this order of precedence:
  *               refused   the router's capability refusal (delivery option REFUSED)
  *               handed    a handover started the turn: another assistant passed the person's message
@@ -4948,7 +5275,13 @@ async function getGoldenSet(
  */
 export const WORK_INTENT_SQL = (alias: string): string => `COALESCE(${alias}.task_type, ${alias}.intent)`;
 
-const FLOW_INTENT_SQL = `COALESCE(e.intent, upd.metadata->>'intent', m.metadata->>'intent', 'unknown')`;
+/**
+ * A TURN'S END TO END: the ledger's span, else, for a turn the platform started (FR43), its exchange's span from the dispatch
+ * to the final answer, because no person's message opened a ledger span for it.
+ */
+const FLOW_E2E_SQL = `COALESCE(vl.e2e_ms, CASE WHEN e.paired_by = 'platform' THEN e.e2e_ms END)`;
+
+const FLOW_INTENT_SQL = `COALESCE(${WORK_INTENT_SQL('e')}, upd.metadata->>'intent', m.metadata->>'intent', 'unknown')`;
 const FLOW_OUTCOME_SQL = `CASE
          WHEN lbl.delivery_option = 'REFUSED' THEN 'refused'
          WHEN lbl.kind = 'handover' THEN 'handed'
@@ -4976,6 +5309,11 @@ const FLOW_POPULATION_SQL = `${LATENCY_TURN_POPULATION_SQL}
 const perfEntryParam = (params: Record<string, string | undefined>): string | null =>
   (params.turnEntry === 'unrecorded' ? 'unknown' : params.turnEntry) || null;
 const perfDuelParam = (params: Record<string, string | undefined>): string | null => params.duelRound || null;
+/** The bar's Version: the comma-separated versions chosen, as integers. Null is every version. */
+const profileVersionsParam = (params: Record<string, string | undefined>): number[] | null => {
+  const versions = (params.profileVersion ?? '').split(',').map((v) => v.trim()).filter((v) => v !== '' && Number.isInteger(Number(v))).map(Number);
+  return versions.length ? versions : null;
+};
 /** The bar's Response type: a delivery option, as the Latency rows name it. Null is every type. */
 const perfTypeParam = (params: Record<string, string | undefined>): string | null => params.responseType || null;
 /** The same filters over an exchange, whose path and round live on its answer message. */
@@ -4990,7 +5328,7 @@ const exchangePathDuelSql = (e: string, n: number): string => {
 const FLOW_FILTER_SQL = `
         AND ($2::varchar IS NULL OR ${LATENCY_DIM.assistant} = $2)
         AND ($3::varchar IS NULL OR ${LATENCY_DIM.role} = $3)
-        AND ($4::int IS NULL OR ${LATENCY_DIM.version} = $4)
+        AND ($4::int[] IS NULL OR ${LATENCY_DIM.version} = ANY($4))
         AND ($5::varchar IS NULL OR ${LATENCY_DIM.classification} = $5)
         AND ($6::text[] IS NULL OR COALESCE(e.conversation_classification, c.conversation_classification, m.conversation_classification) = ANY($6))
         AND ($7::varchar IS NULL OR ${LATENCY_DIM.entry} = $7)
@@ -4999,7 +5337,7 @@ const FLOW_FILTER_SQL = `
 const flowFilterParams = (params: Record<string, string | undefined>): unknown[] => [
   params.agentType || null,
   params.assistantRole || null,
-  params.profileVersion ? parseInt(params.profileVersion, 10) : null,
+  profileVersionsParam(params),
   params.conversationClassification || null,
   ((params as Record<string, unknown>).conversationClassifications as string[] | undefined) ?? null,
   perfEntryParam(params),
@@ -5022,7 +5360,7 @@ async function getMessageFlow(
             ${FLOW_OUTCOME_SQL} AS outcome,
             COUNT(*)::int AS turns,
             ROUND(AVG(vl.ttff_ms))::int AS avg_ttff_ms, COUNT(vl.ttff_ms)::int AS ttff_n,
-            ROUND(AVG(vl.e2e_ms))::int AS avg_e2e_ms, COUNT(vl.e2e_ms)::int AS e2e_n,
+            ROUND(AVG(${FLOW_E2E_SQL}))::int AS avg_e2e_ms, COUNT(${FLOW_E2E_SQL})::int AS e2e_n,
             ROUND(AVG(e.inbound_ms))::int AS avg_inbound_ms, COUNT(e.inbound_ms)::int AS inbound_n,
             ROUND(AVG(m.router_ms))::int AS avg_router_ms, COUNT(m.router_ms)::int AS router_n,
             ROUND(AVG(m.classifier_ms))::int AS avg_classifier_ms, COUNT(m.classifier_ms)::int AS classifier_n,
@@ -5155,8 +5493,9 @@ async function getFlowTurns(
     `SELECT m.id AS message_id, e.id AS exchange_id, m.channel_arn, m.created_at,
             ${LATENCY_DIM.entry} AS path, ${FLOW_INTENT_SQL} AS intent, ${FLOW_OUTCOME_SQL} AS outcome,
             ${LATENCY_DIM.assistant} AS assistant, ${LATENCY_DIM.classification} AS conversation_classification,
-            vl.ttff_ms, vl.e2e_ms, m.total_ms, m.bedrock_model, m.input_tokens, m.output_tokens,
+            vl.ttff_ms, ${FLOW_E2E_SQL} AS e2e_ms, m.total_ms, m.bedrock_model, m.input_tokens, m.output_tokens,
             e.task_type, e.task_step, e.task_state, e.model_kind, e.model_from,
+            ${ROUTED_AS_SQL} AS routed_as,
             ${TURN_STEPS_COST_SQL} AS steps_cost,
             (SELECT er.relevance_score FROM evaluation_results er
               WHERE er.exchange_id = e.id AND er.evaluation_type = 'exchange'
@@ -5191,9 +5530,11 @@ async function getFlowTurn(
             ${LATENCY_DIM.entry} AS path, ${FLOW_INTENT_SQL} AS intent, ${FLOW_OUTCOME_SQL} AS outcome,
             ${LATENCY_DIM.assistant} AS assistant, ${LATENCY_DIM.classification} AS conversation_classification,
             ${LATENCY_DIM.version} AS profile_version,
-            vl.ttff_ms, vl.e2e_ms, e.inbound_ms, m.router_ms, m.classifier_ms, m.guard_ms, m.placeholder_resolve_ms,
+            vl.ttff_ms, ${FLOW_E2E_SQL} AS e2e_ms, e.inbound_ms, m.router_ms, m.classifier_ms, m.guard_ms, m.placeholder_resolve_ms,
             m.poll_ms, m.latency_ms, m.model_ms, m.tool_ms, m.total_ms, m.cold_start,
             m.bedrock_model, m.input_tokens, m.output_tokens, e.task_id,
+            e.task_type, e.task_step, e.task_state, e.model_kind, e.model_from,
+            ${ROUTED_AS_SQL} AS routed_as,
             ${TURN_STEPS_COST_SQL} AS steps_cost
        FROM messages m
        ${LATENCY_TURN_JOINS_SQL}
@@ -6319,7 +6660,10 @@ async function getModelUsage(
        COALESCE(m.bedrock_model, 'unknown') AS model_name,
        COUNT(*) AS message_count,
        ROUND(AVG(m.latency_ms)) AS avg_latency_ms,
-       SUM(COALESCE(m.input_tokens, 0) + COALESCE(m.output_tokens, 0)) AS total_tokens
+       -- The tokens the model's turns RECORDED, and how many turns that is: a turn with no token count
+       -- adds nothing to the total and is outside tokened_count, so the total says what it covers.
+       SUM(m.input_tokens + m.output_tokens) AS total_tokens,
+       COUNT(m.input_tokens + m.output_tokens) AS tokened_count
      FROM messages m
      WHERE m.is_bot = true
        AND m.event_type = 'CREATE_CHANNEL_MESSAGE'
@@ -6385,7 +6729,8 @@ async function getModelEffectiveness(
          -- itself instead of sharing one with a fifth of the traffic.
          ELSE 'unknown'
        END AS model_name,
-       COALESCE(e.intent, 'unknown') AS intent,
+       -- The intent the turn's work counts under, as the Effectiveness rows count it (ADR-064 decision I).
+       COALESCE(${WORK_INTENT_SQL('e')}, 'unknown') AS intent,
        COUNT(*) AS exchange_count,
        -- AN UNJUDGED EXCHANGE IS NOT A ZERO, and coalescing it to one made this the only score in
        -- the console computed on a different convention from its own neighbors.
@@ -6508,7 +6853,7 @@ async function getModelEffectiveness(
          -- Ran a model and lost the attribution. THIS is the defect, and it now has the word to
          -- itself instead of sharing one with a fifth of the traffic.
          ELSE 'unknown'
-       END, COALESCE(e.intent, 'unknown')
+       END, COALESCE(${WORK_INTENT_SQL('e')}, 'unknown')
      -- NULLS LAST, because avg_score is now genuinely absent for a group nothing has judged. The
      -- default for DESC puts NULLs FIRST, which would head the table with the groups carrying the
      -- least evidence.
@@ -6733,11 +7078,7 @@ async function getIntentEffectiveness(
   // is constant today (one is declared), and the filter exists so the dimension is usable the day it
   // is not. Version answers "did v4 regress against v3" without re-reading a JSON key per row.
   const assistantRole = params.assistantRole || null;
-  const profileVersionRaw = params.profileVersion;
-  const profileVersion = profileVersionRaw !== undefined && profileVersionRaw !== ''
-    && Number.isInteger(Number(profileVersionRaw))
-    ? Number(profileVersionRaw)
-    : null;
+  const profileVersion = profileVersionsParam(params);
 
   const result = await query(
     `WITH ex_agg AS (
@@ -6833,6 +7174,10 @@ async function getIntentEffectiveness(
               -- Graded by the rule set, not counted flat: blocking is the severity that means
               -- somebody needs to know today, and it is what the Alerts tab raises on.
               COUNT(*) FILTER (WHERE er.has_blocking_breach) AS blocking_violation_count,
+              -- REPLIES THE RUNNER RECORDED AS AN ERROR, AS A COUNT. The Alerts tab raises a runtime alert
+              -- on it, and a count is all it needs: the replies themselves are conversation content, read
+              -- on the Flagged tab under view-events with a stated reason.
+              COUNT(DISTINCT e.id) FILTER (WHERE er.is_error_response) AS error_response_count,
               ROUND(AVG(m.total_ms)::numeric, 0) AS avg_total_ms,
               ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY m.total_ms)::numeric, 0) AS p95_total_ms,
               ROUND(AVG(m.input_tokens)::numeric, 0) AS avg_input_tokens,
@@ -6884,6 +7229,8 @@ async function getIntentEffectiveness(
                   -- unreachable today, which is precisely why it would have been a silent defect the
                   -- day the index changed rather than a visible one now.
                   BOOL_OR(compliance_categories ?| $4::text[]) AS has_blocking_breach,
+                  -- Whether any verdict on this exchange recorded the reply as an error response.
+                  BOOL_OR(classification = 'error_response') AS is_error_response,
                   -- ── GROUNDEDNESS, WHICH WAS BEING COMPUTED AND READ BY NOTHING ──
                   --
                   -- Pass D judges whether the answer is supported by what the turn retrieved, and has
@@ -6922,7 +7269,7 @@ async function getIntentEffectiveness(
           AND ($8::text[] IS NULL OR e.conversation_classification = ANY($8))
           AND ($6::varchar IS NULL OR e.assistant_role = $6)
           ${exchangePathDuelSql('e', 9)}
-          AND ($7::int IS NULL OR e.profile_version = $7)
+          AND ($7::int[] IS NULL OR e.profile_version = ANY($7))
           -- ONE ROW PER TURN, the predicate getEvaluationMetrics and v_turn_latency anchor on. A
           -- folded answer writes one exchange per message the queue held, all sharing one
           -- agent_message_id, so without this a single slow turn that folded three messages counts as
@@ -6973,7 +7320,7 @@ async function getIntentEffectiveness(
               AND ($8::text[] IS NULL OR e2.conversation_classification = ANY($8))
               AND ($6::varchar IS NULL OR e2.assistant_role = $6)
               ${exchangePathDuelSql('e2', 9)}
-              AND ($7::int IS NULL OR e2.profile_version = $7)
+              AND ($7::int[] IS NULL OR e2.profile_version = ANY($7))
               AND e2.queued_as IS NULL
               AND m2.bedrock_model IS NOT NULL
             GROUP BY ${WORK_INTENT_SQL('e2')}, m2.bedrock_model
@@ -7004,7 +7351,7 @@ async function getIntentEffectiveness(
               AND ($8::text[] IS NULL OR e2.conversation_classification = ANY($8))
               AND ($6::varchar IS NULL OR e2.assistant_role = $6)
               ${exchangePathDuelSql('e2', 9)}
-              AND ($7::int IS NULL OR e2.profile_version = $7)
+              AND ($7::int[] IS NULL OR e2.profile_version = ANY($7))
               AND e2.queued_as IS NULL
               AND m2.classifier_model IS NOT NULL
             GROUP BY ${WORK_INTENT_SQL('e2')}, m2.classifier_model
@@ -7036,7 +7383,7 @@ async function getIntentEffectiveness(
           AND ($8::text[] IS NULL OR e.conversation_classification = ANY($8))
           AND ($6::varchar IS NULL OR e.assistant_role = $6)
           ${exchangePathDuelSql('e', 9)}
-          AND ($7::int IS NULL OR e.profile_version = $7)
+          AND ($7::int[] IS NULL OR e.profile_version = ANY($7))
           AND e.queued_as IS NULL
         GROUP BY ${WORK_INTENT_SQL('e')}
      ),
@@ -7131,7 +7478,7 @@ async function getIntentEffectiveness(
           AND ($8::text[] IS NULL OR e.conversation_classification = ANY($8))
           AND ($6::varchar IS NULL OR e.assistant_role = $6)
           ${exchangePathDuelSql('e', 9)}
-          AND ($7::int IS NULL OR e.profile_version = $7)
+          AND ($7::int[] IS NULL OR e.profile_version = ANY($7))
           -- ONE ROW PER TURN, the predicate getEvaluationMetrics and v_turn_latency anchor on. A
           -- folded answer writes one exchange per message the queue held, all sharing one
           -- agent_message_id, so without this a single slow turn that folded three messages counts as
@@ -7165,7 +7512,7 @@ async function getIntentEffectiveness(
           AND ($8::text[] IS NULL OR e.conversation_classification = ANY($8))
           AND ($6::varchar IS NULL OR e.assistant_role = $6)
           ${exchangePathDuelSql('e', 9)}
-          AND ($7::int IS NULL OR e.profile_version = $7)
+          AND ($7::int[] IS NULL OR e.profile_version = ANY($7))
           AND e.queued_as IS NULL
         GROUP BY ${WORK_INTENT_SQL('e')}
      )
@@ -7203,6 +7550,7 @@ async function getIntentEffectiveness(
             ex_agg.compliance_assessed_count,
             ex_agg.violation_count,
             ex_agg.blocking_violation_count,
+            ex_agg.error_response_count,
             -- NULL (not 0) when the flow evaluator has not scored this intent's tasks yet, so the UI
             -- renders "—" rather than a misleading red 0%. A genuine 0% (flows exist, none completed)
             -- still comes through as 0 from flow_agg. Distinguishes "no data yet" from "actually failing".
@@ -7266,8 +7614,11 @@ async function getIntentEffectiveness(
   // thumbs" - the second is the defect this scope exists to end, so an empty scope is the safe
   // answer and the console shows the columns as unmeasured.
   const scopedMessages = await query(
-    `SELECT e.agent_message_id::text AS message_id, COALESCE(e.task_type, e.intent, 'unknown') AS intent
+    // KEYED BY THE MESSAGE ID A VOTE CARRIES: the Amazon Chime SDK message id (`messages.message_id`), the id the
+    // chat app votes on and the ratings list joins on, never the projection's own row id.
+    `SELECT m.message_id AS message_id, COALESCE(e.task_type, e.intent, 'unknown') AS intent
        FROM exchanges e
+       JOIN messages m ON m.id = e.agent_message_id
       WHERE e.created_at >= lower($1::tstzrange) AND e.created_at < upper($1::tstzrange)
         AND e.agent_message_id IS NOT NULL
         AND e.queued_as IS NULL
@@ -7277,7 +7628,7 @@ async function getIntentEffectiveness(
         AND ($7::text[] IS NULL OR e.conversation_classification = ANY($7))
         AND ($5::varchar IS NULL OR e.assistant_role = $5)
         ${exchangePathDuelSql('e', 8)}
-        AND ($6::int IS NULL OR e.profile_version = $6)`,
+        AND ($6::int[] IS NULL OR e.profile_version = ANY($6))`,
     [win.range, intent, agentType, conversationClassification, assistantRole, profileVersion, conversationClassifications, perfEntryParam(params), perfDuelParam(params), perfTypeParam(params)]
   );
   const voteScope = new Map<string, string>(
@@ -7378,6 +7729,7 @@ async function getIntentEffectiveness(
       'direct_relevance', 'task_completion_rate', 'flow_composite',
       'task_flow_count', 'task_completed', 'task_failed', 'task_abandoned', 'task_running',
       'compliance_rate', 'compliance_assessed_count', 'violation_count', 'blocking_violation_count',
+      'error_response_count',
       'avg_total_ms', 'p95_total_ms',
       'avg_input_tokens', 'avg_output_tokens', 'dominant_model', 'cost_per_reply_usd',
       'cost_priced_replies', 'model_mix',
@@ -7421,8 +7773,7 @@ async function getIntentSteps(
   if (!intent) return success({ data: [] });
   const win = queryWindow(params, 30, 180);
   const conversationClassifications = (params as Record<string, unknown>).conversationClassifications as string[] | undefined ?? null;
-  const profileVersion = params.profileVersion !== undefined && params.profileVersion !== '' && Number.isInteger(Number(params.profileVersion))
-    ? Number(params.profileVersion) : null;
+  const profileVersion = profileVersionsParam(params);
   const result = await query(
     `WITH turns AS (
        SELECT e.id AS exchange_id,
@@ -7440,7 +7791,7 @@ async function getIntentSteps(
           AND ($4::varchar IS NULL OR e.conversation_classification = $4)
           AND ($5::text[] IS NULL OR e.conversation_classification = ANY($5))
           AND ($6::varchar IS NULL OR e.assistant_role = $6)
-          AND ($7::int IS NULL OR e.profile_version = $7)
+          AND ($7::int[] IS NULL OR e.profile_version = ANY($7))
           AND ($8::varchar IS NULL OR e.task_step = $8)
           ${exchangePathDuelSql('e', 9)}
           AND e.queued_as IS NULL
@@ -7552,6 +7903,393 @@ export function intentStepRows(rows: Array<Record<string, unknown>>): Array<Reco
       return { ...taskStep, models: list };
     }
     return { ...rest, models: list };
+  });
+}
+
+/**
+ * RUNS PER WORKFLOW EDITION (ADR-067 decision 6, WT109). One row per workflow, the assistant whose run it was, and the hash
+ * of the workflow its run started on (`dimension = 'edition'`): the runs that said anything, the runs whose run-end record (WT62) says they
+ * ended, and the share that ended in success; and one row per run-level step of that edition (`dimension = 'step'`):
+ * its messages, the runs it spoke in, and the average and p95 time of its turns. Read from the five run columns a run's
+ * messages carry (migration 099) and the `AE_RUN_ENDED` records the archive holds beside them: no counter (tenet D7).
+ * A run that has not ended within the window is counted in `runs` and not in `ended`, so a share is read over the runs that ended.
+ * EACH EDITION IS ONE POPULATION WHOEVER STARTED ITS RUNS (WT118): a `trigger` row per person, assistant or event breaks it
+ * down with the same measures, so the team owning an intent reads requests from another assistant beside a person's.
+ * `?workflow=` narrows to one workflow. Aurora only.
+ */
+async function getWorkflowEditions(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const win = queryWindow(params, 30, 180);
+  const conversationClassifications = (params as Record<string, unknown>).conversationClassifications as string[] | undefined ?? null;
+  const result = await query(
+    `WITH run_msgs AS (
+       SELECT m.assistant, m.workflow_name, m.workflow_origin_hash, m.workflow_step, m.workflow_run_key, m.total_ms, m.workflow_trigger
+         FROM messages m
+        WHERE m.created_at >= lower($1::tstzrange) AND m.created_at < upper($1::tstzrange)
+          AND m.workflow_run_key IS NOT NULL AND m.workflow_name IS NOT NULL
+          AND ($2::varchar IS NULL OR m.workflow_name = $2)
+          AND ($3::varchar IS NULL OR m.assistant = $3)
+          AND ($4::varchar IS NULL OR m.conversation_classification = $4)
+          AND ($5::text[] IS NULL OR m.conversation_classification = ANY($5))
+     ),
+     ends AS (
+       SELECT DISTINCT ON (f.metadata->>'runKey') f.metadata->>'runKey' AS run_key, f.metadata->>'disposition' AS disposition
+         FROM messages f
+        WHERE f.event_type = 'AE_RUN_ENDED'
+          AND f.created_at >= lower($1::tstzrange) AND f.created_at < upper($1::tstzrange)
+          AND f.metadata->>'runKey' IN (SELECT workflow_run_key FROM run_msgs)
+        ORDER BY f.metadata->>'runKey', f.created_at
+     )
+     SELECT 'edition'::text AS dimension, r.assistant, r.workflow_name, r.workflow_origin_hash, NULL::varchar AS workflow_step, NULL::varchar AS workflow_trigger,
+            COUNT(DISTINCT r.workflow_run_key) AS runs,
+            COUNT(DISTINCT r.workflow_run_key) FILTER (WHERE e.run_key IS NOT NULL) AS ended,
+            COUNT(DISTINCT r.workflow_run_key) FILTER (WHERE e.disposition = 'success') AS succeeded,
+            COUNT(*) AS messages,
+            ROUND(AVG(r.total_ms)::numeric, 0) AS avg_ms,
+            ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY r.total_ms)::numeric, 0) AS p95_ms
+       FROM run_msgs r
+       LEFT JOIN ends e ON e.run_key = r.workflow_run_key
+      GROUP BY r.workflow_name, r.workflow_origin_hash, r.assistant
+     UNION ALL
+     SELECT 'trigger'::text AS dimension, r.assistant, r.workflow_name, r.workflow_origin_hash, NULL::varchar AS workflow_step, r.workflow_trigger,
+            COUNT(DISTINCT r.workflow_run_key) AS runs,
+            COUNT(DISTINCT r.workflow_run_key) FILTER (WHERE e.run_key IS NOT NULL) AS ended,
+            COUNT(DISTINCT r.workflow_run_key) FILTER (WHERE e.disposition = 'success') AS succeeded,
+            COUNT(*) AS messages,
+            ROUND(AVG(r.total_ms)::numeric, 0) AS avg_ms,
+            ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY r.total_ms)::numeric, 0) AS p95_ms
+       FROM run_msgs r
+       LEFT JOIN ends e ON e.run_key = r.workflow_run_key
+      WHERE r.workflow_trigger IS NOT NULL
+      GROUP BY r.workflow_name, r.workflow_origin_hash, r.assistant, r.workflow_trigger
+     UNION ALL
+     SELECT 'step'::text AS dimension, r.assistant, r.workflow_name, r.workflow_origin_hash, r.workflow_step, NULL::varchar AS workflow_trigger,
+            COUNT(DISTINCT r.workflow_run_key) AS runs,
+            NULL::bigint AS ended,
+            NULL::bigint AS succeeded,
+            COUNT(*) AS messages,
+            ROUND(AVG(r.total_ms)::numeric, 0) AS avg_ms,
+            ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY r.total_ms)::numeric, 0) AS p95_ms
+       FROM run_msgs r
+      WHERE r.workflow_step IS NOT NULL
+      GROUP BY r.workflow_name, r.workflow_origin_hash, r.assistant, r.workflow_step
+      ORDER BY workflow_name, assistant, workflow_origin_hash NULLS LAST, dimension, runs DESC`,
+    [win.range, params.workflow || null, params.agentType || null, params.conversationClassification || null, conversationClassifications],
+  );
+  return success({ data: workflowEditionRows(result.rows as Array<Record<string, unknown>>) });
+}
+
+/**
+ * PROCESSES (SPEC-PROCESSES P8 to P10; DESIGN-PROCESSES section 6). Every run of a process, from the process its messages'
+ * out-of-band record carries (`metadata->'processRun'`) and its `AE_RUN_ENDED` record, joined by run key: a message archived
+ * before its record costs the run nothing, since the record and the fact name the same process. No counter, no table (D7).
+ * Rows by `dimension`: `process` (processes started, ended, all-success, end-to-end p50 and p95 over the ended ones), and
+ * `workflow` and `team` (runs and time from a run's first message to its end). `runs` lists the runs themselves, references
+ * only (the drill and the declared metrics, read per process edition), as `dimension = 'run'` rows. `?process=` narrows every
+ * row to one process, and `?processId=` to one process id, so the drill reads that process's own row (ended, succeeded, end
+ * to end) beside its runs. Aurora only.
+ */
+const PROCESS_RUNS_CTE = `WITH msg_runs AS (
+       SELECT m.workflow_run_key AS run_key, MAX(m.workflow_name) AS workflow, MIN(m.created_at) AS first_at,
+              MAX(m.metadata->'processRun'->>'processId') AS process_id, MAX(m.metadata->'processRun'->>'process') AS process,
+              MAX(m.metadata->'processRun'->>'processEdition') AS edition, MAX(m.metadata->'processRun'->>'ownerTeam') AS owner_team,
+              -- THE VERSION THE RUN RAN ON (its origin), so a run is read against its own stages whatever is active now.
+              MAX(m.workflow_origin_config_id) AS origin_config_id,
+              -- THE CONVERSATION THE RUN RAN IN: the one its first message was said in, so the console opens the run where it ran.
+              (ARRAY_AGG(m.channel_arn ORDER BY m.created_at))[1] AS channel_arn
+         FROM messages m
+        WHERE m.created_at >= lower($1::tstzrange) AND m.created_at < upper($1::tstzrange)
+          AND m.workflow_run_key IS NOT NULL AND m.metadata ? 'processRun'
+          AND ($3::varchar IS NULL OR m.assistant = $3)
+          AND ($4::varchar IS NULL OR m.conversation_classification = $4)
+          AND ($5::text[] IS NULL OR m.conversation_classification = ANY($5))
+        GROUP BY m.workflow_run_key
+     ),
+     ends AS (
+       SELECT DISTINCT ON (f.metadata->>'runKey') f.metadata->>'runKey' AS run_key, f.metadata->>'workflow' AS workflow,
+              f.metadata->>'processId' AS process_id, f.metadata->>'process' AS process, f.metadata->>'processEdition' AS edition,
+              f.metadata->>'ownerTeam' AS owner_team, f.metadata->>'disposition' AS disposition,
+              f.metadata->'steps' AS steps, f.created_at AS ended_at, f.channel_arn
+         FROM messages f
+        WHERE f.event_type = 'AE_RUN_ENDED' AND f.metadata ? 'processId'
+          AND f.created_at >= lower($1::tstzrange) AND f.created_at < upper($1::tstzrange)
+          AND ($3::varchar IS NULL OR f.metadata->>'runKey' LIKE '%#' || $3)
+          AND ($4::varchar IS NULL OR f.metadata->>'classification' = $4)
+          AND ($5::text[] IS NULL OR f.metadata->>'classification' = ANY($5))
+        ORDER BY f.metadata->>'runKey', f.created_at
+     ),
+     runs AS (
+       SELECT COALESCE(m.run_key, e.run_key) AS run_key, COALESCE(e.process_id, m.process_id) AS process_id,
+              COALESCE(e.process, m.process) AS process, COALESCE(e.workflow, m.workflow) AS workflow,
+              COALESCE(e.owner_team, m.owner_team) AS owner_team, COALESCE(e.edition, m.edition) AS edition,
+              COALESCE(m.first_at, e.ended_at) AS started_at, e.ended_at, e.disposition, e.steps, m.origin_config_id,
+              COALESCE(m.channel_arn, e.channel_arn) AS channel_arn,
+              -- THE ASSISTANT WHOSE WORKFLOW THE RUN IS: the one its run key names last (its last segment after #).
+              SUBSTRING(COALESCE(m.run_key, e.run_key) FROM '#([^#]+)$') AS assistant
+         FROM msg_runs m FULL OUTER JOIN ends e ON e.run_key = m.run_key
+        WHERE ($2::varchar IS NULL OR COALESCE(e.process, m.process) = $2)
+          AND ($6::varchar IS NULL OR COALESCE(e.process_id, m.process_id) = $6)
+     ),
+     procs AS (
+       SELECT process_id, MAX(process) AS process, MIN(started_at) AS started_at, MAX(ended_at) AS ended_at,
+              BOOL_AND(ended_at IS NOT NULL) AS all_ended, BOOL_AND(COALESCE(disposition = 'success', false)) AS all_succeeded,
+              (ARRAY_AGG(edition ORDER BY started_at) FILTER (WHERE edition IS NOT NULL))[1] AS edition
+         FROM runs GROUP BY process_id
+     )`;
+
+const msBetween = (a: string, b: string) => `EXTRACT(EPOCH FROM (${b} - ${a})) * 1000`;
+
+async function getProcessRuns(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const win = queryWindow(params, 30, 180);
+  const conversationClassifications = (params as Record<string, unknown>).conversationClassifications as string[] | undefined ?? null;
+  const args = [win.range, params.process || null, params.agentType || null, params.conversationClassification || null, conversationClassifications, params.processId || null];
+  const groups = await query(
+    `${PROCESS_RUNS_CTE}
+     SELECT 'process'::text AS dimension, p.process, NULL::text AS workflow, NULL::text AS owner_team,
+            COUNT(*) AS runs, COUNT(*) FILTER (WHERE p.all_ended) AS ended, COUNT(*) FILTER (WHERE p.all_ended AND p.all_succeeded) AS succeeded,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ${msBetween('p.started_at', 'p.ended_at')}) FILTER (WHERE p.all_ended) AS p50_ms,
+            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ${msBetween('p.started_at', 'p.ended_at')}) FILTER (WHERE p.all_ended) AS p95_ms
+       FROM procs p GROUP BY p.process
+     UNION ALL
+     SELECT 'workflow', r.process, r.workflow, r.owner_team,
+            COUNT(*), COUNT(*) FILTER (WHERE r.ended_at IS NOT NULL), COUNT(*) FILTER (WHERE r.disposition = 'success'),
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ${msBetween('r.started_at', 'r.ended_at')}) FILTER (WHERE r.ended_at IS NOT NULL),
+            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ${msBetween('r.started_at', 'r.ended_at')}) FILTER (WHERE r.ended_at IS NOT NULL)
+       FROM runs r GROUP BY r.process, r.workflow, r.owner_team
+     UNION ALL
+     SELECT 'team', r.process, NULL, r.owner_team,
+            COUNT(*), COUNT(*) FILTER (WHERE r.ended_at IS NOT NULL), COUNT(*) FILTER (WHERE r.disposition = 'success'),
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ${msBetween('r.started_at', 'r.ended_at')}) FILTER (WHERE r.ended_at IS NOT NULL),
+            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ${msBetween('r.started_at', 'r.ended_at')}) FILTER (WHERE r.ended_at IS NOT NULL)
+       FROM runs r GROUP BY r.process, r.owner_team
+      ORDER BY process, dimension, workflow NULLS FIRST`,
+    args,
+  );
+  // EACH RUN'S STEPS IN TIME (DESIGN-PROCESSES section 6): the first message each step of the run said, as the run's own
+  // messages (`workflow_run_key`, `workflow_step`, `created_at`), which the console turns into stages by the version's labels.
+  // WHO ANSWERED EACH STEP AND WHAT IT COST: the assistant that posted the step's messages, and their model's tokens, summed per
+  // model over each message once (its first event) and priced here by the one rate table (`step_costs`).
+  // A request to another assistant is answered under that assistant's own run (WT118), so its message names the asking run's
+  // step on its record (`askedStep`). Materialized: read once over the window, not once per run.
+  const runs = await query(
+    `${PROCESS_RUNS_CTE},
+     -- ONE ROW PER MESSAGE, ITS CREATE: archival folds the turn's model and tokens onto it. A task's turn posts its placeholder
+     -- before it knows its task, so the run and step it answers ride the edit that holds the answer: the step that asked for it
+     -- (askedStep), or the run and step the edit itself names (workflow_run_key, workflow_step, as its run record names them). Each
+     -- is read as a pair, in that order: the message's own asking step, the edit's asking step, the edit's run, the message's run.
+     step_msgs AS MATERIALIZED (
+       SELECT CASE WHEN s.metadata->'askedStep'->>'runKey' IS NOT NULL THEN s.metadata->'askedStep'->>'runKey'
+                   WHEN u.asked_run_key IS NOT NULL THEN u.asked_run_key
+                   WHEN u.run_key IS NOT NULL THEN u.run_key
+                   ELSE s.workflow_run_key END AS run_key,
+              CASE WHEN s.metadata->'askedStep'->>'runKey' IS NOT NULL THEN s.metadata->'askedStep'->>'step'
+                   WHEN u.asked_run_key IS NOT NULL THEN u.asked_step
+                   WHEN u.run_key IS NOT NULL THEN u.step
+                   ELSE s.workflow_step END AS step,
+              s.assistant, s.bedrock_model, s.input_tokens, s.output_tokens, s.created_at AS at
+         FROM messages s
+         LEFT JOIN LATERAL (
+           SELECT x.metadata->'askedStep'->>'runKey' AS asked_run_key, x.metadata->'askedStep'->>'step' AS asked_step,
+                  x.workflow_run_key AS run_key, x.workflow_step AS step
+             FROM messages x
+            WHERE x.channel_arn = s.channel_arn AND x.event_type = 'UPDATE_CHANNEL_MESSAGE' AND x.base_message_id = s.message_id
+              AND (x.metadata ? 'askedStep' OR x.workflow_run_key IS NOT NULL)
+            ORDER BY (x.metadata ? 'askedStep') DESC, x.created_at DESC
+            LIMIT 1
+         ) u ON TRUE
+        WHERE s.created_at >= lower($1::tstzrange) AND s.created_at < upper($1::tstzrange)
+          AND s.event_type = 'CREATE_CHANNEL_MESSAGE' AND s.is_bot = true
+          AND ($4::varchar IS NULL OR s.conversation_classification = $4)
+          AND ($5::text[] IS NULL OR s.conversation_classification = ANY($5))
+     ),
+     -- WHEN EACH STEP FIRST SAID SOMETHING: a run's own message by its own step, and a task's turn by the step its answer names,
+     -- at the turn's first message (its placeholder), not at the answer's edit, so a request's stage starts when its work did.
+     step_firsts AS MATERIALIZED (
+       SELECT f.run_key, f.step, MIN(f.at) AS at
+         FROM (
+           SELECT COALESCE(s.metadata->'askedStep'->>'runKey', s.workflow_run_key) AS run_key,
+                  COALESCE(s.metadata->'askedStep'->>'step', s.workflow_step) AS step, s.created_at AS at
+             FROM messages s
+            WHERE s.created_at >= lower($1::tstzrange) AND s.created_at < upper($1::tstzrange)
+              AND COALESCE(s.metadata->'askedStep'->>'step', s.workflow_step) IS NOT NULL
+              AND ($4::varchar IS NULL OR s.conversation_classification = $4)
+              AND ($5::text[] IS NULL OR s.conversation_classification = ANY($5))
+           UNION ALL
+           SELECT m.run_key, m.step, m.at FROM step_msgs m WHERE m.step IS NOT NULL
+         ) f
+        WHERE f.run_key IN (SELECT run_key FROM runs)
+        GROUP BY f.run_key, f.step
+     ),
+     step_usage AS MATERIALIZED (
+       SELECT m.run_key, m.step, MIN(m.assistant) AS assistant, m.bedrock_model AS model,
+              SUM(m.input_tokens) AS tokens_in, SUM(m.output_tokens) AS tokens_out
+         FROM step_msgs m
+        WHERE m.step IS NOT NULL AND m.run_key IN (SELECT run_key FROM runs)
+        GROUP BY m.run_key, m.step, m.bedrock_model
+     )
+     SELECT r.process_id, r.process, p.edition AS process_edition, r.workflow, r.owner_team, r.disposition, r.steps, r.origin_config_id,
+            r.channel_arn, r.assistant, r.started_at, r.ended_at, p.started_at AS process_started_at,
+            (SELECT COALESCE(JSON_AGG(JSON_BUILD_OBJECT('step', f.step, 'at', f.at) ORDER BY f.at, f.step), '[]'::json)
+               FROM step_firsts f WHERE f.run_key = r.run_key) AS step_times,
+            (SELECT COALESCE(JSON_AGG(JSON_BUILD_OBJECT('step', u.step, 'assistant', u.assistant, 'model', u.model, 'tokensIn', u.tokens_in, 'tokensOut', u.tokens_out)), '[]'::json)
+               FROM step_usage u WHERE u.run_key = r.run_key) AS step_usage
+       FROM runs r JOIN procs p ON p.process_id = r.process_id
+      ORDER BY p.started_at DESC, r.started_at
+      LIMIT ${PROCESS_RUNS_CAP + 1}`,
+    args,
+  );
+  // ONE ROW KEY, so the caller's scope narrows every row the response carries (`ROW_BEARING_SIBLING_KEYS`). A WINDOW WITH MORE
+  // RUNS THAN THE CAP SAYS SO (`truncated`): one more row than the cap is read to know, and the runs past the cap are not sent.
+  const { rows: runRows, truncated } = capProcessRuns(runs.rows as Array<Record<string, unknown>>);
+  return success({ data: [...processGroupRows(groups.rows as Array<Record<string, unknown>>), ...processRunRows(runRows)], truncated });
+}
+
+/** The most runs one read of a window's processes returns, newest process first. */
+export const PROCESS_RUNS_CAP = 500;
+
+/** The runs a read returns, at most the cap, and whether the window held more (read as one row past the cap). */
+export function capProcessRuns<T>(rows: T[]): { rows: T[]; truncated: boolean } {
+  return rows.length > PROCESS_RUNS_CAP ? { rows: rows.slice(0, PROCESS_RUNS_CAP), truncated: true } : { rows, truncated: false };
+}
+
+/** The grouped rows as the console reads them: counts and times as numbers. */
+export function processGroupRows(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const num = (v: unknown): number | null => (v == null ? null : Math.round(Number(v)));
+  return rows.map((r) => ({ ...r, runs: num(r.runs), ended: num(r.ended), succeeded: num(r.succeeded), p50_ms: num(r.p50_ms), p95_ms: num(r.p95_ms) }));
+}
+
+/**
+ * A run as the drill reads it: references, its steps by name and outcome, its times as epoch milliseconds, and when each step
+ * the run took first said something (`step_times`, oldest first), from which a stage's start, end and duration are read.
+ */
+export function processRunRows(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const ms = (v: unknown): number | null => (v == null ? null : new Date(v as string).getTime());
+  return rows.map((r) => ({
+    dimension: 'run', ...r, started_at: ms(r.started_at), ended_at: ms(r.ended_at), process_started_at: ms(r.process_started_at),
+    steps: Array.isArray(r.steps) ? (r.steps as Array<{ step?: unknown; outcome?: unknown }>).map((s) => ({ step: String(s.step ?? ''), outcome: String(s.outcome ?? '') })) : [],
+    step_times: Array.isArray(r.step_times)
+      ? (r.step_times as Array<{ step?: unknown; at?: unknown }>)
+        .map((s) => ({ step: String(s.step ?? ''), at: ms(s.at) }))
+        .filter((s): s is { step: string; at: number } => !!s.step && s.at !== null && Number.isFinite(s.at))
+        .sort((a, b) => a.at - b.at)
+      : [],
+    step_costs: stepCosts(r.step_usage),
+    step_usage: undefined,
+  }));
+}
+
+/**
+ * WHO ANSWERED EACH STEP AND WHAT ITS MODEL COST: per step, the assistant that posted it, and its tokens priced per model from the
+ * one rate table. A step whose model was never recorded, or that the table does not price, is left out of the cost and counted
+ * as unpriced, so a figure never reads as cheaper than it was.
+ */
+export function stepCosts(raw: unknown): Array<{ step: string; assistant: string | null; usd: number | null; unpriced: number }> {
+  const out = new Map<string, { step: string; assistant: string | null; usd: number | null; unpriced: number }>();
+  for (const u of Array.isArray(raw) ? raw as Array<Record<string, unknown>> : []) {
+    const step = String(u.step ?? '');
+    if (!step) continue;
+    const row = out.get(step) ?? { step, assistant: null, usd: null, unpriced: 0 };
+    if (!row.assistant && typeof u.assistant === 'string') row.assistant = u.assistant;
+    const tokensIn = u.tokensIn == null ? null : Number(u.tokensIn);
+    const tokensOut = u.tokensOut == null ? null : Number(u.tokensOut);
+    const usd = u.model && (tokensIn !== null || tokensOut !== null) ? estimateStepCostUsd({ modelId: String(u.model), tokensIn, tokensOut }) : null;
+    if (usd === null) { if (u.model) row.unpriced += 1; } else row.usd = (row.usd ?? 0) + usd;
+    out.set(step, row);
+  }
+  return [...out.values()];
+}
+
+/** The rows as the console reads them: counts as numbers, and an edition's success share over the runs that ended. */
+export function workflowEditionRows(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const num = (v: unknown): number | null => (v == null ? null : Number(v));
+  return rows.map((r) => {
+    const ended = num(r.ended);
+    const succeeded = num(r.succeeded);
+    return {
+      ...r,
+      runs: num(r.runs), ended, succeeded, messages: num(r.messages), avg_ms: num(r.avg_ms), p95_ms: num(r.p95_ms),
+      success_share: (r.dimension === 'edition' || r.dimension === 'trigger') && ended ? Math.round(((succeeded ?? 0) / ended) * 1000) / 1000 : null,
+    };
+  });
+}
+
+/**
+ * REWORK (ADR-067 OPEN 6, WT105): reopens per task, by intent and the machine edition the task started on. A reopen is
+ * a transition whose `from` is a state the same task ended in earlier: a `task_terminal` entry of the turn ledger there, or a
+ * settlement the archive holds as an `AE_TASK_SETTLED` record (a card press, a deadline). Read from the transitions the
+ * archive already holds, never a new counter (tenet D7). One row per `task_type`, `task_origin_machine_hash` and assistant: the
+ * tasks that had a turn in the window, the tasks reopened, and the reopens. `?intent=` narrows to one. Aurora only.
+ */
+async function getTaskRework(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const win = queryWindow(params, 30, 180);
+  const conversationClassifications = (params as Record<string, unknown>).conversationClassifications as string[] | undefined ?? null;
+  const result = await query(
+    `WITH task_msgs AS (
+       SELECT m.task_id, m.task_type, m.task_origin_machine_hash, m.assistant, m.task_state, m.task_transition, m.created_at
+         FROM messages m
+        WHERE m.created_at >= lower($1::tstzrange) AND m.created_at < upper($1::tstzrange)
+          AND m.task_id IS NOT NULL AND m.task_type IS NOT NULL
+          AND ($2::varchar IS NULL OR m.task_type = $2)
+          AND ($3::varchar IS NULL OR m.assistant = $3)
+          AND ($4::varchar IS NULL OR m.conversation_classification = $4)
+          AND ($5::text[] IS NULL OR m.conversation_classification = ANY($5))
+     ),
+     endings AS (
+       SELECT te.task_id, te.task_state AS state, te.occurred_at AS created_at
+         FROM turn_events te
+        WHERE te.kind = 'task_terminal' AND te.task_state IS NOT NULL
+          AND te.task_id IN (SELECT task_id FROM task_msgs)
+       UNION ALL
+       -- A DEADLINE'S SETTLEMENT names no state it moved to: the task ended in the state it was in (fromState).
+       SELECT f.metadata->>'taskId', COALESCE(f.metadata->>'toState', f.metadata->>'fromState'), f.created_at
+         FROM messages f
+        WHERE f.event_type = 'AE_TASK_SETTLED' AND f.metadata->>'terminal' IS NOT NULL
+          AND f.created_at >= lower($1::tstzrange) AND f.created_at < upper($1::tstzrange)
+          AND f.metadata->>'taskId' IN (SELECT task_id FROM task_msgs)
+     ),
+     reopens AS (
+       SELECT t.task_id, t.task_type, t.task_origin_machine_hash
+         FROM task_msgs t
+        WHERE t.task_transition IS NOT NULL AND COALESCE(t.task_transition->>'from', '') <> ''
+          AND EXISTS (SELECT 1 FROM endings e
+                       WHERE e.task_id = t.task_id AND e.state = t.task_transition->>'from' AND e.created_at < t.created_at)
+     ),
+     tasks AS (
+       -- A TASK IS ONE ASSISTANT'S ROW: the first assistant its turns name.
+       SELECT DISTINCT ON (task_id) task_id, task_type, task_origin_machine_hash,
+              FIRST_VALUE(assistant) OVER (PARTITION BY task_id ORDER BY (assistant IS NULL), created_at) AS assistant
+         FROM task_msgs ORDER BY task_id, created_at
+     ),
+     per_task AS (
+       SELECT task_id, COUNT(*) AS n FROM reopens GROUP BY task_id
+     )
+     SELECT k.task_type, k.task_origin_machine_hash, k.assistant,
+            COUNT(*) AS tasks,
+            COUNT(p.task_id) AS tasks_reopened,
+            COALESCE(SUM(p.n), 0) AS reopens
+       FROM tasks k
+       LEFT JOIN per_task p ON p.task_id = k.task_id
+      GROUP BY k.task_type, k.task_origin_machine_hash, k.assistant
+      ORDER BY k.task_type, k.assistant, tasks DESC`,
+    [win.range, params.intent || null, params.agentType || null, params.conversationClassification || null, conversationClassifications],
+  );
+  return success({ data: taskReworkRows(result.rows as Array<Record<string, unknown>>) });
+}
+
+/** The rows as the console reads them: counts as numbers, and reopens per task. */
+export function taskReworkRows(rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  return rows.map((r) => {
+    const tasks = Number(r.tasks ?? 0);
+    const reopens = Number(r.reopens ?? 0);
+    return {
+      ...r, tasks, tasks_reopened: Number(r.tasks_reopened ?? 0), reopens,
+      reopens_per_task: tasks ? Math.round((reopens / tasks) * 1000) / 1000 : 0,
+    };
   });
 }
 
@@ -7757,7 +8495,8 @@ async function getDocumentEvaluation(
               MAX(doc_evaluator_model) AS doc_evaluator_model`;
   const result = await query(
     `WITH docs AS (
-       SELECT COALESCE(e.intent, 'unknown') AS intent,
+       -- The intent the turn served, as the Effectiveness rows beside this panel count it (ADR-064 decision I).
+       SELECT COALESCE(${WORK_INTENT_SQL('e')}, 'unknown') AS intent,
               COALESCE(NULLIF(md.ref->>'kind', ''), 'document') AS task_type,
               d.exchange_id IS NOT NULL AS scored,
               d.relevance_score AS doc_relevance,
@@ -7899,7 +8638,7 @@ async function getLatencyExchanges(
         AND ($3::varchar IS NULL OR ${LATENCY_DIM.assistant} = $3)
         AND ($4::varchar IS NULL OR ${LATENCY_DIM.label} = $4)
         AND ($5::varchar IS NULL OR ${LATENCY_DIM.role} = $5)
-        AND ($6::int IS NULL OR ${LATENCY_DIM.version} = $6)
+        AND ($6::int[] IS NULL OR ${LATENCY_DIM.version} = ANY($6))
         AND ($7::varchar IS NULL OR ${LATENCY_DIM.classification} = $7)
         AND ($8::varchar IS NULL OR ${LATENCY_DIM.entry} = $8)
         AND ($11::varchar IS NULL OR ${LATENCY_DIM.round} = $11)
@@ -7911,7 +8650,7 @@ async function getLatencyExchanges(
     [
       win.range, day, params.agentType || null, params.deliveryOption || null,
       params.assistantRole || null,
-      params.profileVersion ? parseInt(params.profileVersion, 10) : null,
+      profileVersionsParam(params),
       params.conversationClassification || null, params.turnEntry || null,
       limit, offset,
       // $11. Absent means "the caller did not name a round", which keeps an older console working
@@ -7948,33 +8687,64 @@ async function getUserRatings(
   const win = queryWindow(params, 30, 180);
   const wantIntent = params.intent || null;
   const votes = await scanLatestVotes(win);
-  const rated = votes
-    .filter((v) => v.feedback === 'up' || v.feedback === 'down')
-    .filter((v) => !wantIntent || v.intent === wantIntent)
-    // Newest first: a rating is a moment, and the recent ones are the ones somebody is chasing.
-    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
-    .slice(0, Math.min(parseInt(params.limit || '200', 10), 500));
-  if (rated.length === 0) return success({ data: [] });
+  // Newest first: a rating is a moment, and the recent ones are the ones somebody is chasing.
+  const opinions = votes.filter((v) => v.feedback === 'up' || v.feedback === 'down')
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  if (opinions.length === 0) return success({ data: [] });
+  const asked = parseInt(params.limit || '200', 10);
+  const limit = Number.isFinite(asked) && asked > 0 ? Math.min(asked, 500) : 200;
+  // A LIST NARROWED TO ONE INTENT FIRST READS EACH RATED TURN'S INTENT ALONE, no content: the intent a rating counts under
+  // is read from its turn (ADR-064 decision I), and only the ratings the list then returns have their replies read.
+  const workIntents = new Map<string, string>();
+  if (wantIntent) {
+    try {
+      const rows = await query(
+        `SELECT m.message_id, ${WORK_INTENT_SQL('e')} AS work_intent_only
+           FROM messages m
+           LEFT JOIN exchanges e ON e.agent_message_id = m.id
+          WHERE m.message_id = ANY($1::varchar[])`,
+        [opinions.map((v) => v.messageId)]
+      );
+      for (const r of rows.rows as Array<Record<string, unknown>>) {
+        if (r.work_intent_only != null && r.work_intent_only !== '') workIntents.set(String(r.message_id), String(r.work_intent_only));
+      }
+    } catch (err) {
+      console.warn('[user-ratings] intent lookup failed; narrowing by the intent each vote carries:', err);
+    }
+  }
+  // A RATING COUNTS UNDER THE INTENT ITS TURN'S WORK COUNTS UNDER (ADR-064 decision I), as the intent's
+  // Effectiveness row counts it: a task turn under its task's type. The intent the client stamped on the
+  // vote stands where the turn is not archived yet.
+  const byId = new Map<string, Record<string, unknown>>();
+  const intentOf = (v: LatestVote): string => {
+    const work = byId.get(v.messageId)?.work_intent ?? workIntents.get(v.messageId);
+    return work != null && work !== '' ? String(work) : v.intent;
+  };
+  // THE CONTENT READ IS BOUNDED BY WHAT IS SHOWN: only the replies of the ratings the list returns are looked up.
+  const rated = opinions.filter((v) => !wantIntent || intentOf(v) === wantIntent).slice(0, limit);
 
   // THE REPLY THAT WAS RATED, so the row shows what the person was reacting to rather than an id.
   // Left-joined by Chime MessageId: a vote can outlive archival lag, and dropping those rows would
   // under-report the signal precisely when it is newest.
-  const byId = new Map<string, Record<string, unknown>>();
-  try {
-    const rows = await query(
-      `SELECT m.message_id,
-              COALESCE(m.updated_content, m.content) AS agent_response,
-              m.channel_arn,
-              m.assistant,
-              e.intent AS exchange_intent
-         FROM messages m
-         LEFT JOIN exchanges e ON e.agent_message_id = m.id
-        WHERE m.message_id = ANY($1::varchar[])`,
-      [rated.map((v) => v.messageId)]
-    );
-    for (const r of rows.rows as Array<Record<string, unknown>>) byId.set(String(r.message_id), r);
-  } catch (err) {
-    console.warn('[user-ratings] reply lookup failed; returning the ratings alone:', err);
+  if (rated.length > 0) {
+    try {
+      const rows = await query(
+        `SELECT m.message_id,
+                COALESCE(m.updated_content, m.content) AS agent_response,
+                m.channel_arn,
+                m.assistant,
+                -- The room's classification, so a rating is narrowed to the caller's scope.
+                COALESCE(e.conversation_classification, m.conversation_classification) AS conversation_classification,
+                ${WORK_INTENT_SQL('e')} AS work_intent
+           FROM messages m
+           LEFT JOIN exchanges e ON e.agent_message_id = m.id
+          WHERE m.message_id = ANY($1::varchar[])`,
+        [rated.map((v) => v.messageId)]
+      );
+      for (const r of rows.rows as Array<Record<string, unknown>>) byId.set(String(r.message_id), r);
+    } catch (err) {
+      console.warn('[user-ratings] reply lookup failed; returning the ratings alone:', err);
+    }
   }
 
   return success({
@@ -7986,11 +8756,12 @@ async function getUserRatings(
         // 'unspecified' is the common case and is NOT a reason - the console renders the difference.
         reason: v.reason === 'unspecified' ? null : v.reason,
         note: v.note,
-        intent: v.intent,
+        intent: intentOf(v),
         created_at: v.createdAt,
         channel_arn: v.channelArn ?? (m ? m.channel_arn : null),
         agent_response: m ? m.agent_response : null,
         assistant: m ? m.assistant : null,
+        conversation_classification: m ? m.conversation_classification ?? null : null,
       };
     }),
   });
@@ -8177,6 +8948,14 @@ function experimentPopulationWhere(
  */
 const CONVERSATION_SQL = `COALESCE(e.channel_arn, e.id::text)`;
 
+/**
+ * A turn's recorded duration, NULL when the turn recorded none. The rollup and the units read take latency
+ * from this one expression, so the mean, the SD and the cluster moments are over the same turns.
+ */
+const EXPERIMENT_LATENCY_SQL = `COALESCE(m.total_ms, e.response_latency_ms)`;
+/** A turn's recorded tokens, NULL unless both directions were recorded. Shared the same way. */
+const EXPERIMENT_TOKENS_SQL = `(m.input_tokens + m.output_tokens)`;
+
 /** Votes and picks already scanned, so one read serves the rollup and the recommendation's clustered axes. */
 interface PrefetchedSignals {
   feedback: FeedbackRecord[];
@@ -8218,6 +8997,9 @@ async function fetchExperimentRows(
        COALESCE(m.bedrock_model, 'unknown') AS model_name,
        COALESCE(e.intent, 'unknown') AS intent,
        e.assistant,
+       -- The conversations' classifications behind this row, so the console states which classifications
+       -- the figures cover beside the ones the experiment targets. An aggregate, so the row grain is unchanged.
+       COALESCE(ARRAY_AGG(DISTINCT e.conversation_classification) FILTER (WHERE e.conversation_classification IS NOT NULL), '{}') AS classifications,
        COUNT(*) AS exchange_count,
        -- THE UNIT OF ANALYSIS (§4.2): the conversations these exchanges came from. An experiment enrolls a
        -- conversation to one arm while it is active, so its turns are correlated and the tests count conversations. Summing
@@ -8245,13 +9027,20 @@ async function fetchExperimentRows(
        -- Welch t-test on (mean, sd, n). Sample SD is NULL for a single-row group;
        -- surfaced as null and pooled/guarded downstream.
        ROUND(STDDEV_SAMP(er.relevance_score)::numeric, 2) AS score_sd,
-       ROUND(AVG(COALESCE(m.total_ms, e.response_latency_ms, 0))::numeric, 0) AS avg_total_ms,
-       ROUND(STDDEV_SAMP(COALESCE(m.total_ms, e.response_latency_ms, 0))::numeric, 1) AS latency_sd,
-       ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY COALESCE(m.total_ms, e.response_latency_ms, 0))::numeric, 0) AS p95_total_ms,
-       ROUND(AVG(COALESCE(m.input_tokens, 0))::numeric, 0) AS avg_input_tokens,
-       ROUND(AVG(COALESCE(m.output_tokens, 0))::numeric, 0) AS avg_output_tokens,
-       ROUND(AVG(COALESCE(m.input_tokens, 0) + COALESCE(m.output_tokens, 0))::numeric, 0) AS avg_tokens,
-       ROUND(STDDEV_SAMP(COALESCE(m.input_tokens, 0) + COALESCE(m.output_tokens, 0))::numeric, 1) AS tokens_sd,
+       -- LATENCY AND TOKENS ARE TAKEN OVER THE TURNS THAT RECORDED THEM, the rule the score above and the
+       -- model-effectiveness timing follow. A turn with no recorded duration or token count is not an
+       -- instant or free turn, so it is left out of the mean, the SD and the percentile, and counted:
+       -- timed_count and tokened_count are the populations, and the gap to exchange_count is the turns
+       -- whose telemetry is missing. Those counts are the n each metric's Welch test runs on.
+       ROUND(AVG(${EXPERIMENT_LATENCY_SQL})::numeric, 0) AS avg_total_ms,
+       ROUND(STDDEV_SAMP(${EXPERIMENT_LATENCY_SQL})::numeric, 1) AS latency_sd,
+       ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ${EXPERIMENT_LATENCY_SQL})::numeric, 0) AS p95_total_ms,
+       COUNT(${EXPERIMENT_LATENCY_SQL}) AS timed_count,
+       ROUND((AVG(m.input_tokens) FILTER (WHERE ${EXPERIMENT_TOKENS_SQL} IS NOT NULL))::numeric, 0) AS avg_input_tokens,
+       ROUND((AVG(m.output_tokens) FILTER (WHERE ${EXPERIMENT_TOKENS_SQL} IS NOT NULL))::numeric, 0) AS avg_output_tokens,
+       ROUND(AVG(${EXPERIMENT_TOKENS_SQL})::numeric, 0) AS avg_tokens,
+       ROUND(STDDEV_SAMP(${EXPERIMENT_TOKENS_SQL})::numeric, 1) AS tokens_sd,
+       COUNT(${EXPERIMENT_TOKENS_SQL}) AS tokened_count,
        -- Image (generation-out) variants: per-reply image count so cost prices per-image (an
        -- image model reports 0 tokens). Regex-guarded cast so a malformed value never errors
        -- the whole query; NULL on token-only variants.
@@ -8373,6 +9162,13 @@ async function fetchExperimentRows(
       // Scoring coverage, coerced (pg returns counts as strings). The recommendation's sufficiency
       // gate for a score-backed objective counts THIS, not n.
       scored_count: Number(r.scored_count) || 0,
+      // The turns latency and tokens are taken over; exchange_count less each is the turns whose
+      // telemetry is missing, which the recommendation reports per arm.
+      timed_count: Number(r.timed_count) || 0,
+      tokened_count: Number(r.tokened_count) || 0,
+      // The turns avg_cost_usd is priced from: an image variant prices every reply by its image count, a
+      // token variant only the turns that recorded their tokens.
+      priced_count: isImageModel ? n : Number(r.tokened_count) || 0,
       score_sd: r.score_sd == null ? null : Number(r.score_sd),
       latency_sd: r.latency_sd == null ? null : Number(r.latency_sd),
       tokens_sd: tokensSd,
@@ -8401,13 +9197,22 @@ export interface VariantUnits {
   /** Conversations with at least one scored exchange: the unit a quality or accuracy test counts. */
   scored_conversation_count: number;
   scored_count: number;
-  /** Per-metric cluster moments (score over scored exchanges; latency and tokens over every exchange). */
+  /** Conversations with at least one turn that recorded its duration: the unit a latency test counts. */
+  timed_conversation_count: number;
+  /** Turns that recorded their duration. */
+  timed_count: number;
+  /** Conversations with at least one turn that recorded its tokens: the unit a tokens or cost test counts. */
+  tokened_conversation_count: number;
+  /** Turns that recorded their tokens. */
+  tokened_count: number;
+  /** Per-metric cluster moments, each over the turns that recorded the metric. */
   moments: { score: ClusterMoments; latency: ClusterMoments; tokens: ClusterMoments };
 }
 
 const EXPERIMENT_UNIT_COLUMNS = [
   'experiment_id', 'variant_id', 'unit', 'conversation_count', 'exchange_count',
   'scored_conversation_count', 'scored_count',
+  'timed_conversation_count', 'timed_count', 'tokened_conversation_count', 'tokened_count',
 ];
 
 /**
@@ -8427,8 +9232,8 @@ async function fetchExperimentUnits(
        SELECT m.experiment_id, m.variant_id,
               ${CONVERSATION_SQL} AS conversation,
               er.relevance_score::float8 AS score,
-              COALESCE(m.total_ms, e.response_latency_ms, 0)::float8 AS latency,
-              (COALESCE(m.input_tokens, 0) + COALESCE(m.output_tokens, 0))::float8 AS tokens
+              ${EXPERIMENT_LATENCY_SQL}::float8 AS latency,
+              ${EXPERIMENT_TOKENS_SQL}::float8 AS tokens
          FROM exchanges e
          JOIN messages m ON e.agent_message_id = m.id
          LEFT JOIN (
@@ -8442,8 +9247,12 @@ async function fetchExperimentUnits(
      per_conversation AS (
        SELECT experiment_id, variant_id, conversation,
               COUNT(*)::float8 AS n,
-              SUM(latency) AS lat_t, SUM(latency * latency) AS lat_ss,
-              SUM(tokens) AS tok_t, SUM(tokens * tokens) AS tok_ss,
+              -- Each metric over the turns that recorded it, as in the rollup: a turn with no duration or
+              -- no tokens is no observation of that metric, so it adds nothing to its sums or its cluster size.
+              COUNT(latency)::float8 AS ln,
+              COALESCE(SUM(latency), 0) AS lat_t, COALESCE(SUM(latency * latency), 0) AS lat_ss,
+              COUNT(tokens)::float8 AS tn,
+              COALESCE(SUM(tokens), 0) AS tok_t, COALESCE(SUM(tokens * tokens), 0) AS tok_ss,
               COUNT(score)::float8 AS sn,
               COALESCE(SUM(score), 0) AS sc_t, COALESCE(SUM(score * score), 0) AS sc_ss
          FROM turns
@@ -8452,9 +9261,12 @@ async function fetchExperimentUnits(
      SELECT experiment_id, variant_id,
             COUNT(*) AS conversation_count,
             SUM(n) AS exchange_count,
-            SUM(n * n) AS n_sq,
-            SUM(lat_t) AS lat_sum, SUM(lat_ss) AS lat_sumsq, SUM(lat_t * lat_t) AS lat_tot_sq, SUM(lat_t * n) AS lat_tot_n,
-            SUM(tok_t) AS tok_sum, SUM(tok_ss) AS tok_sumsq, SUM(tok_t * tok_t) AS tok_tot_sq, SUM(tok_t * n) AS tok_tot_n,
+            COUNT(*) FILTER (WHERE ln > 0) AS timed_conversation_count,
+            SUM(ln) AS timed_count, SUM(ln * ln) AS ln_sq,
+            SUM(lat_t) AS lat_sum, SUM(lat_ss) AS lat_sumsq, SUM(lat_t * lat_t) AS lat_tot_sq, SUM(lat_t * ln) AS lat_tot_n,
+            COUNT(*) FILTER (WHERE tn > 0) AS tokened_conversation_count,
+            SUM(tn) AS tokened_count, SUM(tn * tn) AS tn_sq,
+            SUM(tok_t) AS tok_sum, SUM(tok_ss) AS tok_sumsq, SUM(tok_t * tok_t) AS tok_tot_sq, SUM(tok_t * tn) AS tok_tot_n,
             COUNT(*) FILTER (WHERE sn > 0) AS scored_conversation_count,
             SUM(sn) AS scored_count, SUM(sn * sn) AS sn_sq,
             SUM(sc_t) AS sc_sum, SUM(sc_ss) AS sc_sumsq, SUM(sc_t * sc_t) AS sc_tot_sq, SUM(sc_t * sn) AS sc_tot_n
@@ -8469,6 +9281,10 @@ async function fetchExperimentUnits(
     const exchanges = num(r.exchange_count);
     const scoredConversations = num(r.scored_conversation_count);
     const scored = num(r.scored_count);
+    const timedConversations = num(r.timed_conversation_count);
+    const timed = num(r.timed_count);
+    const tokenedConversations = num(r.tokened_conversation_count);
+    const tokened = num(r.tokened_count);
     return {
       experiment_id: r.experiment_id,
       variant_id: r.variant_id,
@@ -8477,18 +9293,22 @@ async function fetchExperimentUnits(
       exchange_count: exchanges,
       scored_conversation_count: scoredConversations,
       scored_count: scored,
+      timed_conversation_count: timedConversations,
+      timed_count: timed,
+      tokened_conversation_count: tokenedConversations,
+      tokened_count: tokened,
       moments: {
         score: {
           clusters: scoredConversations, n: scored, sum: num(r.sc_sum), sumSq: num(r.sc_sumsq),
           clusterTotalSq: num(r.sc_tot_sq), clusterTotalTimesSize: num(r.sc_tot_n), clusterSizeSq: num(r.sn_sq),
         },
         latency: {
-          clusters: conversations, n: exchanges, sum: num(r.lat_sum), sumSq: num(r.lat_sumsq),
-          clusterTotalSq: num(r.lat_tot_sq), clusterTotalTimesSize: num(r.lat_tot_n), clusterSizeSq: num(r.n_sq),
+          clusters: timedConversations, n: timed, sum: num(r.lat_sum), sumSq: num(r.lat_sumsq),
+          clusterTotalSq: num(r.lat_tot_sq), clusterTotalTimesSize: num(r.lat_tot_n), clusterSizeSq: num(r.ln_sq),
         },
         tokens: {
-          clusters: conversations, n: exchanges, sum: num(r.tok_sum), sumSq: num(r.tok_sumsq),
-          clusterTotalSq: num(r.tok_tot_sq), clusterTotalTimesSize: num(r.tok_tot_n), clusterSizeSq: num(r.n_sq),
+          clusters: tokenedConversations, n: tokened, sum: num(r.tok_sum), sumSq: num(r.tok_sumsq),
+          clusterTotalSq: num(r.tok_tot_sq), clusterTotalTimesSize: num(r.tok_tot_n), clusterSizeSq: num(r.tn_sq),
         },
       },
     };
@@ -8522,6 +9342,7 @@ interface BattleEffectivenessRow {
   battle_count: number;    // DISTINCT duels these turns came from - turn_count alone cannot say
   avg_score: number | null; // avg relevance where scored; null when no battle turn is scored yet
   avg_cost_usd: number | null; // image-aware; null when the model/usage can't be priced
+  tokened_count: number;   // turns that recorded their tokens; the token-priced cost is taken over these
   battle_wins: number | null; // head-to-head picks this variant won; null when none
 }
 
@@ -8530,6 +9351,7 @@ const BATTLE_EFFECTIVENESS_COLUMNS = [
   'conversation_classification', 'assistant', 'assistant_role', 'profile_version',
   'model_name', 'turn_count', 'battle_count', 'avg_score', 'avg_cost_usd', 'battle_wins',
   'profile_config_id',
+  'tokened_count',
 ];
 
 /**
@@ -8725,8 +9547,10 @@ async function fetchBattleEffectivenessRows(
        -- not counted, so this reads 0 on history the backfill could not reach rather than guessing.
        COUNT(DISTINCT e.battle_id) AS battle_count,
        ROUND(AVG(er.relevance_score)::numeric, 1) AS avg_score,
-       ROUND(AVG(COALESCE(m.input_tokens, 0))::numeric, 0) AS avg_input_tokens,
-       ROUND(AVG(COALESCE(m.output_tokens, 0))::numeric, 0) AS avg_output_tokens,
+       -- Over the turns that recorded their tokens, counted in tokened_count, as the experiment rollup takes them.
+       ROUND((AVG(m.input_tokens) FILTER (WHERE ${EXPERIMENT_TOKENS_SQL} IS NOT NULL))::numeric, 0) AS avg_input_tokens,
+       ROUND((AVG(m.output_tokens) FILTER (WHERE ${EXPERIMENT_TOKENS_SQL} IS NOT NULL))::numeric, 0) AS avg_output_tokens,
+       COUNT(${EXPERIMENT_TOKENS_SQL}) AS tokened_count,
        -- Image (generation-out) turns: per-turn image count so cost prices per-image (an image model
        -- reports 0 tokens). Regex-guarded cast so a malformed value never errors the whole query.
        ROUND(AVG(CASE WHEN m.metadata->>'imageCount' ~ '^[0-9]+$'
@@ -8793,6 +9617,7 @@ async function fetchBattleEffectivenessRows(
       model_name: r.model_name || 'unknown',
       turn_count: Number(r.turn_count) || 0,
       battle_count: Number(r.battle_count) || 0,
+      tokened_count: Number(r.tokened_count) || 0,
       avg_score: avgScore,
       // Image-aware cost via the shared resolver (never a duplicated rate table): an image variant
       // prices per-image from avg_image_count; a text variant prices on tokens. null when unpriceable.
@@ -8808,9 +9633,10 @@ async function fetchBattleEffectivenessRows(
 }
 
 const EXPERIMENT_COLUMNS = [
-  'experiment_id', 'variant_id', 'model_name', 'intent', 'assistant',
-  'exchange_count', 'n', 'conversation_count', 'scored_count', 'avg_score', 'score_sd', 'avg_total_ms', 'latency_sd', 'p95_total_ms',
-  'avg_tokens', 'tokens_sd', 'avg_cost_usd', 'cost_sd', 'compliance_rate', 'fallback_count', 'fallback_rate',
+  'experiment_id', 'variant_id', 'model_name', 'intent', 'assistant', 'classifications',
+  'exchange_count', 'n', 'conversation_count', 'scored_count', 'avg_score', 'score_sd',
+  'timed_count', 'avg_total_ms', 'latency_sd', 'p95_total_ms',
+  'tokened_count', 'avg_tokens', 'tokens_sd', 'avg_cost_usd', 'cost_sd', 'compliance_rate', 'fallback_count', 'fallback_rate',
   'task_count', 'task_completion_rate',
   // Human-signal joins — separate from avg_score.
   'thumbs_up', 'thumbs_down', 'feedback_count', 'approval_rate',
@@ -9885,8 +10711,9 @@ async function getExperimentRecommendation(
     const acc = byVariant.get(key) || {
       // ── THREE DENOMINATORS IN ONE ACCUMULATOR, ON PURPOSE ────────────────────────────────────
       //
-      // `_scoreWeight` carries avg_score / avg_total_ms / avg_cost_usd / fallback_rate - measures that
-      // exist for every exchange, so their denominator is simply the traffic.
+      // `_scoreWeight` carries fallback_rate, a measure that exists for every exchange, so its denominator
+      // is simply the traffic. avg_score, avg_total_ms and avg_cost_usd each carry the count of turns that
+      // recorded them (`_scoredWeight`, `timed_count`, `_pricedWeight`).
       // `_taskWeight` and `_complianceWeight` carry the two that do NOT: a group with no tasks and a
       // group nothing has assessed contribute no opinion, and folding either onto `_scoreWeight`
       // averages a real number against rows that never had one.
@@ -9898,15 +10725,26 @@ async function getExperimentRecommendation(
       fallback_rate: 0, task_completion_rate: null,
       thumbs_up: 0, thumbs_down: 0, feedback_count: 0, battle_wins: 0,
       _scoreWeight: 0, _scoredWeight: 0, _taskWeight: 0, _complianceWeight: 0,
+      timed_count: 0, tokened_count: 0, _pricedWeight: 0,
     };
     const n = Number(r.exchange_count) || 0;
+    const timed = Number(r.timed_count) || 0;
+    const tokened = Number(r.tokened_count) || 0;
+    const priced = Number(r.priced_count) || 0;
     acc.exchange_count += n;
     // Weighted by SCORED exchanges, the population each row's avg_score is taken over, so the figure shown
     // is the mean the quality test runs on.
     acc.avg_score += (Number(r.avg_score) || 0) * (Number(r.scored_count) || 0);
     acc._scoredWeight += Number(r.scored_count) || 0;
-    acc.avg_total_ms += (Number(r.avg_total_ms) || 0) * n;
-    acc.avg_cost_usd += (Number(r.avg_cost_usd) || 0) * n;
+    // Latency is weighted by the turns that recorded a duration and cost by the turns it was priced from,
+    // the populations each row's mean is taken over, so a turn with missing telemetry weighs nothing.
+    acc.avg_total_ms += (Number(r.avg_total_ms) || 0) * timed;
+    acc.timed_count += timed;
+    acc.tokened_count += tokened;
+    if (r.avg_cost_usd != null) {
+      acc.avg_cost_usd += Number(r.avg_cost_usd) * priced;
+      acc._pricedWeight += priced;
+    }
     // COMPLIANCE CARRIES ITS OWN WEIGHT, because NULL here means "nothing in this group was
     // assessed" - not "this group scored zero". `|| 0` against the shared `_scoreWeight` folded an
     // unassessed intent in as a 0% compliant group at full exchange weight, so a variant with one
@@ -9941,10 +10779,13 @@ async function getExperimentRecommendation(
     // (`AVG(er.relevance_score)` skips an unscored exchange). Weighting it by every exchange counted
     // unscored traffic as evidence in the Welch test's n.
     grp.score.push({ n: Number(r.scored_count) || 0, mean: Number(r.avg_score) || 0, sd: r.score_sd == null ? 0 : Number(r.score_sd) });
-    grp.latency.push({ n, mean: Number(r.avg_total_ms) || 0, sd: r.latency_sd == null ? 0 : Number(r.latency_sd) });
-    grp.tokens.push({ n, mean: Number(r.avg_tokens) || 0, sd: r.tokens_sd == null ? 0 : Number(r.tokens_sd) });
+    // LATENCY, TOKENS AND COST ARE POOLED OVER THE TURNS THAT RECORDED THEM, for the same reason: the row's
+    // mean and SD are over those turns, so they are the n of the Welch test, and a turn whose telemetry is
+    // missing is no evidence about how fast or how costly the arm is.
+    grp.latency.push({ n: timed, mean: Number(r.avg_total_ms) || 0, sd: r.latency_sd == null ? 0 : Number(r.latency_sd) });
+    grp.tokens.push({ n: tokened, mean: Number(r.avg_tokens) || 0, sd: r.tokens_sd == null ? 0 : Number(r.tokens_sd) });
     if (r.avg_cost_usd != null) {
-      grp.cost.push({ n, mean: Number(r.avg_cost_usd), sd: r.cost_sd == null ? 0 : Number(r.cost_sd) });
+      grp.cost.push({ n: priced, mean: Number(r.avg_cost_usd), sd: r.cost_sd == null ? 0 : Number(r.cost_sd) });
     }
     statsByVariant.set(key, grp);
   }
@@ -9961,8 +10802,15 @@ async function getExperimentRecommendation(
       scored_conversation_count: u?.scored_conversation_count ?? 0,
       scored_count: statsByVariant.get(v.variant_id)?.scored ?? 0,
       avg_score: v._scoredWeight ? Math.round((v.avg_score / v._scoredWeight) * 10) / 10 : 0,
-      avg_total_ms: Math.round(v.avg_total_ms / w),
-      avg_cost_usd: Math.round((v.avg_cost_usd / w) * 1e6) / 1e6,
+      // Null when no turn of the arm recorded the metric, which is not a zero-millisecond or free arm.
+      avg_total_ms: v.timed_count ? Math.round(v.avg_total_ms / v.timed_count) : null,
+      avg_cost_usd: v._pricedWeight ? Math.round((v.avg_cost_usd / v._pricedWeight) * 1e6) / 1e6 : null,
+      // THE TURNS WHOSE TELEMETRY IS MISSING, per arm. They are left out of the latency and token means
+      // and tests rather than entered as zero, and the rationale says how many there were.
+      timed_count: v.timed_count,
+      tokened_count: v.tokened_count,
+      missing_latency_count: Math.max(0, v.exchange_count - v.timed_count),
+      missing_tokens_count: Math.max(0, v.exchange_count - v.tokened_count),
       compliance_rate: v._complianceWeight
         ? Math.round((v.compliance_rate / v._complianceWeight) * 10) / 10
         : null,
@@ -10036,7 +10884,10 @@ async function getExperimentRecommendation(
         + `${(approval.ci[0] * 100).toFixed(1)} to ${(approval.ci[1] * 100).toFixed(1)} points), `
         + `which ${approval.significant ? 'excludes' : 'includes'} zero.`
       : '';
-    const rec = inconclusiveRecommendation(`${metricNote}${humanNote}${approvalNote}`, objective, decision);
+    const missingNote = missingTelemetryNote(variants);
+    const rec = inconclusiveRecommendation(
+      `${metricNote}${missingNote ? ` ${missingNote}` : ''}${humanNote}${approvalNote}`, objective, decision,
+    );
     return success({
       ...rec,
       ...(humanAxis ? { human: humanAxis } : {}),
@@ -10064,9 +10915,10 @@ async function getExperimentRecommendation(
     const exchanges = u?.exchange_count || tokens.n || 1;
     pooled.set(key, {
       score: clusterAdjust(score, u ? clusterDesignEffect(u.moments.score) : 1, u?.scored_conversation_count ?? 0),
-      latency: clusterAdjust(latency, u ? clusterDesignEffect(u.moments.latency) : 1, conversations),
+      // Latency and tokens count the conversations that recorded them, the clusters their moments are over.
+      latency: clusterAdjust(latency, u ? clusterDesignEffect(u.moments.latency) : 1, u?.timed_conversation_count ?? 0),
       cost: clusterAdjust(cost, tokensDeff, Math.round(conversations * Math.min(1, cost.n / exchanges))),
-      tokens: clusterAdjust(tokens, tokensDeff, conversations),
+      tokens: clusterAdjust(tokens, tokensDeff, u?.tokened_conversation_count ?? 0),
       scoredCount: grp.scored,
       unit: 'conversation',
     });
@@ -10290,6 +11142,31 @@ function zeroStats(): VariantContinuousStats {
   return { score: { ...z }, latency: { ...z }, cost: { ...z }, tokens: { ...z }, scoredCount: 0 };
 }
 
+/**
+ * The sentence naming each arm's turns that recorded no duration or no tokens, or '' when every turn did.
+ * Those turns are outside the latency and token means and tests, so the reader is told how many there were.
+ */
+export function missingTelemetryNote(
+  variants: Array<{ variant_id: string; missing_latency_count?: number; missing_tokens_count?: number } | undefined>,
+): string {
+  const clauses = variants
+    .filter((v): v is NonNullable<typeof v> => !!v)
+    .map((v) => {
+      const lat = Number(v.missing_latency_count) || 0;
+      const tok = Number(v.missing_tokens_count) || 0;
+      if (!lat && !tok) return '';
+      const items = [
+        ...(lat ? [`${lat} turn${lat === 1 ? '' : 's'} with no recorded latency`] : []),
+        ...(tok ? [`${tok} turn${tok === 1 ? '' : 's'} with no recorded tokens`] : []),
+      ];
+      return `${v.variant_id} ${items.join(' and ')}`;
+    })
+    .filter(Boolean);
+  return clauses.length
+    ? `Missing telemetry, excluded from the latency, token and cost figures rather than counted as zero: ${clauses.join('; ')}.`
+    : '';
+}
+
 const round1 = (n: number): number => Math.round(n * 10) / 10;
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 
@@ -10320,6 +11197,8 @@ function buildRationale(a: {
       + `treatment ${a.treatment.conversation_count} conversations (${a.treatment.exchange_count} exchanges).`,
     );
   }
+  const missing = missingTelemetryNote([a.control, a.treatment]);
+  if (missing) parts.push(missing);
   parts.push(
     `Primary metric ${a.primary.metric}: treatment ${a.primary.deltaPct >= 0 ? '+' : ''}${a.primary.deltaPct}% vs control (CI [${a.primary.ci[0]}, ${a.primary.ci[1]}], ${sigTxt}).`,
   );

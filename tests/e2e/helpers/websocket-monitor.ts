@@ -42,7 +42,7 @@ export function isPlaceholder(text: string): boolean {
   //
   // Mirrors `backend/lambda/src/lib/turn-declaration.ts`; bounded and character-classed exactly as
   // the writer builds it, so prose quoting the words asserts nothing.
-  const declaration = text.match(/<!--turn:([A-Za-z0-9._;=-]{1,512})-->/);
+  const declaration = text.match(/<!--turn:([A-Za-z0-9._;=-]{1,1024})-->/);
   if (declaration && declaration[1].split(';').includes('phase=final')) return false;
 
   const lower = text.toLowerCase().trim();

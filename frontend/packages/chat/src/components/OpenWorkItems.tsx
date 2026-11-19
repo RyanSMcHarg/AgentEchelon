@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useConversations } from '../providers/ConversationProvider.chime';
 import { isUnnamedConversation } from '../utils/conversationTitle';
+import { readableAddressText } from '@ae/shared/utils/addressTokens.ts';
 
 /**
  * The work a person still owes, across every assistant and every conversation.
@@ -105,7 +106,7 @@ export function OpenWorkItems() {
                   <span className="open-work-items-item-title">
                     {/* The reference a person types to answer it, on any channel (ADR-035). */}
                     {item.taskRef ? <span className="open-work-items-item-ref">#{item.taskRef} </span> : null}
-                    {item.title || readableTaskType(item.taskType)}
+                    {item.title ? readableAddressText(item.title) : readableTaskType(item.taskType)}
                   </span>
                   <span className="open-work-items-item-where">
                     {blockedByBattle

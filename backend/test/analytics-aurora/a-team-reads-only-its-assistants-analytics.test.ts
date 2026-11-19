@@ -18,7 +18,10 @@ jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
 
 process.env.ADMIN_IAM_ENFORCEMENT = 'true';
 
-import { handler } from '../../lambda/src/analytics-aurora/analytics-query';
+import { handler, __setContentReadRecorder } from '../../lambda/src/analytics-aurora/analytics-query';
+
+// Every content read is recorded in the access log before it is served; the record itself is tested elsewhere.
+__setContentReadRecorder(async () => undefined);
 
 const SUB = '11111111-2222-3333-4444-555555555555';
 /** A team console session, named by the exchange with its holder's clearance. */
@@ -135,6 +138,20 @@ describe('a team\'s triage and labels', () => {
     const reach = (call[1] as unknown[]).filter((p) => Array.isArray(p)).pop() as string[];
     expect(reach).toContain('standard');
     expect(reach).not.toContain('premium');
+  });
+
+  it('records a team read of its responses in the access log, with the assistant and the reason', async () => {
+    const lines: Array<Record<string, unknown>> = [];
+    __setContentReadRecorder(async (line) => { lines.push(line); });
+    try {
+      const res = await handler(teamPost('analyst', { queryType: 'flagged_responses', accessReason: 'weekly review' }));
+      expect(res.statusCode).toBe(200);
+      expect(lines).toEqual([expect.objectContaining({
+        _auditEvent: 'team_quality_read', assistant: 'analyst', queryType: 'flagged_responses', reason: 'weekly review',
+      })]);
+    } finally {
+      __setContentReadRecorder(async () => undefined);
+    }
   });
 });
 

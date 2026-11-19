@@ -4,7 +4,7 @@
  *
  * Confirms, against DEPLOYED infrastructure, that the assistant only surfaces
  * company documents the caller's tier is permitted to see. Company docs live
- * in the attachments bucket under context/{basic,standard,premium}/, and each
+ * in the company bucket under context/{basic,standard,premium}/, and each
  * tier's async-processor Lambda has an S3 role scoped to its own prefixes:
  *
  *   basic    → context/basic/* only

@@ -71,7 +71,7 @@ The Aurora cluster, the Titan v2 embedding model, the pgvector extension, and th
 
 ## Uploading a corpus
 
-Find your archive bucket name (CDK output `ArchiveBucketName` from the `<prefix>Archive` stack), then:
+The corpus lives in the company bucket, which expires nothing. Find its name (CDK output `CompanyBucketName` on `<prefix>Conversations`), then:
 
 ```bash
 # wiki/ as the source_type - anything you upload under rag/wiki/ is
@@ -81,7 +81,7 @@ Find your archive bucket name (CDK output `ArchiveBucketName` from the `<prefix>
 # with the fail-closed default (premium in the sample config). In the
 # sample config every conversational classification grants basic, so
 # content for everyone goes under basic/ as shown here.
-aws s3 cp ./local-docs/ s3://<archive-bucket>/rag/wiki/basic/ --recursive \
+aws s3 cp ./local-docs/ s3://<company-bucket>/rag/wiki/basic/ --recursive \
   --exclude "*" --include "*.md" --include "*.txt" --include "*.html"
 ```
 
@@ -112,7 +112,7 @@ The platform corpus is generated from the `docs/` tree, which a deployed instanc
 **Skipping it is silent.** The assistant still answers platform questions - from the curated index (`platform-knowledge/standard/agentechelon-about.json`, a title plus a ~400-character summary per doc, read through the `load_platform_info` tool), which `seed-demo` does upload. A basic conversation reads only `platform-knowledge/basic/agentechelon-about.json`, a public overview with no document index, so a short answer there is by design and not this symptom. So the symptom is a vague-but-confident answer, not an error or an empty result. If platform answers read as thin, check this prefix before anything else:
 
 ```bash
-aws s3 ls s3://<archive-bucket>/rag/agentechelon/ --recursive | wc -l   # 0 ⇒ never uploaded
+aws s3 ls s3://<company-bucket>/rag/agentechelon/ --recursive | wc -l   # 0 ⇒ never uploaded
 cd backend && node scripts/sync-project-knowledge.mjs --rag --dry-run   # the keys the database holds no chunks for
 ```
 
@@ -199,13 +199,13 @@ The dominant cost line is Titan embedding calls. At ~10K turns/day, query-side e
 
 **Re-ingest a single file** (e.g. after editing):
 ```bash
-aws s3 cp ./updated-doc.md s3://<archive-bucket>/rag/wiki/basic/updated-doc.md
+aws s3 cp ./updated-doc.md s3://<company-bucket>/rag/wiki/basic/updated-doc.md
 # The ETag changes; the ingestor clears prior chunks + re-embeds.
 ```
 
 **Delete a document from the corpus:**
 ```bash
-aws s3 rm s3://<archive-bucket>/rag/wiki/basic/old-doc.md
+aws s3 rm s3://<company-bucket>/rag/wiki/basic/old-doc.md
 # The ObjectRemoved event reaches the ingestor, which deletes the
 # object's rows from the embeddings table (removeObjectChunks in
 # document-ingestion.ts) as the classification writer role.

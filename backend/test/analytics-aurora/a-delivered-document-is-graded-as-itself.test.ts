@@ -397,7 +397,7 @@ describe('each read and write is scoped to the prefix it needs', () => {
     const { ArchiveStackAurora } = await import('../../lib/stacks/archive-stack-aurora');
     const { testMessageStream } = await import('../helpers/synth');
     const app = new cdk.App();
-    const stack = new ArchiveStackAurora(app, 'TestDeliveredDocuments', {
+    const stack = new ArchiveStackAurora(app, 'TestDeliveredDocuments', { companyBucketArn: 'arn:aws:s3:::test-company-bucket',
       env: { account: '123456789012', region: 'us-east-1' },
       appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
       messageStream: testMessageStream(app),

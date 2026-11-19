@@ -147,6 +147,14 @@ describe('MessageInput — answering a work item', () => {
     expect(sendMessage.mock.calls[0][0]).toBe('the audience is engineering leadership');
   });
 
+  it('names a person in the item it answers by their name, never by the token the title carries', async () => {
+    ctx.openWorkItems = [{ ...ITEM, title: 'Ask @<Dee|dana> about the report' }];
+    ctx.answeringTaskId = 't-1';
+    render(<MessageInput />);
+    await waitFor(() => expect(screen.getByText(/#1: /)).toBeInTheDocument());
+    expect(screen.getByText(/#1: /).textContent).toBe('#1: Ask @Dana about the report');
+  });
+
   it('answers an older item with no reference only when the person chose it', async () => {
     ctx.openWorkItems = [{ ...ITEM, taskRef: undefined }];
     ctx.answeringTaskId = 't-1';

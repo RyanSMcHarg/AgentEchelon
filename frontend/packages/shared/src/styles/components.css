@@ -243,6 +243,15 @@
   cursor: pointer;
 }
 
+/* A select's prompt ("Choose a type") is a placeholder, not a choice: muted while it shows, and absent from the list
+   (`<option value="" className="select-placeholder" disabled hidden>`). */
+.select:has(> option.select-placeholder:checked) {
+  color: var(--text-tertiary);
+}
+.select option {
+  color: var(--text-primary);
+}
+
 
 /* ========================================
    Labels

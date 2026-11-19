@@ -11,7 +11,7 @@
  */
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { ChimeSDKIdentityClient } from '@aws-sdk/client-chime-sdk-identity';
-import { callerPersonArn, respond } from './auth.js';
+import { callerPersonArn, consoleSessionOf, respond } from './auth.js';
 import { defaultDirectory } from './membership-source.js';
 import { listAssistantIdentities, scopeFor, type AssistantIdentity } from './assistant-ownership.js';
 import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry';
@@ -67,6 +67,18 @@ export async function requireOwnedAssistant(event: APIGatewayProxyEvent, origin?
     console.error('[assistant-scope] could not resolve ownership', err);
     return refuse('ownership unresolvable');
   }
+}
+
+/**
+ * A TEAM CONSOLE SESSION REACHES TEAM ROUTES ONLY: the 403 for one on a route that names no assistant, else
+ * null. The second check behind the gateway, which grants the team console role its team routes alone: on an
+ * administrator's route a body or a query names the assistant, and nothing binds it to the team's own.
+ */
+export function refuseTeamSessionOnAdminRoute(event: APIGatewayProxyEvent, origin?: string): APIGatewayProxyResult | null {
+  const userArn = (event.requestContext?.identity as { userArn?: string | null } | undefined)?.userArn;
+  if (consoleSessionOf(userArn)?.kind !== 'team' || scopedAssistant(event)) return null;
+  console.warn("[assistant-scope] a team session on an administrator's route was refused", { path: event.resource || event.path });
+  return respond(403, { error: "This route is an administrator's; a team member uses the route that names its assistant", code: 'ADMIN_ROUTE' }, origin);
 }
 
 /** Narrowing helper: true when `requireOwnedAssistant` returned a refusal. */

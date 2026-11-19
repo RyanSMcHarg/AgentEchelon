@@ -224,10 +224,13 @@ describe('the demo cast: every login is a mailbox something can read', () => {
 
   it('keeps the tiers, groups and names the demo script relies on', () => {
     const rows = cast({ DEMO_LEAD_NAME: 'Alex Kim' }, '');
-    expect(rows.find((r) => r.key === 'onCallLead')).toMatchObject({ tier: 'premium', groups: ['premium'], name: 'Alex Kim' });
+    expect(rows.find((r) => r.key === 'onCallLead')).toMatchObject({ tier: 'premium', groups: ['premium', 'ops-on-call'], name: 'Alex Kim' });
     expect(rows.find((r) => r.key === 'demoAdmin')).toMatchObject({ groups: ['premium', 'admins'] });
     expect(rows.find((r) => r.key === 'basicDemo')).toMatchObject({ tier: 'basic', groups: ['basic'] });
-    // Nobody is in `ops`: the presenter ticks it on camera.
+    // James Okafor is sales: no cast member leads the account team (the seed's CSM Maria Santos does).
+    expect(rows.find((r) => r.key === 'salesVp')).toMatchObject({ tier: 'premium', groups: ['premium'], name: 'James Okafor' });
+    expect(rows.filter((r) => r.groups.includes('account-team-lead'))).toEqual([]);
+    // Nobody is in `ops`: the presenter ticks it on camera. The on-call lead is in `ops-on-call`, the stand-in for who is on call.
     expect(rows.every((r) => !r.groups.includes('ops'))).toBe(true);
   });
 

@@ -40,7 +40,6 @@ export interface AlertSources {
   intentEffectiveness?: Array<Record<string, unknown>> | null; // intent_effectiveness rows
   latency?: Array<Record<string, unknown>> | null;             // latency_metrics rows
   modelEffectiveness?: Array<Record<string, unknown>> | null;  // model_effectiveness rows
-  flagged?: Array<Record<string, unknown>> | null;             // flagged_responses rows
   errorRate?: Array<Record<string, unknown>> | null;           // error_rate_daily rows
   /**
    * The Performance surface's filters, so an alert is judged over the population the operator is
@@ -182,9 +181,10 @@ export function computeAlerts(sources: AlertSources): Alert[] {
   }
 
   // --- Runtime: literal error-response replies -----------------------------------------------------
-  const errorResponses = (sources.flagged ?? []).filter(
-    (r) => String(r.classification ?? '').toLowerCase() === 'error_response',
-  ).length;
+  // A COUNT FROM THE PER-INTENT ROLLUP, so raising it reads no conversation content and asks no reason.
+  // The replies themselves are on the Flagged tab the alert links to, read there with a stated reason.
+  const errorResponses = (sources.intentEffectiveness ?? [])
+    .reduce((s, r) => s + (Number(r.error_response_count) || 0), 0);
   if (errorResponses > 0) {
     alerts.push({
       id: 'r-error-responses', severity: 'error', category: 'runtime',

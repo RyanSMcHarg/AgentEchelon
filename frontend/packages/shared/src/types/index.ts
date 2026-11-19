@@ -46,6 +46,9 @@ export interface Conversation {
    *  A DISPLAY HINT from channel Metadata: the client disables Share and says why; the server refuses
    *  the share from its own record whatever this says. */
   membershipSource?: string;
+  /** A meeting's own conversation: the id of the room it belongs to. A DISPLAY HINT from channel Metadata, read only
+   *  to list the conversation with its room's meetings rather than among ordinary conversations. */
+  meetingOf?: string;
 }
 
 export interface MessageSender {
@@ -103,10 +106,29 @@ export interface Message {
    * choices it offers, carried on the targeted message's Metadata and drawn as a task card.
    */
   taskCard?: { id: string; state: string; choices: string[]; expiresAt?: number };
+  /**
+   * A CONVERSATION'S MEETING CARD (the `meetings` capability): the platform's message that its meeting started or ended,
+   * which tells a person already looking at the conversation without a read of their own. `conversationId` is the
+   * meeting's own conversation, where it is held.
+   */
+  /** A meeting's card; an ended one names its hosts by person id, whose transcript and recording they alone are offered. */
+  meetingCard?: { event: 'meeting-started' | 'meeting-ended'; meetingId: string; conversationId?: string; hosts?: string[] };
+  /**
+   * A CONVERSATION'S DASHBOARD (DESIGN-CONVERSATION-DASHBOARDS): which kind, which conversation, when it was updated and
+   * the alarm's state. References only; the figures are read with the member's own credentials when it is opened.
+   */
+  dashboard?: { kind: 'snapshot' | 'page'; conversationId: string; updatedAt: string; state?: 'ALARM' | 'OK' | 'INSUFFICIENT_DATA' };
   // True when the SendChannelMessage Target included the current user's ARN —
   // i.e., the message was targeted to us (and is invisible to other channel
   // members). Used to drive the sticky-mention follow-up behavior.
   targetedToUser?: boolean;
+  /** The members a message's `Target` names, where this client knows them: the reader's own targeted sends. */
+  targetArns?: string[];
+  /**
+   * The message's `Target` and what it says about itself disagree (`targetIntegrity.ts`): it opens with a private address,
+   * or an assistant stamped it for a person, its `Target` does not name. Shown as an error on the message.
+   */
+  targetMismatch?: 'address' | 'assistant';
   /**
    * WHICH STEP OF THE ANSWER THIS MESSAGE IS, as the backend declared it (`respPhase` in the Chime
    * metadata): `placeholder`, `interim`, `final`, `error`, `notice`.
@@ -228,7 +250,7 @@ export interface ChannelMember {
   isBot: boolean;
 }
 
-/** Sticky-mention target — a real channel member, or the synthetic `@all` entry. */
+/** Sticky-mention target — a real channel member, or the synthetic `@all` or `@humans` entry. */
 export type StickyMentionTarget = ChannelMember & { isAll?: boolean };
 
 export interface Model {

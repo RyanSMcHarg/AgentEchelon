@@ -32,6 +32,13 @@ jest.mock('../lambda/src/lib/battle-state', () => ({
   loadChannelBattleConfig: jest.fn().mockResolvedValue(null),
 }));
 
+// THE CALLER'S OWN BOUNDARY (`lib/conversation-access.ts`) is proven for this route in
+// `lib/a-person-route-reaches-only-a-conversation-its-caller-reaches.test.ts`. Here the caller reaches the channel
+// they name, so the binding of that channel to the battle is the only thing that decides.
+jest.mock('../lambda/src/lib/conversation-access', () => ({
+  callerReachesConversation: async (_e: unknown, channelArn: string) => ({ ok: true, channelArn, classification: 'premium' }),
+}));
+
 import { handler } from '../lambda/src/battle-outcome-api';
 import { edgeContext } from './helpers/edge-context';
 
@@ -77,8 +84,7 @@ describe('a pick is bound to the battle it names', () => {
   it('refuses a pick whose battle ran in another channel', async () => {
     mockReadRows.mockResolvedValueOnce([round1Row(THEIRS), botRow()]);
 
-    // The caller is a member of MINE (membership passes: APP_INSTANCE_ARN is unset in this process),
-    // and names a battle that ran in THEIRS.
+    // The caller reaches MINE, and names a battle that ran in THEIRS.
     const res = await handler(post({ battleId: BATTLE_ID, winner: 'A', channelArn: MINE }));
 
     expect(res.statusCode).toBe(403);
@@ -97,37 +103,44 @@ describe('a pick is bound to the battle it names', () => {
     expect(mockRecord).toHaveBeenCalledTimes(1);
   });
 
-  // ── UNKNOWN IS NOT MISMATCH ───────────────────────────────────────────────────────────────────
-  //
-  // Three different situations produce no recorded channel: a duel that predates the binding, one
-  // whose rows have passed their TTL, and a deployment with no state table. Refusing on any of them
-  // would discard a real judgement from someone who did watch the comparison, and would make the
-  // endpoint's behavior depend on a clock.
+  // ── A BINDING THAT CANNOT BE ESTABLISHED REFUSES ─────────────────────────────────────────────
   it.each([
-    ['the sentinel carries no channel (a duel from before the binding)', [round1Row(), botRow()]],
-    ['there is no sentinel at all (rows aged out)', [botRow()]],
-    ['there are no rows at all (no state table, or read failed)', []],
-  ])('still records when %s', async (_case, rows) => {
+    ['the sentinel carries no channel', [round1Row(), botRow()]],
+    ['there is no sentinel at all', [botRow()]],
+    ['there are no rows at all', []],
+  ])('refuses when %s, in the membership gate\'s own words', async (_case, rows) => {
     mockReadRows.mockResolvedValueOnce(rows);
 
     const res = await handler(post({ battleId: BATTLE_ID, winner: 'A', channelArn: MINE }));
 
-    expect(res.statusCode).toBe(200);
-    expect(mockRecord).toHaveBeenCalledTimes(1);
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.body).code).toBe('NOT_A_MEMBER');
+    expect(mockRecord).not.toHaveBeenCalled();
   });
 
-  it('refuses in the membership gate\'s own words, not more specific ones', async () => {
-    // A distinct code or message would confirm to a caller who has just failed the check that the id
-    // they hold is real and belongs to a channel they are not in. The refusal is byte-identical to
-    // the one a non-member gets, so the two are indistinguishable from outside.
-    mockReadRows.mockResolvedValueOnce([round1Row(THEIRS), botRow()]);
+  it('answers 503 and records nothing when the duel\'s rows cannot be read', async () => {
+    mockReadRows.mockRejectedValueOnce(Object.assign(new Error('slow down'), { name: 'ProvisionedThroughputExceededException' }));
+
     const res = await handler(post({ battleId: BATTLE_ID, winner: 'A', channelArn: MINE }));
 
-    expect(res.statusCode).toBe(403);
-    expect(JSON.parse(res.body)).toEqual({
-      error: "Caller is not a member of the battle's channel",
-      code: 'NOT_A_MEMBER',
-    });
+    expect(mockReadRows).toHaveBeenCalledWith(BATTLE_ID, { throwOnFailure: true });
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body).code).toBe('OUTCOME_STORE_UNAVAILABLE');
+    expect(mockRecord).not.toHaveBeenCalled();
+  });
+
+  it('answers a battle bound elsewhere and a battle with no binding alike, and in neutral words', async () => {
+    // The caller is a member of the channel they named. A distinct answer for a battle bound elsewhere would
+    // confirm that the id they hold is real and belongs to a channel they are not in.
+    const neutral = { error: 'That battle has no result to judge in this conversation', code: 'NOT_A_MEMBER' };
+    mockReadRows.mockResolvedValueOnce([round1Row(THEIRS), botRow()]);
+    const elsewhere = await handler(post({ battleId: BATTLE_ID, winner: 'A', channelArn: MINE }));
+    expect(elsewhere.statusCode).toBe(403);
+    expect(JSON.parse(elsewhere.body)).toEqual(neutral);
+    mockReadRows.mockResolvedValueOnce([botRow()]);
+    const unbound = await handler(post({ battleId: BATTLE_ID, winner: 'A', channelArn: MINE }));
+    expect(unbound.statusCode).toBe(403);
+    expect(JSON.parse(unbound.body)).toEqual(neutral);
   });
 
   it('checks the binding before it tells anyone a duel was abandoned', async () => {

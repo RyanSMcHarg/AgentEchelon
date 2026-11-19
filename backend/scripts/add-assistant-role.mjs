@@ -15,8 +15,14 @@
  * the role's declared assistant, once (ADR-048, amended 2026-10-24): built when it is absent, left alone when it
  * exists, and not recreated when it was retired in the console, which the deploy says.
  *
+ * THEN ITS FIRST VERSION, BY IMPORT. For an assistant that ships a manifest (`ops-premium`,
+ * `demo/portable-assistants/ops-assistant-manifest.ts`), the last step after a successful deploy imports it through the profile API
+ * (a draft, validated, then activated; `scripts/lib/ops-assistant-import.mjs`), so one command creates the assistant with
+ * its first version. A run where the active version already says what the manifest says writes nothing, and one a team
+ * edited is left alone with its differing fields named. `npm run ops-assistant -- import` runs the same import again.
+ *
  *   [assistant]   the role assistant to add, default ops-premium (the premium ops assistant)
- *   --dry-run     print the config change and the deploy command, and do neither
+ *   --dry-run     print the config change, the deploy command and the import, and do none of them
  *   --remove      take the name back out and deploy the same stack, which withdraws the ROLE. A role and the
  *                 assistants filling it are separate: the withdrawal is refused while any assistant (declared or
  *                 created in the console) still fills the role, naming them, so retire them in the console first.
@@ -43,6 +49,7 @@ const {
 } = require('./lib/assistant-role-config.cjs');
 const { resolveInstancePrefix } = require('./lib/deploy-guards.cjs');
 const { resolveInstanceName } = require('./lib/stack-lookup.cjs');
+const { importOpsAssistant, importPreview, IMPORTED_ASSISTANTS } = await import('./lib/ops-assistant-import.mjs');
 
 const REGION = process.env.AWS_REGION || 'us-east-1';
 
@@ -97,6 +104,9 @@ console.log(`\n${args.remove ? 'Removing' : 'Adding'} the ${selection.role} assi
 console.log(`  profiles before: ${JSON.stringify(selection.before)}`);
 console.log(`  profiles after:  ${JSON.stringify(selection.after)}${selection.changed ? '' : '   (unchanged: it already says this)'}`);
 console.log(`  then:            npm ${deploy.join(' ')}`);
+// The assistant's first version is imported after the deploy, for an assistant that ships a manifest. A withdrawal imports nothing.
+const importsVersion = !args.remove && IMPORTED_ASSISTANTS.includes(args.assistant);
+if (importsVersion) console.log(`  ${importPreview(args.assistant)}`);
 
 // A ROLE IS WITHDRAWN ONLY ONCE NO ASSISTANT FILLS IT, checked before the config is written. The deploy's provisioner
 // refuses the same withdrawal, so this is the earlier of two layers, not the only one.
@@ -141,3 +151,19 @@ console.log(args.remove
   ? `\n✓ The ${selection.role} role is withdrawn from ${stack}. No assistant filled it, and a declared ${args.assistant} `
     + 'retired in the console is released, so adding the role again seeds it afresh.'
   : `\n✓ The ${selection.role} role is deployed in ${stack}, and the provisioner seeds ${args.assistant} when it is absent (a retire in the console sticks). See what the rollout created: node scripts/show-ops-rollout.mjs ${selection.classification} ${selection.role}`);
+
+// THE ASSISTANT'S FIRST VERSION, imported from its shipped manifest now that the role and its identity exist.
+if (importsVersion) {
+  console.log(`\n▶ Import ${args.assistant}'s first version from its shipped manifest`);
+  let result;
+  try {
+    result = await importOpsAssistant();
+  } catch (err) {
+    console.error(`\n✗ the role is deployed, and the import failed (${err?.message || err}); rerun it with npm run ops-assistant -- import`);
+    process.exit(1);
+  }
+  if (result.outcome === 'refused') {
+    console.error('\n✗ the role is deployed, and the import was refused (above); rerun it with npm run ops-assistant -- import once that is resolved');
+    process.exit(1);
+  }
+}

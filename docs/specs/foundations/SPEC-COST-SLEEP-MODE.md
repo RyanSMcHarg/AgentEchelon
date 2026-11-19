@@ -164,17 +164,18 @@ It is a table rather than an SSM parameter because `lastActivityAt` is written b
 
 ## Appendix B - What keeps the cluster awake
 
-**Measured on the reference deployment.** Sleep pauses Aurora; it does not stop anything that connects to Aurora. Three scheduled jobs do, on these cadences:
+**Read from the stack definitions** (`backend/lib/stacks/archive-stack-aurora.ts`, `backend/lib/constructs/membership-audit.ts`, `backend/lib/stacks/notification-stack.ts`); no deployment measurement is recorded. Sleep pauses Aurora; it does not stop anything that connects to Aurora. Four scheduled jobs do, on these cadences:
 
 | Rule | Cadence | Touches Aurora |
 |---|---|---|
 | Abandonment detector | every 5 minutes | yes |
 | Summary updater | every 30 minutes | yes |
 | Evaluation runner (construct name `DailyEvaluationSchedule`) | every 30 minutes | yes |
+| Clean copy (`CleanCopySchedule`) | daily at 02:00 UTC, or `-c cleanCopySchedule` | yes - through the data plane |
 | Membership audit | every 6 hours | no - Amazon Chime SDK |
 | Proactive briefing | daily | no - it may invoke the model |
 
-**Not measured; read from the stack definitions.** Two event-driven jobs also run while the deployment sleeps. Neither touches Aurora.
+**Also from the stack definitions** (`admin-services-stack.ts`, `assistant-profile-stack.ts`). Two event-driven jobs also run while the deployment sleeps. Neither touches Aurora.
 
 | Rule | Trigger | Touches Aurora |
 |---|---|---|

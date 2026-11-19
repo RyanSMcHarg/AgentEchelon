@@ -29,7 +29,7 @@ import {
 } from '../../lambda/src/lib/participant-roles';
 import { groupsToReconcile, reconcileGroupRoles, type RoleReconcileDeps } from '../../lambda/src/group-membership-reconcile';
 import {
-  PLATFORM_EVENT_WORKFLOWS,
+  SHIPPED_EVENT_WORKFLOWS,
   conferredBy,
   eventWorkflowErrors,
   eventWorkflowRoleWarnings,
@@ -39,6 +39,7 @@ import {
   type EventRunContext,
   type EventWorkflow,
 } from '../../lambda/src/lib/event-workflow';
+import { AGENT_STEP_OPS_ROOM } from '../helpers/agent-step-ops-room';
 
 const APP = 'arn:aws:chime:us-east-1:111122223333:app-instance/test';
 const arn = (id: string) => `${APP}/user/${id}`;
@@ -66,14 +67,14 @@ describe('the group source and adds, declared', () => {
   it('a declared membership group fills a role, and its groups are reconciled at the type\'s classification only', () => {
     expect(participantRoleDeclarationErrors({ 'test-oncall': ONCALL }, ctx)).toEqual([]);
     expect(participantRoleDeclarationErrors({ 'test-oncall': ONCALL }, { membershipGroups: {} }).join()).toMatch(/group 'ops' is not a declared membership group/);
-    expect(roleGroups('premium')).toEqual(['ops', 'reviewers']);
+    expect(roleGroups('premium')).toEqual(['account-team-lead', 'ops', 'ops-on-call', 'ops-secondary', 'reviewers']);
     expect(roleGroups('standard')).toEqual([]);
     expect(groupsToReconcile({ detail: { eventName: 'AdminRemoveUserFromGroup', requestParameters: { groupName: 'reviewers' } } }, 'premium')).toEqual(['reviewers']);
   });
 
   it('refuses adds where a membership source would remove the added holders, and adds with no source that names outsiders', () => {
     const sourced = { ...CONVERSATION_TYPES.ops, participants: { participantRoles: { 'on-call:ops': { from: [{ group: 'ops' }], adds: true } } } } as ConversationTypeConfig;
-    expect(participantRoleDeclarationErrors({ ops: sourced }, ctx).join()).toMatch(/membership source keeps its room equal to that source/);
+    expect(participantRoleDeclarationErrors({ ops: sourced }, ctx).join()).toMatch(/membership source keeps its conversation equal to that source/);
     const eventAdds = { ...CONVERSATION_TYPES.ops, participants: { participantRoles: { lead: { from: [{ event: 'forPerson' }], adds: true } } } } as ConversationTypeConfig;
     expect(participantRoleDeclarationErrors({ ops: eventAdds }, ctx).join()).toMatch(/adds needs a source that names people who are not members yet/);
   });
@@ -195,15 +196,18 @@ describe('fromRole: a role confers the template and the brief its holders get', 
   });
 
   it('fromRole is refused on a room send, and a brief on an agent step not written for one person', () => {
-    const base = clone(PLATFORM_EVENT_WORKFLOWS['ops-room']) as any;
+    const base = clone(SHIPPED_EVENT_WORKFLOWS['ops-room']) as any;
     base.states.opening.send.fromRole = 'template';
     expect(eventWorkflowErrors('x', base).join()).toMatch(/fromRole says the template a person's role confers, so it is on a send to people/);
-    const agent = clone(PLATFORM_EVENT_WORKFLOWS['ops-room']) as any;
+    // The stored agent-step first look, the step a brief is drafted on.
+    const agent = clone(AGENT_STEP_OPS_ROOM) as any;
     agent.states['first-look'].agent.fromRole = 'brief';
     expect(eventWorkflowErrors('x', agent).join()).toMatch(/fromRole drafts one person's brief/);
     agent.states['first-look'].agent.to = { people: 'event:person' };
     // A step written for one person opens no task the room works on.
     delete agent.states['first-look'].agent.workflow;
+    delete agent.states['first-look'].agent.as;
+    delete agent.states['first-look'].agent.fallback.absent;
     expect(eventWorkflowErrors('x', agent)).toEqual([]);
   });
 });

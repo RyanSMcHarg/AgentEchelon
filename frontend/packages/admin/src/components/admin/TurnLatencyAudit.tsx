@@ -105,7 +105,7 @@ export function TurnLatencyAudit({ dateRange, initialChannelArn }: Props) {
 
   return (
     <section className="turn-latency-audit" aria-label={t('admin.turnLatencyAudit.auditOneTurn')}>
-      <h3>{t('admin.turnLatencyAudit.auditATurn')}</h3>
+      <h2>{t('admin.turnLatencyAudit.auditATurn')}</h2>
       <p className="admin-help-text">
         <Trans i18nKey="admin.turnLatencyAudit.lead" components={{ c: <code /> }} />
       </p>

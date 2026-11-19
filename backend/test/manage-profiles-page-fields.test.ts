@@ -12,6 +12,22 @@ jest.mock('@aws-sdk/client-ssm', () => {
   const actual = jest.requireActual('@aws-sdk/client-ssm');
   return { ...actual, SSMClient: jest.fn(() => ({ send })) };
 });
+// THE PROFILE BODY STORE, in memory: a version's event workflows are a body of it, so a draft that carries
+// them writes one, and the definition keeps the pointer.
+const mockBodies = new Map<string, string>();
+jest.mock('@aws-sdk/client-s3', () => {
+  const actual = jest.requireActual('@aws-sdk/client-s3');
+  return {
+    ...actual,
+    S3Client: jest.fn(() => ({
+      send: async (cmd: { input: { Key: string; Body?: string } }) => {
+        if (cmd.input.Body !== undefined) { mockBodies.set(cmd.input.Key, String(cmd.input.Body)); return {}; }
+        const body = mockBodies.get(cmd.input.Key);
+        return { Body: body === undefined ? undefined : { transformToString: async () => body } };
+      },
+    })),
+  };
+});
 jest.mock('@aws-sdk/client-lambda', () => {
   const actual = jest.requireActual('@aws-sdk/client-lambda');
   return {
@@ -33,7 +49,8 @@ jest.mock('../lambda/src/lib/assistant-scope', () => {
 });
 
 // The attachments bucket the company-context prefixes are keys in, served with the catalog.
-process.env.PROFILE_BODY_BUCKET = 'ae-attachments';
+process.env.PROFILE_BODY_BUCKET = 'ae-profile';
+process.env.CONTEXT_BUCKET = 'ae-company';
 import type { APIGatewayProxyEvent } from 'aws-lambda';
 import { handler } from '../lambda/src/manage-profiles';
 import { edgeContext } from './helpers/edge-context';
@@ -106,7 +123,9 @@ describe('a draft patch carrying a welcome workflow, a retired welcome, or a ret
     expect(res.statusCode).toBe(200);
     const draft = writes().find((c) => c.input.Name === `${ROOT}/assistant/${advisor}/draft`);
     const stored = JSON.parse(draft.input.Value);
-    expect(stored.eventWorkflows).toEqual(patch.eventWorkflows);
+    // Written to the body store, the definition keeping the pointer.
+    expect(stored.eventWorkflows).toBeUndefined();
+    expect(JSON.parse(mockBodies.get(stored.eventWorkflowsRef.key)!)).toEqual(patch.eventWorkflows);
     expect(stored.welcome).toBeUndefined();
     expect(stored.copy).toBeUndefined();
   });
@@ -116,7 +135,10 @@ describe('the listing serves what the page needs', () => {
   it('serves each listed classification\'s catalog, bounded to what it selects, with the decisions and messages', async () => {
     ssmFrom({
       [`${ROOT}/assistant/${classification}/guardrails`]: JSON.stringify([{ key: 'strict', guardrailId: 'gr-1' }]),
-      [`${ROOT}/assistant/${classification}/context-sources`]: JSON.stringify([{ key: 'crm', description: 'Accounts' }]),
+      [`${ROOT}/assistant/${classification}/context-sources`]: JSON.stringify([
+        { key: 'crm', description: 'Accounts' },
+        { key: 'company-docs', type: 's3-prefix', prefix: `context/${classification}/`, locator: 'ae-company' },
+      ]),
       [`${ROOT}/assistant/${classification}/templates/report`]: JSON.stringify({ active: 'a'.repeat(64), history: [] }),
       [`${ROOT}/assistant/${classification}/router-arn`]: 'arn:aws:lambda:us-east-1:1:function:AgentEchelonRouter',
     });
@@ -129,12 +151,16 @@ describe('the listing serves what the page needs', () => {
     expect(cat.models.text.every((m: string) => selected.includes(m))).toBe(true);
     expect(cat.models.image.every((m: string) => selected.includes(m))).toBe(true);
     expect(cat.guardrails).toEqual([{ key: 'strict', guardrailId: 'gr-1' }]);
-    expect(cat.contextSources).toEqual([{ key: 'crm', description: 'Accounts' }]);
+    // Each source with its type and prefix, so the console reads which roles can read it; nothing else of the entry.
+    expect(cat.contextSources).toEqual([
+      { key: 'crm', description: 'Accounts' },
+      { key: 'company-docs', type: 's3-prefix', prefix: `context/${classification}/` },
+    ]);
     expect(cat.templates).toEqual([{ name: 'report', active: 'a'.repeat(64) }]);
     expect(cat.budgets).toEqual({ userHourly: 750, globalHourly: 1500 });
     expect(cat.workflows.length).toBeGreaterThan(0);
     // The bucket the reach prefixes are keys in, so the console can say where they are.
-    expect(cat.contextBucket).toBe('ae-attachments');
+    expect(cat.contextBucket).toBe('ae-company');
     // The turn queue's machines are marked as every assistant's, read from the list the runtime exempts from a
     // selection, and only those: a reference workflow such as report_generation stays selectable.
     const required = cat.workflows.filter((w: { required: boolean }) => w.required).map((w: { key: string }) => w.key).sort();
@@ -145,6 +171,8 @@ describe('the listing serves what the page needs', () => {
     expect(body.copyCatalog).toBeUndefined();
     const row = body.profiles.find((p: { profileName: string }) => p.profileName === advisor);
     expect(row.deployedClassifierMode).toBe(defaultProfileRegistry.profileByName(advisor)?.classifierMode);
+    // The name a version that sets none inherits, which the page shows where the name is left blank.
+    expect(row.provisionedDisplayName).toBe(defaultProfileRegistry.profileByName(advisor)?.displayName || advisor);
   });
 
   it('lists the classification without the parts it could not read, rather than failing', async () => {

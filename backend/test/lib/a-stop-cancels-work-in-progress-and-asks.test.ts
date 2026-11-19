@@ -162,7 +162,7 @@ describe('the router cancels the work in progress at the stop', () => {
     require('path').join(__dirname, '../../lambda/src/router-agent-handler.ts'), 'utf8');
   const stopBlock = SRC.slice(
     SRC.indexOf('const parsedStop = parseStopCommand'),
-    SRC.indexOf('const turnAttachment = bypassAttachment(event);'),
+    SRC.indexOf('const lexEnteredRead = '),
   );
 
   it('the stop path is not empty, so the assertions below are not vacuous', () => {
@@ -198,7 +198,7 @@ describe('the router cancels the work in progress at the stop', () => {
   it('asks how to proceed only when something was actually cancelled', () => {
     // A failed cancel leaves the work open; asking "leave it cancelled, or start again?" about work
     // that has not stopped would misinform the person.
-    expect(stopBlock).toMatch(/if \(held\.length && !cancelFailed\)[\s\S]{0,200}dispatchStopEvaluationTurn/);
+    expect(stopBlock).toMatch(/if \(held\.length && !cancelFailed\) \{\s*const evaluation: StopEvaluationDispatch = \{/);
     expect(stopBlock).toContain('const cancelFailed = held.length > 0 && cancelled === 0;');
   });
 
@@ -221,14 +221,31 @@ describe('the router cancels the work in progress at the stop', () => {
     expect(corrected).toMatch(/if \(!asked\) \{[\s\S]*UpdateChannelMessageCommand[\s\S]*notAskedLine/);
   });
 
-  it('posts the acknowledgment before the question turn exists, so the order is not a race', () => {
-    // Returned to Lex, the acknowledgment is posted only after the handler returns - after the
-    // question turn was already started - so the question often landed first (measured live).
+  it('sends the question when the flow releases the acknowledgment, so the order is not a race', () => {
+    // Returned to Lex, the acknowledgment is posted only after the handler returns; and even posted first, each message
+    // is released by its own flow pass and stamped then, so a slower acknowledgment can land after its question. So the
+    // router posts it, records the question against its id, and the flow sends the
+    // question from the pass that releases it.
     const post = stopBlock.indexOf('postedAckId = posted.MessageId;');
+    const defer = stopBlock.indexOf('deferStopEvaluation({ channelArn, responderId: thisResponderId, acknowledgementId: postedAckId');
     expect(post).toBeGreaterThan(-1);
-    expect(post).toBeLessThan(stopBlock.indexOf('dispatchStopEvaluationTurn({'));
-    // Nothing waits: no timer or poll sits between them.
-    expect(stopBlock.slice(post, stopBlock.indexOf('dispatchStopEvaluationTurn({'))).not.toMatch(/setTimeout|sleep|poll/i);
+    expect(defer).toBeGreaterThan(post);
+    // Dispatched by the router only when there is nothing to defer to, or the deferral was not recorded.
+    expect(stopBlock).toContain('asked = deferred || await dispatchStopEvaluationTurn(evaluation)');
+    // Nothing waits: no timer or poll on either side.
+    expect(stopBlock.slice(post, defer)).not.toMatch(/setTimeout|sleep|poll/i);
+    const flow = require('fs').readFileSync(require('path').join(__dirname, '../../lambda/src/channel-flow-processor.ts'), 'utf8') as string;
+    const allow = flow.indexOf('await callbackAllow(CallbackId, channelArn, MessageId, storedContent, Metadata);');
+    const take = flow.indexOf('await takeStopEvaluation({');
+    expect(allow).toBeGreaterThan(-1);
+    expect(take).toBeGreaterThan(allow);
+    expect(flow.slice(allow, take)).toContain('if (stopAcknowledgement(Metadata))');
+    expect(flow.slice(allow, take + 400)).not.toMatch(/setTimeout|sleep|poll/i);
+    // Routed by the conversation's own classification tag, never by the recorded value alone.
+    const routed = flow.slice(take, take + 1600);
+    expect(routed).toContain('await getChannelClassification(channelArn, senderArn)');
+    expect(routed).toContain('classification !== evaluation.classification');
+    expect(routed).toContain('dispatchStopEvaluationTurn({ ...evaluation, classification })');
     // And the Lex reply stays silent, so the acknowledgment is not posted twice.
     expect(stopBlock).toMatch(/if \(postedAckId\) \{[\s\S]*return formatLexSilentResponse\(event\);/);
   });
@@ -254,7 +271,7 @@ describe('the router cancels the work in progress at the stop', () => {
     // A record of a question nobody heard would make a later unrelated message be read as its answer.
     const at = stopBlock.indexOf('await rememberStopDecision({');
     expect(at).toBeGreaterThan(-1);
-    expect(stopBlock.slice(0, at)).toContain('dispatchStopEvaluationTurn({');
+    expect(stopBlock.slice(0, at)).toContain('const deferred = postedAckId');
     expect(stopBlock.slice(at - 200, at)).toContain('if (asked)');
   });
 

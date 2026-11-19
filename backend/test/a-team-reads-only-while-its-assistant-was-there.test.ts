@@ -67,7 +67,7 @@ const read = (query: Record<string, string> | null = { reason: 'customer escalat
   headers: { origin: 'http://localhost:5173' },
   pathParameters: { assistant: 'hr', channelId: CHANNEL_ID },
   queryStringParameters: query,
-  requestContext: { identity: { userArn: 'arn:aws:sts::1:assumed-role/ae-team-console/console-sub@standard' } },
+  requestContext: { identity: { userArn: 'arn:aws:sts::1:assumed-role/agent-echelon-team-console/console-sub@standard' } },
 } as unknown as APIGatewayProxyEvent);
 const body = (res: { body: string }) => JSON.parse(res.body);
 

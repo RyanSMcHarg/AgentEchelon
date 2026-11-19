@@ -58,7 +58,7 @@ export function InvitationsPanel({ channelArn, canRevoke, deps = {} }: Invitatio
 
   return (
     <div className="admin-section">
-      <h4>{t('admin.invitations.title')}</h4>
+      <h3>{t('admin.invitations.title')}</h3>
       <p className="admin-field-hint">{t('admin.invitations.hint')}</p>
       {error && <div className="admin-error" role="alert">{error}</div>}
       <DataTable

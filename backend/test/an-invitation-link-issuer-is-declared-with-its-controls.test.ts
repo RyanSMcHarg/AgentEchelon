@@ -47,7 +47,6 @@ describe('an invitation-link issuer', () => {
   it.each([
     ['a groups source', { clearance: { groups: true, classifications: ['basic'] } }, /clearance is the fixed set of classifications a link session may be vended at/],
     ['a mapping', { clearance: { mapping: { claim: 'x', values: { a: 'basic' } }, classifications: ['basic'] } }, /clearance is the fixed set/],
-    ['oneChannel', { clearance: { oneChannel: 'basic', classifications: ['basic'] } }, /clearance is the fixed set/],
     ['a visitor\'s classification', { clearance: { fixed: ['guest'], classifications: ['guest'] } }, /a visitor's classification; only a guest issuer reaches it/],
     ['the admin plane', { clearance: { fixed: ['admin'], classifications: ['admin'] } }, /not a classification a conversation is held at/],
     ['a set outside its classifications', { clearance: { fixed: ['premium'], classifications: ['basic'] } }, /fixed names "premium", outside the issuer's classifications/],

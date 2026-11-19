@@ -30,6 +30,7 @@
  */
 import * as cdk from 'aws-cdk-lib';
 import * as path from 'path';
+import { TRANSCRIPTS_FAMILY } from '../../lambda/src/lib/meeting-transcript';
 import * as appsync from 'aws-cdk-lib/aws-appsync';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
@@ -47,7 +48,7 @@ import { Construct } from 'constructs';
 import { adminAuthEnv } from '../constructs/admin-auth-mode';
 import { adminOrigin } from '../config/app-origins';
 import { ADMIN_CAPABILITIES, ADMIN_ROLE_GROUP, vendRoutePath, type AdminRole } from '../config/admin-capabilities';
-import { ADMIN_CONSOLE_ROLE_NAME, adminRoute } from '../constructs/admin-role-grants';
+import { ADMIN_CONSOLE_ROLE_NAME, ADMIN_PLANE_ROLE_NAME, ADMIN_PLANE_ROUTES, adminRoute } from '../constructs/admin-role-grants';
 import { grantAssistantScopeCheck } from '../constructs/assistant-scope-grants';
 import { grantAccountStateRead, grantDirectoryRead } from '../constructs/directory-access';
 import { MEMBERSHIP_AUDIT_FN_NAME } from '../constructs/membership-audit';
@@ -67,11 +68,14 @@ import {
   INSTANCE_SSM,
   SHARED_SSM,
   SSM_ROOT,
+  CAPABILITY_RESOURCES,
+  resolveSharedSSM,
   STACK_PREFIX,
   adminPlaneMembershipStatements,
   createOwnClassificationOnly,
   guestKillSwitchParameter,
   ownInstanceFunctions,
+  ownInstanceFunctionsOnly,
   serviceAdminArnOf,
   tagOnCreateStatements,
   taskServiceByNameEnvironment,
@@ -83,11 +87,15 @@ import type { ArchiveStackAurora } from './archive-stack-aurora';
 import { TEAM_MEMBERS_GROUP_PRECEDENCE } from '../config/profiles';
 import { templateFamilyPrefix, templatePointerPath } from '../../lambda/src/lib/template-store';
 import { ADMIN_NOTICE_ASSISTANT, ADMIN_NOTICE_CLASSIFICATION } from '../../lambda/src/lib/admin-notice-templates';
+import { ADMIN_TWIN_OWNER_TAG } from '../../lambda/src/lib/person-arn';
+import { typedCreatorName } from '../constructs/conversation-creator';
 
 /** The team-members group's Cognito precedence, which no classification may declare (`validateProfilesConfig`). */
 export const TEAM_MEMBERS_PRECEDENCE = TEAM_MEMBERS_GROUP_PRECEDENCE;
 
 export interface AdminServicesStackProps extends cdk.StackProps {
+  /** Whether the deployment declares the `notifications` capability, so a workflow can offer email. */
+  emailConfigured?: boolean;
   /** The Amazon Chime SDK app instance (Messaging). */
   appInstanceArn: string;
   /** The service app-instance-admin (Messaging): adds the admins to the admin channel, and never joins. */
@@ -113,8 +121,12 @@ export interface AdminServicesStackProps extends cdk.StackProps {
    * (P-13): user management invokes it for `POST /users/provision`, and holds no `Identities` write itself.
    */
   subjectProvisioner?: lambda.IFunction;
-  /** The attachments bucket ARN (Conversations): admin attachment reads, and the profile body store. */
+  /** The attachments bucket ARN (Conversations): admin attachment reads, and golden-set hand-overs. */
   attachmentsBucketArn: string;
+  /** The company bucket's name (Conversations): where the company-context prefixes the console shows are keys. */
+  companyBucketName: string;
+  /** The profile bucket ARN (Conversations): profile bodies, intent packs and templates. */
+  profileBucketArn: string;
   /** The thumbs table (Conversations), for the feedback summary and the per-variant thumbs join. */
   feedbackTable: { tableName: string; tableArn: string };
   /** The archive bucket ARN (Archive). */
@@ -125,15 +137,22 @@ export interface AdminServicesStackProps extends cdk.StackProps {
   experimentsTable?: dynamodb.ITable;
   /** Whether `battle` is declared, for the analytics battle-wins join. */
   battle: boolean;
+  /** Whether `meetings` is declared: the console's meeting routes join this stack. */
+  meetings?: boolean;
   /** The group that marks an admin of this deployment's pool. Default `admins`. */
   adminGroupName?: string;
 }
+
+/** A JSON object as the guarded deploy scripts forward one (`json64:<base64url JSON>`), decoded to its JSON text. */
+const thresholdsText = (text: string): string => (text.startsWith('json64:') ? Buffer.from(text.slice('json64:'.length), 'base64url').toString('utf8') : text);
 
 export class AdminServicesStack extends cdk.Stack implements RouteSource {
   /** Every admin route, on `AdminApi`; the nested stacks' routes are appended to it. */
   public readonly routes: RouteSpec[] = [];
   /** The console roles, which `AdminApi` grants on exactly the routes their capabilities name. */
   public readonly consoleRoles: Record<AdminRole, iam.IRole>;
+  /** The admin plane role, which `AdminApi` grants on its routes by that API's own id (`grantAdminPlaneOnApi`). */
+  public readonly adminPlaneRole: iam.IRole;
   /** The admin notification channel ARN. */
   public readonly channelArn: string;
   /** The admin assistant's AppInstanceBot ARN: the channel's owner and the bearer of every alert in it. */
@@ -154,6 +173,7 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
     const exchange = this.adminExchange(props, trustedIssuersJsonValue);
     const consoleRoles: Record<AdminRole, iam.IRole> = { admins: exchange.adminConsoleRole, 'team-members': exchange.teamConsoleRole };
     this.consoleRoles = consoleRoles;
+    this.adminPlaneRole = exchange.adminPlaneRole;
     this.consoleEvents(consoleRoles, exchange.exchangeFn);
 
     // A14 Scoped: the role -> scope map the analytics and admin-conversation handlers resolve a caller's
@@ -176,9 +196,11 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
     this.feedbackSummary(props, adminAppUrl);
 
     const assistants = new AdminAssistantAdministration(this, 'AssistantAdministration', {
+      emailConfigured: props.emailConfigured,
       appInstanceArn: props.appInstanceArn,
       userPoolId: props.selfPoolId,
-      attachmentsBucketArn: props.attachmentsBucketArn,
+      companyBucketName: props.companyBucketName,
+      profileBucketArn: props.profileBucketArn,
       experimentsTable: props.experimentsTable,
       identities: { tableName: props.identitiesTable.tableName, tableArn: props.identitiesTable.tableArn },
     });
@@ -191,11 +213,14 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
       aurora: props.aurora,
       classificationRoleScopes,
       feedbackTable: props.feedbackTable,
+      accessLogTable: props.accessLogTable,
       // Resolved here, at deploy, from the battle contract: the Battle stack deploys first.
       battleOutcomeTableName: props.aurora && props.battle ? ssm.StringParameter.valueForStringParameter(this, SHARED_SSM.battleOutcomeName) : undefined,
-      attachmentsBucketArn: props.attachmentsBucketArn,
+      profileBucketArn: props.profileBucketArn,
     });
     this.routes.push(...analytics.routes);
+
+    if (props.meetings) this.adminMeetings(props, adminAppUrl, classificationRoleScopes);
 
     cdk.Tags.of(this).add('Component', 'AdminServices');
   }
@@ -277,12 +302,12 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
         SSM_ROOT,
         // THE CHANNEL IS NAMED FROM THE ADMIN PLANE'S conversation-name TEMPLATE (`conversation-name.ts`), so a console edit
         // names it at the next provisioning.
-        TEMPLATE_BUCKET: cdk.Arn.split(props.attachmentsBucketArn, cdk.ArnFormat.NO_RESOURCE_NAME).resource,
+        TEMPLATE_BUCKET: cdk.Arn.split(props.profileBucketArn, cdk.ArnFormat.NO_RESOURCE_NAME).resource,
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
     // Read-only, the admin plane's templates and no other's (`messageTemplateReadStatements`).
-    for (const stmt of messageTemplateReadStatements(this, props.attachmentsBucketArn, adminClassification)) fn.addToRolePolicy(stmt);
+    for (const stmt of messageTemplateReadStatements(this, props.profileBucketArn, adminClassification)) fn.addToRolePolicy(stmt);
     // THE ROOM'S PRIMARY, read from the admin plane's own assignment records (`primaryTagFor`): the path and
     // its children, because `GetParametersByPath` authorizes against the path itself. Read only, and no other
     // classification's records.
@@ -476,7 +501,7 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
         ADMIN_ALERT_CHANNEL_ARN: notification.channelArn,
         ADMIN_ALERT_BEARER_ARN: notification.botArn,
         // The admin assistant's own notice templates (ADR-062 decision 6): the store's bucket and the pointers' root.
-        TEMPLATE_BUCKET: cdk.Arn.split(props.attachmentsBucketArn, cdk.ArnFormat.NO_RESOURCE_NAME).resource,
+        TEMPLATE_BUCKET: cdk.Arn.split(props.profileBucketArn, cdk.ArnFormat.NO_RESOURCE_NAME).resource,
         SSM_ROOT,
       },
       bundling: { externalModules: ['@aws-sdk/*'], minify: true, sourceMap: true },
@@ -487,7 +512,7 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
     poster.addToRolePolicy(new iam.PolicyStatement({
       sid: 'ReadTheAdminAgentsNoticeTemplates',
       actions: ['s3:GetObject'],
-      resources: [`${props.attachmentsBucketArn}/${templateFamilyPrefix(ADMIN_NOTICE_CLASSIFICATION, adminFamily)}*`],
+      resources: [`${props.profileBucketArn}/${templateFamilyPrefix(ADMIN_NOTICE_CLASSIFICATION, adminFamily)}*`],
     }));
     poster.addToRolePolicy(new iam.PolicyStatement({
       sid: 'ReadTheAdminAgentsNoticePointers',
@@ -535,15 +560,54 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       inlinePolicies: {
         AdminTwin: new iam.PolicyDocument({
-          statements: [new iam.PolicyStatement({
-            // THE ADMIN-PLANE TWIN `<personId>-admin`, and its standing app-instance-admin registration.
-            // This exchange creates no person: the person exchange is the one minter.
-            actions: [
-              'chime:CreateAppInstanceUser', 'chime:DescribeAppInstanceUser', 'chime:UpdateAppInstanceUser',
-              'chime:CreateAppInstanceAdmin', 'chime:TagResource',
-            ],
-            resources: [`${props.appInstanceArn}/user/*`, props.appInstanceArn],
-          })],
+          statements: [
+            // THE ADMIN-PLANE TWIN `<personId>-admin`, and its standing app-instance-admin registration: written
+            // only under the twin suffix (`adminTwinIdFor`, person-arn.ts), so IAM, not only the code, keeps this
+            // exchange from creating, renaming, retagging or elevating a person's own chat identity. This exchange
+            // creates no person: the person exchange is the one minter. Each action names only the resources the
+            // Service Authorization Reference lists for it, so the suffix binds wherever the action names a user.
+            new iam.PolicyStatement({
+              // A rename and a retag authorize against the AppInstanceUser alone, so the twin suffix is the whole grant.
+              sid: 'WritesOnlyTheAdminTwin',
+              actions: ['chime:UpdateAppInstanceUser'],
+              resources: [`${props.appInstanceArn}/user/*-admin`],
+            }),
+            new iam.PolicyStatement({
+              // The twin carries exactly its admin-plane classification and its owner (`tagIdentity`, vend.ts).
+              sid: 'TagsOnlyTheAdminTwin',
+              actions: ['chime:TagResource'],
+              resources: [`${props.appInstanceArn}/user/*-admin`],
+              conditions: { 'ForAllValues:StringEquals': { 'aws:TagKeys': ['classification', ADMIN_TWIN_OWNER_TAG] } },
+            }),
+            new iam.PolicyStatement({
+              // The elevation authorizes against the app instance AND the identity being elevated, so both must
+              // match: the app instance alone elevates nobody, and the identity is held to the twin suffix.
+              sid: 'ElevatesOnlyTheAdminTwin',
+              actions: ['chime:CreateAppInstanceAdmin'],
+              resources: [props.appInstanceArn, `${props.appInstanceArn}/user/*-admin`],
+            }),
+            new iam.PolicyStatement({
+              // The create names the app instance it creates in; the reference lists no resource type for it, so
+              // the twin id is the handler's (`ensureAdminIdentity` creates only `adminTwinIdFor(personId)`), and
+              // every later write to the identity is held to the twin suffix above.
+              sid: 'CreatesTheAdminTwin',
+              actions: ['chime:CreateAppInstanceUser'],
+              resources: [props.appInstanceArn, `${props.appInstanceArn}/user/*-admin`],
+            }),
+            new iam.PolicyStatement({
+              // The service admin's id also ends in the twin suffix; it is no person's twin, and this exchange
+              // never renames, retags or re-registers it.
+              sid: 'NeverTheServiceAdmin',
+              effect: iam.Effect.DENY,
+              actions: ['chime:CreateAppInstanceUser', 'chime:UpdateAppInstanceUser', 'chime:CreateAppInstanceAdmin', 'chime:TagResource'],
+              resources: [serviceAdminArnOf(props.appInstanceArn)],
+            }),
+            new iam.PolicyStatement({
+              sid: 'ReadsAnIdentity',
+              actions: ['chime:DescribeAppInstanceUser'],
+              resources: [`${props.appInstanceArn}/user/*`],
+            }),
+          ],
         }),
       },
       managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')],
@@ -570,14 +634,23 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
       // The admin plane's own classification, which the exchange asserts on every admin-plane vend.
       StringEquals: { 'aws:RequestTag/classification': profiles.adminPlaneValues()[0] },
     };
-    // ── THE ARCHIVE PLANE'S BOUNDARIES: the wildcard here, the one subject in each vend's session policy ──
+    // ── THE ARCHIVE PLANE: this instance's API in the grant and in each vend's session policy ──
     //
-    // The message read and the task routes are on this stack's admin conversation API. Named by a
-    // wildcard-api-id ARN with the exact method and path, and completed per vend with the one channel or
-    // owner id, the same two layers the S3 attachment plane uses (boundary on the bucket, session policy
-    // on one key prefix). Handing work to a different person and stopping it are different authorities,
-    // so each has its own boundary (tenet P4).
-    const executeApi = (method: string, p: string) => `arn:aws:execute-api:${this.region}:${this.account}:*/*/${method}/${p}`;
+    // The message read and the task routes are on `AdminApi`, which is built on this stack's routes and so
+    // deploys after it. Its id is named in two places, by two stacks: `AdminApi` grants the admin plane its
+    // routes by the API's own id (`grantAdminPlaneOnApi`), and the exchange completes each session policy
+    // with the id of the API that carried the vend request, which is this instance's `AdminApi` (the only
+    // API its invoke permission names). Each session policy names one channel or owner as well. The
+    // boundary names the exact method and path on any API id, because it is fixed on the role when this
+    // stack creates it, before the API exists. Handing work to a different person and stopping it are
+    // different authorities, so each has its own route (tenet P4).
+    const routePath = (p: string) => p.replace(/^\//, '');
+    // `{apiId}` and `{id}` are completed per vend (admin-credential-exchange.ts `archiveResourceFor`).
+    const sessionTemplate = (method: string, p: string) => `arn:aws:execute-api:${this.region}:${this.account}:{apiId}/*/${method}/${routePath(p)}`;
+    const archiveBoundary = new iam.PolicyStatement({
+      actions: ['execute-api:Invoke'],
+      resources: ADMIN_PLANE_ROUTES.map((r) => `arn:aws:execute-api:${this.region}:${this.account}:*/*/${r.method}/${routePath(r.path).replace(/\{[^}]+\}/g, '*')}`),
+    });
     // WHAT THE ADMIN PLANE REACHES, written once: its identity policy, and its permissions boundary, so a grant
     // attached to it later reaches nothing this list does not (STACKS.md "Permissions boundaries").
     const adminPlaneStatements = (): iam.PolicyStatement[] => [
@@ -587,17 +660,6 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
         actions: [...new Set([...MSG_ACTIONS, ...MODERATION_ACTIONS])],
         resources: [`${props.appInstanceArn}/channel/*`, PINNED_ADMIN_USER_ARN],
       }),
-      new iam.PolicyStatement({
-        actions: ['execute-api:Invoke'],
-        resources: [
-          executeApi('GET', 'admin/conversations/*/messages'),
-          executeApi('GET', 'admin/tasks/channel/*'),
-          executeApi('POST', 'admin/tasks/channel/*/cancel'),
-          executeApi('POST', 'admin/tasks/channel/*/owner'),
-          executeApi('GET', 'admin/tasks/assignee/*'),
-          executeApi('GET', 'admin/tasks/owned-by/*'),
-        ],
-      }),
       // Admin conversation attachment review: the BOUNDARY on the two attachment key families. The exchange's
       // per-request session policy narrows to one channel's keys and picks the prefix per capability.
       new iam.PolicyStatement({
@@ -606,9 +668,11 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
       }),
     ];
     const adminPlaneRole = new iam.Role(this, 'ExchangeRoleAdminPlane', {
+      // Named, so every admin handler recognizes this instance's admin plane by its name (lambda/src/lib/auth.ts).
+      roleName: ADMIN_PLANE_ROLE_NAME,
       assumedBy: new iam.PrincipalWithConditions(new iam.ArnPrincipal(exchangeRole.roleArn), adminPlaneTagPin),
       permissionsBoundary: permissionsBoundary(this, 'ExchangeRoleAdminPlaneBoundary',
-        'The boundary of the admin plane: view and moderation as the admin twin, the archive plane routes and the attachment reads', adminPlaneStatements()),
+        'The boundary of the admin plane: view and moderation as the admin twin, the archive plane routes and the attachment reads', [...adminPlaneStatements(), archiveBoundary]),
     });
     for (const st of adminPlaneStatements()) adminPlaneRole.addToPolicy(st);
     adminPlaneRole.assumeRolePolicy?.addStatements(new iam.PolicyStatement({
@@ -713,13 +777,13 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
         // Every issuer's entry: whether it declares `admin`, its subject claim, and its clearance source.
         TRUSTED_ISSUERS: trustedIssuersJsonValue,
         EXCHANGE_ATTACHMENTS_BUCKET_ARN_PARAM: SHARED_SSM.attachmentsBucketArn,
-        // `{id}` is substituted per vend with the channel id or the owner id the vend is scoped to.
-        EXCHANGE_EXECUTE_API_MESSAGES_ARN: executeApi('GET', 'admin/conversations/{id}/messages'),
-        EXCHANGE_EXECUTE_API_TASKS_READ_ARN: executeApi('GET', 'admin/tasks/channel/{id}'),
-        EXCHANGE_EXECUTE_API_TASKS_MANAGE_ARN: executeApi('POST', 'admin/tasks/channel/{id}/cancel'),
-        EXCHANGE_EXECUTE_API_TASKS_REASSIGN_ARN: executeApi('POST', 'admin/tasks/channel/{id}/owner'),
-        EXCHANGE_EXECUTE_API_TASKS_OWNED_BY_ARN: executeApi('GET', 'admin/tasks/owned-by/{id}'),
-        EXCHANGE_EXECUTE_API_TASKS_ASSIGNEE_ARN: executeApi('GET', 'admin/tasks/assignee/{id}'),
+        // Per vend, `{apiId}` is the id of the API that carried the request and `{id}` the channel or owner id the vend is scoped to.
+        EXCHANGE_EXECUTE_API_MESSAGES_ARN: sessionTemplate('GET', '/admin/conversations/{id}/messages'),
+        EXCHANGE_EXECUTE_API_TASKS_READ_ARN: sessionTemplate('GET', '/admin/tasks/channel/{id}'),
+        EXCHANGE_EXECUTE_API_TASKS_MANAGE_ARN: sessionTemplate('POST', '/admin/tasks/channel/{id}/cancel'),
+        EXCHANGE_EXECUTE_API_TASKS_REASSIGN_ARN: sessionTemplate('POST', '/admin/tasks/channel/{id}/owner'),
+        EXCHANGE_EXECUTE_API_TASKS_OWNED_BY_ARN: sessionTemplate('GET', '/admin/tasks/owned-by/{id}'),
+        EXCHANGE_EXECUTE_API_TASKS_ASSIGNEE_ARN: sessionTemplate('GET', '/admin/tasks/assignee/{id}'),
       },
       bundling: { minify: false, forceDockerBundling: false, externalModules: ['@aws-sdk/*'] },
     });
@@ -836,8 +900,15 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
     // THE CONSOLE LISTS PEOPLE FROM THE APPINSTANCEUSERS (ADR-058), and re-stamps a person's classification
     // tag on a clearance change: a stale tag on a principal is worse than an absent one.
     fn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['chime:ListAppInstanceUsers', 'chime:TagResource'],
+      actions: ['chime:ListAppInstanceUsers'],
       resources: [props.appInstanceArn, `${props.appInstanceArn}/user/*`],
+    }));
+    // The re-stamp writes the `classification` key and no other, on a person's identity and nothing else.
+    fn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'RestampsOnlyTheClassification',
+      actions: ['chime:TagResource'],
+      resources: [`${props.appInstanceArn}/user/*`],
+      conditions: { 'ForAllValues:StringEquals': { 'aws:TagKeys': ['classification'] } },
     }));
     fn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['ssm:GetParameter'],
@@ -967,16 +1038,31 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
       ],
     })) fn.addToRolePolicy(stmt);
     // Clean up a demoted admin's orphaned `${personId}-admin` identity, and drop the elevation.
+    // Dropping an elevation may name any identity (a stray one included); deleting one is the twin's alone, so a
+    // misfire of the loop cannot delete a person's own chat identity.
     fn.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['chime:DeleteAppInstanceAdmin', 'chime:DeleteAppInstanceUser'],
+      sid: 'DropsAnElevation',
+      actions: ['chime:DeleteAppInstanceAdmin'],
       resources: [props.appInstanceArn, `${props.appInstanceArn}/user/*`],
+    }));
+    fn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'DeletesOnlyAnAdminTwin',
+      actions: ['chime:DeleteAppInstanceUser'],
+      resources: [`${props.appInstanceArn}/user/*-admin`],
+    }));
+    // The service admin's id also ends in the twin suffix; the sync keeps it, and IAM keeps it too.
+    fn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'KeepsTheServiceAdmin',
+      effect: iam.Effect.DENY,
+      actions: ['chime:DeleteAppInstanceUser', 'chime:DeleteAppInstanceAdmin'],
+      resources: [serviceAdminArnOf(props.appInstanceArn)],
     }));
     // ListAppInstanceAdmins authorizes against TWO resources, and needs both: the app instance and a
     // wildcard covering the identities it would return. Its own statement, so the wildcard applies to the
     // LIST call alone.
     fn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['chime:ListAppInstanceAdmins'],
-      resources: [props.appInstanceArn, `arn:aws:chime:${this.region}:${this.account}:app-instance/*/user/*`],
+      resources: [props.appInstanceArn, `${props.appInstanceArn}/user/*`],
     }));
     fn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['ssm:GetParameter'],
@@ -1003,6 +1089,145 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
     });
   }
 
+  /**
+   * THE CONVERSATION ARCHIVE, READ THROUGH ATHENA: the workgroup, the catalog, the archive bucket and its key, and the
+   * workgroup's results as the only write. One definition for every admin reader of the archive.
+   */
+  private archiveReadStatements(): iam.PolicyStatement[] {
+    return [
+      new iam.PolicyStatement({
+        // Stop: a query still running at its caller's deadline is stopped rather than left scanning (`runArchiveQuery`).
+        actions: ['athena:StartQueryExecution', 'athena:GetQueryExecution', 'athena:GetQueryResults', 'athena:StopQueryExecution'],
+        resources: [`arn:aws:athena:${this.region}:${this.account}:workgroup/${ATHENA_WORKGROUP_NAME}`],
+      }),
+      new iam.PolicyStatement({
+        actions: ['glue:GetTable', 'glue:GetPartitions', 'glue:GetDatabase'],
+        resources: [
+          `arn:aws:glue:${this.region}:${this.account}:catalog`,
+          `arn:aws:glue:${this.region}:${this.account}:database/${ANALYTICS_DB_NAME}`,
+          `arn:aws:glue:${this.region}:${this.account}:table/${ANALYTICS_DB_NAME}/*`,
+        ],
+      }),
+      // THE WHOLE ARCHIVE, FOR ATHENA, ON EVERY ROUTE. The archive is partitioned by event type and date, and one
+      // object holds the records of every assistant that spoke in that window, so no key prefix names an assistant
+      // and a team route's read cannot be narrowed here. A team read is bound to its assistant where the rows are:
+      // the gateway narrows the console session to `.../assistants/{owned}/...`, the handler re-reads ownership
+      // (`requireOwnedAssistant`), and the query selects that assistant's conversations and membership periods.
+      new iam.PolicyStatement({
+        actions: ['s3:GetBucketLocation', 's3:GetObject', 's3:ListBucket'],
+        resources: [
+          `arn:aws:s3:::${ANALYTICS_PREFIX}-conversation-archive-${this.account}-${this.region}`,
+          `arn:aws:s3:::${ANALYTICS_PREFIX}-conversation-archive-${this.account}-${this.region}/*`,
+        ],
+      }),
+      // Its only write is Athena's results, which the workgroup puts under `athena-results/`: a reader
+      // never writes the conversation record.
+      new iam.PolicyStatement({
+        actions: ['s3:PutObject'],
+        resources: [`arn:aws:s3:::${ANALYTICS_PREFIX}-conversation-archive-${this.account}-${this.region}/athena-results/*`],
+      }),
+      // The archive bucket is SSE-KMS on the archive's key: the key is used through S3 alone, and only for the
+      // archive bucket's objects, which S3 names in the encryption context of every call it makes for them
+      // (the bucket with an S3 Bucket Key, the object without one).
+      new iam.PolicyStatement({
+        sid: 'UseTheArchiveKeyForTheArchiveOnly',
+        actions: ['kms:Decrypt', 'kms:GenerateDataKey'],
+        resources: ['*'],
+        conditions: {
+          StringEquals: { 'kms:ViaService': `s3.${this.region}.amazonaws.com` },
+          StringLike: {
+            'kms:EncryptionContext:aws:s3:arn': [
+              `arn:aws:s3:::${ANALYTICS_PREFIX}-conversation-archive-${this.account}-${this.region}`,
+              `arn:aws:s3:::${ANALYTICS_PREFIX}-conversation-archive-${this.account}-${this.region}/*`,
+            ],
+          },
+        },
+      }),
+    ];
+  }
+
+  // ── THE CONSOLE'S MEETINGS, when `meetings` is declared (`admin-meetings.ts`) ──────────────────────────────────
+  //
+  // Every meeting figure, folded from the recorded events: the archive's `meeting_events` family through Athena, or the
+  // Aurora projection through the data plane. Whether a meeting runs now is read from its conversation's record and
+  // confirmed with Amazon Chime SDK; ending one for everyone (`end-meetings`) writes the access log first and asks the
+  // meetings function's run entry to end it, so the console holds no meeting write of its own.
+  private adminMeetings(props: AdminServicesStackProps, adminAppUrl: string, classificationRoleScopes: string): void {
+    const shared = resolveSharedSSM(this);
+    const meetingMaxMinutes = String(this.node.tryGetContext('meetingMaxMinutes') ?? '').trim();
+    // The thresholds a meeting's poor stretches are judged against (`meeting-experience.ts`): a JSON object in
+    // `deploy.config.json`, forwarded as given; absent, the declared defaults.
+    const thresholdsContext = this.node.tryGetContext('meetingExperienceThresholds');
+    const meetingExperienceThresholds = thresholdsContext && typeof thresholdsContext === 'object'
+      ? JSON.stringify(thresholdsContext) : thresholdsText(String(thresholdsContext ?? '').trim());
+    const fn = new lambdaNodeJs.NodejsFunction(this, 'AdminMeetingsFunction', {
+      entry: './lambda/src/admin-meetings.ts',
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      // Served by the HTTP API, whose integration answers within 30 s: the read is bounded inside that (`READ_BUDGET_MS`),
+      // and a window too large to read in time is answered as incomplete.
+      timeout: cdk.Duration.seconds(29),
+      memorySize: 512,
+      environment: {
+        ...adminAuthEnv(this),
+        ADMIN_IAM_ENFORCEMENT: 'true',
+        APP_INSTANCE_ARN: props.appInstanceArn,
+        ATHENA_WORKGROUP: ATHENA_WORKGROUP_NAME,
+        ATHENA_DATABASE: ANALYTICS_DB_NAME,
+        ALLOWED_ORIGIN: adminAppUrl,
+        AURORA_DATA_PLANE_ARN_PARAM: SHARED_SSM.auroraDataPlaneArn,
+        // A SCOPED ROLE ENDS ONLY ITS CLASSIFICATIONS' MEETINGS: the signed role's scope (`caller-scope.ts`).
+        CLASSIFICATION_ROLE_SCOPES: classificationRoleScopes,
+        CHANNEL_CONTEXT_TABLE: shared.channelContextName,
+        ACCESS_LOG_TABLE: props.accessLogTable.tableName,
+        // THE RUN ENTRY OF THE MEETING'S RECORDED CLASSIFICATION, its name with the classification filled in.
+        MEETING_RUN_FUNCTION_PATTERN: CAPABILITY_RESOURCES.meetingRun('{classification}'),
+        // A MEETING'S TRANSCRIPT, read under `view-events` with a stated reason, from the conversation store.
+        TRANSCRIPT_BUCKET: cdk.Fn.select(5, cdk.Fn.split(':', props.attachmentsBucketArn)),
+        // The deployment's longest meeting (`meetingMaxMinutes`), so a meeting still within it is never folded as abandoned.
+        ...(meetingMaxMinutes ? { MEETING_MAX_MINUTES: meetingMaxMinutes } : {}),
+        // The deployment's experience thresholds (`meetingExperienceThresholds`), where it tunes them.
+        ...(meetingExperienceThresholds ? { MEETING_EXPERIENCE_THRESHOLDS: meetingExperienceThresholds } : {}),
+      },
+      bundling: { minify: false, forceDockerBundling: false },
+    });
+    for (const st of this.archiveReadStatements()) fn.addToRolePolicy(st);
+    // THE TRANSCRIPT FAMILY ONLY (`meeting-transcript.ts`): each meeting's written transcript, and the listing that lets a
+    // meeting with none be answered as having none.
+    fn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadAMeetingsTranscript', actions: ['s3:GetObject'], resources: [`${props.attachmentsBucketArn}/${TRANSCRIPTS_FAMILY}*/*.md`] }));
+    fn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'KnowATranscriptIsMissing', actions: ['s3:ListBucket'], resources: [props.attachmentsBucketArn],
+      conditions: { StringLike: { 's3:prefix': [`${TRANSCRIPTS_FAMILY}*`] } },
+    }));
+    // WHETHER A MEETING RUNS NOW: its conversation's record, read only, and the service's own answer, on meetings only.
+    fn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadAMeetingsRecord', actions: ['dynamodb:GetItem'], resources: [shared.channelContextArn] }));
+    fn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ConfirmAMeetingRuns',
+      actions: ['chime:GetMeeting'],
+      resources: [`arn:${this.partition}:chime:${this.region}:${this.account}:meeting/*`],
+    }));
+    // ENDING ONE FOR EVERYONE: the access log, write-once, and the run entry of the meeting's classification by its fixed
+    // name. An admin spans every classification, so every classification's run entry, and each entry refuses a conversation
+    // of any classification but its own.
+    fn.addToRolePolicy(new iam.PolicyStatement({ sid: 'RecordAnEnd', actions: ['dynamodb:PutItem'], resources: [props.accessLogTable.tableArn] }));
+    fn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'EndAMeetingThroughItsOwnFunction',
+      actions: ['lambda:InvokeFunction'],
+      resources: [`arn:${this.partition}:lambda:${this.region}:${this.account}:function:${CAPABILITY_RESOURCES.meetingRun('*')}`],
+      // The name pattern also matches an instance whose prefix starts with this one, so the Instance tag bounds it.
+      conditions: ownInstanceFunctionsOnly(),
+    }));
+    fn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['ssm:GetParameter'],
+      resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SHARED_SSM.auroraDataPlaneArn}`],
+    }));
+    if (props.aurora) fn.addToRolePolicy(new iam.PolicyStatement({ actions: ['lambda:InvokeFunction'], resources: [props.aurora.dataPlaneLambdaArn] }));
+    this.routes.push(adminRoute('admin-conversations', 'GET', '/admin/meetings', fn, { capability: 'meetings' }));
+    this.routes.push(adminRoute('admin-conversations', 'GET', '/admin/meetings/{meetingId}', fn, { capability: 'meetings' }));
+    this.routes.push(adminRoute('admin-conversations', 'POST', '/admin/meetings/{meetingId}/end', fn, { capability: 'meetings' }));
+    this.routes.push(adminRoute('admin-conversations', 'GET', '/admin/meetings/{meetingId}/transcript', fn, { capability: 'meetings' }));
+  }
+
   // ── THE ADMIN CONVERSATION READ PLANE AND THE OPERATOR TASK ROUTES ─────────────────────────────────
   //
   // List, message content and membership history over the archive, and the task routes (ADR-033). The
@@ -1019,31 +1244,7 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
       inlinePolicies: {
         AthenaQuery: new iam.PolicyDocument({
           statements: [
-            new iam.PolicyStatement({
-              actions: ['athena:StartQueryExecution', 'athena:GetQueryExecution', 'athena:GetQueryResults'],
-              resources: [`arn:aws:athena:${this.region}:${this.account}:workgroup/${ATHENA_WORKGROUP_NAME}`],
-            }),
-            new iam.PolicyStatement({
-              actions: ['glue:GetTable', 'glue:GetPartitions', 'glue:GetDatabase'],
-              resources: [
-                `arn:aws:glue:${this.region}:${this.account}:catalog`,
-                `arn:aws:glue:${this.region}:${this.account}:database/${ANALYTICS_DB_NAME}`,
-                `arn:aws:glue:${this.region}:${this.account}:table/${ANALYTICS_DB_NAME}/*`,
-              ],
-            }),
-            new iam.PolicyStatement({
-              actions: ['s3:GetBucketLocation', 's3:GetObject', 's3:ListBucket', 's3:PutObject'],
-              resources: [
-                `arn:aws:s3:::${ANALYTICS_PREFIX}-conversation-archive-${this.account}-${this.region}`,
-                `arn:aws:s3:::${ANALYTICS_PREFIX}-conversation-archive-${this.account}-${this.region}/*`,
-              ],
-            }),
-            // The archive bucket is SSE-KMS on the archive's key: decrypt scoped to KMS-via-S3.
-            new iam.PolicyStatement({
-              actions: ['kms:Decrypt', 'kms:GenerateDataKey'],
-              resources: ['*'],
-              conditions: { StringEquals: { 'kms:ViaService': `s3.${this.region}.amazonaws.com` } },
-            }),
+            ...this.archiveReadStatements(),
           ],
         }),
       },
@@ -1128,6 +1329,61 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
     // TWO CROSS-CONVERSATION READS, because a task has two principal roles (ADR-024 D8).
     conversations('GET', '/admin/tasks/assignee/{assigneeId}', tasksFn);
     conversations('GET', '/admin/tasks/owned-by/{ownerPersonId}', tasksFn);
+
+    // ── EVENT TRIGGERS (WT121): AN AWS EVENT STARTS A WORKFLOW IN A TEAM'S ROOM ─────────────────────────
+    //
+    // THE VERSION NAMES A WORKFLOW AND THIS MAKES THE AWS RESOURCES, each write bounded to the deployment's own: rules under its
+    // trigger prefix, whose one target may only be a relay to a router, and `event-rule:` tags on a channel of this instance.
+    const triggersFn = new lambdaNodeJs.NodejsFunction(this, 'EventTriggersFn', {
+      entry: path.join(__dirname, '../../lambda/src/event-triggers-api.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: cdk.Duration.seconds(29),
+      memorySize: 256,
+      environment: {
+        ALLOWED_ORIGINS: adminAppUrl,
+        ...adminAuthEnv(this),
+        ADMIN_IAM_ENFORCEMENT: 'true',
+        APP_INSTANCE_ARN: props.appInstanceArn,
+        EVENT_TRIGGER_RULE_PREFIX: `${STACK_PREFIX}-`,
+        TYPED_CREATOR_NAME_PATTERN: typedCreatorName('{classification}'),
+        EVENT_TRIGGER_RELAY_NAME_PATTERN: `${STACK_PREFIX}Assistants-{classification}-EventTriggerRelay`,
+        EVENT_POLICY_PARAM: `${SSM_ROOT}/event-triggers/policy`,
+        // A WATCH RULE ON A PLATFORM SOURCE MATCHES THIS INSTANCE (DESIGN-EVENT-TARGETS section 4), as its opener's rule does.
+        AE_INSTANCE_NAME: INSTANCE_NAME,
+      },
+      bundling: { minify: false, forceDockerBundling: false },
+    });
+    // THIS INSTANCE'S TRIGGER RULES ONLY: the separator after the prefix keeps a look-alike instance's rules outside the grant.
+    // AND ITS WATCH RULES (DESIGN-EVENT-TARGETS section 4): a watched conversation's trigger, whose binding is the rule's own tags.
+    const triggerRules = [`arn:aws:events:${this.region}:${this.account}:rule/${STACK_PREFIX}-*-trigger-*`, `arn:aws:events:${this.region}:${this.account}:rule/${STACK_PREFIX}-*-watch-*`];
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'WriteOnlyTriggerRules', actions: ['events:PutRule', 'events:DeleteRule', 'events:RemoveTargets', 'events:TagResource'], resources: triggerRules }));
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'TargetOnlyARelay', actions: ['events:PutTargets'], resources: triggerRules,
+      conditions: { ArnLike: { 'events:TargetArn': `arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Assistants-*-EventTriggerRelay` } },
+    }));
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadARuleToCopy', actions: ['events:DescribeRule'], resources: [`arn:aws:events:${this.region}:${this.account}:rule/*`] }));
+    // A WATCH RULE IS LISTED BY ITS OWN TAGS AND ITS TARGET'S KEY PATH, on this instance's watch rules only, and a team
+    // room's trigger by the `assistant` tag it was attached for, on this instance's trigger rules only.
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadWatchRules', actions: ['events:ListTagsForResource', 'events:ListTargetsByRule'], resources: [triggerRules[1]] }));
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadTriggerRuleTags', actions: ['events:ListTagsForResource'], resources: [triggerRules[0]] }));
+    // LIST IS EVALUATED ON THE REGISTRY'S OWN SCHEMA PATH (`schema/aws.events`, no name after it), DESCRIBE ON ONE SCHEMA's.
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadEventTypes', actions: ['schemas:ListSchemas', 'schemas:DescribeSchema'], resources: ['aws.events', 'discovered-schemas'].flatMap((r) => [`arn:aws:schemas:${this.region}:${this.account}:registry/${r}`, `arn:aws:schemas:${this.region}:${this.account}:schema/${r}`, `arn:aws:schemas:${this.region}:aws:schema/${r}/*`, `arn:aws:schemas:${this.region}:${this.account}:schema/${r}/*`]) }));
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadTeamRoomTags', actions: ['chime:ListTagsForResource'], resources: [`${props.appInstanceArn}/channel/team-*`] }));
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'TagOnlyEventRules', actions: ['chime:TagResource', 'chime:UntagResource'], resources: [`${props.appInstanceArn}/channel/team-*`],
+      conditions: { 'ForAllValues:StringLike': { 'aws:TagKeys': ['event-rule:*'] } },
+    }));
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'OpenTheTeamRoom', actions: ['lambda:InvokeFunction'], resources: [`arn:${this.partition}:lambda:${this.region}:${this.account}:function:${typedCreatorName('*')}`], conditions: ownInstanceFunctions(EVERY_CLASSIFICATION) }));
+    // LISTING RULES TAKES NO RESOURCE: AWS evaluates `events:ListRules` on `*`, so a rule ARN never matches. It reads names only.
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'CountTriggerRules', actions: ['events:ListRules'], resources: ['*'] }));
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadAndWriteTheEventPolicy', actions: ['ssm:GetParameter', 'ssm:PutParameter'], resources: [cdk.Arn.format({ service: 'ssm', resource: 'parameter', resourceName: `${SSM_ROOT}/event-triggers/policy`.replace(/^\//, '') }, this)] }));
+    conversations('GET', '/admin/event-policy', triggersFn);
+    conversations('POST', '/admin/event-policy', triggersFn);
+    conversations('GET', '/admin/event-types', triggersFn);
+    conversations('GET', '/admin/event-triggers/{typeKey}/{classification}', triggersFn);
+    conversations('POST', '/admin/event-triggers/{typeKey}/{classification}', triggersFn);
+    conversations('POST', '/admin/event-triggers/{typeKey}/{classification}/{ruleId}/remove', triggersFn);
 
     conversations('GET', '/admin/conversations');
     // Message content hangs off the CONVERSATION, so the id is in the path and the vended session policy

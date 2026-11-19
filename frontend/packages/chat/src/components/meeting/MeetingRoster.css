@@ -1,0 +1,95 @@
+/* THE MEETING WINDOW'S ROSTER, at the top of the right column (MeetingChatPanel), above the chat panel. No frame of its
+   own: the column's divider beneath it separates it from the chat. */
+.ae-meeting-roster { color: var(--text-primary, #09090B); font-size: var(--text-sm, 0.875rem); border: none; border-radius: 0; box-shadow: none; }
+.ae-meeting-roster-top { display: flex; align-items: center; gap: 4px; padding-right: 8px; position: relative; }
+.ae-meeting-roster-top > .ae-meeting-roster-head { flex: 1 1 auto; min-width: 0; }
+.ae-meeting-roster-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 8px 12px; border: none; border-radius: 0; box-shadow: none; background: transparent; color: inherit; font: inherit; cursor: pointer; text-align: left;
+}
+.ae-meeting-roster-head:hover { background: var(--surface-100, #F4F4F5); }
+.ae-meeting-roster-head:focus-visible { outline: 2px solid var(--focus-ring, #7C3AED); outline-offset: -2px; }
+.ae-meeting-roster-title { font-weight: 600; }
+.ae-meeting-roster-count { color: var(--text-secondary, #71717A); }
+.ae-meeting-roster-chevron { margin-left: auto; color: var(--text-secondary, #71717A); }
+.ae-meeting-roster-body { padding: 0 8px 8px; }
+.ae-meeting-roster-list { list-style: none; margin: 0; padding: 0; }
+.ae-meeting-roster-subhead {
+  padding: 8px 4px 4px; color: var(--text-secondary, #71717A);
+  font-size: var(--text-xs, 0.75rem); text-transform: uppercase; letter-spacing: 0.04em;
+}
+.ae-meeting-roster-row { display: flex; align-items: center; gap: 8px; padding: 4px; border-radius: 6px; min-height: 28px; }
+.ae-meeting-roster-row--away .ae-meeting-roster-name { color: var(--text-secondary, #71717A); }
+.ae-meeting-roster-row--speaking { box-shadow: inset 2px 0 0 var(--focus-ring, #7C3AED); }
+.ae-meeting-roster-avatar {
+  flex: 0 0 24px; width: 24px; height: 24px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--surface-200, #E4E4E7); color: var(--text-primary, #09090B); font-size: var(--text-xs, 0.75rem); font-weight: 600;
+}
+.ae-meeting-roster-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ae-meeting-roster-you { color: var(--text-secondary, #71717A); }
+.ae-meeting-roster-state { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; justify-content: flex-end; }
+.ae-meeting-roster-tag {
+  padding: 1px 6px; border-radius: 999px; font-size: var(--text-xs, 0.75rem);
+  background: var(--surface-100, #F4F4F5); color: var(--text-secondary, #71717A);
+  border: 1px solid var(--divider-strong, #8F8F99);
+}
+.ae-meeting-roster-tag--on { color: var(--text-primary, #09090B); border-color: var(--focus-ring, #7C3AED); }
+.ae-meeting-roster-tag--warn { color: var(--text-primary, #09090B); border-color: var(--warning, #EAB308); }
+
+/* A host's controls: everyone's, above the list, and each person's, at the end of their row. */
+/* Everyone's controls, behind the host's icon at the top of the roster. */
+.ae-meeting-roster-hostwrap { flex: none; display: contents; }
+.ae-meeting-roster-hostbtn, .ae-meeting-roster-more {
+  display: inline-grid; place-items: center; width: 32px; height: 32px; padding: 0; cursor: pointer;
+  border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--text-secondary, #71717A);
+}
+.ae-meeting-roster-more { width: 28px; height: 28px; }
+.ae-meeting-roster-hostbtn:hover, .ae-meeting-roster-more:hover, .ae-meeting-roster-hostbtn--on {
+  background: var(--surface-100, #F4F4F5); color: var(--text-primary, #09090B); border-color: var(--control-border-strong, #71717A);
+}
+.ae-meeting-roster-hostbtn:focus-visible, .ae-meeting-roster-more:focus-visible { outline: 2px solid var(--focus-ring, #7C3AED); outline-offset: 1px; }
+.ae-meeting-roster-hostbar { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 8px; }
+.ae-meeting-roster-menu {
+  position: fixed; z-index: 1300; display: grid; gap: 4px; padding: 6px; min-width: 180px; max-width: 200px;
+  border-radius: 8px; border: 1px solid var(--control-border-strong, #71717A); background: var(--surface-0, #FFFFFF);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+}
+.ae-meeting-roster-more-wrap { position: relative; display: inline-flex; }
+.ae-meeting-roster-menu-item {
+  text-align: left; padding: 6px 10px; border: none; border-radius: 6px; background: transparent; color: var(--text-primary, #09090B);
+  font: inherit; cursor: pointer; white-space: nowrap;
+}
+.ae-meeting-roster-menu-item:hover, .ae-meeting-roster-menu-item:focus-visible { background: var(--surface-100, #F4F4F5); outline: none; }
+/* A member's name mentions them in the chat. */
+.ae-meeting-roster-who {
+  border: none; background: transparent; padding: 0; margin: 0; font: inherit; color: inherit; text-align: left; cursor: pointer;
+}
+.ae-meeting-roster-who:hover { text-decoration: underline; }
+.ae-meeting-roster-who:focus-visible { outline: 2px solid var(--focus-ring, #7C3AED); outline-offset: 1px; border-radius: 4px; }
+.ae-meeting-roster-ctl {
+  min-height: 28px; padding: 2px 10px; border-radius: 6px; border: 1px solid var(--control-border-strong, #71717A); background: var(--btn-secondary-bg, #FFFFFF);
+  color: var(--text-primary, #09090B); font: inherit; font-size: var(--text-xs, 0.75rem); cursor: pointer;
+}
+.ae-meeting-roster-ctl:hover { background: var(--surface-100, #F4F4F5); }
+.ae-meeting-roster-ctl:focus-visible { outline: 2px solid var(--focus-ring, #7C3AED); outline-offset: 1px; }
+.ae-meeting-roster-ctl--danger { border-color: var(--danger-text, #B91C1C); }
+.ae-meeting-roster-error { margin: 0 4px 6px; color: var(--danger-text, #B91C1C); font-size: var(--text-xs, 0.75rem); }
+/* A person asking to speak, shown to a host with Allow and Dismiss. */
+.ae-meeting-roster-ask { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 4px 6px; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--focus-ring, #7C3AED); font-size: var(--text-xs, 0.75rem); }
+.ae-meeting-roster-ask > span { flex: 1 1 auto; }
+
+/* THE ROSTER AS A PANE on a phone-width screen: 16px gutters, and every control a finger presses is 44px at the least. */
+@media (max-width: 640px), (max-height: 480px) and (orientation: landscape) {
+  .ae-meeting-roster-top { padding-right: 16px; }
+  .ae-meeting-roster-head { min-height: 44px; padding: 8px 16px; }
+  .ae-meeting-roster-body { padding: 0 16px 16px; }
+  .ae-meeting-roster-hostbar { padding: 0 16px 8px; }
+  /* A row wraps: the person's name keeps its line, and what is said of them and done to them follows beneath. */
+  .ae-meeting-roster-row { min-height: 44px; flex-wrap: wrap; }
+  .ae-meeting-roster-name { flex: 1 1 12ch; }
+  .ae-meeting-roster-state { margin-left: auto; }
+  .ae-meeting-roster-hostbtn, .ae-meeting-roster-more { width: 44px; height: 44px; flex: none; }
+  .ae-meeting-roster-who { min-height: 44px; min-width: 44px; }
+  .ae-meeting-roster-ctl, .ae-meeting-roster-menu-item { min-height: 44px; }
+}

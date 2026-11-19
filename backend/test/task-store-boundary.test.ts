@@ -100,6 +100,10 @@ function classificationTemplate(): Template {
       appInstanceArn: APP_INSTANCE_ARN,
       attachmentsBucketName: 'agent-echelon-attachments-test',
       attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
+      companyBucketName: 'agent-echelon-company-test',
+      companyBucketArn: 'arn:aws:s3:::agent-echelon-company-test',
+      profileBucketName: 'agent-echelon-profile-test',
+      profileBucketArn: 'arn:aws:s3:::agent-echelon-profile-test',
     } as never),
   );
 }

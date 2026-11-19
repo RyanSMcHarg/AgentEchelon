@@ -65,7 +65,16 @@ const awsAsync = async (args) => {
 
 const bots = aws(['chime-sdk-identity', 'list-app-instance-bots', '--app-instance-arn', env.VITE_APP_INSTANCE_ARN]).AppInstanceBots ?? [];
 if (!bots.length) { console.error('no AppInstanceBot to test against'); process.exit(2); }
-const bot = bots[0].AppInstanceBotArn;
+// A MEMBER CLASSIFICATION'S ASSISTANT, never the admin plane's. The admin plane's AppInstanceBots are not made by
+// a classification provisioner and no conversation is created at the admin plane, so testing against one fails every
+// allow-side control for a reason that is not the one it names (the first AppInstanceBot listed can be the admin
+// assistant's). DENY_TEST_BOT_ARN names one instead.
+const classOf = (arn) => (aws(['chime-sdk-identity', 'list-tags-for-resource', '--resource-arn', arn]).Tags ?? [])
+  .find((t) => t.Key === 'classification')?.Value;
+const ADMIN_PLANE = new Set((process.env.DENY_TEST_ADMIN_PLANE || 'admin').split(','));
+const bot = process.env.DENY_TEST_BOT_ARN
+  || bots.map((b) => b.AppInstanceBotArn).find((arn) => { const c = classOf(arn); return c && !ADMIN_PLANE.has(c); });
+if (!bot) { console.error('no member-classification assistant (AppInstanceBot) to test against'); process.exit(2); }
 
 const stackRoles = PREFIXES ? null : await (async () => {
   const cfn = new CloudFormationClient({ region: REGION });
@@ -85,19 +94,24 @@ const decide = async (arn, action, key, value) => (await awsAsync([
   ...(value ? [`ContextKeyName=aws:RequestTag/${key},ContextKeyValues=${value},ContextKeyType=string`] : []),
 ])).EvaluationResults[0].EvalDecision;
 
-// WHICH ASSISTANT A BOT IS: `assistant` and `role`, written the way the provisioner writes them - beside
-// the bot's own classification, on a bot already carrying it - so a correctly scoped provisioner is
-// allowed and the check cannot pass merely because nothing could tag at all.
+// WHICH ASSISTANT AN AppInstanceBot IS: `assistant` and `role`, written the way the provisioner writes them - beside
+// its own classification, on one already carrying it, from a session tagged with that classification, and stamped
+// `provisioner = runtime` (ADR-048: one role, `RuntimeAssistantProvisionerRole`, assumed per
+// classification) - so the one correctly scoped provisioner is allowed and the check cannot pass merely because
+// nothing could tag at all.
 const botClass = (aws(['chime-sdk-identity', 'list-tags-for-resource', '--resource-arn', bot]).Tags ?? [])
   .find((t) => t.Key === 'classification')?.Value;
 if (!botClass) { console.error(`${bot} carries no classification tag to test against`); process.exit(2); }
 const decideIdentity = async (arn, key) => (await awsAsync([
   'iam', 'simulate-principal-policy', '--policy-source-arn', arn, '--action-names', 'chime:TagResource',
   '--resource-arns', bot, '--context-entries', JSON.stringify([
-    { ContextKeyName: 'aws:TagKeys', ContextKeyValues: ['classification', key], ContextKeyType: 'stringList' },
+    { ContextKeyName: 'aws:TagKeys', ContextKeyValues: ['classification', key, 'provisioner'], ContextKeyType: 'stringList' },
     { ContextKeyName: 'aws:RequestTag/classification', ContextKeyValues: [botClass], ContextKeyType: 'string' },
     { ContextKeyName: `aws:RequestTag/${key}`, ContextKeyValues: ['another-assistant'], ContextKeyType: 'string' },
+    { ContextKeyName: 'aws:RequestTag/provisioner', ContextKeyValues: ['runtime'], ContextKeyType: 'string' },
     { ContextKeyName: 'aws:ResourceTag/classification', ContextKeyValues: [botClass], ContextKeyType: 'string' },
+    { ContextKeyName: 'aws:ResourceTag/provisioner', ContextKeyValues: ['runtime'], ContextKeyType: 'string' },
+    { ContextKeyName: 'aws:PrincipalTag/classification', ContextKeyValues: [botClass], ContextKeyType: 'string' },
   ]),
 ])).EvaluationResults[0].EvalDecision;
 const identityWriters = { assistant: [], role: [] };
@@ -153,7 +167,7 @@ if (writers.length !== 1 || !/AssistantOwnershipRole/.test(writers[0] ?? '')) {
 }
 if (tagging === 0) failures.push('no role may tag a bot at all, so the provisioners can no longer classify an assistant');
 for (const [key, who] of Object.entries(identityWriters)) {
-  const others = who.filter((n) => !/CreateBot/i.test(n));
+  const others = who.filter((n) => !/RuntimeAssistantProvisioner/i.test(n));
   if (others.length) failures.push(`roles other than a provisioner that may write ${key}: ${others.join(', ')}`);
   if (who.length === 0) failures.push(`no provisioner may write ${key} on a ${botClass} bot, so a new assistant could not be identified`);
 }

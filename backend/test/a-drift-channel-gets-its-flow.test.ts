@@ -40,6 +40,17 @@ function resourcesFor(action: string): string[] {
     .filter((r): r is string => typeof r === 'string');
 }
 
+describe('the grant for reading whether a channel has its flow', () => {
+  // Completing a team room reads the channel first (`completeTeamRoom`), so it needs `chime:DescribeChannel`. Like the
+  // associate, it is authorized on the channel and the bearer.
+  it('reaches the channel, by its classification, and the service admin bearing it', () => {
+    const described = resourcesFor('chime:DescribeChannel');
+    expect(described.some((r) => r.includes('/channel/'))).toBe(true);
+    expect(described).toContain(SERVICE_ADMIN);
+    expect(described.some((r) => r.includes('/bot/'))).toBe(false);
+  });
+});
+
 describe('the grant for associating a channel flow', () => {
   const resources = resourcesFor('chime:AssociateChannelFlow');
 

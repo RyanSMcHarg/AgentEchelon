@@ -136,11 +136,11 @@ describe('resolveReplyCostUsd (L0 cost column, D4) — null-honesty + coercion',
   });
 
   it('prices an image-gen turn per-image (0 tokens) from avg_image_count', () => {
-    // gpt-image-1 has no text-catalog rate; the image path prices it per image
-    // (IMAGE_GEN_RATE_USD_PER_IMAGE.openai_gpt_image_1 = 0.04). avg 2 images => 0.08.
+    // gpt-image-2 has no text-catalog rate; the image path prices it per image
+    // (IMAGE_GEN_RATE_USD_PER_IMAGE.openai_gpt_image_2 = 0.04). avg 2 images => 0.08.
     expect(
       resolveReplyCostUsd({
-        dominant_model: 'gpt-image-1',
+        dominant_model: 'gpt-image-2',
         avg_input_tokens: '0',
         avg_output_tokens: '0',
         avg_image_count: '2',
@@ -184,7 +184,7 @@ describe('Aurora analytics-query: experiment_results carries a battle-scoped eff
           turn_count: '6', avg_score: '84', avg_input_tokens: '1000', avg_output_tokens: '500', avg_image_count: null,
         },
         {
-          experiment_id: 'exp-battle', variant_id: 'treatment', model_name: 'gpt-image-1',
+          experiment_id: 'exp-battle', variant_id: 'treatment', model_name: 'gpt-image-2',
           turn_count: '4', avg_score: null, avg_input_tokens: '0', avg_output_tokens: '0', avg_image_count: '2',
         },
       ],
@@ -244,7 +244,7 @@ describe('Aurora analytics-query: experiment_results carries a battle-scoped eff
     // Text variant: priced on tokens (non-null, positive); relevance passes through.
     expect(ctrl).toMatchObject({ turn_count: 6, avg_score: 84 });
     expect(ctrl.avg_cost_usd).toBeGreaterThan(0);
-    // Image variant: PER-IMAGE cost from avg_image_count (gpt-image-1 @ $0.04 × 2 = $0.08, 0 tokens),
+    // Image variant: PER-IMAGE cost from avg_image_count (gpt-image-2 @ $0.04 × 2 = $0.08, 0 tokens),
     // and an unscored variant reports a null quality (honesty contract), not 0.
     expect(trt.avg_score).toBeNull();
     expect(trt.avg_cost_usd).toBeCloseTo(0.08, 6);
@@ -538,6 +538,14 @@ describe('Aurora analytics-query — L2 drills (intent_exchanges + task_details 
     expect(sql).toMatch(/\$3::varchar IS NULL OR COALESCE\(task_type, intent\) = \$3/);
     expect(args[2]).toBe('report_generation');
   });
+
+  it('task_details names each task\'s machine and the assistant whose turns worked it, so an unfiltered row still links to its editor', async () => {
+    mockDbQuery.mockResolvedValueOnce({ rows: [] });
+    await handler(postEvent({ queryType: 'task_details', intent: 'report_generation', dateRange: VALID_RANGE }));
+    const [sql] = mockDbQuery.mock.calls[0];
+    expect(sql).toMatch(/\(ARRAY_AGG\(task_type ORDER BY created_at ASC\) FILTER \(WHERE task_type IS NOT NULL\)\)\[1\] AS task_type,/);
+    expect(sql).toMatch(/\(ARRAY_AGG\(assistant ORDER BY created_at ASC\) FILTER \(WHERE assistant IS NOT NULL\)\)\[1\] AS assistant,/);
+  });
 });
 
 describe('Aurora is a strict superset — no metric is Athena-only', () => {
@@ -812,6 +820,8 @@ describe('experiment_results — the rollup resolves one evaluation per exchange
     scored_count: '40',
     avg_score: '80',
     score_sd: '10',
+    // Every turn recorded its duration and tokens unless a test says otherwise.
+    timed_count: over.exchange_count ?? '40',
     avg_total_ms: '1200',
     latency_sd: '300',
     p95_total_ms: '1800',
@@ -819,6 +829,7 @@ describe('experiment_results — the rollup resolves one evaluation per exchange
     avg_output_tokens: '500',
     avg_tokens: '1500',
     tokens_sd: '200',
+    tokened_count: over.exchange_count ?? '40',
     avg_image_count: null,
     compliance_rate: '100',
     fallback_count: '0',
@@ -853,6 +864,19 @@ describe('experiment_results — the rollup resolves one evaluation per exchange
     const body = JSON.parse(res.body);
     expect(body.data[0]).toMatchObject({ exchange_count: '40', scored_count: 12 });
   });
+
+  it('carries the classifications of the conversations behind each row, without changing the row grain', async () => {
+    mockDbQuery.mockResolvedValueOnce({ rows: [experimentRow({ classifications: ['premium', 'standard'] })] }).mockResolvedValueOnce({ rows: [] });
+
+    const res = await handler(postEvent({ queryType: 'experiment_results', dateRange: VALID_RANGE }));
+
+    const sql = String(mockDbQuery.mock.calls[0][0]);
+    expect(sql).toMatch(/ARRAY_AGG\(DISTINCT e\.conversation_classification\)[^\n]*AS classifications/);
+    expect(sql).not.toMatch(/GROUP BY[^\n]*conversation_classification/);
+    const body = JSON.parse(res.body);
+    expect(body.data[0].classifications).toEqual(['premium', 'standard']);
+    expect(body.columns).toContain('classifications');
+  });
 });
 
 /**
@@ -867,8 +891,13 @@ function unitsRowFromClusters(variantId: string, clusters: number[][], experimen
     variant_id: variantId,
     conversation_count: String(m.clusters),
     exchange_count: String(m.n),
-    n_sq: String(m.clusterSizeSq),
+    timed_conversation_count: String(m.clusters),
+    timed_count: String(m.n),
+    ln_sq: String(m.clusterSizeSq),
     lat_sum: m.sum, lat_sumsq: m.sumSq, lat_tot_sq: m.clusterTotalSq, lat_tot_n: m.clusterTotalTimesSize,
+    tokened_conversation_count: String(m.clusters),
+    tokened_count: String(m.n),
+    tn_sq: String(m.clusterSizeSq),
     tok_sum: m.sum, tok_sumsq: m.sumSq, tok_tot_sq: m.clusterTotalSq, tok_tot_n: m.clusterTotalTimesSize,
     scored_conversation_count: String(m.clusters),
     scored_count: String(m.n),
@@ -894,6 +923,8 @@ describe('experiment_recommendation', () => {
     scored_count: '40',
     avg_score: '80',
     score_sd: '10',
+    // Every turn recorded its duration and tokens unless a test says otherwise.
+    timed_count: over.exchange_count ?? '40',
     avg_total_ms: '1200',
     latency_sd: '300',
     p95_total_ms: '1800',
@@ -901,6 +932,7 @@ describe('experiment_recommendation', () => {
     avg_output_tokens: '500',
     avg_tokens: '1500',
     tokens_sd: '200',
+    tokened_count: over.exchange_count ?? '40',
     avg_image_count: null,
     compliance_rate: '100',
     fallback_count: '0',
@@ -1014,6 +1046,59 @@ describe('experiment_recommendation', () => {
     );
     expect(body.verdict).toBe('inconclusive');
     expect(String(body.rationale)).toMatch(/3 conversations, below the 5-conversation floor/);
+  });
+
+  // ── A TURN WITH NO TELEMETRY IS NOT A FAST OR FREE TURN ─────────────────────────────────────────
+  //
+  // A turn whose duration or token count was never recorded is left out of each metric and counted per
+  // arm. Entered as 0 in the latency and token means, SDs and cluster moments, it would make an arm that
+  // lost its telemetry read as faster and cheaper, with the Welch tests run on the zeros.
+  describe('missing telemetry', () => {
+    it('reads latency and tokens over the turns that recorded them, in the rollup and the units read alike', async () => {
+      await recommend([variantRow('control'), variantRow('treatment')]);
+      const [rowsSql] = mockDbQuery.mock.calls[0] as [string];
+      const [unitsSql] = mockDbQuery.mock.calls[1] as [string];
+      for (const sql of [rowsSql, unitsSql]) {
+        expect(sql).not.toMatch(/COALESCE\(m\.total_ms, e\.response_latency_ms, 0\)/);
+        expect(sql).not.toMatch(/COALESCE\(m\.(input|output)_tokens, 0\)/);
+      }
+      expect(rowsSql).toContain('COUNT(COALESCE(m.total_ms, e.response_latency_ms)) AS timed_count');
+      expect(rowsSql).toContain('COUNT((m.input_tokens + m.output_tokens)) AS tokened_count');
+      // A conversation's latency cluster is its timed turns, not all of its turns.
+      expect(unitsSql).toContain('COUNT(latency)::float8 AS ln');
+      expect(unitsSql).toContain('SUM(lat_t * ln) AS lat_tot_n');
+      expect(unitsSql).toContain('COUNT(tokens)::float8 AS tn');
+    });
+
+    it('weights an arm\'s latency by its timed turns, so untimed turns do not pull it toward zero', async () => {
+      const body = await recommend([
+        variantRow('control'),
+        variantRow('control', { intent: 'billing', avg_total_ms: null, latency_sd: null, timed_count: '0' }),
+        variantRow('treatment'),
+      ]);
+      const control = body.variants.find((v: any) => v.variant_id === 'control');
+      expect(control.exchange_count).toBe(80);
+      expect(control.avg_total_ms).toBe(1200);
+      expect(control.missing_latency_count).toBe(40);
+      expect(control.missing_tokens_count).toBe(0);
+    });
+
+    it('reports each arm\'s turns with missing telemetry in the rationale', async () => {
+      const body = await recommend([
+        variantRow('control'),
+        variantRow('treatment', { timed_count: '30', tokened_count: '35' }),
+      ]);
+      const treatment = body.variants.find((v: any) => v.variant_id === 'treatment');
+      expect(treatment).toMatchObject({ timed_count: 30, tokened_count: 35, missing_latency_count: 10, missing_tokens_count: 5 });
+      expect(String(body.rationale)).toMatch(
+        /Missing telemetry, excluded from the latency, token and cost figures rather than counted as zero: treatment 10 turns with no recorded latency and 5 turns with no recorded tokens\./,
+      );
+    });
+
+    it('says nothing about missing telemetry when every turn recorded it', async () => {
+      const body = await recommend([variantRow('control'), variantRow('treatment')]);
+      expect(String(body.rationale)).not.toMatch(/Missing telemetry/);
+    });
   });
 
   it('the units read counts the population the rollup counts, grouped by conversation, with no intent clause', async () => {

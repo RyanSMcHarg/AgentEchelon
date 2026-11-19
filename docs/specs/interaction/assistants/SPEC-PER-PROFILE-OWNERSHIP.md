@@ -132,7 +132,7 @@ Personas are defined in [PERSONAS.md](../../../overview/PERSONAS.md) and are not
 |---|---|
 | `AgentEchelonMessaging` | One Amazon Chime SDK app instance per account; classification stacks add their assistants' identities to it |
 | `AgentEchelonIdentity` | One user and identity pool; a classification is a claim, not a separate authentication backend |
-| `AgentEchelonConversations` | One attachments bucket, whose `context/{classification}/` prefixes are the IAM boundary, and cross-classification state: the task tables, the per-user profile store, the private channel-context store, the abuse-controls and turn-state tables |
+| `AgentEchelonConversations` | The attachments bucket, the profile bucket, and the company bucket, whose `context/{classification}/` prefixes are the IAM boundary, and cross-classification state: the task tables, the per-user profile store, the private channel-context store, the abuse-controls and turn-state tables |
 | `AgentEchelonChannelFlow` | One channel-flow processor, dispatching per classification from the immutable channel tag |
 | `AgentEchelonNotifications`, `AgentEchelonArchive` | Cross-classification; classification is a partition or a claim there rather than a stack boundary |
 | `AgentEchelonExperiments`, `AgentEchelonBattle` | Cross-classification comparison state: the experiment table, and the battle state, per-channel battle configuration, outcome table and orchestrator |
@@ -177,7 +177,7 @@ A classification stack **consumes** resolved parameters or plain props from the 
 |---|---|---|
 | The shared table ARNs | the platform | processor IAM and environment: tasks, experiments |
 | The app instance ARN | the platform | the assistant identity and the messaging IAM |
-| The attachments bucket | the platform | the context bucket and the classification's object grants |
+| The company bucket | the platform | the classification's object grants on `context/` and `platform-knowledge/` |
 | The battle-specific parameters | the platform | resolved separately, and only where the classification is battle-capable, because the battle stack is opt-in and a missing parameter would otherwise fail the deploy |
 
 The consumers of the published contract are the shared router logic, which resolves a classification's processor to dispatch to, and the conversation-creation path, which resolves a classification's assistant identity to add the right one to a new channel.

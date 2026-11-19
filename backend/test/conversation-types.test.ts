@@ -24,10 +24,10 @@ import {
 } from '../lib/config/conversation-types';
 
 describe('conversation-types registry', () => {
-  it('ships the ordinary type, the ops types, the guest visitor type and the customer engagement type, none named after a classification', () => {
+  it('ships the ordinary type, the ops types, the guest visitor type, the customer engagement type and the meeting type, none named after a classification', () => {
     // A type never shares a value with a classification. The full guard, over the
     // deployment's declared classifications, is conversation-type-keys-are-not-classifications.test.ts.
-    expect(Object.keys(CONVERSATION_TYPES).sort()).toEqual(['customer-engagement', 'general', 'guest-visitor', 'ops', 'ops-team']);
+    expect(Object.keys(CONVERSATION_TYPES).sort()).toEqual(['customer-engagement', 'customer-messaging', 'general', 'guest-visitor', 'meeting', 'ops', 'ops-team']);
   });
 
   it('the ordinary type takes any classification as input, keeps drift on, and has manual membership', () => {
@@ -50,7 +50,7 @@ describe('conversation-types registry', () => {
   });
 
   it('knows which groups are sourced at a classification, and which types each one feeds', () => {
-    expect(membershipSourceGroups('premium')).toEqual(['ops']);
+    expect(membershipSourceGroups('premium')).toEqual(['account-management', 'ops']);
     expect(membershipSourceGroups('basic')).toEqual([]);
     expect(typesSourcedFromGroup('ops', 'premium').sort()).toEqual(['ops', 'ops-team']);
     expect(typesSourcedFromGroup('ops', 'basic')).toEqual([]);

@@ -166,7 +166,9 @@ describe('every service that speaks outside a turn writes a speak route', () => 
     expect(src('battle-orchestrator.ts')).toContain('aeRebuttal');
     expect(src('battle-orchestrator.ts')).toContain('sayThroughRouter(');
     // The router posts the placeholder and clears markers on speak routes of its own.
-    expect(src('router-agent-handler.ts').match(/routeId: `\$\{SPEAK_ROUTE_PREFIX\}duel-/g)).toHaveLength(2);
+    // Each through the one scoped speak (`speakingAs`), whose route is `${SPEAK_ROUTE_PREFIX}<purpose>-`.
+    expect(src('router-agent-handler.ts').match(/speakingAs\(\{ botArn, channelArn, purpose: 'duel' \}/g)).toHaveLength(2);
+    expect(src('router-agent-handler.ts')).toContain('routeId: `${SPEAK_ROUTE_PREFIX}${speaker.purpose}-${randomUUID()}`');
   });
 
   it('the modules that send on a speak session make only the speak calls', () => {
@@ -190,6 +192,22 @@ describe('every service that speaks outside a turn writes a speak route', () => 
 });
 
 describe('IAM lets a shared service write only speak routes', () => {
+  it('the flow reads one message only in a classified conversation, as a classified assistant (tenet D12)', async () => {
+    const env = { account: '123456789012', region: 'us-east-1' };
+    const appInstanceArn = 'arn:aws:chime:us-east-1:123456789012:app-instance/test';
+    const { ChannelFlowStack } = await import('../lib/stacks/channel-flow-stack');
+    const flow = Template.fromStack(new ChannelFlowStack(new cdk.App(), 'AgentEchelonChannelFlow', { env, classifications: assistantClassifications(), appInstanceArn } as never));
+    const reads = Object.entries(flow.toJSON().Resources as Record<string, any>)
+      .filter(([id, r]) => r.Type === 'AWS::IAM::Role' && id.startsWith('ChannelFlowProcessorRole'))
+      .flatMap(([, r]) => r.Properties.Policies as any[])
+      .flatMap((p) => p.PolicyDocument.Statement)
+      .filter((s: any) => [s.Action].flat().includes('chime:GetChannelMessage'));
+    expect(reads.map((s: any) => ({ resources: [s.Resource].flat().sort(), condition: s.Condition }))).toEqual([{
+      resources: [`${appInstanceArn}/bot/*`, `${appInstanceArn}/channel/*`],
+      condition: { Null: { 'aws:ResourceTag/classification': 'false' }, StringNotEquals: { 'aws:ResourceTag/classification': ['admin'] } },
+    }]);
+  });
+
   it('speakAsAssistantStatements conditions the write on the key and the vend invoke on the tags', () => {
     const stack = new cdk.Stack(new cdk.App(), 'S', { env: { account: '111122223333', region: 'us-east-1' } });
     const [write, , invoke] = speakAsAssistantStatements(stack, ['basic']).map((s) => s.toStatementJson());
@@ -265,6 +283,10 @@ describe('the speak edge grants exactly the speak actions', () => {
       appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
       attachmentsBucketName: 'test-bucket',
       attachmentsBucketArn: 'arn:aws:s3:::test-bucket',
+      companyBucketName: 'test-company-bucket',
+      companyBucketArn: 'arn:aws:s3:::test-company-bucket',
+      profileBucketName: 'test-profile-bucket',
+      profileBucketArn: 'arn:aws:s3:::test-profile-bucket',
     } as never);
     const policies = Object.values(Template.fromStack(stack).findResources('AWS::IAM::ManagedPolicy')) as any[];
     const speak = policies.find((p) => String(p.Properties.ManagedPolicyName).endsWith(`AssistantGrant-basic-${SPEAK_EDGE}`));
@@ -280,7 +302,7 @@ describe('each turn data plane reads only its own routing table', () => {
     const { assistantsOf } = await import('./helpers/assistants');
     const { CLASSIFICATION_TEST_PROPS } = await import('./helpers/synth');
     const app = new cdk.App();
-    const archive = new ArchiveStackAurora(app, 'TestArchiveAurora', {
+    const archive = new ArchiveStackAurora(app, 'TestArchiveAurora', { companyBucketArn: 'arn:aws:s3:::test-company-bucket',
       env: { account: '123456789012', region: 'us-east-1' },
       appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
       messageStream: testMessageStream(app),
@@ -525,6 +547,14 @@ describe('an ended duel\'s waiting markers are taken down by the router, as each
       { battleId: 'b1', botArn: RIVAL, state: 'COMPLETED' },
       { battleId: 'b1', botArn: BOT, state: 'WAITING_FOR_USER', waitingMessageId: 'question-1' },
     ]);
+    // The round reads the duel BEFORE it ends: an abandoned record already in place stands the round down
+    // without ending anything. The reads after `endDuelHere` see the abandoned record it wrote.
+    mockDocSend.mockResolvedValueOnce({ Items: [
+      { battleId: 'b1', botArn: '__round1__', channelArn: CHANNEL },
+      { battleId: 'b1', botArn: '__orchestrator__', state: 'COMPLETED' },
+      { battleId: 'b1', botArn: RIVAL, state: 'COMPLETED' },
+      { battleId: 'b1', botArn: BOT, state: 'WAITING_FOR_USER', waitingMessageId: 'question-1' },
+    ] });
     mockSides.mockResolvedValueOnce({ self: null, rival: null, ended: true });
     const rebuttal = {
       correlationId: 'corr-r2', botArn: RIVAL, channelArn: CHANNEL, classification: 'premium', trigger: 'rebuttal',

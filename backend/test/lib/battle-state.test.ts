@@ -395,6 +395,15 @@ describe('readBattleRows + allBotsTerminal + botRowsOnly', () => {
     expect(cmd.input.ExpressionAttributeValues[':id']).toBe(BATTLE_ID);
   });
 
+  it('answers a failed read with no rows, unless the caller asks for the failure', async () => {
+    const failure = Object.assign(new Error('slow down'), { name: 'ProvisionedThroughputExceededException' });
+    mockSend.mockRejectedValueOnce(failure);
+    const { readBattleRows } = await import('../../lambda/src/lib/battle-state');
+    await expect(readBattleRows(BATTLE_ID)).resolves.toEqual([]);
+    mockSend.mockRejectedValueOnce(failure);
+    await expect(readBattleRows(BATTLE_ID, { throwOnFailure: true })).rejects.toThrow('slow down');
+  });
+
   it('allBotsTerminal returns false when any bot is still INVOKED', async () => {
     const { allBotsTerminal } = await import('../../lambda/src/lib/battle-state');
     const result = allBotsTerminal([

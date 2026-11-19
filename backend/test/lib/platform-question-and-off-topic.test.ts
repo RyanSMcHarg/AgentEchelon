@@ -13,7 +13,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { DEFAULT_INTENT_PACK, UNIVERSAL_INTENT_KEYS } from '../../lambda/src/lib/intent-pack';
 import { intentAnswerPrompt } from '../../lambda/src/lib/intent-answer';
-import { stratumIntentPack } from '../../demo/intent-packs';
+import { stratumIntentPack } from '../../../demo/stratum-company/intent-packs';
 
 const platformQuestionIn = (tier: 'basic' | 'standard' | 'premium') =>
   stratumIntentPack(tier).intents.find((d) => (d as { key: string }).key === 'platform_question') as

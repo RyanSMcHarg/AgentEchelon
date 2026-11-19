@@ -153,7 +153,7 @@ describe('POST /admin/profiles/activate-past-golden-gate', () => {
   });
 
   it('Activate refuses the draft, and an administrator activates it past the gate, recorded on the version and announced', async () => {
-    const refused = await handler(evt('/admin/profiles/activate', { profileName: 'advisor' }));
+    const refused = await handler(evt('/admin/profiles/activate', { profileName: 'advisor', configId }));
     expect(refused.statusCode).toBe(409);
     expect(parse(refused).code).toBe('GOLDEN_SET_REFUSED');
 

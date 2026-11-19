@@ -1,8 +1,8 @@
 /**
  * SPEC-PORTABLE-PROFILES P0 — active profile resolution.
  *
- * The load-bearing guarantees: (1) seed byte-identical (behavior diff empty), (2) fail-closed to seed
- * on absent/corrupt versions, (3) the §7 cut — a version overrides ONLY runtime-editable fields, never
+ * The load-bearing guarantees: (1) seed byte-identical (behavior diff empty), (2) the seed serves an
+ * absent version only, and a corrupt one is refused (an-unreadable-version-never-serves-the-seed.test.ts), (3) the §7 cut — a version overrides ONLY runtime-editable fields, never
  * the boundary (contextScope), (4) TTL caching, (5) stable version fingerprint.
  */
 import { GetParameterCommand } from '@aws-sdk/client-ssm';
@@ -22,6 +22,7 @@ import {
   PROFILE_DEFINITION_SCHEMA_VERSION,
   resolveFromDefinition,
   classificationOfProfile,
+  ProfileVersionUnreadableError,
 } from '../../lambda/src/lib/active-profile';
 import { ALL_TOOL_NAMES } from '../../lambda/src/lib/tool-registry';
 import { defaultProfileRegistry } from '../../lib/profile-registry';
@@ -176,12 +177,10 @@ describe('active-profile P0 resolution', () => {
     expect(resolved.configId).toEqual('aa11bb22cc33');
   });
 
-  it('SERVES a version carrying an invalid machine, because the field is inert now', async () => {
-    // THIS USED TO FAIL CLOSED TO THE SEED, and it must not any more. The rule protected against a
-    // hostile or malformed version seeding an invalid lifecycle that would strand tasks - a real risk
-    // while a version's machines reached the runtime. They no longer do (global workflows, 2026-09-20):
-    // `bodyFrom` drops the field, so an invalid machine on a version is INERT and cannot strand
-    // anything.
+  it('SERVES a version carrying an invalid legacy top-level machine, because the field is inert', async () => {
+    // The top-level `machines` field is legacy: a version's own machines ride its pack (`intentPack.machines`,
+    // ADR-066) and are validated there. `bodyFrom` drops the top-level field, so an invalid machine in it is INERT
+    // and cannot strand anything.
     //
     // Discarding the version for it would now be the destructive option, not the safe one: the whole
     // definition - persona, models, tools - would be replaced by the compiled seed over a field that
@@ -206,7 +205,7 @@ describe('active-profile P0 resolution', () => {
     expect('machines' in resolved).toBe(false);
   });
 
-  it('fails closed to the seed on a malformed / invalid definition', async () => {
+  it('refuses a malformed / invalid definition rather than serving the seed in its place', async () => {
     const cases = [
       'not json at all',
       JSON.stringify({ schemaVersion: 99, profileName: 'analyst', modelKey: 'x' }),
@@ -216,9 +215,7 @@ describe('active-profile P0 resolution', () => {
     for (const raw of cases) {
       __clearActiveProfileCache();
       const ssm = fakeSsm((name) => (name.endsWith(':active') ? { Parameter: { Value: raw } } : notFound()));
-      const { profile, configId } = await resolveActiveProfile('analyst', { ssm, ssmRoot: SSM_ROOT });
-      expect(profile).toEqual(defaultProfileRegistry.profileByName('analyst'));
-      expect(configId).toBe('seed');
+      await expect(resolveActiveProfile('analyst', { ssm, ssmRoot: SSM_ROOT, retryDelayMs: 0 })).rejects.toBeInstanceOf(ProfileVersionUnreadableError);
     }
   });
 
@@ -234,13 +231,17 @@ describe('active-profile P0 resolution', () => {
     expect((ssm.send as jest.Mock).mock.calls.length).toBe(2);
   });
 
-  it('DECOUPLE is behavior-neutral on the seed: each seed modelKey is the default model of its classification', () => {
-    // The async-processor serves the active version's modelKey as the classification's default. On the seed
-    // (fail-closed) that is the classification's own declared default, so the resolved base model is unchanged.
-    for (const classification of ['basic', 'standard', 'premium'] as const) {
+  it('each seed modelKey is a model its classification selects; the advisor chooses a lighter base than premium\'s default', () => {
+    // The async-processor serves the active version's modelKey as the classification's default. The basic and standard
+    // seeds take their classification's default; the advisor declares Sonnet beneath premium's Opus and puts Opus on the
+    // report steps that write the document (`AssistantProfile.routes`).
+    for (const classification of ['basic', 'standard'] as const) {
       const seedModelKey = defaultProfileRegistry.requireProfileFor(classification).modelKey;
       expect(seedModelKey).toBe(defaultProfileRegistry.defaultModelOf(classification));
     }
+    expect(defaultProfileRegistry.requireProfileFor('premium').modelKey).toBe('sonnet');
+    expect(defaultProfileRegistry.defaultModelOf('premium')).toBe('opus');
+    expect(defaultProfileRegistry.selectsModel('premium', 'sonnet')).toBe(true);
   });
 
   it('configId is stable and body-derived (order-independent)', () => {
@@ -276,9 +277,12 @@ describe('a seed says what it serves: the platform routes, with each route the r
     const def = JSON.parse(serializeSeedDefinition('advisor')!);
     const base = def.models.default as string;
     const rebuilt = buildIntentStrategy(def.models)!;
+    const declared = defaultProfileRegistry.profileByName('advisor')!.routes ?? {};
     for (const r of INTENT_ROUTE_STRATEGY) {
       const rr = rebuilt.find((x) => x.intent === r.intent);
       if (!rr) continue; // a route the classification cannot use is not seeded
+      // A route the profile declares is written as declared.
+      if (declared[r.intent]) { expect(rr.primaryModel).toBe(declared[r.intent].primary); continue; }
       const cheaper = ({ low: 0, medium: 1, high: 2 } as const)[(catalog as any)[r.primaryModel].costClass as 'low']
         < ({ low: 0, medium: 1, high: 2 } as const)[(catalog as any)[base].costClass as 'low'];
       expect({ intent: r.intent, primary: rr.primaryModel }).toEqual({ intent: r.intent, primary: cheaper ? base : r.primaryModel });
@@ -293,17 +297,21 @@ describe('a seed says what it serves: the platform routes, with each route the r
     // classification default, so the answering model is the same either way. A fallback is only ever one
     // the classification allows.
     for (const classification of CLASSIFICATIONS) {
-      const name = defaultProfileRegistry.requireProfileFor(classification).name;
-      const def = JSON.parse(serializeSeedDefinition(name)!);
+      const profile = defaultProfileRegistry.requireProfileFor(classification);
+      const def = JSON.parse(serializeSeedDefinition(profile.name)!);
       const profileStrategy = buildIntentStrategy(def.models)!;
+      // The selection with the version's base model as its default, as the processor resolves a turn.
+      const models = { ...defaultProfileRegistry.modelsOf(classification)!, default: profile.modelKey };
       for (const intent of INTENTS) {
-        const viaProfile = resolveModelForIntent(intent, classification, catalog as any, profileStrategy, defaultProfileRegistry.modelsOf(classification));
-        // WHAT THE RETIRED FLOOR SERVED: the global route as written, raised to the classification base when
-        // it was cheaper, except on a standalone greeting or acknowledgment.
-        const viaGlobal = resolveModelForIntent(intent, classification, catalog as any, INTENT_ROUTE_STRATEGY, defaultProfileRegistry.modelsOf(classification));
-        const base = (catalog as any)[defaultProfileRegistry.defaultModelOf(classification)!];
+        const viaProfile = resolveModelForIntent(intent, classification, catalog as any, profileStrategy, models);
+        // WHAT THE RETIRED FLOOR SERVED: the global route as written, raised to the base when it was cheaper, except
+        // on a standalone greeting or acknowledgment. A route the profile declares is served as declared.
+        const viaGlobal = resolveModelForIntent(intent, classification, catalog as any, INTENT_ROUTE_STRATEGY, models);
+        const base = (catalog as any)[profile.modelKey];
         const rank = { low: 0, medium: 1, high: 2 } as const;
-        const floored = viaGlobal.resolvedFromStrategy && intent !== 'greeting' && intent !== 'acknowledgment'
+        const declaredRoute = intent ? profile.routes?.[intent] : undefined;
+        const floored = declaredRoute ? declaredRoute.primary
+          : viaGlobal.resolvedFromStrategy && intent !== 'greeting' && intent !== 'acknowledgment'
           && rank[(catalog as any)[viaGlobal.primaryModelKey].costClass as 'low'] < rank[base.costClass as 'low']
           ? base.key : viaGlobal.primaryModelKey;
         expect({ intent, classification, model: viaProfile.primaryModelKey }).toEqual({ intent, classification, model: floored });
@@ -514,17 +522,14 @@ describe("image generation is a per-profile capability (models.byIntent['image_g
     warn.mockRestore();
   });
 
-  it('a stored body carrying the retired models.image is refused whole, and the seed is served', async () => {
+  it('a stored body carrying the retired models.image is refused whole, and never served as the seed', async () => {
     const raw = JSON.stringify({ ...JSON.parse(serializeSeedDefinition('analyst')!), models: { default: 'sonnet', image: 'stability_image_core' } });
     const ssm = fakeSsm((name) => (name.endsWith(':active') ? { Parameter: { Value: raw } } : notFound()));
     __clearActiveProfileCache();
-    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const active = await resolveActiveProfile('analyst', { ssm, ssmRoot: SSM_ROOT });
-    expect(active.configId).toBe('seed');
-    expect(active.imageModelKey).toBeUndefined();
-    expect(active.models?.image).toBeUndefined();
-    expect(warn.mock.calls.some((c) => String(c[0]).includes('serving seed'))).toBe(true);
-    warn.mockRestore();
+    const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    await expect(resolveActiveProfile('analyst', { ssm, ssmRoot: SSM_ROOT, retryDelayMs: 0 })).rejects.toBeInstanceOf(ProfileVersionUnreadableError);
+    expect(error.mock.calls.some((c) => String(c[0]).includes('refusing to serve the seed'))).toBe(true);
+    error.mockRestore();
   });
 
   it('a stored base model or classifier the classification does not allow is ignored too', () => {

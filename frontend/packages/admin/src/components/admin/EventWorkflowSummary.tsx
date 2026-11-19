@@ -1,13 +1,16 @@
 /**
  * ONE EVENT WORKFLOW, READ ON THE ASSISTANT'S PAGE (SPEC-ADMIN-CONSOLE "Assistants", Workflows).
  *
- * The event that starts it in words, the rooms it runs in, its steps as one line in the order a run reaches them, and,
- * for a welcome, the opening a person reads, composed by the router's own composer (`eventWorkflowPreview.ts`). It is
- * read-only: the workflow is edited on the draft's builder, which the page's Edit in a draft action opens.
+ * The event that starts it in words, the rooms it runs in, its steps as one line in the order a run reaches them (a
+ * `person-joined` workflow with the join recap the runtime adds, `withJoinRecap`, and a step nothing reaches marked as
+ * never running), and, for a welcome, the opening a person reads, composed by the router's own composer
+ * (`eventWorkflowPreview.ts`), with the types a `conversation-opened` workflow greets in its place. It is read-only:
+ * the workflow is edited on the draft's builder, which the page's Edit in a draft action opens.
  */
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import type { EventWorkflow } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
+import { arrivalWelcomeOwner, openedWorkflowOf, withJoinRecap, type EventWorkflow } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
+import { CONVERSATION_TYPES } from '../../../../../../backend/lib/config/conversation-types.ts';
 import { previewOpening, workflowSteps, type StepSummary } from './eventWorkflowPreview';
 
 type T = (key: string, opts?: Record<string, unknown>) => string;
@@ -18,9 +21,21 @@ const eventLabel = (t: T, event: string): string => t(`admin.eventWorkflows.even
 /** One step in the sequence: its kind, and the role, template, prompt or machine it names. */
 function stepText(t: T, s: StepSummary): string {
   const kind = t(`admin.workflowEditor.kind_${s.kind}`);
-  if (s.disposition === 'failure') return t('admin.eventWorkflows.stepFailure', { kind });
-  if (s.as) return t('admin.eventWorkflows.stepAs', { kind, role: s.as, names: s.names ?? '' });
-  return s.names ? t('admin.eventWorkflows.stepNamed', { kind, names: s.names }) : kind;
+  const text = s.disposition === 'failure' ? t('admin.eventWorkflows.stepFailure', { kind })
+    : s.as ? t('admin.eventWorkflows.stepAs', { kind, role: s.as, names: s.names ?? '' })
+      : s.names ? t('admin.eventWorkflows.stepNamed', { kind, names: s.names }) : kind;
+  return s.unreached ? t('admin.eventWorkflows.stepNeverRuns', { step: text }) : text;
+}
+
+/**
+ * THE ROOMS A WELCOME DOES NOT GREET: of the types it answers for (every type, for one that names none), those a
+ * `conversation-opened` workflow of the version greets when it opens (`arrivalWelcomeOwner`), each with that workflow.
+ */
+export function greetedInstead(welcome: EventWorkflow, all: Record<string, EventWorkflow> | null | undefined): Array<{ type: string; by: string }> {
+  return Object.keys(CONVERSATION_TYPES)
+    .filter((type) => !welcome.types?.length || welcome.types.includes(type))
+    .flatMap((type) => (arrivalWelcomeOwner({ conversationType: type, own: all }) === 'conversation-opened'
+      ? [{ type, by: openedWorkflowOf(all, type)?.name ?? '' }] : []));
 }
 
 /**
@@ -68,15 +83,19 @@ export const WelcomePreview: React.FC<{ name: string; workflow: EventWorkflow; r
   );
 };
 
-/** What an event workflow is: the event that starts it, the rooms it runs in, its steps, and a welcome's opening. */
-const EventWorkflowSummary: React.FC<{ name: string; workflow: EventWorkflow; role?: string }> = ({ name, workflow, role }) => {
+/**
+ * What an event workflow is: the event that starts it, the rooms it runs in, its steps, and a welcome's opening. `all`
+ * is every workflow of the version, so a welcome names the types another workflow greets in its place.
+ */
+const EventWorkflowSummary: React.FC<{ name: string; workflow: EventWorkflow; role?: string; all?: Record<string, EventWorkflow> | null }> = ({ name, workflow, role, all }) => {
   const { t: translate } = useTranslation();
   const t = translate as unknown as T;
   const welcome = workflow.on === 'assistant-joined';
   const rooms = workflow.types?.length
     ? workflow.types.join(', ')
     : t(welcome ? 'admin.eventWorkflows.roomsOther' : 'admin.eventWorkflows.roomsEvery');
-  const steps = workflowSteps(workflow);
+  const steps = workflowSteps(withJoinRecap(workflow));
+  const instead = welcome ? greetedInstead(workflow, all) : [];
   return (
     <>
       <span data-testid={`workflow-starts-${name}`}>{t('admin.eventWorkflows.starts', { event: eventLabel(t, workflow.on), rooms })}</span>
@@ -84,6 +103,11 @@ const EventWorkflowSummary: React.FC<{ name: string; workflow: EventWorkflow; ro
         <span className="admin-field-label">{t('admin.eventWorkflows.steps')}</span>{' '}
         {steps.map((s) => stepText(t, s)).join(t('admin.eventWorkflows.stepSeparator'))}
       </span>
+      {instead.length > 0 && (
+        <span className="admin-field-hint" data-testid={`workflow-greeted-instead-${name}`}>
+          {t('admin.eventWorkflows.greetedInstead', { rooms: instead.map((i) => t('admin.eventWorkflows.greetedInsteadBy', { type: i.type, by: i.by })).join(t('admin.eventWorkflows.listSeparator')) })}
+        </span>
+      )}
       {welcome && <WelcomePreview name={name} workflow={workflow} role={role} />}
     </>
   );

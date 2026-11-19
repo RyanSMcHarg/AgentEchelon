@@ -20,8 +20,12 @@ export interface ReasonRequest {
   capability: string;
   channelArn?: string;
   kind: ReasonKind;
-  /** What a read reaches when it is not one conversation: a team's list of its assistant's responses. */
-  subject?: 'responses';
+  /**
+   * What a read reaches when it is not one conversation: a team's list of its assistant's responses,
+   * or the analytics lists that carry conversation content (summaries, scored, flagged, labelled and
+   * rated responses).
+   */
+  subject?: 'responses' | 'content';
   /** The key a read's reason is remembered under for the session, when it is not a conversation. */
   readKey?: string;
 }

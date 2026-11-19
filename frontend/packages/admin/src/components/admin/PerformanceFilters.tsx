@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 /**
@@ -39,7 +39,8 @@ export interface PerformanceFilters {
   classification: string | null;
   assistant: string | null;
   role: string | null;
-  version: string | null;
+  /** The versions chosen: any number of one assistant's, compared side by side. */
+  version: string[] | null;
   /** How the turn arrived: `lex` (targeted) or `flow`. Migration 054 states the equivalence. */
   entry: string | null;
   /** Duel round, for keeping battle turns out of a production population. */
@@ -66,10 +67,10 @@ export const EMPTY_FILTERS: PerformanceFilters = {
  * could observe was a rendered pill, and a test written against that passes whether or not the reset
  * happens.
  */
-export function withFilterChange(
+export function withFilterChange<K extends keyof PerformanceFilters>(
   current: PerformanceFilters,
-  key: keyof PerformanceFilters,
-  value: string | null,
+  key: K,
+  value: PerformanceFilters[K],
 ): PerformanceFilters {
   const next = { ...current, [key]: value };
   // A classification decides which assistants and roles exist at all.
@@ -171,12 +172,13 @@ export function rowMatches(r: Row, f: PerformanceFilters): boolean {
   return eq(r.conversation_classification ?? r.classification, f.classification)
     && eq(r.assistant, f.assistant)
     && eq(r.assistant_role, f.role)
-    && eq(r.profile_version, f.version)
+    && (f.version === null || f.version.includes(String(r.profile_version ?? '')))
     && matchesEntry(r.turn_entry ?? r.entry, f.entry)
     && matchesDuel(r.battle_round, f.duel)
     && eq(r.delivery_option, f.responseType);
 }
 
+/** An axis with a short, fixed list of options, shown in full. */
 export const FilterPills: React.FC<{
   label: string;
   allLabel: string;
@@ -211,6 +213,71 @@ export const FilterPills: React.FC<{
 );
 
 /**
+ * A MULTI-SELECT'S NEXT VALUE. `null` is every option, so choosing the last one left, or clearing the last one chosen,
+ * both return to it and the selection is never empty.
+ */
+export function toggledSelection(current: string[] | null, option: string, options: string[]): string[] | null {
+  const held = current ?? [];
+  const next = held.includes(option) ? held.filter((v) => v !== option) : [...held, option];
+  return next.length === 0 || next.length >= options.length ? null : next;
+}
+
+/** An axis whose options grow with the deployment, as a drop-down, so a long list stays on one line of the bar. */
+export const FilterDropdown: React.FC<{
+  label: string;
+  allLabel: string;
+  options: string[];
+  value: string[] | null;
+  onChange: (v: string[] | null) => void;
+  /** Check any number of options, and stay open while choosing. */
+  multi?: boolean;
+  format?: (v: string) => string;
+}> = ({ label, allLabel, options, value, onChange, multi = false, format }) => {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const outside = (e: MouseEvent) => { if (!root.current?.contains(e.target as Node)) setOpen(false); };
+    const escape = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', outside);
+    document.addEventListener('keydown', escape);
+    return () => {
+      document.removeEventListener('mousedown', outside);
+      document.removeEventListener('keydown', escape);
+    };
+  }, [open]);
+  const show = (v: string) => (format ? format(v) : v);
+  const summary = value === null ? allLabel
+    : value.length === 1 ? show(value[0])
+      : t('admin.filters.selectedCount', { count: value.length });
+  const choose = (next: string[] | null) => {
+    onChange(next);
+    if (!multi) setOpen(false);
+  };
+  return (
+    <div ref={root} role="group" aria-label={`${label} filter`} className="admin-filter-dropdown">
+      <button type="button" className="admin-filter-trigger" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+        <span className="admin-filter-label">{label}:</span> {summary}
+      </button>
+      {open && (
+        <div className="admin-filter-panel">
+          <label className="admin-filter-option">
+            <input type={multi ? 'checkbox' : 'radio'} checked={value === null} onChange={() => choose(null)} /> {allLabel}
+          </label>
+          {options.map((o) => (
+            <label key={o} className="admin-filter-option">
+              <input type={multi ? 'checkbox' : 'radio'} checked={!!value?.includes(o)}
+                onChange={() => choose(multi ? toggledSelection(value, o, options) : [o])} /> {show(o)}
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+/**
  * The filter bar both Performance surfaces render.
  *
  * PROGRESSIVE, so the bar states what is decidable rather than everything that exists. Assistants and
@@ -225,10 +292,18 @@ const PerformanceFilterBar: React.FC<{
   /** Hidden where the surface has no such column to cut on. */
   showEntry?: boolean;
   showDuel?: boolean;
-}> = ({ rows, value, onChange, showEntry = true, showDuel = true }) => {
+  /** What else narrows this page, shown first: an open intent, for one. */
+  scope?: React.ReactNode;
+}> = ({ rows, value, onChange, showEntry = true, showDuel = true, scope }) => {
   const { t } = useTranslation();
   const base = filterOptions(rows, value);
-  const set = (k: keyof PerformanceFilters) => (v: string | null) => onChange(withFilterChange(value, k, v));
+  type SingleAxis = Exclude<keyof PerformanceFilters, 'version'>;
+  const set = (k: SingleAxis) => (v: string | null) => onChange(withFilterChange(value, k, v));
+  /** An axis that holds one choice, as the drop-down's list of selected values. */
+  const one = (k: SingleAxis) => ({
+    value: value[k] ? [value[k] as string] : null,
+    onChange: (v: string[] | null) => onChange(withFilterChange(value, k, v ? v[0] : null)),
+  });
 
   // ── AN ACTIVE FILTER IS ALWAYS VISIBLE AND ALWAYS CLEARABLE ──────────────
   //
@@ -252,23 +327,25 @@ const PerformanceFilterBar: React.FC<{
     classifications: withSelected(base.classifications, value.classification),
     assistants: withSelected(base.assistants, value.assistant),
     roles: withSelected(base.roles, value.role),
-    versions: withSelected(base.versions, value.version),
+    // Newest first, compared as numbers, because v10 follows v9.
+    versions: Array.from(new Set([...base.versions, ...(value.version ?? [])])).sort((a, b) => Number(b) - Number(a)),
     entries: withSelected(base.entries, value.entry ?? null),
     responseTypes: withSelected(base.responseTypes, value.responseType ?? null),
   };
   /** Render an axis when it can be chosen between, or when it is already carrying a choice. */
-  const show = (options: string[], selected: string | null | undefined) => options.length > 1 || !!selected;
+  const show = (options: string[], selected: string | string[] | null | undefined) => options.length > 1 || !!selected;
 
   return (
     <div className="admin-filter-bar">
+      {scope}
       {show(o.classifications, value.classification) && (
-        <FilterPills label={t('admin.filters.tier')} allLabel="All tiers" options={o.classifications} value={value.classification} onChange={set('classification')} />
+        <FilterDropdown label={t('admin.filters.tier')} allLabel={t('admin.filters.allClassifications')} options={o.classifications} {...one('classification')} />
       )}
 
       {/* ONLY ONCE A CLASSIFICATION IS CHOSEN. Assistants and roles exist WITHIN one; offering them
           across all of them invites a pairing that never ran and returns an empty chart. */}
       {(value.classification || value.assistant) && show(o.assistants, value.assistant) && (
-        <FilterPills label={t('admin.filters.assistant')} allLabel={t('admin.filters.allAssistants')} options={o.assistants} value={value.assistant} onChange={set('assistant')} />
+        <FilterDropdown label={t('admin.filters.assistant')} allLabel={t('admin.filters.allAssistants')} options={o.assistants} {...one('assistant')} />
       )}
       {(value.classification || value.role) && show(o.roles, value.role) && (
         <FilterPills label={t('admin.filters.role')} allLabel="All roles" options={o.roles} value={value.role} onChange={set('role')} />
@@ -277,7 +354,8 @@ const PerformanceFilterBar: React.FC<{
       {/* A VERSION NUMBER MEANS NOTHING WITHOUT THE ASSISTANT THAT RAN IT. Two assistants both have a
           version 3, and they are not the same thing. */}
       {(value.assistant || value.version) && show(o.versions, value.version) && (
-        <FilterPills label={t('admin.filters.version')} allLabel={t('admin.filters.allVersions')} options={o.versions} value={value.version} onChange={set('version')} format={(v) => `v${v}`} />
+        <FilterDropdown multi label={t('admin.filters.version')} allLabel={t('admin.filters.allVersions')} options={o.versions} value={value.version}
+          onChange={(v) => onChange(withFilterChange(value, 'version', v))} format={(v) => `v${v}`} />
       )}
 
       {showEntry && show(o.entries, value.entry) && (
@@ -348,7 +426,9 @@ export function filtersFromUrl(search: string = window.location.search): Perform
   const out = { ...EMPTY_FILTERS };
   for (const [key, param] of URL_KEYS) {
     const v = q.get(param);
-    if (v) out[key] = v;
+    if (!v) continue;
+    if (key === 'version') out.version = v.split(',').filter(Boolean);
+    else out[key as Exclude<keyof PerformanceFilters, 'version'>] = v;
   }
   return out;
 }
@@ -358,7 +438,7 @@ export function filtersToSearch(f: PerformanceFilters, search: string = window.l
   const q = new URLSearchParams(search);
   for (const [key, param] of URL_KEYS) {
     const v = f[key];
-    if (v) q.set(param, v); else q.delete(param);
+    if (v) q.set(param, Array.isArray(v) ? v.join(',') : v); else q.delete(param);
   }
   const s = q.toString();
   return s ? `?${s}` : '';

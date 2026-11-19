@@ -8,7 +8,7 @@ import { parseDriftCounts, driftHealthMetrics, formatRate } from './driftHealth'
  */
 describe('driftHealthMetrics', () => {
   it('computes acceptance from the recorded counts, parsing Postgres string counters', () => {
-    const counts = parseDriftCounts({ total_events: '10', accepted_count: '6', pending_count: '0' });
+    const counts = parseDriftCounts({ total_events: '10', moved_count: '6', pending_count: '0' });
     expect(counts.offered).toBe(10);
 
     const m = driftHealthMetrics(counts);
@@ -16,11 +16,19 @@ describe('driftHealthMetrics', () => {
     expect(formatRate(m.acceptance)).toBe('60%');
   });
 
+  it('counts a yes whatever became of the new conversation, and says where each settled offer ended', () => {
+    const m = driftHealthMetrics(parseDriftCounts({
+      total_events: '10', moved_count: '7', carried_on_count: '4', moved_unused_count: '2', move_failed_count: '1', declined_count: '2', unanswered_count: '1',
+    }));
+    expect(m.acceptance.value).toBeCloseTo(0.7);
+    expect(m.outcomes).toEqual({ carriedOn: 4, neverUsed: 2, declined: 2, unanswered: 1, moveFailed: 1 });
+  });
+
   it('computes accuracy from the judge verdicts', () => {
     const m = driftHealthMetrics(
       parseDriftCounts({
         total_events: '10',
-        accepted_count: '5',
+        moved_count: '5',
         evaluated_count: '8',
         evaluated_correct_count: '6',
       }),
@@ -42,7 +50,7 @@ describe('driftHealthMetrics', () => {
 
   it('reports accuracy as unmeasurable until something has been judged', () => {
     // Any number with a zero denominator - 0% or 100% - would be a claim no evaluation supports.
-    const m = driftHealthMetrics(parseDriftCounts({ total_events: '10', accepted_count: '10' }));
+    const m = driftHealthMetrics(parseDriftCounts({ total_events: '10', moved_count: '10' }));
     expect(m.accuracy.value).toBeNull();
     expect(m.accuracy.denominator).toBe(0);
   });
@@ -53,7 +61,7 @@ describe('driftHealthMetrics', () => {
     const m = driftHealthMetrics(
       parseDriftCounts({
         total_events: '10',
-        accepted_count: '1',
+        moved_count: '1',
         evaluated_count: '10',
         evaluated_correct_count: '10',
       }),
@@ -70,7 +78,7 @@ describe('driftHealthMetrics', () => {
 
   it('surfaces pending offers, because acceptance counts them in its denominator', () => {
     const m = driftHealthMetrics(
-      parseDriftCounts({ total_events: '10', accepted_count: '4', pending_count: '6' }),
+      parseDriftCounts({ total_events: '10', moved_count: '4', pending_count: '6' }),
     );
     expect(m.acceptance.value).toBeCloseTo(0.4);
     expect(m.pending).toBe(6);
@@ -78,7 +86,7 @@ describe('driftHealthMetrics', () => {
 
   it('treats missing, null and malformed counters as zero rather than NaN', () => {
     const m = driftHealthMetrics(
-      parseDriftCounts({ total_events: 'not-a-number', accepted_count: null }),
+      parseDriftCounts({ total_events: 'not-a-number', moved_count: null }),
     );
     expect(m.acceptance.value).toBeNull();
     expect(Number.isNaN(m.acceptance.numerator)).toBe(false);

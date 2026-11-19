@@ -243,6 +243,21 @@ describe('the creator opens the continuation', () => {
     expect(sent('CreateMembership').filter((c) => c.input.ChannelArn === CONTINUATION).map((c) => c.input.MemberArn)).toEqual([BOT, VISITOR]);
   });
 
+  it('a retried bind attaches the flow its first creation left off, before any member is added', async () => {
+    mockMessagingSend.mockImplementation(async (cmd: { __type: string }) => {
+      if (cmd.__type === 'CreateChannel') throw Object.assign(new Error('exists'), { name: 'ConflictException' });
+      if (cmd.__type === 'ListTags') return { Tags: [{ Key: 'classification', Value: 'standard' }, { Key: UPGRADE_SOURCE_TAG, Value: GUEST_CHANNEL }, { Key: UPGRADE_SOURCE_PERSON_TAG, Value: VISITOR }] };
+      if (cmd.__type === 'DescribeChannel') return { Channel: {} };
+      return {};
+    });
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await expect(creatorAt('standard')(bindRequest('standard'))).resolves.toMatchObject({ ok: true });
+    warn.mockRestore();
+    const order = mockMessagingSend.mock.calls.map((c) => (c[0] as { __type: string }).__type);
+    expect(sent('AssociateFlow')[0].input).toMatchObject({ ChannelArn: CONTINUATION, ChannelFlowArn: FLOW });
+    expect(order.indexOf('AssociateFlow')).toBeLessThan(order.indexOf('CreateMembership'));
+  });
+
   it('an existing channel at that id that is not this visit\'s continuation is not re-opened', async () => {
     mockMessagingSend.mockImplementation(async (cmd: { __type: string }) => {
       if (cmd.__type === 'CreateChannel') throw Object.assign(new Error('exists'), { name: 'ConflictException' });

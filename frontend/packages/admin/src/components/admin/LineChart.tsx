@@ -31,7 +31,7 @@ const PAD_L = 48;
 const PAD_R = 12;
 const PAD_T = 10;
 const PAD_B = 22;
-const SERIES_COLORS = ['var(--accent-500)', 'var(--status-good)', '#6366f1', '#db2777'];
+const SERIES_COLORS = ['var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)', 'var(--chart-4)'];
 
 /**
  * Axis line chart (SVG, no chart lib) — multi-series with optional TARGET

@@ -251,11 +251,14 @@ async function kindProbes(b, name, boundary) {
     // without the boundary listing them, and its own context is the control.
     await refused('s3:GetObject in a bucket the boundary does not name',
       await decision(boundary, 's3:GetObject', 'arn:aws:s3:::deny-test-probe-bucket/deny-test-probe'));
-    const objects = list(JSON.parse(boundary).Statement).find((st) => st.Sid === 'BoundaryObjectsATurnUses');
+    const objects = list(JSON.parse(boundary).Statement).find((st) => st.Sid === 'BoundaryWhatATurnReads');
     const own = list(objects?.Resource).find((r) => typeof r === 'string' && /\/context\/[^/*]+\/\*$/.test(r));
-    if (!own) fail(`${name}: the boundary allows no context prefix of its own (BoundaryObjectsATurnUses)`);
+    if (!own) fail(`${name}: the boundary allows no context prefix of its own (BoundaryWhatATurnReads)`);
     else {
       const bucket = own.slice(0, own.indexOf('/context/'));
+      // The company corpus is read, never written, by a turn.
+      await refused('s3:PutObject on its own context prefix',
+        await decision(boundary, 's3:PutObject', `${own.slice(0, -1)}deny-test-probe`));
       await refused('s3:GetObject on a context prefix of a classification it does not grant',
         await decision(boundary, 's3:GetObject', `${bucket}/context/deny-test-undeclared/deny-test-probe`));
       await refused('s3:ListBucket on a context prefix of a classification it does not grant',

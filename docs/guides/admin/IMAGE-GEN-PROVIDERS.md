@@ -12,7 +12,7 @@ Pick an active model and configure auth. The registry knows which models are inv
 |---|---|---|---|
 | Stability Image Core | AWS Bedrock | IAM (classification acting role) | Active |
 | Stability Image Ultra | AWS Bedrock | IAM (classification acting role) | Active |
-| OpenAI gpt-image-1 | External (OpenAI API) | `OPENAI_API_KEY`, and the classification selects `openai_gpt_image_1` | Active |
+| OpenAI gpt-image-2 | External (OpenAI API) | `OPENAI_API_KEY`, and the classification selects `openai_gpt_image_2` | Active |
 | FAL.ai FLUX 1.1 Pro | External (FAL API) | `FAL_KEY`, and the classification selects `fal_flux_pro_1_1` | Active |
 | Amazon Titan Image v2 | AWS Bedrock | IAM | Legacy - AWS may block |
 | Amazon Nova Canvas | AWS Bedrock | IAM | Legacy - AWS may block |
@@ -70,21 +70,21 @@ Stability text-to-image models exposed by Bedrock. AWS-native, IAM-authed, activ
 
 Enable in Bedrock console: us-west-2 / Bedrock / Model access, then request access to Stability models. Approval is usually immediate.
 
-### OpenAI gpt-image-1
+### OpenAI gpt-image-2
 
 External-HTTP only.
 
 | Field | Value |
 |---|---|
-| Registry key | `openai_gpt_image_1` |
-| OpenAI model id | `gpt-image-1` |
+| Registry key | `openai_gpt_image_2` |
+| OpenAI model id | `gpt-image-2` |
 | Endpoint | `https://api.openai.com/v1/images/generations` |
 | Auth | `Authorization: Bearer $OPENAI_API_KEY` |
-| Approx cost per image | $0.04 (standard quality, 1024×1024) |
-| Request body | `{ model:'gpt-image-1', prompt, n, size:'1024x1024' }` |
+| Approx cost per image | about $0.04 (an estimate carried from `gpt-image-1`; `gpt-image-2` is priced by tokens and quality, so check openai.com/pricing) |
+| Request body | `{ model:'gpt-image-2', prompt, n, size:'1024x1024' }` |
 | Response | `{ data: [{ b64_json:'...' }, ...] }` |
 
-**API surface.** `gpt-image-1` always returns inline base64 (`data[].b64_json`) and rejects the `response_format` parameter, so the shaper does not send it. `seed` is likewise not a `gpt-image-1` parameter and is omitted. The base64 result feeds the persistence path identically to the Bedrock providers.
+**API surface.** `gpt-image-2` returns inline base64 (`data[].b64_json`); measured 2026-11-03 with this request body, at the default `low` quality. The shaper sends no `response_format` (which `gpt-image-1` rejected) and no `seed`, which the gpt-image models do not take. `gpt-image-1` was shut down on 2026-10-23 and answers "does not exist". The base64 result feeds the persistence path identically to the Bedrock providers.
 
 Provision:
 
@@ -123,7 +123,7 @@ Both models stay in the registry so an existing profile or battle binding keeps 
 
 When a legacy model returns `ResourceNotFoundException` or `AccessDeniedException`, `invokeImageGenModel` wraps the SDK error with an actionable message:
 
-> `invokeImageGenModel: Bedrock model "amazon.titan-image-generator-v2:0" is LEGACY-locked for this AWS account (ResourceNotFoundException). AWS blocks deprecated image models for accounts without recent usage, with no self-serve unblock. Switch to an active model: stability.stable-image-core-v1:1, stability.stable-image-ultra-v1:1, gpt-image-1, fal-ai/flux-pro/v1.1.`
+> `invokeImageGenModel: Bedrock model "amazon.titan-image-generator-v2:0" is LEGACY-locked for this AWS account (ResourceNotFoundException). AWS blocks deprecated image models for accounts without recent usage, with no self-serve unblock. Switch to an active model: stability.stable-image-core-v1:1, stability.stable-image-ultra-v1:1, gpt-image-2, fal-ai/flux-pro/v1.1.`
 
 The admin console's hand-kept picker (`IMAGE_GEN_MODEL_OPTIONS` in `ExperimentsTab.tsx`) omits both, so an operator cannot bind a legacy model in a new experiment from the console.
 
@@ -177,7 +177,7 @@ An assistant then uses the model by routing an intent to it in `models.byIntent`
 **Per-invocation latency.** Image generation is the slow path. Typical wall-clock:
 - Stability Core: 5-10s
 - Stability Ultra: 10-20s
-- OpenAI gpt-image-1: 10-20s (standard quality)
+- OpenAI gpt-image-2: not yet measured (`gpt-image-1` took 10-20s)
 - FAL FLUX 1.1 Pro: 5-15s
 
 The `requestTimeoutMs` default of 60s leaves headroom for the slower end of these ranges. The processor's own timeout is the classification topology's `timeoutSeconds` (90 for premium). The per-call timeout must stay under the Lambda timeout, otherwise a hung call delivers its timeout error too late; raise `timeoutSeconds` before raising `requestTimeoutMs`.

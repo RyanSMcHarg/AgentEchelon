@@ -1,9 +1,9 @@
 /**
  * THE ACCESS LOG TAB (ADR-052, SPEC-ADMIN-CONSOLE 3.3, FR30).
  *
- * It shows who was given access to which conversation, when, and why; it filters by conversation and by
- * person; and a read the service refuses (the log could not record it) shows the refusal rather than an
- * empty table that would read as "nobody looked".
+ * It shows who was given access to which conversation, when, and why, and each refusal distinctly with its
+ * code; it filters by conversation and by person; and a read the service refuses (the log could not record
+ * it) shows the refusal rather than an empty table that would read as "nobody looked".
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
@@ -13,6 +13,14 @@ import { fetchAccessLog } from '../../services/accessLogService';
 import { TAB_CAPABILITY, SECTIONS } from './AdminDashboard';
 
 vi.mock('../../services/accessLogService', () => ({ fetchAccessLog: vi.fn() }));
+vi.mock('../../services/peopleService', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  userManagementUrl: () => 'https://api.test/users',
+  listPeople: vi.fn(async () => ({
+    users: [{ personId: 'sub-legal-1', displayName: 'Lena Ortiz' }],
+    membershipGroups: [],
+  })),
+}));
 const mockFetch = vi.mocked(fetchAccessLog);
 
 const record = (over: Record<string, unknown> = {}) => ({
@@ -56,7 +64,42 @@ describe('the Access Log tab', () => {
     mockFetch.mockResolvedValue([record({ event: 'team_conversation_read', detail: { assistant: 'hr' } })]);
     render(<AccessLogTab />);
     expect(await screen.findByText('Conversation read by a team member (through hr)')).toBeTruthy();
-    expect(screen.getByText('Not a timed credential')).toBeTruthy();
+    expect(screen.getByText('Read on the console session')).toBeTruthy();
+  });
+
+  it('marks a grant as granted', async () => {
+    mockFetch.mockResolvedValue([record({ outcome: 'granted' })]);
+    render(<AccessLogTab />);
+    expect(await screen.findByText('Granted')).toBeTruthy();
+    expect(screen.queryByTestId('access-log-refused')).toBeNull();
+  });
+
+  it('shows a refusal distinctly: refused, with its code, what was asked for, and no expiry', async () => {
+    mockFetch.mockResolvedValue([record({
+      id: 'r2', event: 'admin_credential_refused', outcome: 'refused', code: 'CONVERSATION_NOT_FOUND', status: 404,
+      capabilities: ['attachment-read'], reason: 'customer asked about the report',
+    })]);
+    render(<AccessLogTab />);
+    const refused = await screen.findByTestId('access-log-refused');
+    expect(within(refused).getByText('Refused')).toBeTruthy();
+    expect(within(refused).getByText('CONVERSATION_NOT_FOUND')).toBeTruthy();
+    expect(screen.getByText('Admin credential request')).toBeTruthy();
+    expect(screen.getByText('Open attachments')).toBeTruthy();
+    expect(screen.getByText('Not granted')).toBeTruthy();
+    expect(screen.queryByText('Granted')).toBeNull();
+  });
+
+  it('shows a refusal with no code by its status, and one with no person as such', async () => {
+    mockFetch.mockResolvedValue([record({
+      id: 'r3', event: 'person_credential_refused', outcome: 'refused', code: null, status: 400, actor: null, conversation: null,
+      capabilities: [], reason: null,
+    })]);
+    render(<AccessLogTab />);
+    const refused = await screen.findByTestId('access-log-refused');
+    expect(refused.textContent).toContain('(HTTP 400)');
+    expect(screen.getByText('Sign-in credential request')).toBeTruthy();
+    expect(screen.getByText('Not signed in as a person')).toBeTruthy();
+    expect(screen.getByText('None given')).toBeTruthy();
   });
 
   it('filters by conversation and person', async () => {
@@ -74,6 +117,53 @@ describe('the Access Log tab', () => {
     render(<AccessLogTab />);
     expect((await screen.findByRole('alert')).textContent).toContain('cannot be recorded');
     expect(screen.queryByText('No access recorded in this window.')).toBeNull();
+  });
+
+  it('names the person beside their id, for a role that may be told who a person is', async () => {
+    mockFetch.mockResolvedValue([record()]);
+    render(
+      <CapabilityTestProvider capabilities={['view-access-log', 'view-users', 'see-user-identity']}>
+        <AccessLogTab />
+      </CapabilityTestProvider>,
+    );
+    const person = await screen.findByTestId('access-log-person');
+    expect(person.textContent).toContain('Lena Ortiz');
+    expect(person.textContent).toContain('sub-legal-1');
+  });
+
+  it('shows the id alone to a role that may not be told who a person is', async () => {
+    mockFetch.mockResolvedValue([record()]);
+    render(
+      <CapabilityTestProvider capabilities={['view-access-log']}>
+        <AccessLogTab />
+      </CapabilityTestProvider>,
+    );
+    expect(await screen.findByText('sub-legal-1')).toBeTruthy();
+    expect(screen.queryByText(/Lena Ortiz/)).toBeNull();
+  });
+
+  it('shows an analytics content read with its reason, the scope it reached, and that it was read on the session', async () => {
+    mockFetch.mockResolvedValue([record({
+      event: 'analytics_content_read', conversation: null, capabilities: ['view-events'], reason: 'checking a flagged answer',
+      detail: { queryType: 'flagged_responses', scope: 'full' },
+    })]);
+    render(<AccessLogTab />);
+    expect(await screen.findByText('Conversation content read in analytics')).toBeTruthy();
+    expect(screen.getByText('checking a flagged answer')).toBeTruthy();
+    expect(screen.getByText('Classifications: full · Query: flagged_responses')).toBeTruthy();
+    expect(screen.getByText('Read conversation content')).toBeTruthy();
+    expect(screen.getByText('Read on the console session')).toBeTruthy();
+  });
+
+  it('says "None required" only for an access that asks for no reason', async () => {
+    mockFetch.mockResolvedValue([
+      record({ id: 'a', event: 'admin_console_session_vend', conversation: null, reason: null, detail: { role: 'admins', ttlSeconds: 3600 } }),
+      record({ id: 'b', event: 'clean_conversation_read', reason: null }),
+    ]);
+    render(<AccessLogTab />);
+    expect(await screen.findByText('None required')).toBeTruthy();
+    expect(screen.getByText('Not recorded')).toBeTruthy();
+    expect(screen.getByText('Role: admins')).toBeTruthy();
   });
 
   it('sits in Oversight and needs view-access-log', () => {
@@ -113,5 +203,17 @@ describe('Your access, on the Access Log tab', () => {
     );
     await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
     expect(screen.queryByTestId('access-log-your-access')).toBeNull();
+  });
+});
+
+describe('a reader that is not a person', () => {
+  it('is shown by the name of the IAM role that signed the request, with the principal ARN as its title', async () => {
+    const arn = 'arn:aws:sts::111122223333:assumed-role/App-AdminRole-def/ops-automation';
+    mockFetch.mockResolvedValue([record({ event: 'analytics_content_read', actor: `iam#${arn}`, actorKind: 'iam', actorPrincipalArn: arn })]);
+    render(<AccessLogTab />);
+    const who = await screen.findByTestId('access-log-iam-actor');
+    expect(who.textContent).toBe('App-AdminRole-def (IAM principal)');
+    expect(who.getAttribute('title')).toBe(arn);
+    expect(screen.queryByText(`iam#${arn}`)).toBeNull();
   });
 });

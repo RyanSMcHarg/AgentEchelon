@@ -37,6 +37,12 @@ vi.mock('./ExperimentsTab', () => ({
     <button type="button" onClick={() => onOpenConversation?.(CHANNEL, LINK)}>open battle</button>
   ),
 }));
+// The Processes view stands in for a run's "Open conversation": one button that opens the conversation the run ran in.
+vi.mock('./ProcessesTab', () => ({
+  default: ({ onOpenConversation }: { onOpenConversation?: (arn: string) => void }) => (
+    <button type="button" onClick={() => onOpenConversation?.(CHANNEL)}>open run</button>
+  ),
+}));
 // The viewer stands in as the contract it keeps: take the link, consume it, and report the open conversation with it.
 vi.mock('./ConversationsTab', async () => {
   const React = await import('react');
@@ -82,6 +88,15 @@ describe('a link to a message', () => {
     expect(param('conv')).toBe('c-1');
     expect(param('at')).toBe('2026-10-29T09:59:57.000Z');
     expect(param('kind')).toBe('battle');
+  });
+
+  it('a process run opens the conversation it ran in, in the Conversations tab', async () => {
+    window.history.replaceState(null, '', '/?admin=processes');
+    render(<AdminDashboard onBack={() => {}} analyticsMode="aurora" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'open run' }));
+    expect(await screen.findByTestId('viewer')).toHaveTextContent('no message');
+    await waitFor(() => expect(param('admin')).toBe('conversations'));
+    expect(param('conv')).toBe('c-1');
   });
 
   it('a shared address opens the viewer at the message it names', async () => {

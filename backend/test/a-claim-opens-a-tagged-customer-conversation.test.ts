@@ -9,6 +9,11 @@
  * clearance does not reach the target consumes nothing; a creator that fails leaves the claim
  * redeemable. The live proof is `scripts/deny-test-upgrade.mjs`.
  */
+const mockStillCleared = jest.fn(async (..._a: unknown[]): Promise<string> => 'cleared');
+jest.mock('../lambda/src/lib/conversation-access', () => ({
+  ...jest.requireActual('../lambda/src/lib/conversation-access'),
+  callerStillCleared: (...a: unknown[]) => mockStillCleared(...a),
+}));
 import { register, claim } from '../lambda/src/guest-upgrade';
 import { tokenKey } from '../lambda/src/lib/tokens';
 import { registrationKeyOf } from '../lambda/src/lib/upgrade';
@@ -203,6 +208,17 @@ describe('an account claims', () => {
     const r = await claim(accountEvent({ claimToken }, STAFF_ISS), deps(doc, lambda));
     expect(r.statusCode).toBe(403);
     expect(parse(r).code).toBe('NOT_CLEARED_FOR_TARGET');
+    expect(doc.rows.get(tokenKey('claim', claimToken))!.consumedAt).toBeUndefined();
+    expect(lambda.calls).toEqual([]);
+  });
+
+  it.each([['not-cleared', 403, 'NOT_CLEARED_FOR_TARGET'], ['unavailable', 503, 'UNAVAILABLE']])('an account whose current clearance reads %s consumes nothing', async (verdict, status, code) => {
+    const { doc, claimToken } = await registered();
+    const lambda = creatorOk();
+    mockStillCleared.mockResolvedValueOnce(verdict);
+    const r = await claim(accountEvent({ claimToken }), deps(doc, lambda));
+    expect(r.statusCode).toBe(status);
+    expect(parse(r).code).toBe(code);
     expect(doc.rows.get(tokenKey('claim', claimToken))!.consumedAt).toBeUndefined();
     expect(lambda.calls).toEqual([]);
   });

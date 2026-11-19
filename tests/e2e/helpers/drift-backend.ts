@@ -328,3 +328,26 @@ export function assertNotAnErrorReply(content: string, context = 'assistant repl
     );
   }
 }
+
+/**
+ * A channel's messages as stored, decoded and oldest first: who sent each, its id, its content and Metadata. Read as the
+ * app-instance admin unless a `bearer` is named; a targeted message is listed only for its sender and its target.
+ */
+export async function channelMessagesAsStored(channelArn: string, bearer?: string): Promise<Array<{
+  id: string; fromAssistant: boolean; senderArn: string; content: string; metadata?: string;
+}>> {
+  const r = aws(['chime-sdk-messaging', 'list-channel-messages', '--channel-arn', channelArn, '--chime-bearer', bearer ?? adminArn(), '--max-results', '50']);
+  return ((r?.ChannelMessages || []) as any[])
+    .sort((a, b) => new Date(a.CreatedTimestamp).getTime() - new Date(b.CreatedTimestamp).getTime())
+    .map((m) => {
+      let content = String(m?.Content ?? '');
+      try { content = decodeURIComponent(content); } catch { /* not encoded */ }
+      return {
+        id: String(m?.MessageId ?? ''),
+        fromAssistant: String(m?.Sender?.Arn || '').includes('/bot/'),
+        senderArn: String(m?.Sender?.Arn || ''),
+        content,
+        ...(m?.Metadata ? { metadata: String(m.Metadata) } : {}),
+      };
+    });
+}

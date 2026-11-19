@@ -31,7 +31,7 @@ tracking: |
 
 **Accepted.** The layout and the as-built list are both in [STACKS.md](../../overview/STACKS.md). What the CDK app does:
 
-- It reads one declared list, `capabilities` (`backend/lib/config/capabilities.ts`), and builds the required core (`Messaging`, `Identity`, `Conversations`, `Archive`, `ChannelFlow`, `PostProcessing`, `PersonApi` and the `Assistants-*` stacks) plus each declared capability's stacks: `chat` (`ChatApp`), `admin` (`AdminServices`, `AdminApi`, `AdminApp`), `notifications`, `experiments`, `battle` (which requires `experiments`), `operations`, `connectors` (`Connectors`) and `widget` (`Widget`). `meetings` is refused at synth as NOT BUILT.
+- It reads one declared list, `capabilities` (`backend/lib/config/capabilities.ts`), and builds the required core (`Messaging`, `Identity`, `Conversations`, `Archive`, `ChannelFlow`, `PostProcessing`, `PersonApi` and the `Assistants-*` stacks) plus each declared capability's stacks: `chat` (`ChatApp`), `admin` (`AdminServices`, `AdminApi`, `AdminApp`), `notifications`, `experiments`, `battle` (which requires `experiments`), `operations`, `connectors` (`Connectors`), `widget` (`Widget`) and `meetings` (`Meetings`, which requires `chat`).
 - `enableBattle`, `enableAdminApp`, `enableAdminNotificationChannel` and `enableMeetings` are retired keys, refused at synth with the capability that replaced each (`RETIRED_CONTEXT_KEYS`).
 - It creates one `Assistants-<classification>` stack per classification the profile registry declares ([ADR-057](./057-assistant-stacks-come-from-the-registry.md)).
 - A core stack names an optional capability's resources only at that capability's attach points (`attaches` on its registry entry), and core code reads an absent attach point as off, with no call and no warning: offboarding names the battle-setting table only with `battle`, the channel flow answers `/battle` without a read when `battle` is absent, the invitation and guest-upgrade functions name the mail sender only with `notifications`, and an observability role reads a capability's alarms only where it is declared.
@@ -98,7 +98,6 @@ An API stack takes handler references from the capability stacks it fronts, so a
 
 ## What is not built
 
-- The `meetings` capability and its `Meetings` stack, which synth refuses with the reason.
 - `IngressApi`, for a vendor with no Amazon EventBridge integration ([ADR-056](./056-two-http-apis-and-no-aws-waf.md)).
 
 ## What proves it

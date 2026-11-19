@@ -20,8 +20,18 @@
 export interface DriftOutcomeCounts {
   /** Offers made. The denominator for acceptance. */
   offered: number;
-  /** User said yes at the prompt. */
-  accepted: number;
+  /** The person said yes at the prompt, whatever became of the new conversation. */
+  moved: number;
+  /** Said yes and went on in the new conversation, once the engagement sweep has judged it. */
+  carriedOn: number;
+  /** Said yes and the move could not be made. */
+  moveFailed: number;
+  /** Said yes and nobody wrote in the new conversation. */
+  neverUsed: number;
+  /** Said no at the prompt, or in the new conversation afterwards. */
+  declined: number;
+  /** Nobody answered the offer. */
+  unanswered: number;
   /** Offers still unsettled (outcome IS NULL). */
   pending: number;
   /** Offers the post-hoc judge has ruled on. The denominator for accuracy. */
@@ -39,8 +49,10 @@ export interface DriftRate {
 }
 
 export interface DriftHealthMetrics {
-  /** Question 2: accepted / offered. Fully instrumented today. */
+  /** Question 2: said yes / offered. Fully instrumented today. */
   acceptance: DriftRate;
+  /** Where the settled offers ended. Each is a count; a move the sweep has not judged is in none yet. */
+  outcomes: { carriedOn: number; neverUsed: number; declined: number; unanswered: number; moveFailed: number };
   /**
    * Question 1: of the offers judged after the fact, how many the judge called correct.
    *
@@ -68,7 +80,12 @@ export function parseDriftCounts(
 ): DriftOutcomeCounts {
   return {
     offered: count(stats, 'total_events'),
-    accepted: count(stats, 'accepted_count'),
+    moved: count(stats, 'moved_count'),
+    carriedOn: count(stats, 'carried_on_count'),
+    moveFailed: count(stats, 'move_failed_count'),
+    neverUsed: count(stats, 'moved_unused_count'),
+    declined: count(stats, 'declined_count'),
+    unanswered: count(stats, 'unanswered_count'),
     pending: count(stats, 'pending_count'),
     evaluated: count(stats, 'evaluated_count'),
     evaluatedCorrect: count(stats, 'evaluated_correct_count'),
@@ -81,7 +98,8 @@ function rate(numerator: number, denominator: number): DriftRate {
 
 export function driftHealthMetrics(counts: DriftOutcomeCounts): DriftHealthMetrics {
   return {
-    acceptance: rate(counts.accepted, counts.offered),
+    acceptance: rate(counts.moved, counts.offered),
+    outcomes: { carriedOn: counts.carriedOn, neverUsed: counts.neverUsed, declined: counts.declined, unanswered: counts.unanswered, moveFailed: counts.moveFailed },
     // Denominator is offers JUDGED, not offers made: a growing unjudged backlog must not read as
     // falling accuracy. `awaitingEvaluation` carries that backlog separately.
     accuracy: rate(counts.evaluatedCorrect, counts.evaluated),

@@ -49,7 +49,7 @@ What the two functions do about it:
 
 On the default path the router runs `classifyIntent()`, which for the default **LLM classifier** is a **synchronous Bedrock call** in the inbound window, before the async worker is invoked. That is often a second or more added to every turn's Inbound and TTFF.
 
-- **Keyword classifier.** For classifications that do not need model-grade routing, set the profile's `classifierMode: 'keyword'` (`backend/lib/config/profiles.ts`). This removes the model call from the inbound path. The three default classification profiles use `'llm'`; the opt-in `ops-premium` role uses `'keyword'` as a cost control.
+- **Keyword classifier.** For classifications that do not need model-grade routing, set the profile's `classifierMode: 'keyword'` (`backend/lib/config/profiles.ts`). This removes the model call from the inbound path. Every shipped profile, `ops-premium` included, uses `'llm'`; keyword mode is an option no shipped assistant selects.
 - **Classification caching.** **NOT BUILT:** the classifier does not cache results; every non-trivial turn makes the call.
 - **Classifier model.** The classifier runs on Haiku (`CLASSIFIER_MODEL_ID`, set by `assistant-profile-stack.ts`), independent of the answering model. Changing the default is an operator change in CDK; a `classification` experiment (`resolveClassificationExperiment` in `backend/lambda/src/lib/experiment-manager.ts`) swaps the classifier model for a share of turns, which is how to measure a faster one before adopting it.
 

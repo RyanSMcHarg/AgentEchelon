@@ -28,7 +28,7 @@ import { TokenRefused, verifyToken } from '../../lambda/src/lib/token-verificati
 import { edgeIssuers, type EdgeIssuer } from '../../lib/config/edge-verification';
 import { expandIssuer, issuerRegistry } from '../../lib/config/issuers';
 import { EXCHANGE_ROUTE } from '../../lib/constructs/edge-authorizer';
-import { GUEST_ROUTES, ONE_CHANNEL_ROUTES } from '../../lib/constructs/trusted-issuers';
+import { GUEST_ROUTES } from '../../lib/constructs/trusted-issuers';
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
 import type { IdentityState } from '../../lambda/src/lib/person-identity';
 
@@ -139,7 +139,7 @@ describe('a host assertion is checked against the keys the registry pins', () =>
 });
 
 describe('the edge admits an assertion once, at the exchange alone', () => {
-  const routes: EdgeRoutes = { exchange: [EXCHANGE_ROUTE], oneChannel: [...ONE_CHANNEL_ROUTES], guest: [...GUEST_ROUTES] };
+  const routes: EdgeRoutes = { exchange: [EXCHANGE_ROUTE], guest: [...GUEST_ROUTES] };
   const PERSON_ARN = 'arn:aws:chime:us-east-1:111122223333:app-instance/test/user/0190a000-0000-7000-8000-000000000001';
 
   function harness(state: IdentityState) {
@@ -186,7 +186,7 @@ describe('the edge admits an assertion once, at the exchange alone', () => {
 
   it('refuses an assertion on the admin plane', async () => {
     const h = harness({ state: 'active', personArn: PERSON_ARN });
-    const admin: EdgeRoutes = { plane: 'admin', exchange: [], oneChannel: [], guest: [], admin: ['POST /exchange-credentials'] };
+    const admin: EdgeRoutes = { plane: 'admin', exchange: [], guest: [], admin: ['POST /exchange-credentials'] };
     expect(await decide(sign(head(), claims()), { ...h.deps, routes: admin }, 'POST /exchange-credentials')).toEqual({ effect: 'unauthorized', reason: 'off-route' });
   });
 

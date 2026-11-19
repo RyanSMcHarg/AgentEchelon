@@ -122,6 +122,16 @@ export async function activeTaskByType(input: {
  * A REFUSAL READS AS ZERO, like every other call here: the caller cannot tell a refused channel from
  * work that was already gone, and the stop reply does not change either way.
  */
+/** Close the work an ended duel's sides opened. A refusal or a failure reads as nothing closed. */
+export async function endDuelTasks(input: { channelArn: string; battleId: string }): Promise<{ closed: Array<{ taskId: string; assistantId?: string }> }> {
+  try {
+    return (await invoke<{ closed: Array<{ taskId: string; assistantId?: string }> }>('endDuelTasks', input)) ?? { closed: [] };
+  } catch (err) {
+    console.warn('[task-service-client] endDuelTasks failed', { err: (err as Error)?.message });
+    return { closed: [] };
+  }
+}
+
 export async function cancelStoppedTasks(input: {
   channelArn: string;
   taskIds: string[];
@@ -273,7 +283,7 @@ export async function noTransitionTurn(input: { task: Task }): Promise<number> {
 }
 
 /** One task the caller already holds the id for. Null on refusal and on failure alike. */
-export async function getTask(input: { taskId: string; channelArn: string }): Promise<Task | null> {
+export async function getTask(input: { taskId: string; channelArn: string; consistent?: boolean }): Promise<Task | null> {
   try {
     return (await invoke<Task | null>('getTask', input)) ?? null;
   } catch (err) {
@@ -396,6 +406,73 @@ export async function openWorkflowTask(input: Record<string, unknown>): Promise<
   }
 }
 
+/**
+ * A PERSON'S CHOICE ON THEIR TASK (ADR-063 decision 2), relayed: by the card's route, or by the router for an answer the
+ * person wrote (a drift offer's reply, WT89). The service takes it only for the assignee, in the state named, along a
+ * choice that state declares, and closes the task. A transport fault is a refusal.
+ */
+export async function advanceAsAssignee(input: {
+  taskId: string; channelArn: string; callerPersonId: string; state: string; choice: string; messageId?: string; continuedByCaller?: boolean;
+}): Promise<{ ok: boolean; to?: string; error?: string }> {
+  try {
+    return (await invoke<{ ok: boolean; to?: string; error?: string }>('advanceAsAssignee', input)) ?? { ok: false, error: 'REFUSED' };
+  } catch (err) {
+    console.warn('[task-service-client] advanceAsAssignee failed', { err: (err as Error)?.message });
+    return { ok: false, error: 'REFUSED' };
+  }
+}
+
+/** A request whose task no router turn opened takes its intent's run (WT115, WT106). Null when refused or not written. */
+export async function attachRequestRun(input: { taskId: string; channelArn: string; workflowRun: Record<string, unknown>; dueBy?: string; ttlSeconds?: number }): Promise<Task | null | undefined> {
+  try {
+    return (await invoke<Task | null>('attachRequestRun', input)) ?? null;
+  } catch (err) {
+    // A FAULT IS NOT A REFUSAL: undefined, which the caller may try again; null is the service's refusal.
+    console.warn('[task-service-client] attachRequestRun failed', { err: (err as Error)?.message });
+    return undefined;
+  }
+}
+
+/** The task a requester may move while another person holds it, with the moves its step allows (WT114), or null. */
+export async function requesterMovableTask(input: { channelArn: string; personId: string; machines?: Record<string, unknown> }): Promise<{ task: Task; moves: string[] } | null> {
+  try {
+    return (await invoke<{ task: Task; moves: string[] } | null>('requesterMovableTask', input)) ?? null;
+  } catch (err) {
+    console.warn('[task-service-client] requesterMovableTask failed', { err: (err as Error)?.message });
+    return null;
+  }
+}
+
+/** Hold a run's wait and its continuation (WT20). A transport fault holds nothing. */
+export async function holdRunWait(input: { waitId: string; channelArn: string; continuation: Record<string, unknown> }): Promise<{ claimed: boolean; reason?: string }> {
+  try {
+    return (await invoke<{ claimed: boolean; reason?: string }>('holdRunWait', input)) ?? { claimed: false };
+  } catch (err) {
+    console.warn('[task-service-client] holdRunWait failed', { err: (err as Error)?.message });
+    return { claimed: false };
+  }
+}
+
+/** The continuation a run's wait holds. A transport fault reads nothing. */
+export async function readRunWait(input: { waitId: string; channelArn: string }): Promise<Record<string, unknown> | null> {
+  try {
+    return (await invoke<Record<string, unknown> | null>('readRunWait', input)) ?? null;
+  } catch (err) {
+    console.warn('[task-service-client] readRunWait failed', { err: (err as Error)?.message });
+    return null;
+  }
+}
+
+/** Record a run's end (WT62). A transport fault records nothing and fails nothing. */
+export async function recordRunEnded(input: Record<string, unknown>): Promise<{ recorded: boolean }> {
+  try {
+    return (await invoke<{ recorded: boolean }>('recordRunEnded', input)) ?? { recorded: false };
+  } catch (err) {
+    console.warn('[task-service-client] recordRunEnded failed', { err: (err as Error)?.message });
+    return { recorded: false };
+  }
+}
+
 /** End a task step's task at its deadline. A transport fault cancels nothing. */
 export async function cancelForDeadline(input: { taskId: string; channelArn: string }): Promise<{ cancelled: boolean }> {
   try {
@@ -426,6 +503,54 @@ export async function claimPickup(input: { taskId: string; channelArn: string; s
   }
 }
 
+/**
+ * THE OPEN TASKS OF ONE MACHINE IN EVERY CONVERSATION A CONVERSATION'S WORKFLOW OPENED (WT122), each whole: for a limit
+ * counted from them. A read that fails is null, never an empty list, so a limit is never passed because its count could not
+ * be taken.
+ */
+export async function openTasksOpenedFrom(input: { openedFrom: string; taskType: string }): Promise<Task[] | null> {
+  try {
+    const tasks = await invoke<Task[] | null>('openTasksOpenedFrom', input);
+    return Array.isArray(tasks) ? tasks : null;
+  } catch (err) {
+    console.warn('[task-service-client] openTasksOpenedFrom failed', { err: (err as Error)?.message });
+    return null;
+  }
+}
+
+/** Settle an archived conversation's open workflow tasks (ADR-017): the ids it settled, or null when it could not. */
+export async function settleArchivedTasks(input: { channelArn: string }): Promise<string[] | null> {
+  try {
+    const out = await invoke<{ settled?: string[]; failed?: true }>('settleArchivedTasks', input);
+    return Array.isArray(out?.settled) ? out!.settled : null;
+  } catch (err) {
+    console.warn('[task-service-client] settleArchivedTasks failed', { err: (err as Error)?.message });
+    return null;
+  }
+}
+
+/** Cancel the open work of a run a settlement ended mid-way (`endsRun`): the ids it cancelled, or null when it could not. */
+export async function endRunTasks(input: { channelArn: string; runKey: string }): Promise<string[] | null> {
+  try {
+    const out = await invoke<{ cancelled?: string[]; failed?: true }>('endRunTasks', input);
+    return Array.isArray(out?.cancelled) ? out!.cancelled : null;
+  } catch (err) {
+    console.warn('[task-service-client] endRunTasks failed', { err: (err as Error)?.message });
+    return null;
+  }
+}
+
+/** Which of a run's step claims are held, with their outcomes. A transport fault is null, never "none held". */
+export async function readEventSteps(input: { runKey: string; channelArn: string; steps: string[] }): Promise<Record<string, string> | null> {
+  try {
+    const out = await invoke<Record<string, string> | null>('readEventSteps', input);
+    return out && typeof out === 'object' ? out : null;
+  } catch (err) {
+    console.warn('[task-service-client] readEventSteps failed', { err: (err as Error)?.message });
+    return null;
+  }
+}
+
 /** The ids of a conversation's open tasks a workflow step opened (`evt-` ids), for deleting their deadlines on archive. */
 export async function workflowTaskIds(input: { channelArn: string }): Promise<string[]> {
   try {
@@ -434,5 +559,19 @@ export async function workflowTaskIds(input: { channelArn: string }): Promise<st
   } catch (err) {
     console.warn('[task-service-client] workflowTaskIds failed', { err: (err as Error)?.message });
     return [];
+  }
+}
+
+/**
+ * The open item an id names, when its sender may answer it (ADR-035): the task service's own check, the one the channel flow
+ * asks. Null on a refusal, an id naming nothing, or a transport fault, so an id it could not confirm is never honored.
+ */
+export async function answerableTaskById(input: { channelArn: string; taskId: string; senderSub: string }): Promise<{ taskId: string; assistantId?: string; private?: true } | null> {
+  try {
+    const found = await invoke<{ taskId?: string; assistantId?: string; private?: true } | null>('answerableTaskById', input);
+    return found && typeof found.taskId === 'string' && found.taskId ? found as { taskId: string; assistantId?: string; private?: true } : null;
+  } catch (err) {
+    console.warn('[task-service-client] answerableTaskById failed', { err: (err as Error)?.message });
+    return null;
   }
 }

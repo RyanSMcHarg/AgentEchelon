@@ -12,9 +12,30 @@
    CONTRAST. Secondary and tertiary text, control borders, links and accent text are set to meet WCAG
    AA on both themes (4.5:1 for text, 3:1 for a control's edge). The shared light tertiary (#A1A1AA on
    white, 2.6:1) does not, so the console darkens it; in dark mode the accent text and tint swap so an
-   accent label on an accent tint stays legible. */
+   accent label on an accent tint stays legible.
+
+   THE CONSOLE'S ACCENT IS TEAL, set here once. It tells an operator at a glance that this is the console and not
+   the chat client, which is violet, and every control, link, focus ring, the sign-in screen and the tab icon
+   (public/admin-mark.svg) read it. Amber, green and red are for status and say something about a value.
+
+   A CHART'S SERIES ARE `--chart-1` to `--chart-4`, in that order. None of them is a status color, so a line never
+   reads as good or bad because of where it falls in the order. */
 
 :root {
+  --accent-50: #F0FDFA;
+  --accent-100: #CCFBF1;
+  --accent-200: #99F6E4;
+  --accent-300: #5EEAD4;
+  --accent-400: #14B8A6;
+  --accent-500: #0F766E;
+  --accent-600: #115E59;
+  --accent-700: #134E4A;
+
+  --chart-1: #0D9488;
+  --chart-2: #2563EB;
+  --chart-3: #BE185D;
+  --chart-4: #A16207;
+
   --text-xs: 0.75rem;     /* 12px: monospace badges and counters only */
   --text-sm: 0.875rem;    /* 14px: help, captions, secondary text */
   --text-base: 0.9375rem; /* 15px: tables, buttons, dense lists */
@@ -41,10 +62,19 @@
     --text-secondary: #A1A1AA;
     --text-tertiary: #8E8E96;
     --control-border: #6B6B74;
-    --accent-50: #1E1038;
-    --accent-100: #2E1065;
-    --accent-200: #4C1D95;
-    --accent-700: #DDD6FE;
+    --accent-50: #042F2E;
+    --accent-100: #134E4A;
+    --accent-200: #115E59;
+    --accent-300: #5EEAD4;
+    --accent-400: #2DD4BF;
+    --accent-500: #14B8A6;
+    --accent-600: #2DD4BF;
+    --accent-700: #99F6E4;
+    --text-on-accent: #042F2E;
+    --chart-1: #0D9488;
+    --chart-2: #3B82F6;
+    --chart-3: #EC4899;
+    --chart-4: #D97706;
   }
 }
 
@@ -52,10 +82,19 @@
   --text-secondary: #A1A1AA;
   --text-tertiary: #8E8E96;
   --control-border: #6B6B74;
-  --accent-50: #1E1038;
-  --accent-100: #2E1065;
-  --accent-200: #4C1D95;
-  --accent-700: #DDD6FE;
+  --accent-50: #042F2E;
+  --accent-100: #134E4A;
+  --accent-200: #115E59;
+  --accent-300: #5EEAD4;
+  --accent-400: #2DD4BF;
+  --accent-500: #14B8A6;
+  --accent-600: #2DD4BF;
+  --accent-700: #99F6E4;
+  --text-on-accent: #042F2E;
+  --chart-1: #0D9488;
+  --chart-2: #3B82F6;
+  --chart-3: #EC4899;
+  --chart-4: #D97706;
 }
 
 /* A link is the link color in both themes, not the browser's default blue (unreadable on dark). */

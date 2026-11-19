@@ -99,7 +99,7 @@ function identityStatements(t: Template, roleId: string): Statement[] {
 const shape = (s: Statement) => JSON.stringify({ ...s, Sid: undefined });
 
 describe('the person vend roles', () => {
-  // Identity's two (the one-conversation role and the admin plane's chat identity), and a classification's own.
+  // Identity's two (the `restricted` role and the admin plane's chat identity), and a classification's own.
   const vend = [
     ...rolesMatching(identity, /^ExchangeRole/).map((r) => ({ ...r, t: identity })),
     ...rolesMatching(basicStack, /^ExchangeRole/).map((r) => ({ ...r, t: basicStack })),
@@ -115,11 +115,19 @@ describe('the person vend roles', () => {
     expect(new Set(vend.map((r) => `${r.t === identity}:${r.boundary}`)).size).toBe(vend.length);
   });
 
-  it('the boundary is the role\'s own reach, statement for statement: the Amazon Chime SDK and nothing else', () => {
+  it('the boundary is the role\'s own reach, statement for statement: the Amazon Chime SDK, and reading dashboards', () => {
     for (const r of vend) {
       const bounded = boundaryStatements(r.t, r.boundary!);
       expect(bounded.map(shape).sort()).toEqual(identityStatements(r.t, r.id).map(shape).sort());
-      expect(actionsOf(bounded).every((a) => a.startsWith('chime:'))).toBe(true);
+      // Beyond the Amazon Chime SDK a role reads the dashboards of the classifications it grants, and the restricted role nothing.
+      const beyondChime = bounded.filter((s) => list(s.Action).some((a) => !a.startsWith('chime:')));
+      if (/Restricted/.test(r.id)) expect(beyondChime).toEqual([]);
+      for (const s of beyondChime) {
+        expect(s.Effect).toBe('Allow');
+        expect(list(s.Action)).toEqual(['s3:GetObject']);
+        expect(list(s.Resource).length).toBeGreaterThan(0);
+        for (const resource of list(s.Resource)) expect(JSON.stringify(resource)).toContain('/dashboards/');
+      }
       for (const never of ['chime:CreateChannel', 'chime:CreateChannelMembership', 'chime:CreateAppInstanceUser', 'chime:RedactChannelMessage']) {
         expect(actionsOf(bounded)).not.toContain(never);
       }
@@ -139,12 +147,48 @@ describe('the person vend roles', () => {
 describe('the admin exchange\'s roles', () => {
   const byId = (re: RegExp) => rolesMatching(adminServices, re)[0];
 
-  it('the admin plane is bounded by its own statements', () => {
+  it('the admin plane is bounded by its own statements, and its archive routes', () => {
     const plane = byId(/^ExchangeRoleAdminPlane/);
     expect(plane.boundary).toMatch(/^ExchangeRoleAdminPlaneBoundary/);
-    expect(boundaryStatements(adminServices, plane.boundary!).map(shape).sort())
+    const bounded = boundaryStatements(adminServices, plane.boundary!);
+    const archive = bounded.filter((s) => list(s.Action).includes('execute-api:Invoke'));
+    expect(archive).toHaveLength(1);
+    expect(bounded.filter((s) => !archive.includes(s)).map(shape).sort())
       .toEqual(identityStatements(adminServices, plane.id).map(shape).sort());
-    expect(actionsOf(boundaryStatements(adminServices, plane.boundary!))).not.toContain('chime:CreateAppInstanceUser');
+    expect(actionsOf(bounded)).not.toContain('chime:CreateAppInstanceUser');
+  });
+
+  // THE ARCHIVE PLANE NAMES THIS INSTANCE'S ADMIN API BY ITS ID. With a second instance in the same account, a
+  // grant or a session policy naming any API id would reach that instance's admin routes too.
+  it('the admin plane\'s grant names this instance\'s admin API by id, never any API', () => {
+    const apiIds = Object.keys(adminApi.findResources('AWS::ApiGatewayV2::Api'));
+    expect(apiIds).toHaveLength(1);
+    const grants = (Object.entries(adminApi.findResources('AWS::IAM::ManagedPolicy')) as Array<[string, any]>)
+      .filter(([id]) => id.startsWith('AdminPlaneGrant'));
+    expect(grants).toHaveLength(1);
+    const resources = grants[0][1].Properties.PolicyDocument.Statement.flatMap((s: Statement) => list(s.Resource as unknown[]));
+    expect(resources.length).toBe(6);
+    for (const r of resources) {
+      const json = JSON.stringify(r);
+      expect(json).toContain(`{"Ref":"${apiIds[0]}"}`);
+      expect(json).not.toMatch(/execute-api:[^"]*:\*\//);
+    }
+    // And the role holds no execute-api grant of its own that could name another API.
+    const plane = byId(/^ExchangeRoleAdminPlane/);
+    expect(actionsOf(identityStatements(adminServices, plane.id))).not.toContain('execute-api:Invoke');
+    expect(plane.role.Properties.RoleName).toMatch(/-admin-plane$/);
+  });
+
+  it('the exchange\'s archive templates take the API id per vend, never a wildcard', () => {
+    const fns = Object.values(adminServices.findResources('AWS::Lambda::Function')) as any[];
+    const env = fns.map((f) => f.Properties.Environment?.Variables ?? {}).find((v) => v.EXCHANGE_EXECUTE_API_MESSAGES_ARN);
+    const templates = Object.entries(env).filter(([k]) => k.startsWith('EXCHANGE_EXECUTE_API_'));
+    expect(templates.length).toBe(6);
+    for (const [, value] of templates) {
+      const json = JSON.stringify(value);
+      expect(json).toContain(':{apiId}/*/');
+      expect(json).not.toMatch(/:\*\/\*\//);
+    }
   });
 
   it('both console roles share one boundary: an admin route and following console events, and nothing else', () => {

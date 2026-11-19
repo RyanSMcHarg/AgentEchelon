@@ -30,7 +30,7 @@ import {
   eventWorkflowErrors,
   runEventWorkflow,
   openedWorkflowOf,
-  PLATFORM_EVENT_WORKFLOWS,
+  SHIPPED_EVENT_WORKFLOWS,
   versionEventWorkflowsErrors,
   welcomePlan,
   welcomeWorkflowOf,
@@ -39,7 +39,7 @@ import {
 } from '../../lambda/src/lib/event-workflow';
 import { legacyWelcomePlan, type LegacyWelcome } from '../../lambda/src/lib/legacy-welcome-migration';
 import { MIGRATE_LEGACY_WELCOME, patchShapeErrors, retiredWelcomeErrors } from '../../lambda/src/lib/profile-copy-fields';
-import { OPS_WELCOME, ADVISOR_WELCOME } from '../../demo/welcomes';
+import { OPS_WELCOME, ADVISOR_WELCOME } from '../../../demo/portable-assistants/welcomes';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -106,7 +106,10 @@ function workflowOpening(own: Record<string, EventWorkflow> | undefined, type: s
   return composeOpening(sel?.template, { ...(orientation ?? {}), ...room }, { role: 'ops' }).content;
 }
 
-/** The retired demo welcomes, as they were seeded before W1. */
+/**
+ * The demo's welcomes in the retired structured shape, with the demo's wording (short, so an ops room's greetings do not
+ * restate each other): the seed must still be what the migration writes for them, word for word.
+ */
 const LEGACY_OPS: LegacyWelcome = {
   companyName: 'Stratum Technologies',
   companyBlurb: 'an enterprise SaaS company (workflow automation, ~280 people, based in Austin)',
@@ -114,13 +117,17 @@ const LEGACY_OPS: LegacyWelcome = {
   examples: ['What is the error rate across the deployment right now?', 'Which functions are slowest, and since when?', 'Which alarms are in alarm, and what do they cover?'],
   platformNote: 'I also know the AgentEchelon platform that powers this demo - ask me "how does AgentEchelon work?" or "how do I customize it?"',
   byConversationType: {
-    ops: { template: 'This conversation is open for an operations issue.\n{eventSummary}\nI can read this deployment\'s metrics and alarm state - ask me what is happening and I will start there.' },
+    ops: { template: '{eventSummary}\nAsk me what\'s happening; I\'ll start from the metrics and alarm state.' },
+    'ops-team': { template: 'This is the ops team\'s conversation.\nIt\'s for {topic}.\nMembers follow the ops group. Ask me about the deployment; alerts open their own conversations.' },
   },
 };
 const LEGACY_ADVISOR: LegacyWelcome = {
   byConversationType: {
-    ops: { template: 'I am here too, and I am checking in on this one.' },
-    'ops-team': { template: 'This is the operations team\'s standing room.\nIt is for {topic}.\nEveryone in the ops group is here, and people join or leave as the group changes.\nAsk me anything here. When an alert opens an incident, a separate room opens for it with the Ops assistant, which reads this deployment\'s metrics and alarm state.' },
+    ops: { template: 'I\'m Advisor, here for the customer side of this incident. Ask me which customers are affected, what their accounts '
+      + 'are worth and when they renew, and who their account contacts are; once the call is running I can bring their '
+      + 'account teams in.' },
+    'ops-team': { template: 'I\'m Advisor, here for the customer side. When something breaks, ask me which customers it reaches and who their '
+      + 'account contacts are.' },
   },
 };
 
@@ -166,12 +173,12 @@ describe('a structured welcome says, as a workflow, exactly what it said', () =>
   it('a welcome that says only what the platform\'s does writes no workflow, and the platform\'s welcome opens the room', () => {
     expect(legacyWelcomePlan({}, undefined).workflows).toEqual([]);
     expect(legacyWelcomePlan({ mode: 'structured' }, undefined).eventWorkflows).toEqual({});
-    expect(welcomeWorkflowOf(undefined, 'ops')).toEqual({ name: 'welcome', workflow: PLATFORM_EVENT_WORKFLOWS.welcome, declared: false });
-    expect(selectOpening(welcomePlan(PLATFORM_EVENT_WORKFLOWS.welcome).opening)).toBeNull();
+    expect(welcomeWorkflowOf(undefined, 'ops')).toEqual({ name: 'welcome', workflow: SHIPPED_EVENT_WORKFLOWS.welcome, declared: false });
+    expect(selectOpening(welcomePlan(SHIPPED_EVENT_WORKFLOWS.welcome).opening)).toBeNull();
   });
 
   it('carries the version\'s other workflows unchanged', () => {
-    const own: Record<string, EventWorkflow> = { 'chase': JSON.parse(JSON.stringify(PLATFORM_EVENT_WORKFLOWS['chase-unredeemed'])) };
+    const own: Record<string, EventWorkflow> = { 'chase': JSON.parse(JSON.stringify(SHIPPED_EVENT_WORKFLOWS['chase-unredeemed'])) };
     const plan = legacyWelcomePlan({ companyName: 'Acme' }, own);
     expect(plan.eventWorkflows.chase).toEqual(own.chase);
     expect(Object.keys(plan.eventWorkflows).sort()).toEqual(['chase', 'welcome']);
@@ -207,7 +214,7 @@ describe('a workflow welcome selects its workflow in exactly the rooms it ran in
   it('a platform workflow named by the version\'s own welcome is copied in and answers for every room', () => {
     const plan = legacyWelcomePlan({ mode: 'workflow', workflow: 'opening-and-subject' }, undefined);
     expect(plan.refused).toEqual([]);
-    expect(plan.eventWorkflows['opening-and-subject']).toEqual(PLATFORM_EVENT_WORKFLOWS['opening-and-subject']);
+    expect(plan.eventWorkflows['opening-and-subject']).toEqual(SHIPPED_EVENT_WORKFLOWS['opening-and-subject']);
     for (const type of TYPES) {
       const chosen = welcomeWorkflowOf(plan.eventWorkflows, type);
       expect(chosen.name).toBe('opening-and-subject');
@@ -239,7 +246,7 @@ describe('a workflow welcome selects its workflow in exactly the rooms it ran in
   it('a conversation-opened welcome becomes the workflow its room\'s type selects, and the join posts nothing there', () => {
     const plan = legacyWelcomePlan({ byConversationType: { ops: { mode: 'workflow', workflow: 'ops-room' } } }, undefined);
     expect(plan.refused).toEqual([]);
-    expect(plan.eventWorkflows['ops-room']).toEqual(PLATFORM_EVENT_WORKFLOWS['ops-room']);
+    expect(plan.eventWorkflows['ops-room']).toEqual(SHIPPED_EVENT_WORKFLOWS['ops-room']);
     expect(openedWorkflowOf(plan.eventWorkflows, 'ops')?.name).toBe('ops-room');
     expect(openedWorkflowOf(plan.eventWorkflows, 'general')).toBeUndefined();
     expect(arrivalWelcomeOwner({ conversationType: 'ops', own: plan.eventWorkflows })).toBe('conversation-opened');
@@ -279,8 +286,8 @@ describe('the retired welcome is refused, naming the script', () => {
     expect(retiredWelcomeErrors(undefined)).toEqual([]);
     expect(retiredWelcomeErrors({})[0]).toMatch(/welcome is retired: the welcome is this assistant's assistant-joined workflow/);
     const lifecycle = readFileSync(join(__dirname, '../../lambda/src/lib/profile-lifecycle.ts'), 'utf8');
-    // validate, activate, an experiment's variant and a rollback.
-    expect(lifecycle.match(/retiredWelcomeErrors\(/g)?.length).toBe(4);
+    // validate, activate, an experiment's variant and a rollback, and the listing's flag on a version a rollback refuses.
+    expect(lifecycle.match(/retiredWelcomeErrors\(/g)?.length).toBe(5);
     expect(readFileSync(join(__dirname, '../../lambda/src/lib/profile-manifest.ts'), 'utf8')).toMatch(/retiredWelcomeErrors\(\(body as \{ welcome\?: unknown \}\)\.welcome\)/);
     expect(readFileSync(join(__dirname, '../../package.json'), 'utf8')).toContain('"migrate-legacy-welcome": "tsc && node scripts/migrate-legacy-welcome.mjs"');
   });
@@ -364,14 +371,14 @@ describe('a welcome that greets and then continues runs as a workflow, its openi
   it('refuses two openings, and a welcome step on any other event', () => {
     const two = JSON.parse(JSON.stringify(GREET_THEN_CONTINUE)) as EventWorkflow;
     two.states['greet-subject'] = { opening: {}, onSuccess: 'intake' };
-    expect(eventWorkflowErrors('two', two).join()).toMatch(/has 2 opening steps .* a welcome opens the room once/);
+    expect(eventWorkflowErrors('two', two).join()).toMatch(/has 2 opening steps .* a welcome opens the conversation once/);
     expect(eventWorkflowErrors('x', { ...GREET_THEN_CONTINUE, on: 'person-joined' }).join()).toMatch(/is an opening, which only the welcome takes/);
     // The opening opens the room, so it comes first: never after a send, nor after an agent step a run continues past.
     const late = JSON.parse(JSON.stringify(GREET_THEN_CONTINUE)) as EventWorkflow;
     late.initial = 'greet-subject';
     late.states['greet-subject'].onSuccess = 'opening';
     late.states.opening.onSuccess = 'intake';
-    expect(eventWorkflowErrors('late', late).join()).toMatch(/states\.opening is an opening, which opens the room, so it is the welcome's first step/);
+    expect(eventWorkflowErrors('late', late).join()).toMatch(/states\.opening is an opening, which opens the conversation, so it is the welcome's first step/);
   });
 
   it('the router gives a run the opening it composed and the prompt values, only where WelcomeIntent runs the welcome', () => {

@@ -55,6 +55,21 @@ describe('the confirmation card', () => {
     expect(screen.queryByRole('button', { name: 'Confirm' })).toBeNull();
   });
 
+  it.each([
+    ['NOT_CLEARED', 'Your access does not reach this conversation.', false],
+    ['CLASSIFICATION_UNREADABLE', 'This conversation cannot be acted on until its classification is set.', false],
+    ['NOT_A_PERSON_SESSION', 'Answer from your own sign-in, not an administrator session.', false],
+    ['UNAVAILABLE', 'The conversation could not be checked just now. Try again.', true],
+  ])('says the conversation access refusal %s in its own words; only an outage may be tried again', async (code, text, retryable) => {
+    const user = userEvent.setup();
+    const decide = vi.fn().mockRejectedValue(new ProposalError(code as string, 'server sentence'));
+    render(<ProposalCard proposal={nudge} decide={decide} now={() => NOW} />);
+    await user.type(screen.getByLabelText('Their email address'), 'friend@example.com');
+    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    expect(await screen.findByRole('status')).toHaveTextContent(text as string);
+    expect(screen.queryByRole('button', { name: 'Confirm' }) !== null).toBe(retryable);
+  });
+
   it('shows an expired proposal as expired, with nothing to press', () => {
     render(<ProposalCard proposal={{ ...nudge, expiresAt: NOW / 1000 - 1 }} decide={vi.fn()} now={() => NOW} />);
     expect(screen.getByRole('status')).toHaveTextContent('This proposal has expired.');

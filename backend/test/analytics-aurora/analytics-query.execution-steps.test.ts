@@ -62,13 +62,13 @@ describe('execution-steps filters are bound, never inlined', () => {
     ['agentType', { agentType: 'assistant' }, 'm.assistant', 'assistant'],
     ['conversationClassification', { conversationClassification: 'premium' }, 'm.conversation_classification', 'premium'],
     ['assistantRole', { assistantRole: 'ops' }, 'm.assistant_role', 'ops'],
-    ['profileVersion', { profileVersion: '6' }, 'm.profile_version', 6],
+    ['profileVersion', { profileVersion: '6,7' }, 'm.profile_version', [6, 7]],
   ])('%s compares against a placeholder holding its value', async (_name, params, column, expected) => {
     const { sql, values } = await sqlFor(params as Record<string, string>);
 
     // The comparison exists, and its right-hand side is `$n` - not a bare number, which is what a
     // dropped `$` produces and what Postgres then reads as an integer literal.
-    const match = new RegExp(`${column.replace('.', '\\.')}\\s*=\\s*(\\$?\\d+)`).exec(sql);
+    const match = new RegExp(`${column.replace('.', '\\.')}\\s*=\\s*(?:ANY\\()?(\\$?\\d+)`).exec(sql);
     expect(match).not.toBeNull();
     const rhs = match![1];
     expect(rhs.startsWith('$')).toBe(true);
@@ -92,6 +92,6 @@ describe('execution-steps filters are bound, never inlined', () => {
     for (const p of placeholders) {
       expect(Number(p.slice(1))).toBeLessThanOrEqual(values.length);
     }
-    expect(values).toEqual(expect.arrayContaining([CHANNEL, 'assistant', 'premium', 'ops', 6]));
+    expect(values).toEqual(expect.arrayContaining([CHANNEL, 'assistant', 'premium', 'ops', [6]]));
   });
 });

@@ -21,8 +21,8 @@
  * a `place_item` intent, which a deployment declares in its INTENT PACK; the platform default pack
  * this deployment runs declares the five enterprise intents and no work-item ones, and the work-item
  * tools are registered only for a conversation that carries a host plan (`domainContext`, written by
- * the context create, which a one-conversation issuer's people reach and this deployment's
- * trusted-issuer registry does not declare). So the test supplies those two host-side inputs and nothing else - the same technique
+ * the host's membership function, which stands up only where the trusted-issuer registry declares a
+ * one-conversation issuer, and this deployment's does not). So the test supplies those two host-side inputs and nothing else - the same technique
  * `bilingual-conversations.spec.ts` uses for `userLanguage`. Every runtime path under test is the
  * shipped one: the router's resume loop walks `Object.keys(taskStateMachines())` and so finds the
  * row, the processor registers the work-item tools off the stored plan, the proposal coupling

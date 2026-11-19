@@ -10,7 +10,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { parseTemplate, renderTemplateGuidance, renderTemplateChoice, TemplateParseError } from '../../lambda/src/lib/document-template';
 
-const EXAMPLE = readFileSync(join(__dirname, '..', '..', 'demo', 'templates', 'quarterly-account-review.md'), 'utf8');
+const EXAMPLE = readFileSync(join(__dirname, '..', '..', '..', 'demo', 'stratum-company', 'templates', 'quarterly-account-review.md'), 'utf8');
 
 const tpl = (front: Record<string, unknown>, body: string) => `---\n${JSON.stringify(front)}\n---\n${body}`;
 

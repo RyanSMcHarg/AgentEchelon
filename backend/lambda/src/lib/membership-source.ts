@@ -127,7 +127,8 @@ export interface Directory {
   /**
    * The classifications the groups `groupsFor` reads clear the person for, each directory's groups bounded by its own
    * issuer's classifications (`heldWithinIssuer`): the rule the credential exchange applies to the session it issues,
-   * read from the same groups. Null when the person signs in through no directory that keeps groups.
+   * read from the same groups. Null when the person signs in through no issuer whose clearance is its directory's own
+   * groups: a translation, a fixed set and a mapping clear a person some other way, so their directory's groups say nothing.
    */
   clearedByGroups(personArn: string): Promise<string[] | null>;
   /** What the person is cleared for, through each of their issuers' clearance sources. Throws when a source fails. */
@@ -225,6 +226,9 @@ export function createDirectory(config: DirectoryConfig): Directory {
   const readsStoreGroups = (s: IssuerSeam | undefined): boolean =>
     !!s && !('groups' in s.issuer.clearance && isTranslation(s.issuer.clearance.groups));
 
+  /** Whether an entry declares its store's own groups as its people's clearance (`groups: true`). */
+  const clearedByStoreGroups = (s: IssuerSeam): boolean => 'groups' in s.issuer.clearance && readsStoreGroups(s);
+
   /** The issuer ids whose entries read the same store as `seam`, its own first. */
   const sameStore = (seam: IssuerSeam): string[] => [
     seam.issuer.id,
@@ -308,7 +312,7 @@ export function createDirectory(config: DirectoryConfig): Directory {
 
     async clearedByGroups(personArn) {
       const { trusted } = await subjectsWithSeams(personArn);
-      const withGroups = trusted.filter((t) => t.seam.directory.groupsOf);
+      const withGroups = trusted.filter((t) => t.seam.directory.groupsOf && clearedByStoreGroups(t.seam));
       if (!withGroups.length) return null;
       const held = new Set<string>();
       for (const { seam, subject } of withGroups) {

@@ -182,7 +182,8 @@ export interface ConversationSplitRequest {
 }
 
 export interface ConversationSplitResult {
-  created: Array<{ label: string; channelArn: string }>;
+  /** `private`: the subject came from private messages, so nothing about it is said to the room. */
+  created: Array<{ label: string; channelArn: string; private?: boolean }>;
   /** Named rather than silently dropped: the caller tells the person what did not happen. */
   refused: string[];
 }
@@ -315,7 +316,7 @@ async function splitAsTheAssistant(
         parentChannelArn: req.channelArn,
         originatingMessageId: req.originatingMessageId,
       });
-      created.push({ label: topic.label, channelArn: result.channelArn });
+      created.push({ label: topic.label, channelArn: result.channelArn, ...(topic.private ? { private: true } : {}) });
     } catch (err) {
       // ONE SUBJECT FAILING IS NOT ALL OF THEM FAILING. The person chose several things; losing the
       // rest because the first threw would be a worse answer than the partial one, and the caller is

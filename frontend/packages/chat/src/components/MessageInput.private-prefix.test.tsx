@@ -268,10 +268,9 @@ describe('MessageInput - the private prefix', () => {
       });
       fireEvent.keyDown(textarea(), { key: 'Enter', code: 'Enter' });
 
-      // THE PICKER WRITES THE ID BESIDE THE NAME, because a display name is not unique and the channel
-      // flow sees no Target - so the id has to travel in the text. The chip below still shows the NAME,
-      // which is the half a person reads.
-      await waitFor(() => expect(textarea().value).toBe('.<Ryan McHarg|alice> '));
+      // THE FIELD SHOWS THE NAME, and the id rides beside it to the send, because a display name is not
+      // unique and the channel flow sees no Target.
+      await waitFor(() => expect(textarea().value).toBe('.Ryan McHarg '));
       // The chip is the confirmation that privacy was applied, and it must appear for this form too.
       await waitFor(() => {
         const chip = document.querySelector('.message-input-sticky-target-chip--private');
@@ -378,8 +377,8 @@ describe('MessageInput - the private prefix', () => {
     await waitFor(() => expect(document.querySelector('.mention-option-name')).not.toBeNull());
     fireEvent.keyDown(textarea(), { key: 'Enter', code: 'Enter' });
 
-    // Delimited now even for a simple name, because the id is written with it.
-    await waitFor(() => expect(textarea().value).toBe('.<Alice|alice> '));
+    // The field shows the name; the id is written into the sent text.
+    await waitFor(() => expect(textarea().value).toBe('.Alice '));
     await waitFor(() => {
       expect(document.querySelector('.message-input-sticky-target-chip--private')).not.toBeNull();
     });

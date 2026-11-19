@@ -9,7 +9,7 @@
  */
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import type { PublishedVariables, When } from '../../../../../../backend/lambda/src/lib/variables.ts';
+import { processorTurnHolds, type PublishedVariables, type When } from '../../../../../../backend/lambda/src/lib/variables.ts';
 import ConditionBuilder from './ConditionBuilder';
 
 type T = (key: string, opts?: Record<string, unknown>) => string;
@@ -21,7 +21,9 @@ const RoutingRulesEditor: React.FC<{
   /** The text models the classification selects. */
   models: string[];
   published?: PublishedVariables;
-}> = ({ rules, onChange, models, published }) => {
+  /** The context sources the version reads: a rule on a field of any other never holds. */
+  contextSources?: readonly string[];
+}> = ({ rules, onChange, models, published, contextSources }) => {
   const { t: translate } = useTranslation();
   const t = translate as unknown as T;
   const save = (next: Rule[]) => onChange(next.length ? next : undefined);
@@ -35,7 +37,7 @@ const RoutingRulesEditor: React.FC<{
   };
   return (
     <div className="profiles-persona-field" data-testid="routing-rules">
-      <h5>{t('admin.routingRules.title')}</h5>
+      <h4>{t('admin.routingRules.title')}</h4>
       <span className="admin-field-hint">{t('admin.routingRules.help')}</span>
       <ol>
         {rules.map((rule, i) => {
@@ -55,6 +57,7 @@ const RoutingRulesEditor: React.FC<{
               </div>
               {/* A routing rule names sources, never a version's variable: the processor reads its rules by source. */}
               <ConditionBuilder value={rule.when} selects="room" published={published} testId={`${id}-when`}
+                only={(src) => processorTurnHolds(src.source)} hiddenNote={t('admin.routingRules.turnHolds')} contextSources={contextSources}
                 onChange={(when) => put(i, { ...rule, when: when ?? ({} as When) })} />
             </li>
           );

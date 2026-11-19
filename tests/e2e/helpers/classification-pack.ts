@@ -2,13 +2,13 @@
  * A CLASSIFICATION'S INTENT PACK AS THE DEPLOYMENT RUNS IT.
  *
  * The pack is the classification's `assistant-intent-pack` parameter: the pack inline, or a pointer to its body in the
- * attachments bucket (`classification-packs/<classification>/<sha256>/intentPack`), which is followed here. It is the
+ * profile bucket (`classification-packs/<classification>/<sha256>/intentPack`), which is followed here. It is the
  * only place a classification's task machines live (a version does not read `machines`), so a spec that exercises a
  * workflow reads it from here rather than assuming what was seeded.
  */
 import { awsv, awsvText } from './aws';
 import { SSM_ROOT } from './stack-prefix';
-import { attachmentsBucket } from './delivered-template';
+import { profileBucket } from './delivered-template';
 
 /** An SSM parameter's value, or undefined when it does not exist. */
 function parameter(name: string): string | undefined {
@@ -23,7 +23,7 @@ function parameter(name: string): string | undefined {
 export function deployedClassificationPack(classification: string): Record<string, any> | undefined {
   const raw = parameter(`${SSM_ROOT}/assistant/${classification}/assistant-intent-pack`);
   let pack = raw ? JSON.parse(raw) : undefined;
-  const bucket = pack?.ref?.key ? attachmentsBucket() : undefined;
+  const bucket = pack?.ref?.key ? profileBucket() : undefined;
   if (bucket) pack = JSON.parse(awsvText(['s3', 'cp', `s3://${bucket}/${pack.ref.key}`, '-'], { quiet: true }));
   return pack;
 }

@@ -163,6 +163,8 @@ export interface Guide {
   /** The guide's name, which is the link text. */
   title: string;
   href: string;
+  /** The words after the link, when the sentence goes on past it. */
+  tail?: string;
 }
 
 /**
@@ -174,17 +176,18 @@ export const GuideLinks: React.FC<{ guides: Guide[]; className?: string }> = ({ 
   <ul className={`admin-guides${className ? ` ${className}` : ''}`} aria-label={i18n.t('admin.adminHelp.guides')}>
     {guides.map((g) => (
       <li key={g.href}>
-        {g.lead} <DocLink href={g.href}>{g.title}</DocLink>
+        {g.lead} <DocLink href={g.href}>{g.title}</DocLink>{g.tail ? ` ${g.tail}` : ''}
       </li>
     ))}
   </ul>
 );
 
 /** A registered guide by its key, titled from the locale: one name per guide across the console. */
-export const guide = (lead: string, key: DocLinkKey): Guide => ({
+export const guide = (lead: string, key: DocLinkKey, tail?: string): Guide => ({
   lead,
   title: i18n.t(`admin.docs.title.${key}`),
   href: DOC_LINKS[key],
+  ...(tail ? { tail } : {}),
 });
 
 /** A section of a registered guide, titled from the locale. */

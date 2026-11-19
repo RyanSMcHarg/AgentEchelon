@@ -155,8 +155,13 @@ export async function seedAllProfileDefinitions(
    * somebody else, or one that opens differently in a kind of room, is the case this exists for.
    */
   welcomes: Record<string, Record<string, EventWorkflow>> = {},
+  /**
+   * Assistants whose first version arrives another way, and so are not seeded here. The ops assistant (`ops-premium`)
+   * is one: `npm run add-assistant-role -- ops-premium` imports its first version from its shipped manifest.
+   */
+  except: readonly string[] = [],
 ): Promise<SeedResult[]> {
-  const names = new Set(defaultProfileRegistry.profileNames());
+  const names = new Set(defaultProfileRegistry.profileNames().filter((n) => !except.includes(n)));
   const out: SeedResult[] = [];
   for (const name of names) {
     const r = await seedActiveProfileDefinition(ssm, ssmRoot, name, personas[name], deps, intentPacks[name], onboardings[name], boundaries[name], welcomes[name]);

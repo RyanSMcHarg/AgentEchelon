@@ -3,7 +3,6 @@ const {
   CreateChannelMembershipCommand,
   DescribeChannelCommand,
   ListChannelMembershipsCommand,
-  ListTagsForResourceCommand,
 } = require('@aws-sdk/client-chime-sdk-messaging');
 const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
 // Bundled from the TypeScript source (the stack builds this function with esbuild). The share names its
@@ -16,13 +15,15 @@ const { dispatchJoinRecapTurn } = require('../src/lib/join-recap');
 // WHO THE CALLER IS comes from the one resolver every handler uses (`lib/auth.ts`), bundled in like the
 // helpers above, so this handler reads no claim for identity itself.
 const { callerPerson, callerPersonArn } = require('../src/lib/auth');
-const { appInstanceArnOf } = require('../src/lib/person-arn');
+// THE CALLER'S OWN BOUNDARY, the one every person route puts in front of its own role (`lib/conversation-access.ts`).
+const { callerReachesConversation, refusalAnswer } = require('../src/lib/conversation-access');
+const { typeAllows, capabilityRefusal } = require('../src/lib/type-capability');
+const { appInstanceArnOf, personIdFromArn } = require('../src/lib/person-arn');
 // WHO THE RECIPIENT IS, their clearance groups and their name come from the one directory, by person
 // (`lib/membership-source.ts`). The email to them is not sent here: it is the welcome notice's, below.
 const { defaultDirectory, primaryIssuer } = require('../src/lib/membership-source');
 const { responder } = require('../src/lib/http-response');
 const { chimeMessagingClient } = require('../src/lib/chime/clients');
-const { readChannelTags } = require('../src/lib/channel-classification');
 // A TYPE'S ISSUER NARROWING (T1, FR23), applied after the clearance check below.
 const { admittedIssuersOf, resolveConversationTypeKey, typeAdmitsIssuers } = require('../../lib/config/conversation-types');
 
@@ -31,45 +32,30 @@ const ddbClient = new DynamoDBClient({});
 const CHANNEL_CONTEXT_TABLE = process.env.CHANNEL_CONTEXT_TABLE || '';
 
 /**
- * The membership source a conversation ENFORCES, from its server-side context row (DESIGN-CONVERSATION-TYPES §6).
+ * The conversation's context row, read once: the membership source it ENFORCES (DESIGN-CONVERSATION-TYPES §6) and its
+ * registered type. Null when the row cannot be read, so the share is refused rather than decided on an unknown source or type.
  *
  * A conversation whose people come from a group is kept equal to that group by the membership reconcile, so
  * a person invited here would be silently removed on the next pass. Sharing is refused instead (owner
  * decision, 2026-10-05). Read from the context row, never from channel Metadata, which members can write.
- * An unreadable row lets the share through: the worst outcome is a person the reconcile later removes,
- * which is not an access decision, so a transient read failure must not break sharing everywhere.
+ * A row that was read and names no type is the ordinary type, which is what every person-opened conversation
+ * is. A deployment with no context table is refused earlier, by `typeAllows`.
  */
-async function enforcedMembershipSource(conversationArn) {
-  if (!CHANNEL_CONTEXT_TABLE) return '';
+async function conversationRowOf(conversationArn) {
+  if (!CHANNEL_CONTEXT_TABLE) return { membershipSource: '', typeKey: resolveConversationTypeKey({}) };
   try {
     const res = await ddbClient.send(new GetItemCommand({
       TableName: CHANNEL_CONTEXT_TABLE,
       Key: { channelArn: { S: conversationArn } },
-      ProjectionExpression: 'membershipSource',
+      ProjectionExpression: 'membershipSource, conversationType',
     }));
-    return (res.Item && res.Item.membershipSource && res.Item.membershipSource.S) || '';
+    return {
+      membershipSource: (res.Item && res.Item.membershipSource && res.Item.membershipSource.S) || '',
+      typeKey: resolveConversationTypeKey({ explicitType: res.Item && res.Item.conversationType && res.Item.conversationType.S }),
+    };
   } catch (err) {
-    console.warn('[Share] could not read the conversation membership source; allowing the share', err.name);
-    return '';
-  }
-}
-
-/**
- * The conversation's registered type, from the server-only context row the creator stamps. An unreadable
- * or unstamped row is the ordinary type, which is what every person-opened conversation is.
- */
-async function conversationTypeOf(conversationArn) {
-  if (!CHANNEL_CONTEXT_TABLE) return resolveConversationTypeKey({});
-  try {
-    const res = await ddbClient.send(new GetItemCommand({
-      TableName: CHANNEL_CONTEXT_TABLE,
-      Key: { channelArn: { S: conversationArn } },
-      ProjectionExpression: 'conversationType',
-    }));
-    return resolveConversationTypeKey({ explicitType: res.Item && res.Item.conversationType && res.Item.conversationType.S });
-  } catch (err) {
-    console.warn('[Share] could not read the conversation type; reading it as the ordinary type', err.name);
-    return resolveConversationTypeKey({});
+    console.error('[Share] could not read the conversation context row; refusing the share', err.name);
+    return null;
   }
 }
 
@@ -160,6 +146,30 @@ const http = responder({ origin: { fixed: '*' }, allowHeaders: '*', json: false 
 const respond = (statusCode, body) => http.respond(statusCode, body);
 
 /**
+ * THE ONE ANSWER FOR A RECIPIENT WHO CANNOT BE ADDED, whatever the reason: nobody at that address, a person not
+ * cleared for the conversation's classification, or a person whose issuer the conversation's type does not
+ * admit. One status, one code and no detail about the person, so the share route cannot be used to learn
+ * whether an address has an account here, how its owner signs in, or which classifications they hold.
+ */
+const RECIPIENT_NOT_ADDABLE = 'RECIPIENT_NOT_ADDABLE';
+/**
+ * EVERY REFUSAL OF A RECIPIENT ANSWERS AT ONE TIME, measured from the start of the recipient's lookup: nobody at the
+ * address answers after one directory read and an uncleared person after several, so each refusal is held until
+ * {@link RECIPIENT_ANSWER_FLOOR_MS} after the lookup began. The response time says no more than the body does.
+ */
+const RECIPIENT_ANSWER_FLOOR_MS = 1500;
+let clock = () => Date.now();
+let pause = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+const recipientNotAddable = async (lookupStartedAt) => {
+  const left = RECIPIENT_ANSWER_FLOOR_MS - (clock() - lookupStartedAt);
+  if (left > 0) await pause(left);
+  return respond(403, {
+    error: 'That address cannot be added to this conversation',
+    code: RECIPIENT_NOT_ADDABLE,
+  });
+};
+
+/**
  * The recipient's clearance groups, through the one clearance seam (`Directory.groupsFor`), asked by
  * PERSON. THE GROUPS THEMSELVES, not a collapsed name: collapsing is what made an admin-only user resolve
  * to null and be refused everywhere; admission needs the whole set. A read that fails, or a person with no
@@ -174,42 +184,6 @@ async function getUserGroups(directory, personArn) {
   }
 }
 
-// The channel's enforced classification comes from the IMMUTABLE `classification` tag, NOT
-// `metadata.modelTier`. Metadata is mutable via the owner rename cap (chime:UpdateChannel),
-// so trusting it would let a moderator tamper the value to weaken the invite gate or attract an
-// assistant of another classification. The tag cannot be changed by UpdateChannel.
-// ── THE DECLARED CLASSIFICATIONS, FROM CONFIG, AND NO SUBSTITUTE FOR AN ABSENT ONE ──────────────
-//
-// This read a hardcoded `new Set(['basic', 'standard', 'premium'])` and fell back to a literal
-// 'basic'. Both were wrong in the same direction once a fourth classification was declared, and the
-// direction is OPEN, not closed: an `admin`-classified conversation carries a tag this set had never
-// heard of, so the tag was discarded as invalid and the conversation was reported as `basic` - which
-// is exactly what the caller below compares an invitee's reach against. The most sensitive room in
-// the deployment read as the least sensitive one, and any basic user passed the invite gate for it.
-//
-// IT THEN FELL TO `ADMISSION.failClosedTo`, THE DEPLOYMENT'S FLOOR, AND THERE IS NO FLOOR. The
-// admission payload has never carried that field (`lib/classification-admission.ts`), so the constant
-// resolved to `''` on every deployment: the invite gate then compared `''` against the recipient's
-// reach, which never contains it, so the invite was refused - but only after the bot lookup
-// had asked SSM for `/assistant//bot-arn` and thrown, turning a refusal into a 500 with no account of
-// why. A conversation whose classification cannot be established is now `undefined` and the caller
-// refuses it as its own case, before any other work.
-let VALID_CLASSIFICATIONS = new Set();
-
-async function getChannelTier(conversationArn, _botArn) {
-  try {
-    const tag = (await readChannelTags(messagingClient, conversationArn)).classification;
-    if (tag && VALID_CLASSIFICATIONS.has(tag)) return tag;
-    console.warn('[Share][SecurityEvent] channel missing/invalid classification tag; refusing', {
-      conversationArn, tag,
-    });
-    return undefined;
-  } catch (err) {
-    console.warn('[Share][SecurityEvent] could not read the channel classification tag; refusing:', err.name);
-    return undefined;
-  }
-}
-
 /**
  * Share a conversation with another user by email.
  * 1. Find the recipient: the address finds one subject in this deployment's directory, resolved to a person
@@ -221,7 +195,6 @@ async function getChannelTier(conversationArn, _botArn) {
  */
 exports.handler = async (event) => {
   ADMISSION = classificationAdmission(await loadProfileRegistry());
-  VALID_CLASSIFICATIONS = new Set(Object.keys(ADMISSION.grants || {}));
   // Do NOT dump the full event — it carries the caller's verified token (email,
   // subject) and the request body (recipientEmail) into CloudWatch. Log only
   // non-PII request routing info.
@@ -233,7 +206,7 @@ exports.handler = async (event) => {
     //   1. The edge authorizer at API Gateway
     //   2. The caller is the person the verified token resolves to (`callerPersonArn`), and the
     //      sender line is the token's email
-    //   3. Caller must be a member of conversationArn (verified below)
+    //   3. Caller must be a current member of conversationArn, cleared for its classification (verified below)
     const callerUserArn = await callerPersonArn(event, APP_INSTANCE_ARN);
     if (!callerUserArn) {
       return respond(401, { error: 'Unauthorized', code: 'MISSING_CLAIMS' });
@@ -241,13 +214,13 @@ exports.handler = async (event) => {
     const callerEmailFromJwt = (await callerPerson(event))?.contact.email ?? null;
 
     const body = typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
-    const { conversationArn, conversationTitle, recipientEmail } = body;
+    const { conversationArn: requested, recipientEmail } = body;
     // senderName is NO LONGER taken from the body — it's derived from
     // the caller's JWT email (or a generic label if none) to prevent
     // sender-spoofing in the outbound SES email.
     const senderName = callerEmailFromJwt || 'A user of Agent Echelon';
 
-    if (!conversationArn || !recipientEmail) {
+    if (!requested || !recipientEmail) {
       return respond(400, {
         error: 'conversationArn and recipientEmail are required',
         code: 'MISSING_REQUIRED_FIELDS',
@@ -261,121 +234,82 @@ exports.handler = async (event) => {
       });
     }
 
-    // Verify caller is a member of the target channel before allowing
-    // them to add anyone else.
-    try {
-      const { DescribeChannelMembershipCommand } = require('@aws-sdk/client-chime-sdk-messaging');
-      // Bearer = the caller themselves: they're a member, so they can read their
-      // own membership. No shared bot is a member/creator, so it can't.
-      await messagingClient.send(
-        new DescribeChannelMembershipCommand({
-          ChannelArn: conversationArn,
-          MemberArn: callerUserArn,
-          ChimeBearer: callerUserArn,
-        }),
-      );
-    } catch (membershipErr) {
-      console.warn('[Share] caller not a member of channel', {
-        callerUserArn, conversationArn, err: membershipErr.name,
-      });
-      return respond(403, {
-        error: 'Caller is not a member of the target conversation',
-        code: 'NOT_A_MEMBER',
-      });
+    // THE CALLER REACHES THE CONVERSATION before they may add anyone to it: a current member, proven with their
+    // own AppInstanceUser as bearer, and cleared for its classification. A member whose clearance no longer
+    // reaches it is refused, as is anything that cannot be answered.
+    const access = await callerReachesConversation(event, requested, { appInstanceArn: APP_INSTANCE_ARN, client: messagingClient });
+    if (!access.ok) {
+      const refused = refusalAnswer(access);
+      return respond(refused.statusCode, refused.body);
+    }
+    // The conversation as the check named it, its full channel ARN, for every read and write below.
+    const conversationArn = access.channelArn;
+    // A TYPE THAT TURNS SHARING OFF IS REFUSED HERE (`lib/type-capability.ts`): a customer's room declares it off.
+    const allowed = await typeAllows(conversationArn, 'sharing');
+    if (!allowed.ok) return respond(allowed.statusCode, capabilityRefusal(allowed));
+
+    // THE CHANNEL'S TIER is the classification the caller's own check read from the conversation's IMMUTABLE
+    // `classification` tag, never `metadata.modelTier`, which a moderator can rewrite to weaken the invite gate.
+    // The check refused a conversation with no recognized classification before anything here, so the tier is
+    // always a declared classification. Then resolve the channel's REAL per-tier bot, the creator and member
+    // with authority to add members and send as the assistant, and use it for every bot-attributed action
+    // below (membership add, announce, recap).
+    const channelTier = access.classification;
+    // A CONVERSATION WHOSE PEOPLE COME FROM A GROUP CANNOT BE SHARED: the reconcile would undo it. Asked before
+    // the recipient is looked up, so this answer is the same whoever the address names.
+    const row = await conversationRowOf(conversationArn);
+    if (!row) {
+      return respond(503, capabilityRefusal({ code: 'CONVERSATION_TYPE_UNREADABLE', capability: 'sharing' }));
+    }
+    const { membershipSource, typeKey } = row;
+    if (membershipSource) {
+      return respond(409, { error: membershipSourceRefusal(membershipSource), code: 'MEMBERSHIP_FROM_SOURCE', membershipSource });
     }
 
     // Step 1: Find the recipient. THE ADDRESS IS INPUT, NEVER AN IDENTITY: it finds one subject in this
     // deployment's own directory, and that subject becomes a person through `Identities`, exactly as a
     // sign-in does (`Directory.findByAddress`). Nothing is bound by address, and an address that resolves
     // to nobody - no such subject, more than one, or a subject that has never signed in - is refused.
+    //
+    // ONE REFUSAL FOR EVERY RECIPIENT WHO CANNOT BE ADDED (`recipientNotAddable`): nobody at that address, a
+    // person not cleared for this conversation's classification, and a person whose issuer this kind of
+    // conversation does not admit all answer alike. The caller learns that this address cannot be added, never
+    // whether an account exists behind it, how its owner signs in, or which classifications they hold. The
+    // log names the person by id once one is resolved, and never carries the address that was typed.
     const directory = defaultDirectory();
+    const lookupStartedAt = clock();
     const recipientUserArn = await directory.findByAddress(primaryIssuer(), recipientEmail);
     if (!recipientUserArn || appInstanceArnOf(recipientUserArn) !== APP_INSTANCE_ARN) {
-      return respond(404, {
-        error: 'No user found with that email address',
-        code: 'USER_NOT_FOUND',
-      });
+      console.warn('[Share] Membership admission denied (the address names no person here)');
+      return recipientNotAddable(lookupStartedAt);
     }
-    // A DISPLAY NAME, never the address, for the join line the room reads.
-    const recipientName = (await directory.displayNameFor(recipientUserArn)) || recipientEmail.split('@')[0];
+    const recipientId = personIdFromArn(recipientUserArn);
+    console.log('[Share] Found recipient', { recipientId });
 
-    console.log('Found recipient:', { recipientUserArn });
-
-    // Read the channel's tier as the CALLER (a member): no shared bot is a
-    // member/creator, so it can't DescribeChannel. Then resolve the channel's
-    // REAL per-tier bot — the
-    // creator+member with authority to add members and send as the assistant —
-    // and use it for every bot-attributed action below (membership add,
-    // announce, recap).
-    const channelTier = await getChannelTier(conversationArn, callerUserArn);
-    // AN UNESTABLISHED CLASSIFICATION IS ITS OWN REFUSAL, and it comes before the bot lookup. Nothing
-    // can be decided about a conversation whose classification cannot be read: the invite gate below
-    // has no value to test, and the room-primary lookup would find the primary's classification
-    // unequal to an empty one and throw, so the caller would see a 500 rather than a refusal. There is no floor to stand in
-    // for the missing value (ADR-046).
-    if (!channelTier) {
-      return respond(403, {
-        error: 'This conversation\'s classification could not be established, so nobody can be added to it.',
-        code: 'CLASSIFICATION_UNKNOWN',
-      });
-    }
-    // A CONVERSATION WHOSE PEOPLE COME FROM A GROUP CANNOT BE SHARED: the reconcile would undo it.
-    const membershipSource = await enforcedMembershipSource(conversationArn);
-    if (membershipSource) {
-      return respond(409, { error: membershipSourceRefusal(membershipSource), code: 'MEMBERSHIP_FROM_SOURCE', membershipSource });
-    }
-    const botArn = await resolveRoomPrimaryBotArn(conversationArn, channelTier);
-
-    // Step 2: CLEARANCE - the recipient is cleared for this conversation's classification, or is refused
+    // Step 2: CLEARANCE - the recipient is cleared for this conversation's classification, or is refused.
+    // MEMBERSHIP OF THE REACH SET, not a rank comparison (ADR-046: a classification is a declared set, not a
+    // ladder). SPEC-CONVERSATION-SECURITY section 4b: refused at invite time rather than added as a member
+    // Layer 1 would leave inert.
     const recipientGroups = await getUserGroups(directory, recipientUserArn);
-    const recipientReach = reachableClassifications(recipientGroups);
-    const recipientGroupTier = recipientReach.length ? recipientReach.join('+') : null;
-
-    // MEMBERSHIP OF THE REACH SET, not a rank comparison. A grant set need not be a rank prefix,
-    // so `recipientRank < channelRank` could not express it - and ranked an admin at 0.
-    if (!recipientReach.includes(channelTier)) {
-      console.warn('[Share] Membership admission denied (recipient not cleared for the classification)', {
-        channelTier,
-        recipientGroupTier,
-        recipientEmail,
-      });
-      // SPEC-CONVERSATION-SECURITY §4b — error at INVITE time rather than add a
-      // member who'd be inert (Layer 1 would deny their send/read anyway).
-      //
-      // THE MESSAGE SAYS WHAT THE CHECK ABOVE ACTUALLY DOES. It used to read "their access level
-      // (basic+standard) does not meet the conversation's premium tier", which describes a rank
-      // comparison - the exact thing the comment above says this is NOT (ADR-046: a classification is
-      // a declared set, not a ladder). A person reading "does not meet" concludes they need a HIGHER
-      // level, and there is no higher: the recipient needs `premium` GRANTED, and granting something
-      // else changes nothing. Saying "does not include" points at the one action that works.
-      //
-      // "tier" is kept because it is the accepted customer-facing word for this; what was wrong was
-      // the comparison it implied, not the noun.
-      return respond(403, {
-        error:
-          `This user cannot be added to this conversation. Their access (${recipientGroupTier || 'none'}) ` +
-          `does not include the ${channelTier} tier this conversation requires, so they need the ` +
-          `${channelTier} tier granted before they can be added.`,
-        code: 'TIER_FORBIDDEN',
-        recipientTier: recipientGroupTier,
-        channelTier,
-      });
+    if (!reachableClassifications(recipientGroups).includes(channelTier)) {
+      console.warn('[Share] Membership admission denied (recipient not cleared for the classification)', { channelTier, recipientId });
+      return recipientNotAddable(lookupStartedAt);
     }
 
     // Step 2b: the type's issuer narrowing (T1, FR23), after the clearance check and never in its place. A
     // recipient whose issuers cannot be read is not admitted by a type that narrows.
-    const typeKey = await conversationTypeOf(conversationArn);
     if (admittedIssuersOf(typeKey) !== null) {
       const clearance = await directory.clearanceOf(recipientUserArn).catch(() => null);
       const recipientIssuers = clearance && clearance.state === 'held' ? (clearance.issuers || []) : [];
       if (!typeAdmitsIssuers(typeKey, recipientIssuers)) {
-        console.warn('[Share] Membership admission denied (issuer the type does not admit)', { typeKey });
-        return respond(403, {
-          error: 'This user cannot be added: conversations of this kind do not admit people who sign in the way they do.',
-          code: 'ISSUER_NOT_ADMITTED',
-        });
+        console.warn('[Share] Membership admission denied (issuer the type does not admit)', { typeKey, recipientId });
+        return recipientNotAddable(lookupStartedAt);
       }
     }
+
+    // A DISPLAY NAME, never the address, for the join line the room reads.
+    const recipientName = (await directory.displayNameFor(recipientUserArn)) || recipientEmail.split('@')[0];
+    const botArn = await resolveRoomPrimaryBotArn(conversationArn, channelTier);
 
     // Step 3: Add recipient as channel member
     try {
@@ -444,9 +378,14 @@ exports.handler = async (event) => {
     // (`noticeMetadata('memberWelcome')`, a `conversation-shared` notice they can mute). The email is that
     // message, sent by the bridge in Notifications: this function composes and sends none. A welcome the
     // router could not say is logged there; the share stands.
+    // THE WELCOME NAMES THE CONVERSATION BY ITS OWN NAME, read as the caller, who is a member (checked above), so what
+    // the recipient reads is what the room is called. A failed read leaves the name out, and the share stands.
+    const conversationName = await messagingClient.send(new DescribeChannelCommand({ ChannelArn: conversationArn, ChimeBearer: callerUserArn }))
+      .then((r) => r.Channel?.Name || '')
+      .catch((err) => { console.warn('[Share] could not read the conversation name for the welcome:', err?.name); return ''; });
     await sayThroughRouter(channelTier, {
       kind: 'memberWelcome', channelArn: conversationArn, botArn, to: [recipientUserArn],
-      vars: { name: recipientName, recap: conversationTitle || '', notifyPerson: recipientUserArn },
+      vars: { name: recipientName, recap: conversationName, notifyPerson: recipientUserArn },
     });
 
     return respond(200, {
@@ -464,4 +403,9 @@ exports.handler = async (event) => {
 };
 
 // For unit tests only: the membership-source refusal, without the handler's AWS calls.
-exports.__forTests = { enforcedMembershipSource, membershipSourceRefusal };
+exports.__forTests = {
+  conversationRowOf,
+  membershipSourceRefusal,
+  RECIPIENT_ANSWER_FLOOR_MS,
+  setTiming: (t) => { if (t.clock) clock = t.clock; if (t.pause) pause = t.pause; },
+};

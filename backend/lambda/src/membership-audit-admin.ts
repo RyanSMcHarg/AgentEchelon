@@ -5,7 +5,7 @@
  *   GET  /membership-audit/findings  -> list recent findings (newest first)
  *   GET  /membership-audit/enforce   -> { enabled }  (the runtime report-only <-> auto-revoke toggle)
  *   POST /membership-audit/enforce   -> set { enabled }
- *   POST /membership-audit/revoke    -> { channelArn, memberArn, sk? } revoke + mark the finding
+ *   POST /membership-audit/revoke    -> { sk, channelArn?, memberArn? } revoke the open finding's membership + mark it
  *
  * Non-VPC: only DynamoDB + Chime + SSM. Findings and the `config/enforce` toggle live in the
  * `AUDIT_TABLE` created by the MembershipAuditConstruct. The Cognito admin authorizer on the API
@@ -82,11 +82,22 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     }
 
     if (method === 'POST' && path.endsWith('/revoke')) {
+      // A revoke acts on one open finding, and only on the channel and member that finding names.
+      // The body names the finding by `sk`; any channelArn or memberArn it also carries must match it.
       const body = JSON.parse(event.body || '{}');
-      const channelArn = String(body.channelArn || '');
-      const memberArn = String(body.memberArn || '');
-      const sk = body.sk ? String(body.sk) : '';
-      if (!channelArn || !memberArn) return respond(400, { error: 'channelArn and memberArn required' }, origin);
+      const sk = typeof body.sk === 'string' ? body.sk : '';
+      if (!sk) return respond(400, { error: 'sk required' }, origin);
+      const found = await ddb.send(new GetCommand({ TableName: AUDIT_TABLE, Key: { pk: 'finding', sk } }));
+      const finding = found.Item;
+      if (!finding) return respond(404, { error: 'Finding not found' }, origin);
+      if (finding.status !== 'open') return respond(409, { error: 'Finding is not open' }, origin);
+      const channelArn = typeof finding.channelArn === 'string' ? finding.channelArn : '';
+      const memberArn = typeof finding.memberArn === 'string' ? finding.memberArn : '';
+      if (!channelArn || !memberArn) return respond(409, { error: 'Finding names no membership' }, origin);
+      if ((body.channelArn !== undefined && String(body.channelArn) !== channelArn)
+        || (body.memberArn !== undefined && String(body.memberArn) !== memberArn)) {
+        return respond(400, { error: 'channelArn and memberArn must match the finding' }, origin);
+      }
       const adminArn = await getAdminArn();
       if (!adminArn) return respond(500, { error: 'App-instance admin not configured' }, origin);
       try {
@@ -95,18 +106,16 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
         const name = (err as { name?: string })?.name;
         if (name !== 'NotFoundException' && name !== 'ConflictException') throw err; // idempotent
       }
-      if (sk) {
-        await ddb
-          .send(new UpdateCommand({
-            TableName: AUDIT_TABLE,
-            Key: { pk: 'finding', sk },
-            UpdateExpression: 'SET #s = :s, reviewedBy = :b, reviewedAt = :t',
-            ExpressionAttributeNames: { '#s': 'status' },
-            ExpressionAttributeValues: { ':s': 'revoked', ':b': adminSub, ':t': new Date().toISOString() },
-          }))
-          .catch((e) => console.warn('[MembershipAuditAdmin] failed to mark finding:', e));
-      }
-      console.log(JSON.stringify({ _auditEvent: 'membership_audit_revoke', timestamp: new Date().toISOString(), adminSub, channelArn, memberArn }));
+      await ddb
+        .send(new UpdateCommand({
+          TableName: AUDIT_TABLE,
+          Key: { pk: 'finding', sk },
+          UpdateExpression: 'SET #s = :s, reviewedBy = :b, reviewedAt = :t',
+          ExpressionAttributeNames: { '#s': 'status' },
+          ExpressionAttributeValues: { ':s': 'revoked', ':b': adminSub, ':t': new Date().toISOString() },
+        }))
+        .catch((e) => console.warn('[MembershipAuditAdmin] failed to mark finding:', e));
+      console.log(JSON.stringify({ _auditEvent: 'membership_audit_revoke', timestamp: new Date().toISOString(), adminSub, sk, channelArn, memberArn }));
       return respond(200, { success: true, action: 'revoked' }, origin);
     }
 

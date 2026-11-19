@@ -1,6 +1,6 @@
 /* FunnelChart — horizontal-step conversion funnel.
    Visual language: matches DistributionBar + MetricCard family.
-   - Step tile: flex 1, soft border + electric-violet left accent.
+   - Step tile: flex 1, soft border + accent left edge.
    - Connector: chevron + retained-% pill, sits between tiles.
    - Success tile: filled accent background, white text on rank.
    - Failure peel-off: dashed border row below the funnel, never inflates
@@ -38,26 +38,26 @@
   flex: 1 1 0;
   min-width: 0;
   padding: var(--space-3) var(--space-3) var(--space-3) calc(var(--space-3) + 6px);
-  background: var(--surface-elevated, #ffffff);
+  background: var(--surface-0);
   border: 1px solid var(--border-subtle, var(--zinc-200, #e4e4e7));
   border-radius: 10px;
   display: flex;
   flex-direction: column;
   gap: 6px;
   /* Electric-violet rail on the left edge — the funnel "spine". */
-  box-shadow: inset 4px 0 0 0 var(--accent-400, #8b5cf6);
+  box-shadow: inset 4px 0 0 0 var(--accent-400);
   transition: background 120ms ease, border-color 120ms ease;
 }
 
 .funnel-chart-step:hover {
-  background: var(--surface-hover, color-mix(in srgb, var(--accent-50, #faf5ff) 60%, transparent));
-  border-color: var(--accent-200, #ddd6fe);
+  background: var(--surface-hover, color-mix(in srgb, var(--accent-50) 60%, transparent));
+  border-color: var(--accent-200);
 }
 
 .funnel-chart-step--success {
-  background: linear-gradient(180deg, color-mix(in srgb, var(--accent-50, #faf5ff) 80%, transparent), var(--surface-elevated, #ffffff) 100%);
-  border-color: var(--accent-300, #c4b5fd);
-  box-shadow: inset 4px 0 0 0 var(--accent-600, #7c3aed);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent-50) 80%, transparent), var(--surface-0) 100%);
+  border-color: var(--accent-300);
+  box-shadow: inset 4px 0 0 0 var(--accent-600);
 }
 
 .funnel-chart-step-rank {
@@ -66,7 +66,7 @@
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--accent-600, #7c3aed);
+  color: var(--accent-600);
   opacity: 0.7;
 }
 
@@ -113,7 +113,7 @@
 
 .funnel-chart-step-pct {
   font-weight: 600;
-  color: var(--accent-700, #6d28d9);
+  color: var(--accent-700);
 }
 
 .funnel-chart-connector {
@@ -124,7 +124,7 @@
   gap: 4px;
   flex: 0 0 auto;
   padding: 0 4px;
-  color: var(--accent-500, #8b5cf6);
+  color: var(--accent-500);
 }
 
 .funnel-chart-connector-rate {
@@ -134,8 +134,8 @@
   font-weight: 600;
   padding: 2px 6px;
   border-radius: 999px;
-  background: var(--accent-50, #faf5ff);
-  color: var(--accent-700, #6d28d9);
+  background: var(--accent-50);
+  color: var(--accent-700);
   letter-spacing: 0.02em;
   white-space: nowrap;
 }

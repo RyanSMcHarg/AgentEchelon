@@ -286,6 +286,17 @@
   border-radius: var(--radius-md);
 }
 
+/* A toggle that carries a count widens for it, and its icon never shrinks to make room. */
+.conversation-header-btn.has-count {
+  width: auto;
+  min-width: 32px;
+  padding: 0 var(--space-2);
+}
+
+.conversation-header-btn svg {
+  flex-shrink: 0;
+}
+
 .conversation-header-btn:hover:not(:disabled):not(.is-disabled) {
   background: var(--surface-100);
   color: var(--text-primary);
@@ -476,29 +487,6 @@
   font-size: var(--text-xs);
   color: var(--text-tertiary);
   letter-spacing: var(--tracking-wide);
-}
-
-/* Per-message model badge — shows which model actually responded to
-   THIS specific message (the router picks per-intent within a tier).
-   Hover reveals the full modelId via title. */
-.message-model-badge {
-  display: inline-flex;
-  align-items: center;
-  padding: 1px var(--space-2);
-  background: var(--surface-100);
-  color: var(--text-tertiary);
-  border-radius: var(--radius-xs);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 500;
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  cursor: help;
-}
-
-.assistant-message .message-model-badge {
-  color: var(--accent-700);
-  background: var(--accent-50);
 }
 
 .message-text {
@@ -1159,15 +1147,33 @@
   flex-shrink: 0;
 }
 
+/* A CARD STANDS APART FROM THE CHAT AROUND IT: an accent edge, an accent outline, a tinted surface and a lift, so a
+   proposal, a task, a dashboard or a meeting's card never reads as one more line of the conversation or as the window's
+   own frame. The tint is mixed from the surface, so it holds in both themes. */
+.proposal-card,
+.meeting-card-message .message-content {
+  border: 1px solid var(--accent-400);
+  border-left: 4px solid var(--accent-500);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent-500) 7%, var(--surface-0));
+  box-shadow: var(--shadow-md);
+}
+
 /* THE CONFIRMATION CARD of a proposal addressed to this person (ADR-061 decision 8). */
 .proposal-card {
   display: flex;
   flex-direction: column;
   gap: 8px;
   margin-top: 8px;
-  padding: 12px;
-  border: 1px solid var(--border-color, #d0d7de);
-  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+/* A meeting's started and ended cards: the card frame above, with room for its title and links. */
+.meeting-card-message .message-content {
+  padding: 12px 14px;
+}
+.meeting-card-message .message-content strong:first-child {
+  font-size: 1.05em;
 }
 .proposal-card-field {
   display: flex;
@@ -1182,6 +1188,24 @@
 .proposal-card-actions {
   display: flex;
   gap: 8px;
+}
+/* A form's fields on a task card (ADR-067 WT50): one per row, label above its input. */
+.task-card-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.task-card-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.task-card-field textarea,
+.task-card-field input[type="number"] {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 .proposal-card-status:empty {
   display: none;
@@ -1207,4 +1231,32 @@
   margin: var(--space-2) 0 0;
   font-size: var(--text-sm);
   color: var(--text-secondary);
+}
+
+/* THE CONVERSATION'S DASHBOARD (DESIGN-CONVERSATION-DASHBOARDS): its card, and the dialog its sandboxed frame opens in. */
+.dashboard-card-summary { display: flex; align-items: center; gap: var(--space-2, 8px); flex-wrap: wrap; }
+.dashboard-card-state { font-weight: 600; }
+
+/* A targeted message names who can see it, inside the message itself. */
+.message-targeted-label {
+  font-size: 0.75rem;
+  font-style: italic;
+  opacity: 0.8;
+  margin-bottom: 4px;
+}
+
+/* A message whose Target and own words disagree says so, as an error. */
+.message-target-mismatch {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--color-error, #b42318);
+  border: 1px solid var(--color-error, #b42318);
+  border-radius: 6px;
+  padding: 4px 8px;
+  margin-bottom: 6px;
+}
+
+/* A task card's message is the card's own content, above its choices. */
+.task-card-body {
+  margin-bottom: var(--space-2);
 }

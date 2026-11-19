@@ -2,7 +2,7 @@
  * THE TEST ISSUER IS A FIXTURE, NEVER PART OF A REAL DEPLOYMENT (D16).
  *
  * The e2e suite needs people who are not in the deployment's own pool (the H1 rows): a second pool issuer,
- * a foreign OIDC issuer and a one-conversation pool. Their pools come from the opt-in `TestIssuer` stack,
+ * a foreign OIDC issuer and a host app's pool. Their pools come from the opt-in `TestIssuer` stack,
  * created from the registry entries that declare `owner: "test-fixture"`, so there is no separate switch.
  * Pinned here:
  *

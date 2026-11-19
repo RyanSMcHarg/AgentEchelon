@@ -140,16 +140,21 @@ describe('the placeholder declares the message it answers', () => {
   });
 
   /** The same turn from a bypass caller, which declares the inbound id it already holds. */
-  const bypassTurn = (userMessage: string, messageId: string) => {
-    const turn = lexTurn(userMessage);
-    turn.requestAttributes['AE.message.id'] = messageId;
-    return turn;
+  const bypassTurn = (userMessage: string, messageId: string) => ({
+    aeTurn: { channelArn: CHANNEL, senderArn: HUMAN, userMessage, userMessageId: messageId, trigger: 'user', botArn: BOT_SELF, correlationId: 'corr-flow' },
+  });
+
+  /** The placeholder a flow-dispatched turn posted as the assistant itself. */
+  const postedReply = () => {
+    const sent = mockMessagingSend.mock.calls.map((c) => c[0]).filter((c) => c.__type === 'SendMessage').pop();
+    return decodeURIComponent(sent.input.Content);
   };
 
   const QUESTION = 'What was our Q2 ARR and how did it move against Q1?';
 
   it('names the message when the turn was handed the id, on the placeholder itself', async () => {
-    const reply = lexReply(await routerHandler(bypassTurn(QUESTION, 'm-the-question')));
+    await routerHandler(bypassTurn(QUESTION, 'm-the-question'));
+    const reply = postedReply();
 
     // Still a placeholder: it carries its correlation marker and something else will close it.
     expect(correlationMarkerOf(reply)).toBeTruthy();
@@ -160,7 +165,8 @@ describe('the placeholder declares the message it answers', () => {
     // A bot message carrying a correlation marker is read by the ledger as a response something else
     // will close. Declaring `final` here would close it the instant it opened, and every one of
     // these turns would report its own placeholder as the answer.
-    const reply = lexReply(await routerHandler(bypassTurn(QUESTION, 'm-the-question')));
+    await routerHandler(bypassTurn(QUESTION, 'm-the-question'));
+    const reply = postedReply();
 
     expect(turnDeclarationOf(reply).phase).toBeUndefined();
   });
@@ -185,7 +191,8 @@ describe('the placeholder declares the message it answers', () => {
   });
 
   it('shows the person none of it', async () => {
-    const reply = lexReply(await routerHandler(bypassTurn(QUESTION, 'm-the-question')));
+    await routerHandler(bypassTurn(QUESTION, 'm-the-question'));
+    const reply = postedReply();
 
     expect(stripMessageMarkers(reply)).not.toContain('turn:');
     expect(stripMessageMarkers(reply)).not.toContain('corr:');

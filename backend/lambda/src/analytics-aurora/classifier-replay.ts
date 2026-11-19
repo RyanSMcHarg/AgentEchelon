@@ -35,6 +35,7 @@ import type { IntentPack } from '../lib/intent-pack.js';
 import { validateReplayInput, DEFAULT_LIMIT, MAX_LIMIT } from '../lib/classifier-replay-input.js';
 import { getModelCatalog, bedrockInvokeId } from '../../../lib/config/model-strategy.js';
 import { modelFits } from '../../../lib/config/model-availability.js';
+import { mapLimited } from '../lib/map-limited.js';
 
 /**
  * The classification this function serves, from its own environment. Read per call so a test can set it.
@@ -151,21 +152,6 @@ async function selectCandidates(
     [windowStart, windowEnd, limit, classification, assistant],
   );
   return res.rows || [];
-}
-
-/** Run `worker` over `items` with a bounded number in flight. */
-async function mapLimited<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
-  const out: R[] = new Array(items.length);
-  let next = 0;
-  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    for (;;) {
-      const i = next++;
-      if (i >= items.length) return;
-      out[i] = await worker(items[i]);
-    }
-  });
-  await Promise.all(runners);
-  return out;
 }
 
 /**

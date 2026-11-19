@@ -44,7 +44,7 @@ What actually happened. Include error messages, CloudWatch log excerpts, or scre
 ## CloudWatch Logs (if Lambda issue)
 
 ```
-<paste relevant log lines here — redact any account IDs, ARNs, or PII>
+<paste relevant log lines here - redact any account IDs, ARNs, or PII>
 ```
 
 ## Additional Context

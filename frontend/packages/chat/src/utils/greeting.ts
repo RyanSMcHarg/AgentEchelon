@@ -16,3 +16,15 @@ export function getModelGreeting(tier: UserTier, t: Translate): string | null {
   if (!tier) return null;
   return t(`newConversation.class.${tier}.greeting`, { defaultValue: '' }) || null;
 }
+
+/**
+ * WHAT AN EMPTY CONVERSATION OPENS WITH: a meeting's own conversation (shown in its meeting window, or named a meeting's
+ * by `meetingOf`) opens with one line saying it is the meeting's chat, never the classification's welcome; any other
+ * opens with its classification's welcome, or null.
+ */
+export function emptyConversationGreeting(
+  conversation: { modelTier?: UserTier; meetingOf?: string } | null | undefined, inMeetingWindow: boolean, t: Translate,
+): string | null {
+  if (inMeetingWindow || conversation?.meetingOf) return t('meeting.chatEmpty');
+  return conversation?.modelTier ? getModelGreeting(conversation.modelTier, t) : null;
+}

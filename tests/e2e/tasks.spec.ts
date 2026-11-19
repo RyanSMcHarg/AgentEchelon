@@ -177,6 +177,10 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — every tier that
       const metrics = await q('task_metrics');
       expect(metrics.length, `[${tc.tier}] task_metrics should roll up the task`).toBeGreaterThan(0);
 
+      // LEAVES NO WORK OPEN. The report waits on a question this test never answers, so without this it stayed
+      // in_progress for its TTL and read as running work in the console. `/stop` is the person's own way out.
+      await sendAndWaitForResponse(page, '/stop', 120_000);
+
       await api.dispose();
       // Follow-up (separate assertion, may need the daily eval-runner to have run):
       // evaluation_flows (intent_flows grouped by task_id) should then score this flow.
@@ -230,11 +234,8 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — every tier that
       .toBeTruthy();
 
     const attachment = page.locator('.assistant-message .attachment-display').last();
-    // WORDED FOR THE INPUT GUARDRAIL. "Audience is the leadership team. Focus on ARR growth, net revenue
-    // retention, and churn risk. Keep it concise." scores PROMPT_ATTACK at LOW confidence, which the
-    // filter's HIGH input strength blocks (ApplyGuardrail on every classification's guardrail,
-    // 2026-10-22). The requirements answer never reached the model, and the flow it gates never
-    // delivered. The same request as one polite sentence scores NONE.
+    // ONE POLITE SENTENCE, which the input guardrail scores NONE. A terser list of instructions scores
+    // PROMPT_ATTACK at LOW confidence, which the filter's MEDIUM input strength admits.
     const approvals = [
       'The audience is the leadership team. Please cover ARR growth, net revenue retention, and churn risk, and keep it concise.',
       'The outline looks good — generate the full report now and deliver it as a downloadable document.',
@@ -731,7 +732,7 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — every tier that
     // GROUNDED, NOT MERELY ON-TOPIC. The checks above are satisfied by any table containing the word
     // "risk", so on their own they cannot tell a real extraction from a plausible invention - and this
     // test's whole claim is that tier-scoped retrieval fed the answer. These assert the ROWS came from
-    // the seeded records (`backend/demo/context/premium/customer-accounts.json`, `churnRisk`).
+    // the seeded records (`demo/stratum-company/context/premium/customer-accounts.json`, `churnRisk`).
     //
     // Three of four, not four of four: the ask is "every at-risk enterprise account", and which rows
     // qualify as ENTERPRISE is the model's judgement over the corpus, not a fact this test owns. Three

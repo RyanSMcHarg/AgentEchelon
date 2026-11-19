@@ -28,7 +28,10 @@ type CardState =
   | { kind: 'error'; code: string; final: boolean };
 
 /** Codes after which the proposal cannot be answered again. */
-const FINAL_CODES = new Set(['PROPOSAL_DECIDED', 'PROPOSAL_EXPIRED', 'PROPOSAL_UNKNOWN', 'NOT_ADDRESSEE', 'NOT_A_PERSON', 'ROLE_NOT_HELD', 'NOT_A_MEMBER', 'ARCHIVED', 'ALREADY_NUDGED', 'INVITATION_NOT_PENDING']);
+// The conversation access refusals (`NOT_A_MEMBER`, `NOT_CLEARED`, `CLASSIFICATION_UNREADABLE`, `NOT_A_PERSON_SESSION`)
+// are final; `UNAVAILABLE` is an outage, so the card stays open to try again.
+const FINAL_CODES = new Set(['PROPOSAL_DECIDED', 'PROPOSAL_EXPIRED', 'PROPOSAL_UNKNOWN', 'NOT_ADDRESSEE', 'NOT_A_PERSON', 'ROLE_NOT_HELD', 'NOT_A_MEMBER', 'ARCHIVED', 'ALREADY_NUDGED', 'INVITATION_NOT_PENDING',
+  'NOT_CLEARED', 'CLASSIFICATION_UNREADABLE', 'NOT_A_PERSON_SESSION', 'NOT_HOST_OR_MODERATOR', 'NO_ACTIVE_MEETING', 'NOT_PERMITTED']);
 
 export function ProposalCard({ proposal, onOpenConversation, decide = decideProposal, now = Date.now }: ProposalCardProps) {
   const { t, i18n } = useTranslation();

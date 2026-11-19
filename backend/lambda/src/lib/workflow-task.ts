@@ -15,11 +15,15 @@
  *  - ONE TOTAL ORDER (`orderForPickup`): priority, then age, then id.
  */
 import { createHash } from 'crypto';
-import { awaitedPartyOf, entrySequenceOf, terminalKindOf, type TaskStateMachine } from './task-state-machines.js';
+import { actionRunKey, awaitedPartyOf, entrySequenceOf, terminalKindOf, type TaskStateMachine } from './task-state-machines.js';
 import type { Task, TaskPriority } from './task-tracking.js';
 
 /** The `error` a task's deadline writes when it cancels the task (decision 4), which the settlement reads back. */
 export const TASK_DEADLINE_ENDING = 'deadline';
+/** The `error` archiving a conversation writes when it settles the conversation's open workflow tasks (ADR-017). */
+export const TASK_ARCHIVE_ENDING = 'archived';
+/** The `error` a run's end writes on the open tasks it cancels, where a task's settlement ended the run mid-way (`endsRun`). */
+export const TASK_RUN_ENDED_ENDING = 'run-ended';
 
 /** The lifecycle statuses an ended task carries. */
 const ENDED_STATUSES = new Set(['completed', 'failed', 'cancelled']);
@@ -44,6 +48,8 @@ export interface TaskCard {
   id: string;
   state: string;
   choices: string[];
+  /** A form's fields (WT50), shown on the card and answered with its success choice. */
+  fields?: import('./task-step.js').FormField[];
   /** Epoch seconds: the card offers nothing after it. */
   expiresAt?: number;
 }
@@ -54,6 +60,7 @@ export function taskCardOf(task: Pick<Task, 'taskId' | 'taskType' | 'taskState' 
   if (!def?.choices?.length || !task.taskState) return undefined;
   return {
     id: task.taskId, state: task.taskState, choices: [...def.choices],
+    ...(task.workflowRun?.fields?.length ? { fields: task.workflowRun.fields } : {}),
     ...(typeof task.workflowRun?.deadlineAt === 'number' ? { expiresAt: task.workflowRun.deadlineAt } : {}),
   };
 }
@@ -114,8 +121,11 @@ export function pickupReadiness(
   const awaited = awaitedPartyOf(def);
   if (awaited && !(awaited.party === 'worker' && task.workerType === 'assistant' && task.workerId === assistantId)) return hold('awaits-another');
   if (def.rests) return hold('rests');
-  if (def.action) return hold('runs-an-action');
   const entry = entrySequenceOf(task.stateHistory, task.taskState);
+  // A STATE THE PLATFORM RUNS IS TAKEN UP ONLY TO RUN IT (FR29): a task opened in such a state (a workflow's required refresh)
+  // has had no turn to run it, so the pickup's turn does, first, under its own once-per-entry claim. Once its action has
+  // run for this entry, the state is the platform's, and nobody takes it up again.
+  if (def.action && (task.actionRuns ?? []).includes(actionRunKey(task.taskState, entry))) return hold('runs-an-action');
   if ((task.actionRuns ?? []).includes(`${pickupClaimState(task.taskState)}#${entry}`)) return hold('taken-up');
   if ((task.turnsInState ?? 0) > 0) return hold('worked-this-entry');
   if (deliveredThisEntry(task, task.taskState)) return hold('delivered-this-entry');
@@ -157,3 +167,37 @@ export function pickupCorrelationId(task: Pick<Task, 'taskId' | 'taskState' | 's
 
 /** What the processor's exit hands the router when it gives the lock to a pickup turn (decision 5). Ids only. */
 export interface TaskPickupRequest { channelArn: string; botArn: string; taskId: string; correlationId: string }
+
+/**
+ * WHETHER A TASK IS A REQUEST AWAITING ITS INTENT'S RUN: it holds the person's message and the intent it was classified
+ * with, has no run, and is either a queued request its sender accepted (G9) or a request a task's turn opened mid-task
+ * under that intent (G15).
+ */
+export function requestAwaitingRun(task: Pick<Task, 'taskType' | 'taskState' | 'openingIntent' | 'userMessageId' | 'workflowRun' | 'awaitsIntentRun'>): boolean {
+  if (!task.openingIntent || !task.userMessageId || task.workflowRun) return false;
+  // ONLY ONE ITS SENDER ACCEPTED: a request they dropped, or one still proposed, starts nothing.
+  if (task.taskType === 'queued_request') return task.taskState === 'accepted';
+  return task.awaitsIntentRun === true && task.taskType === task.openingIntent;
+}
+
+/**
+ * WHERE A TASK STATE'S NOTICE IS SAID (ADR-067 WT23; SPEC-PROCESSES P8): a task that belongs to a run is told under that run,
+ * its workflow, its run key, the step that opened the task, the run's edition and its process, so every message a process's run says is
+ * a message of a run that ends. The notice's claim, once per entry of the state, is kept on a key of its own (`claimKey`),
+ * which is never a run. A task with no run is told under its own type and its claim key, and carries no process.
+ */
+export function stateNoticeRun(task: Pick<Task, 'taskId' | 'taskType' | 'workflowRun'>, state: string): {
+  claimKey: string; workflow: string; runKey: string; step: string; process?: NonNullable<Task['workflowRun']>['process'];
+  edition?: { originConfigId?: string; workflowHash?: string; trigger?: NonNullable<Task['workflowRun']>['trigger'] };
+} {
+  const claimKey = `notice#${task.taskId}`;
+  const run = task.workflowRun;
+  if (!run) return { claimKey, workflow: task.taskType ?? '', runKey: claimKey, step: `notice:${state}` };
+  const edition = {
+    ...(run.origin ? { originConfigId: run.origin.configId } : {}), ...(run.workflowHash ? { workflowHash: run.workflowHash } : {}), ...(run.trigger ? { trigger: run.trigger } : {}),
+  };
+  return {
+    claimKey, workflow: run.workflow, runKey: run.runKey, step: run.step,
+    ...(run.process ? { process: run.process } : {}), ...(Object.keys(edition).length ? { edition } : {}),
+  };
+}

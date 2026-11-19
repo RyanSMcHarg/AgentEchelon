@@ -25,7 +25,11 @@
 
 import { estimateStepCostUsd } from './lib/model-rate-table.js';
 import { deliversDocument, withConfirmBrief } from './lib/task-state-machines.js';
-import { S3Client } from '@aws-sdk/client-s3';
+import { machinesForVersion, machinesOfTask, resolveTaskMachines } from './lib/version-machines.js';
+import { intentRunWorkflows } from './lib/intent-workflow.js';
+import { INTENT_TRIGGER } from './lib/event-workflow.js';
+import { S3Client, ListObjectsV2Command, GetObjectCommand, type ListObjectsV2CommandInput, type GetObjectCommandInput } from '@aws-sdk/client-s3';
+import { TRANSCRIPT_CONTEXT_CHARS, latestTranscriptOf } from './lib/meeting-transcript.js';
 import { SSMClient, GetParameterCommand, GetParametersByPathCommand } from '@aws-sdk/client-ssm';
 import {
   AsyncProcessorEvent,
@@ -82,11 +86,13 @@ import { actAsAssistant, actingAs, releaseAssistantIdentity, endAssistantTurn, c
 import {
   ChannelMessageType,
   ChannelMessagePersistenceType,
+  DescribeChannelCommand,
 } from '@aws-sdk/client-chime-sdk-messaging';
 import { readPendingSplit, clearPendingSplit, recordDispatchFailure } from './lib/turn-lock.js';
 import type { PendingSplitOffer } from './lib/turn-lock.js';
 import {
   splitOfferDirective,
+  refusedByAudience,
   parseSplitSelection,
   selectionFromTheirWords,
   stripSplitSelection,
@@ -106,6 +112,7 @@ import { loadMessageTemplateSet, loadNamedPromptTemplate, loadNamedTemplate, sel
 import { runWelcomePromptTurn } from './lib/welcome-prompt-turn.js';
 import { ARRIVAL_EVENTS, agentStepIsNarrowed, audienceOf, conferredBy, nothingToRecap, proposalOf, sendValues, stepTakenBy, templatesForPeople, workflowFor } from './lib/event-workflow.js';
 import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { MEETING_INVITES_TOOL, offerMeetingInvites } from './lib/meeting-invite-offer.js';
 import { proposalDraft, proposalDraftRefusal, proposalRecordOf, writeProposal, type ProposalAddressee, type ProposalCard } from './lib/proposals.js';
 import { runAgentStep } from './lib/event-agent-step.js';
 import { renderVoice } from './lib/voice-fill.js';
@@ -113,11 +120,65 @@ import { inLanguage } from './lib/message-language.js';
 import { claimEventStep, wasGreetedByEventRun } from './lib/task-store.js';
 import { openEventTask } from './lib/event-task.js';
 import { DEFAULT_TASK_STATE_MACHINES } from './lib/task-state-machines.js';
-import { continueEventRunThroughRouter } from './lib/say-through-router.js';
+import { continueEventRunThroughRouter, meetingPlaceThroughRouter, meetingSummaryThroughRouter } from './lib/say-through-router.js';
+import { MEETING_SUMMARY_MAX_TOKENS, runMeetingSummaryTurn, readMeetingSegments } from './lib/meeting-summary-turn.js';
+import { conversationIdOf } from './lib/dashboard-keys.js';
+import { writeMessageAnalytics } from './lib/message-analytics.js';
+
+/**
+ * A RUN MESSAGE'S PROCESS, ON ITS OUT-OF-BAND ANALYTICS RECORD (SPEC-PROCESSES P8): the same record the router writes for the
+ * run's own sends, never the message's Metadata. Best-effort.
+ */
+async function recordRunMessageProcess(sent: { MessageId?: string } | undefined, channelArn: string, proc: { id: string; name: string; edition?: string; ownerTeam?: string } | undefined, turn?: PlatformTurnRecord): Promise<void> {
+  if (!sent?.MessageId || (!proc && !turn)) return;
+  await writeMessageAnalytics({ messageId: sent.MessageId, channelArn, analytics: {
+    ...(turn ? platformTurnAnalytics(turn) : {}),
+    ...(proc ? { processRun: processRunOf(proc) } : {}),
+  } });
+}
+
+/**
+ * WHAT A TURN THE PLATFORM STARTED COST AND WHAT IT WAS ASKED (SPEC-ADMIN-CONSOLE-EFFECTIVENESS FR43): the model that wrote it,
+ * its tokens and model time, and the prompt its step rendered, capped. Written on the message's out-of-band record, as a
+ * meeting summary's is, so its exchange (migration 106) is priced, attributed to its model and judged against what the step
+ * asked, the way a person's turn is judged against what they wrote.
+ */
+type PlatformTurnRecord = { call?: { modelUsed?: string; inputTokens?: number; outputTokens?: number; bedrockTime?: number }; ask?: string; totalMs?: number; triggerAtMs?: number };
+const STEP_ASK_CAP = 2000;
+function platformTurnAnalytics(turn: PlatformTurnRecord): Record<string, unknown> {
+  const c = turn.call;
+  return {
+    ...(c?.modelUsed ? { bedrockModel: c.modelUsed } : {}),
+    ...(typeof c?.inputTokens === 'number' ? { inputTokens: c.inputTokens } : {}),
+    ...(typeof c?.outputTokens === 'number' ? { outputTokens: c.outputTokens } : {}),
+    ...(typeof c?.bedrockTime === 'number' ? { latencyMs: c.bedrockTime, modelMs: c.bedrockTime } : {}),
+    ...(typeof turn.totalMs === 'number' ? { totalMs: turn.totalMs } : {}),
+    ...(typeof turn.triggerAtMs === 'number' ? { triggerAtMs: turn.triggerAtMs } : {}),
+    ...(turn.ask ? { stepAsk: turn.ask.slice(0, STEP_ASK_CAP) } : {}),
+  };
+}
+/**
+ * AN ASKED TURN'S MESSAGE, MARKED WITH THE STEP THAT ASKED FOR IT (SPEC-PROCESSES, stage times): the asked turn is measured as
+ * the taker's own run (WT118), so its message carries the asking run's key and step on the out-of-band record alone, where the
+ * process view reads when that step started. Only a process run's step is marked. Best-effort.
+ */
+async function recordAskedStep(sent: { MessageId?: string } | undefined, channelArn: string, asking: { runKey: string; step: string; process?: unknown }, turn?: PlatformTurnRecord): Promise<void> {
+  if (!sent?.MessageId || (!asking.process && !turn)) return;
+  await writeMessageAnalytics({ messageId: sent.MessageId, channelArn, analytics: {
+    ...(turn ? platformTurnAnalytics(turn) : {}),
+    ...(asking.process ? { askedStep: { runKey: asking.runKey, step: asking.step } } : {}),
+  } });
+}
+import { askedTurnClaimStep, askedTurnOutcome, askedTurnWorkflow, proposalAddresseeOf } from './lib/asked-turn.js';
+import { recordRunEnded } from './lib/task-store.js';
+import { instructionsForIntent } from './lib/intent-pack.js';
 import { resolveRouterArn } from './lib/turn-triage.js';
 import { renderMessageTemplate } from './lib/message-template.js';
+import { holdMeetingFileLinks, MEETING_FILES_PROMPT } from './lib/meeting-file-links.js';
+import { MEETING_CONVERSATION_TYPE } from '../../lib/config/conversation-types.js';
 import { evaluateAbuseGate } from './lib/abuse-controls.js';
 import { resolveChannelSize } from './lib/channel-size.js';
+import { readableRelatives, MAX_RELATIVES_NAMED, type RelatedConversation } from './lib/related-conversations.js';
 import { recordWelcomePromptOutcome } from './lib/welcome-metrics.js';
 import { localizedTemplate, resolverValues, templateLine, templatesOf, withMessageTemplates } from './lib/message-lines.js';
 import { buildConfigIdentity, componentVersion } from './lib/config-identity.js';
@@ -125,7 +186,7 @@ import { createHostContextRegistry, createTurnContextRegistry } from './lib/host
 import { parseWhoIsHere } from './lib/who-is-here.js';
 import { composeAnswerPrompt } from './lib/answer-prompt.js';
 import { invokeBedrockWithFallback } from './lib/bedrock-resilience.js';
-import { imageGenerationStep, makeConverseStep, type ConverseStep, type ToolCallRecord } from './lib/analytics-metadata.js';
+import { imageGenerationStep, makeConverseStep, processRunOf, type ConverseStep, type ToolCallRecord } from './lib/analytics-metadata.js';
 import { resolveModelPlan, routedModel } from './lib/resolve-model-plan.js';
 import { externalProviderFromEnv, invokeExternalLlm } from './lib/providers/external-llm.js';
 import {
@@ -136,7 +197,7 @@ import {
   IMAGE_GEN_MODELS,
 } from './lib/image-gen-models.js';
 import { persistImageGenOutput, buildBattleImageContent, buildImageGenAttachment } from './lib/image-gen-output.js';
-import { buildRetrievedContextHint, buildConversationSummaryHint } from './analytics-aurora/document-retrieval.js';
+import { buildRetrievedContextHint, buildConversationSummaryHint, buildRelatedConversationsHint } from './analytics-aurora/document-retrieval.js';
 import { resolveTurnGrounding, type TurnGrounding } from './lib/turn-grounding.js';
 import { findInboundMessage } from './lib/inbound-message.js';
 import { readPublishedCatalog, selectSources, resolveContextSources, renderContextMenu, renderSourceSection, turnCallSite, eventStepCallSite, type PublishedContextSource } from './lib/context-sources-runtime.js';
@@ -144,6 +205,7 @@ import { buildSourceTable, catalogValues, clearanceSet, PREFERRED_LANGUAGE_KEY, 
 import { createSourceReader } from './lib/context-source-readers.js';
 import { roleContextS3Client } from './lib/company-context.js';
 import { emitContextSourceOutcome, classifyAccessError, ContextSourceAccessError } from './lib/context-source-outcomes.js';
+import { isCompanyContextSource, readableByRole } from './lib/context-source-reach.js';
 import {
   getTask,
   buildTaskContextForPrompt,
@@ -162,8 +224,10 @@ import {
 // guards inside the direct implementation never fire. Called directly these three reached
 // DynamoDB, were refused, and task-tracking swallowed the refusal: a delivery was never recorded
 // and a failed placeholder was never marked, silently, on every turn that tried.
-import { updateTaskStatus, recordTaskDelivery, advanceTaskStateTo } from './lib/task-store.js';
-import { clampResponseMaxTokens, taskStateMachines, toolsForIntent, hydrateIntentPackFromSsm, getIntentPack, needsOf, turnNeedsImage, knownIntentKeys, type IntentPack } from './lib/intent-pack.js';
+import { updateTaskStatus, recordTaskDelivery, advanceTaskStateTo, createTask as openRequestTask } from './lib/task-store.js';
+import { DeliveryOption } from './lib/delivery-options.js';
+import { newRequestIntents } from './lib/new-request-tool.js';
+import { clampResponseMaxTokens, toolsForIntent, hydrateIntentPackFromSsm, getIntentPack, needsOf, turnNeedsImage, knownIntentKeys, type IntentPack } from './lib/intent-pack.js';
 import { documentWrittenOnStep, enteredStepModel, modelTheTurnEndedOn, stepOutputOf, taskIntentOf, type StepModelChoice } from './lib/step-models.js';
 import { classificationAllows } from '../../lib/config/model-availability.js';
 import { intentDefFor, deliverAsFile, fileForAnswer, answerShapeIssues } from './lib/intent-answer.js';
@@ -176,7 +240,7 @@ import { deliveredDocumentReference, type DeliveredDocumentReference, type Docum
 import { checkAgainstTemplate, type TurnTemplates } from './lib/document-template.js';
 import { loadTurnTemplates } from './lib/template-store.js';
 import type { DeclaredTemplate, TurnVariables } from './lib/task-tools.js';
-import { isPrivateVisibility } from './lib/task-visibility.js';
+import { isPrivateVisibility, requestVisibility } from './lib/task-visibility.js';
 import {
   acceptCorrection,
   correctionInstruction,
@@ -190,9 +254,10 @@ import {
   templateCheckOutcome,
 } from './lib/deliverable-check.js';
 import { edgeDelivers, templateRefsOfMachine } from './lib/task-state-machines.js';
-import { getModelCatalog, INTENT_ROUTE_STRATEGY } from '../../lib/config/model-strategy.js';
+import { getModelCatalog } from '../../lib/config/model-strategy.js';
 import { EXTERNAL_MODELS } from '../../lib/config/model-catalog.js';
-import { resolveActiveProfile, ownerEventWorkflows, resolveProfileVersion, resolveFromDefinition, buildIntentStrategy, platformRoutesServedOn, personaAddendumBlock, rememberRuntimeSeed } from './lib/active-profile.js';
+import { resolveActiveProfile, resolveProfileVersion, resolveFromDefinition, personaAddendumBlock, rememberRuntimeSeed } from './lib/active-profile.js';
+import { versionRouteStrategy } from './lib/model-resolver.js';
 import type { AssistantCopy } from './lib/active-profile.js';
 import { noticeLine } from './lib/assistant-notice.js';
 import { hydrateBodies } from './lib/profile-bodies.js';
@@ -200,8 +265,9 @@ import { triageContractDirective, mayTakeAnotherPass, QUEUED_CLARIFICATION_TASK_
 import { recallClarifiedMessage } from './lib/queue-drain-task.js';
 import { UTILITY_MODEL_ID } from '../../lib/config/model-strategy.js';
 import { sessionClient, sessionDocumentClient } from './lib/assistant-session.js';
-import { botIdFromArn, personIdFromArn } from './lib/person-arn.js';
-import { sendChannelMessage, sendInParts, splitIntoChunks } from './lib/chime/send.js';
+import { appInstanceArnOf, botIdFromArn, personIdFromArn } from './lib/person-arn.js';
+import { CHIME_METADATA_MAX, sendChannelMessage, sendInParts, splitIntoChunks } from './lib/chime/send.js';
+import { withinMetadataCap } from './lib/notify-directive.js';
 import { defaultProfileRegistry } from '../../lib/profile-registry';
 import { loadProfileRegistry } from '../../lib/profile-registry';
 
@@ -243,6 +309,20 @@ const CLASSIFICATION = (process.env.CLASSIFICATION || '') as AsyncProcessorConfi
  */
 let proposalsDocClient: DynamoDBDocumentClient | null = null;
 const proposalsDoc = (): DynamoDBDocumentClient => (proposalsDocClient ??= sessionDocumentClient({ region: AWS_REGION }, { marshallOptions: { removeUndefinedValues: true } }));
+
+/**
+ * A CONVERSATION'S MEETING PLACE, read by this classification's own router (`handleMeetingPlaceRead`), which answers only for
+ * a conversation of its own classification: which room or meeting it is, its meeting, whether that runs and who hosts it,
+ * and the room's role holdings. The assistant's session reads no context row. Undefined where none runs or it is unreadable.
+ */
+async function meetingPlaceOf(channelArn: string) {
+  return meetingPlaceThroughRouter((await resolveRouterArn(CLASSIFICATION)) ?? '', channelArn);
+}
+/**
+ * WHETHER THIS DEPLOYMENT DECLARES MEETINGS, read from the capability's attach point on this function (`TRANSCRIPT_BUCKET`,
+ * set only with the `meetings` capability): absent means off, and a turn asks its router for no meeting place.
+ */
+const MEETINGS_ATTACHED = !!process.env.TRANSCRIPT_BUCKET;
 /**
  * THE ROLE THIS ASSISTANT HOLDS in its classification (DESIGN-SEPARATE-ASSISTANTS 3.0), stamped by
  * the stack like the classification above.
@@ -261,6 +341,32 @@ const BATTLE_CAPABLE = process.env.BATTLE_CAPABLE === 'true';
 const MODEL_NAME = process.env.MODEL_NAME || 'Claude';
 
 const s3Client = sessionClient(S3Client, { region: AWS_REGION });
+
+/** How many stored transcripts' text a container remembers (`transcriptReader`), the oldest given up first. */
+const TRANSCRIPT_TEXTS_KEPT = 32;
+const transcriptTexts = new Map<string, string>();
+/**
+ * THE S3 CALLS A TURN'S TRANSCRIPT GROUNDING MAKES, with each stored transcript's text remembered per object for the
+ * container's life: a transcript's key names its meeting and is written once, so a later turn that lists the same newest
+ * key reads no object again. The listing is made on every turn as the turn's own session, so which transcript is newest,
+ * and whether this turn may read it, is decided afresh each time. Only the tail a turn reads is kept.
+ */
+export function transcriptReader(s3: { send(command: unknown): Promise<unknown> }): { send(command: unknown): Promise<unknown> } {
+  const said = (text: string) => ({ Body: { transformToString: async () => text } });
+  return {
+    async send(command: unknown) {
+      if (!(command instanceof GetObjectCommand)) return s3.send(command);
+      const id = `${command.input.Bucket}/${command.input.Key}`;
+      const hit = transcriptTexts.get(id);
+      if (hit !== undefined) return said(hit);
+      const out = await s3.send(command) as { Body?: { transformToString(): Promise<string> } };
+      const text = ((await out.Body?.transformToString()) ?? '').slice(-2 * TRANSCRIPT_CONTEXT_CHARS);
+      transcriptTexts.set(id, text);
+      if (transcriptTexts.size > TRANSCRIPT_TEXTS_KEPT) transcriptTexts.delete(transcriptTexts.keys().next().value as string);
+      return said(text);
+    },
+  };
+}
 
 /**
  * DynamoDB client for `dynamodb-table` context sources, created on FIRST USE.
@@ -663,6 +769,24 @@ function machineTurnRoster(channelArn: string, botArn: string): Promise<Array<{ 
   return resolveChannelSize(messagingClient, channelArn, botArn).then((r) => r.members ?? []).catch(() => []);
 }
 
+/**
+ * THE CONVERSATIONS THIS TURN MAY READ BESIDE ITS OWN (DESIGN-WORKFLOWS-AND-TASKS section 6): of the `thread` relatives the
+ * router read from the server-side row, each holding every person here. Both rosters are read as the turn's
+ * assistant: its role reaches only its own classification's conversations (ADR-042), so another classification's is refused
+ * at the read, and a conversation the assistant is not in is not read either. A roster that could not be read whole fails.
+ */
+async function readableRelativesOf(channelArn: string, botArn: string, named: readonly RelatedConversation[]): Promise<RelatedConversation[]> {
+  const appRoot = appInstanceArnOf(channelArn);
+  const candidates = named.filter((r) => typeof r?.channelArn === 'string' && !!appRoot && r.channelArn.startsWith(`${appRoot}/channel/`) && (r.relation === 'parent' || r.relation === 'child')).slice(0, MAX_RELATIVES_NAMED);
+  return readableRelatives({ channelArn, candidates }, {
+    peopleOf: async (arn) => {
+      // A RELATIVE THE ASSISTANT IS NOT IN IS REFUSED, and that is the answer, not a fault.
+      const size = await resolveChannelSize(messagingClient, arn, botArn, { refusalExpected: arn !== channelArn });
+      return size.refused || size.unknown || size.truncated ? null : (size.members ?? []).filter((m) => !m.isBot).map((m) => m.arn);
+    },
+  });
+}
+
 export const handler = async (event: AsyncProcessorEvent, context?: TurnContext): Promise<void> => {
   // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
   await loadProfileRegistry();
@@ -757,6 +881,14 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
         userMessage: event.userMessage,
         classification: event.classification,
         intent: event.intent,
+        // THE CONVERSATIONS THIS ONE THREADS WITH (DESIGN-WORKFLOWS-AND-TASKS section 6), checked here, off the first frame's path.
+        ...(event.channelArn && event.botArn && event.threadRelatives?.length ? { related: () => readableRelativesOf(event.channelArn, event.botArn, event.threadRelatives ?? []) } : {}),
+        // A CHILD'S MEETING TRANSCRIPT, in this classification's transcript family, as the acting role reads it.
+        ...(process.env.TRANSCRIPT_BUCKET ? {
+          transcriptOf: (childArn: string) => latestTranscriptOf(transcriptReader(s3Client), process.env.TRANSCRIPT_BUCKET || '', event.classification, childArn, {
+            list: (input) => new ListObjectsV2Command(input as unknown as ListObjectsV2CommandInput), get: (input) => new GetObjectCommand(input as unknown as GetObjectCommandInput),
+          }),
+        } : {}),
       });
 
     // ── AND WHAT THE QUEUE BEHIND THIS TURN IS WAITING ON ────────────────────────────────────────
@@ -856,21 +988,6 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
     // Published to the hoisted binding the exit path reads. Assigned the moment it resolves, so a
     // turn that dies anywhere after this still settles its notice in the configured voice.
     turnCopy = versionCopy;
-    // ── THE TURN'S TASK MACHINES, RESOLVED ONCE, HERE (ADR-047) ──────────────────────────────
-    //
-    // Every consumer below takes this value; none of them resolves again. It used to be resolved at
-    // each point of use, and every pair of sites that disagreed was a silent defect with its own
-    // symptom: a document delivered as chat text, a task stalled on a transition the prompt promised.
-    //
-    // THE FULL SET, DELIBERATELY - the workflow SELECTION is not applied here. A selection decides
-    // what an assistant may OPEN, which is a router decision; it must not decide what may be RUN.
-    // Narrowing here would strand every task opened before the selection changed: the graph would
-    // vanish from under a task already in flight, `advance_task_state` would stop being offered for
-    // it, and a person waiting on that work would get an ordinary reply and no way to finish it.
-    // Gating the opening cannot strand anything, because nothing is in flight yet.
-    // THE VERSION'S CONFIRMATION SETTING IS APPLIED HERE, once (ADR-064 decision G): every consumer of the turn's machines
-    // reads the same answer to whether a complete request goes past a confirmed step.
-    const turnMachines = withConfirmBrief(taskStateMachines(), activeProfile.confirmBrief);
     // ── THE TURN DIED AND ITS RETRIES ARE SPENT. SAY SO, AS THIS ASSISTANT ────────────────────
     //
     // The recovery handler could have posted this itself, and deliberately does not: messages in a
@@ -984,12 +1101,16 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
     // room step is never handed a fact about one member. The sources read below, and every `ctx:` value a template
     // or a condition reads this turn, are settled by this one call site.
     const senderSub = personIdFromArn(event.senderArn) || '';
-    // A STEP ANOTHER ASSISTANT TAKES (`as: { role }`) is read from the run's assistant's active version, which declares it;
-    // this turn stays this assistant's own, its persona, its session and its grants.
-    const stepOwner = event.eventStep?.workflowOwner && event.eventStep.workflowOwner !== turnProfileName ? event.eventStep.workflowOwner : undefined;
-    const stepWorkflows = stepOwner
-      ? await ownerEventWorkflows(stepOwner, { ssm: ssmClient, ssmRoot: SSM_ROOT })
-      : activeProfile.eventWorkflows;
+    // A STEP IS READ FROM THIS ASSISTANT'S OWN VERSION, ONLY (WT118): no turn here runs a step another assistant's workflow
+    // declares. An intent's run (ADR-067 decision 1) declares its steps in the version's intent workflows.
+    // A TURN ANOTHER ASSISTANT ASKED FOR is one step on this assistant's own intent, read from its own pack.
+    const askedWorkflow = event.eventStep?.asked
+      ? askedTurnWorkflow(turnPack as never, event.eventStep as never) : undefined;
+    const stepWorkflows = event.eventStep?.asked
+      ? (askedWorkflow ? { [event.eventStep.workflow]: askedWorkflow } : {})
+      : event.eventStep?.event === INTENT_TRIGGER
+        ? intentRunWorkflows(activeProfile.intentWorkflows)
+        : activeProfile.eventWorkflows;
     const eventStepDef = event.eventStep ? workflowFor(stepWorkflows, event.eventStep.workflow)?.states[event.eventStep.step]?.agent : undefined;
     const subjectSub = event.eventStep ? personIdFromArn(event.eventStep.subject) || '' : '';
     const turnSite = event.eventStep
@@ -1025,10 +1146,15 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
         // kept only when the assistant's role is scoped to its prefix, and read on the assistant's credentials,
         // so an ops assistant in premium is not offered premium's financials through the catalog either.
         const scope = companyContextScope(CLASSIFICATION);
-        const isCompanyContext = (e: { type: string; prefix?: string }) =>
-          e.type === 's3-prefix' && (e.prefix || '').startsWith('context/');
-        const chosen = selectSources(catalog, selection, callSite, CLASSIFICATION)
-          .filter((e) => !isCompanyContext(e) || scope.prefixes.some((p) => (e.prefix || '').startsWith(p)));
+        const isCompanyContext = isCompanyContextSource;
+        // A source the role cannot read is counted as the `not-readable-by-role` skip, beside `not-in-catalog` and
+        // `unavailable`, so a version selecting it shows on the ContextSources dashboard rather than only in a log.
+        const chosen = selectSources(catalog, selection, callSite, CLASSIFICATION).filter((e) => {
+          if (readableByRole(e, scope.prefixes)) return true;
+          console.warn(`[context-sources] '${e.key}' is company context the assistant's role does not read; skipping`);
+          emitContextSourceOutcome({ classification: CLASSIFICATION, sourceKey: e.key, outcome: 'not-readable-by-role' });
+          return false;
+        });
         if (chosen.length) {
           // A source about a person is read for the person this call site settled: the sender, or the step's subject.
           const readerCtx = { classification: CLASSIFICATION, personId: sourcePersonId, channelArn: event.channelArn };
@@ -1089,7 +1215,7 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
     // resolved above. Nothing is read here. The lookup is the catalog the turn read, else the catalog's
     // least-permitting reading (`withUnreadCatalog`). One holder for the turn's templates, its task's conditions and
     // its step actions' arguments, under no grant the turn did not already use.
-    const personTurn = !event.eventStep && !event.welcomePrompt && !event.voiceSend && turnSite.identitySettled;
+    const personTurn = !event.eventStep && !event.welcomePrompt && !event.voiceSend && !event.meetingSummary && turnSite.identitySettled;
     const turnSourceTable = buildSourceTable({ catalog: turnCatalog ?? [], classifications: defaultProfileRegistry.classificationValues() });
     const turnVariables: TurnVariables = {
       lookup: turnCatalog ? sourceLookup(turnSourceTable) : withUnreadCatalog(sourceLookup(turnSourceTable)),
@@ -1145,6 +1271,34 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
         ...(event.senderArn ? { senderArn: event.senderArn } : {}),
       })
       : null;
+    /** The task this turn continues, read once: the service's read, else the table's. */
+    const turnTaskRow = event.taskId && event.taskType
+      ? (turnTasks ? turnTasks.current : await getTask(event.taskId, event.channelArn))
+      : null;
+    // ── THE TURN'S TASK MACHINES, RESOLVED ONCE, HERE (ADR-047) ──────────────────────────────
+    //
+    // Every consumer below takes this value; none of them resolves again. One resolution means
+    // every site agrees: two sites that resolved separately could disagree silently, and each disagreement has its
+    // own symptom, a document delivered as chat text or a task stalled on a transition the prompt promised.
+    //
+    // THE VERSION'S SET, AND THE TASK'S OWN VERSION'S WHERE THE TURN CONTINUES ONE (ADR-066 decision 5): the serving
+    // version runs its own machines over the platform and classification graphs (`machinesForVersion`), and a task follows
+    // the version it started on (`resolveTaskMachines`), so an edit or a rollback never strands it in a state the new
+    // machine lacks.
+    //
+    // THE FULL SET, DELIBERATELY - the workflow SELECTION is not applied here. A selection decides
+    // what an assistant may OPEN, which is a router decision; it must not decide what may be RUN.
+    // Narrowing here would strand every task opened before the selection changed: the graph would
+    // vanish from under a task already in flight, `advance_task_state` would stop being offered for
+    // it, and a person waiting on that work would get an ordinary reply and no way to finish it.
+    // Gating the opening cannot strand anything, because nothing is in flight yet.
+    // THE VERSION'S CONFIRMATION SETTING IS APPLIED HERE, once (ADR-064 decision G): every consumer of the turn's machines
+    // reads the same answer to whether a complete request goes past a confirmed step.
+    const servedMachines = machinesForVersion(activeProfile);
+    const turnMachines = withConfirmBrief(
+      turnTaskRow ? await resolveTaskMachines(turnTaskRow, { profileName: turnProfileName, fallback: servedMachines }) : servedMachines,
+      activeProfile.confirmBrief,
+    );
 
     // ── THE DOCUMENT TEMPLATES THIS TASK'S WORKFLOW DECLARES, LOADED BEFORE THE TURN RUNS ──────────
     //
@@ -1170,7 +1324,7 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
     let taskStepPrompt = '';
     let renderTaskStep: ((documentWrittenOnStep?: (state: string) => boolean) => string) | undefined;
     if (event.taskId && event.taskType) {
-      const task = turnTasks ? turnTasks.current : await getTask(event.taskId, event.channelArn);
+      const task = turnTaskRow;
       if (task) {
         turnTaskStep = task.taskState || undefined;
         turnTaskOpeningIntent = task.openingIntent || undefined;
@@ -1328,6 +1482,18 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
 
     // Conversation summary as consumable context (ADR-017); no-op when short.
     systemPrompt += buildConversationSummaryHint(grounding.conversationSummary);
+    // The related conversations' summaries (DESIGN-WORKFLOWS-AND-TASKS section 6); no-op where there are none.
+    systemPrompt += buildRelatedConversationsHint(grounding.relatedSummaries);
+    // A MEETING'S CONTENT IS CONTEXT AND ITS FILES ARE ITS HOSTS' (`meeting-file-links.ts`): no meeting file link reaches the
+    // model, and wherever a meeting's transcript, its files or its conversation are in this turn, the assistant carries
+    // its guidance for a request for one, a template a team can reword.
+    const heldMeetingFiles = holdMeetingFileLinks(bedrockMessages);
+    if (heldMeetingFiles || event.conversationType === MEETING_CONVERSATION_TYPE || grounding.relatedSummaries?.some((r) => !!r.transcript)) {
+      const guidance = await loadNamedPromptTemplate({ classification: CLASSIFICATION, assistant: turnProfileName, name: MEETING_FILES_PROMPT }).catch(() => undefined);
+      const said = guidance ? renderMessageTemplate(guidance, {}, { sections: ['prompt'], refusedValue: 'empty' }) : undefined;
+      const text = said?.ok ? (said.sections.prompt ?? '').trim() : '';
+      if (text) systemPrompt += `\n\n## MEETINGS AND THEIR FILES\n\n${text}\n`;
+    }
 
     if (priorAgentContext) {
       systemPrompt += `\n\n[You already said the following — do NOT repeat it. Use completely different wording.]\n${priorAgentContext.trim()}`;
@@ -1430,8 +1596,8 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
     const catalog = getModelCatalog(process.env.AWS_REGION || 'us-east-1', process.env.AWS_ACCOUNT_ID || '');
     // P0 (SPEC-PORTABLE-PROFILES): the profile's BASE model comes from the ACTIVE version in
     // SSM, not the deploy-time default — so activating a new profile version re-models the assistant
-    // with NO redeploy. Fail-closed to the compiled seed (== today's deploy default), so a deployment
-    // that never versions behaves byte-identically. A version whose modelKey is not in this catalog is
+    // with NO redeploy. A profile with no active version serves the compiled seed (== the deploy default),
+    // so a deployment that never versions behaves byte-identically. A version whose modelKey is not in this catalog is
     // ignored here (the deploy-time default holds) — the §7 model-ARN boundary is deploy-owned; a
     // version selects WITHIN it, never beyond. Battle/experiment models still win over this base below.
     //
@@ -1459,9 +1625,7 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
     // when a version carries no per-intent routing.
     // A version with no routes is served the platform routes AS SERVED on its base model
     // (`platformRoutesServedOn`), never the global table raw: routes are served as written.
-    const profileStrategy = buildIntentStrategy(active.models)
-      ?? buildIntentStrategy({ byIntent: platformRoutesServedOn(activeModelKey) })
-      ?? INTENT_ROUTE_STRATEGY;
+    const profileStrategy = versionRouteStrategy(active.models, activeModelKey);
     // WHAT THE TURN IS DOING, not only what the message looked like. The trivial-intent bypass in
     // model-resolver keeps the cheap model for a greeting or an acknowledgment; a turn that carries a
     // task is doing that task's work whatever the message's shape, and resolving it from the shape
@@ -1474,9 +1638,9 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
     //  - `taskId`: the structural fact that this turn is bound to a task at all, which holds whether
     //    the task was opened this turn or resumed, and does not depend on any state's declaration.
     const continuesActiveWork = !!event.isTaskContinuation || !!event.taskId;
-    // Context-aware model routing (SPEC-CONTEXT-AWARE-MODEL-ROUTING), flag-gated + battle-exclusive.
-    // When ENABLE_CONTEXT_ROUTING is off (or this is a /battle turn), `plan` is null and the Bedrock
-    // path below is unchanged. PREFERRED CN path is DeepSeek-on-Bedrock (in-AWS, intent-routed R1/V3,
+    // Context-aware model routing (SPEC-CONTEXT-AWARE-MODEL-ROUTING): every turn's model comes from
+    // `resolveModelPlan`. Only the Chinese-language and external-provider rules below are gated, on
+    // ENABLE_CONTEXT_ROUTING and off for a /battle turn. PREFERRED CN path is DeepSeek-on-Bedrock (in-AWS, intent-routed R1/V3,
     // no external-provider gate); the external provider is used only when no Bedrock CN model is
     // configured AND the classification selects the external adapter (`externalProviderSelected`); a profile
     // version enables nothing.
@@ -1506,7 +1670,8 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
     // ONE RESOLUTION PER TURN (SPEC-CONTEXT-AWARE-MODEL-ROUTING FR1): an experiment override, the version's routing
     // rules, the context rules, then the route's choice for this turn (ADR-064 decision B): the step's override where the
     // version's route sets one for the step the task starts in, the task intent's route where that step delivers, and
-    // otherwise the message's own intent. `plan.routed` is the route's choice, what an override falls back to.
+    // otherwise the message's intent, which is the task's intent when the router's classifier placed the message in the
+    // open task (ADR-064, amended 2026-11-12). `plan.routed` is the route's choice, what an override falls back to.
     const experimentModelId = experimentModelOverride(event);
     const turnTaskIntent = event.taskId ? taskIntentOf(event.taskType, knownIntentKeys(turnPack), turnTaskOpeningIntent, event.intent) : undefined;
     const turnStepDef = event.taskType && turnTaskStep ? turnMachines[event.taskType]?.states?.[turnTaskStep] : undefined;
@@ -1590,6 +1755,10 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
       // An intent declaring no tools of its own returns `active.tools` unchanged, which is every intent
       // today.
       tools: toolsForIntent(event.intent || '', active.tools, turnPack),
+      // THE ALARM THE ROOM WATCHES, read by `read_deployment_health` beside the deployment's own (SPEC-WORKFLOWS-AND-TASKS WT120).
+      ...(typeof event.watchedAlarm === 'string' && event.watchedAlarm ? { watchedAlarm: event.watchedAlarm } : {}),
+      // THE CONVERSATION A DASHBOARD TOOL PUBLISHES IN (DESIGN-CONVERSATION-DASHBOARDS): this turn's own.
+      ...(event.channelArn && event.botArn ? { conversation: { channelArn: event.channelArn, classification: event.classification, botArn: event.botArn, assistant: turnProfileName, ...(typeof event.userLanguage === 'string' && event.userLanguage ? { language: event.userLanguage } : {}) } } : {}),
       // THE INTENT'S ANSWERING TEMPERATURE, when it declares one (FR19): an intent that must answer
       // the same way every time runs low and fixed. Absent keeps the deployment default.
       ...(turnIntentDef?.answer?.temperature !== undefined ? { temperature: turnIntentDef.answer.temperature } : {}),
@@ -1624,31 +1793,89 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
     //
     // One turn of this assistant, from the step's prompt template, with only the step's read tools, ending in one
     // message: its output or the step's fallback, whichever wins the step's claim. No placeholder: nobody asked.
+    // PEOPLE FOR THE RUNNING MEETING (SPEC-ASSISTANT-MEETINGS FR42), offered to one person (`proposalAddresseeOf`): a person's turn's
+    // sender, or the person an asked turn's request is for. Only where the turn's tools allow it and the conversation's meeting runs
+    // and takes people from outside it. The tool records a proposal addressed to that person alone and posts its card to them
+    // privately; it adds nobody, and the add is checked again when they confirm it.
+    const meetingInvitesFor = async (personArn: string | undefined, tools: readonly string[] | undefined) => {
+      if (!MEETINGS_ATTACHED || !personArn || !event.channelArn || !event.botArn) return {};
+      if (tools !== undefined && !tools.includes(MEETING_INVITES_TOOL)) return {};
+      if (!(await meetingPlaceOf(event.channelArn).catch(() => undefined))) return {};
+      return {
+        meetingInvites: {
+          offer: (input: Record<string, unknown>) => offerMeetingInvites(input, {
+            channelArn: event.channelArn, requesterArn: personArn, botArn: event.botArn as string,
+            classification: CLASSIFICATION, appInstanceArn: event.channelArn.split('/channel/')[0],
+            correlationId: event.userMessageId || event.correlationId || '',
+          }, {
+            placeOf: meetingPlaceOf,
+            writeProposal: (record) => writeProposal(proposalsDoc(), process.env.TOKENS_TABLE || '', record),
+            // THE CARD'S WORDS ARE A TEMPLATE the assistant can replace (ADR-062), the count and the list as data.
+            cardText: async (values) => {
+              const card = await loadNamedTemplate({ classification: CLASSIFICATION, assistant: turnProfileName, name: 'add-to-meeting-proposal' }, 'message');
+              const said = card ? localizedTemplate(card, { copy: versionCopy }, 'addressed') : undefined;
+              const rendered = said ? renderMessageTemplate(said, values, { refusedValue: 'empty' }) : undefined;
+              return (rendered?.ok ? (rendered.sections.chat ?? '').trim() : '') || values.teams;
+            },
+            // THE CALL'S NAME, read as the answering assistant, a member of the meeting's conversation through the one it started from.
+            conversationNameOf: async (channelArn) => (await messagingClient.send(new DescribeChannelCommand({
+              ChannelArn: channelArn, ChimeBearer: event.botArn as string,
+            }))).Channel?.Name || undefined,
+            // PRIVATELY, to that one person (ADR-036): the card's handle reaches no one else.
+            postCard: async ({ content, to, card }) => {
+              await sendChannelMessage(messagingClient, {
+                ChannelArn: event.channelArn, Content: content, ChimeBearer: event.botArn,
+                Type: ChannelMessageType.STANDARD, Persistence: ChannelMessagePersistenceType.PERSISTENT,
+                Target: [{ MemberArn: to }],
+                Metadata: { botResponse: true, respPhase: 'final', agentType: turnProfileName, targetedSender: to, proposal: card },
+              });
+            },
+          }),
+        },
+      };
+    };
     if (event.eventStep) {
       const req = event.eventStep;
       // The served version's own workflow of that name first, then the platform's (ADR-061 decision 1).
       const wf = workflowFor(stepWorkflows, req.workflow);
       const def = wf?.states[req.step]?.agent;
+      // WHERE THE TURN'S ENDING GOES, AND WHAT ITS MESSAGES SAY: an asked turn hands the asking run its ending, and is measured
+      // as this assistant's own run of the intent (WT118); any other step is its own run's.
+      const asked = req.asked;
+      const stepClaim = asked ? askedTurnClaimStep(req.step) : req.step;
+      const stamp = asked
+        ? { workflow: asked.intent, step: 'answer', runKey: asked.run.runKey, origin: asked.run.origin, workflowHash: undefined, trigger: asked.run.trigger }
+        : { workflow: req.workflow, step: req.step, runKey: req.runKey, origin: req.origin, workflowHash: req.workflowHash, trigger: req.runTrigger };
+      // THE RUN'S IDENTITY, handed back as it came (the router's `runIdentity`), whichever way the step ends.
+      const identity = {
+        ...(req.eventPerson ? { eventPerson: req.eventPerson } : {}), ...(req.subject ? { subject: req.subject } : {}),
+        ...(req.invitationId ? { invitationId: req.invitationId } : {}), ...(req.alarm ? { alarm: req.alarm } : {}),
+        ...(req.origin ? { origin: req.origin } : {}), ...(req.runTaskId ? { runTaskId: req.runTaskId } : {}), ...(req.reopened ? { reopened: req.reopened } : {}),
+        ...(req.ruleEvent ? { ruleEvent: req.ruleEvent } : {}), ...(req.meeting ? { meeting: req.meeting } : {}),
+        ...(req.process ? { process: req.process } : {}),
+      };
       if (!wf || !def || wf.on !== req.event) {
-        console.warn('[event-step] the dispatch names no agent step of the served version or the platform; nothing runs', { workflow: req.workflow, step: req.step });
+        console.warn('[event-step] the dispatch names no agent step of the served version or the platform; nothing runs', { workflow: req.workflow, step: req.step, asked: asked?.intent });
+        // AN ASKED INTENT THIS VERSION DOES NOT DECLARE ends the asking step on its failure edge, rather than leaving it waiting.
+        if (asked) await continueEventRunThroughRouter((await resolveRouterArn(CLASSIFICATION)) ?? '', {
+          runKey: req.runKey, workflow: req.workflow, step: req.step, outcome: askedTurnOutcome('refused'), event: req.event,
+          channelArn: event.channelArn, botArn: asked.askerBotArn, values: req.values ?? {}, ...identity,
+          transitions: req.transitions ?? [],
+        });
         return;
       }
       // THE RUN GOES BACK TO THE ROUTER of the assistant whose version declares it, naming the step's outcome.
       const handBack = async (outcome: string) => continueEventRunThroughRouter((await resolveRouterArn(CLASSIFICATION)) ?? '', {
-        runKey: req.runKey, workflow: req.workflow, step: req.step, outcome, event: req.event,
-        channelArn: event.channelArn, botArn: (stepOwner && req.ownerBotArn) || event.botArn, values: req.values ?? {},
-        ...(req.eventPerson ? { eventPerson: req.eventPerson } : {}), ...(req.subject ? { subject: req.subject } : {}),
-        ...(req.invitationId ? { invitationId: req.invitationId } : {}),
-        ...(req.alarm ? { alarm: req.alarm } : {}),
+        runKey: req.runKey, workflow: req.workflow, step: req.step, outcome: asked ? askedTurnOutcome(outcome) : outcome, event: req.event,
+        channelArn: event.channelArn, botArn: asked ? asked.askerBotArn : event.botArn, values: req.values ?? {}, ...identity,
         transitions: req.transitions ?? [],
       });
-      // EACH ASSISTANT ACTS ONLY AS ITSELF (tenet D1): a step another assistant's version declares is taken here only when
-      // it names this assistant's role, and a step naming a role is taken only by an assistant holding it. A refused step
-      // runs no turn and calls nothing; it is claimed `refused` and handed back, so the router says its fallback and the
-      // run takes its failure edge, and the room is never left waiting on a step nobody took.
-      if (!stepTakenBy(def, { owner: stepOwner, role: turnAssistantRole })) {
+      // EACH ASSISTANT ACTS ONLY AS ITSELF (tenet D1, WT118), the second layer behind the router: a step naming another
+      // assistant's role (`as`, retired) runs no turn and calls nothing; it is claimed `refused` and handed back, so the
+      // router says its fallback and the run takes its failure edge, and the room is never left waiting on a step nobody took.
+      if (!stepTakenBy(def)) {
         console.warn('[event-step][SecurityEvent] the step is not this assistant\'s to take; nothing runs', { workflow: req.workflow, step: req.step, role: def.as?.role });
-        if (await claimEventStep({ runKey: req.runKey, channelArn: event.channelArn, step: req.step, outcome: 'refused' }).catch(() => false)) await handBack('refused');
+        if (await claimEventStep({ runKey: req.runKey, channelArn: event.channelArn, step: stepClaim, outcome: 'refused' }).catch(() => false)) await handBack('refused');
         return;
       }
       const roster = machineTurnRoster(event.channelArn, event.botArn);
@@ -1662,33 +1889,45 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
         event: req.event, channelArn: event.channelArn, eventPerson: req.eventPerson, subject: req.subject, inviter: req.inviter, values: req.values ?? {},
         ...(roles ? { roles } : {}), ...(req.conversationType ? { conversationType: req.conversationType } : {}),
       };
-      const targetsOf = (to: import('./lib/event-workflow.js').EventAudience) => { const a = audienceOf(to, ctx); return a === 'room' ? [] : a; };
+      const targetsOf = (to: import('./lib/event-workflow.js').EventAudience) => { if (asked) return asked.to; const a = audienceOf(to, ctx); return a === 'room' ? [] : a; };
+      // THE STEP'S MODEL CALL AND WHAT IT ASKED, recorded on what it posts (FR43).
+      const stepTurn: PlatformTurnRecord = { ...(typeof event.triggerAtMs === 'number' ? { triggerAtMs: event.triggerAtMs } : {}) };
       const post = async (content: string, to: string[], outcome: string, proposal?: ProposalCard) => {
         // ONE RESPONSE, IN AS MANY PARTS AS IT NEEDS: a model chose its length, and every part reaches the same audience.
         // A refused part throws, so the step records `post_failed` for the response (`runAgentStep`).
-        await sendInParts(messagingClient, {
+        const sent = await sendInParts(messagingClient, {
           ChannelArn: event.channelArn,
           text: content,
           ChimeBearer: event.botArn,
-          Metadata: JSON.stringify({
+          // A RUN CARD IS HELD WITHIN THE SERVICE'S METADATA CAP as the router's is (`withinMetadataCap`): its oldest moves give way.
+          Metadata: JSON.stringify(withinMetadataCap({
             botResponse: true,
             respPhase: 'final',
             agentType: turnProfileName,
             turnKind: 'event_step',
-            eventStep: { workflow: req.workflow, step: req.step, event: req.event, outcome },
+            eventStep: { workflow: stamp.workflow, step: stamp.step, event: req.event, outcome },
+            // HOW LONG THE TURN TOOK, from the event that started it, so its run is measured as a request's turn is (WT118).
+            ...(typeof event.triggerAtMs === 'number' ? { totalMs: Date.now() - event.triggerAtMs } : {}),
             // Timed from the event that started the run, so the latency grid measures it (`declared_trigger`).
             trigger: 'event_step',
             ...(typeof event.triggerAtMs === 'number' ? { triggerAtMs: event.triggerAtMs } : {}),
             // No message entered this turn; the platform started it (`turnEntryOf`).
             entry: turnEntryOf(event.entry, 'event_step'),
             // THE RUN'S MOVES REACH THE ARCHIVE ON ITS MESSAGES (ADR-061 rule 11).
-            eventRun: { runKey: req.runKey, transitions: [...(req.transitions ?? []), { step: req.step, outcome }] },
+            eventRun: {
+              runKey: stamp.runKey, transitions: [...(asked ? [] : (req.transitions ?? [])), { step: stamp.step, outcome }],
+              ...(stamp.origin ? { originConfigId: stamp.origin.configId } : {}), ...(stamp.workflowHash ? { workflowHash: stamp.workflowHash } : {}),
+              ...(stamp.trigger ? { trigger: stamp.trigger } : {}),
+            },
             ...(to.length ? { targetedSender: to[0] } : {}),
             // A CONFIRMATION CARD (ADR-061 decision 8, rule 8): the proposal's handle, which only its addressee receives.
             ...(proposal ? { proposal } : {}),
-          }),
+          }, CHIME_METADATA_MAX)),
           ...(to.length ? { Target: to.map((MemberArn) => ({ MemberArn })) } : {}),
         });
+        const turn = { ...stepTurn, ...(typeof event.triggerAtMs === 'number' ? { totalMs: Date.now() - event.triggerAtMs } : {}) };
+        if (asked) await recordAskedStep(sent, event.channelArn, req, turn);
+        else await recordRunMessageProcess(sent, event.channelArn, req.process, turn);
       };
       // A STEP THAT PROPOSES (decision 8, rules 6 to 8): its turn drafts the proposal, and whatever it writes executes
       // nothing. Where the draft reaches a person not reading the room (`send_nudge`), the turn is NARROWED: the persona
@@ -1743,13 +1982,17 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
         botArn: event.botArn, excerpt: typeof ctx.values.label === 'string' ? ctx.values.label : '',
       }) : undefined;
       const withStep = (prompt: string) => (opened?.stepPrompt ? `${prompt}\n\n${opened.stepPrompt}` : prompt);
+      // AN ASKED TURN MAY OFFER ITS CARD TO THE PERSON THE REQUEST IS FOR, and to nobody else (`proposalAddresseeOf`): an
+      // incident's runbook asks for the customers affected on its lead's behalf, so the lead confirms adding their account teams.
+      const askedInvites = asked && !narrowed ? await meetingInvitesFor(proposalAddresseeOf({ channelArn: event.channelArn, asked }), def.tools ?? []) : {};
       const run = await runAgentStep({
-        template, values: narrowed ? promptValues : ctx.values, deadlineMs: def.deadlineMs,
+        // AN ASKED TURN IS TOLD WHAT WAS ASKED, AS DATA, AND ANSWERS AS ITS OWN INTENT INSTRUCTS.
+        template, values: asked ? { ask: asked.ask, instructions: instructionsForIntent(asked.intent, turnPack) ?? '' } : narrowed ? promptValues : ctx.values, deadlineMs: def.deadlineMs,
         ...(readsRoom && nothingToRecap(wf.states[req.step], pipeline.personSpoke) ? { nothingToRead: true } : {}),
       }, {
         // No person asked: metered against the global budget only, as the join recap is.
         meter: async () => (await evaluateAbuseGate({ personId: '', rateLimit: 0, isAdmin: false, machineWritten: true })).allowed,
-        invoke: async (prompt) => (narrowed
+        invoke: async (prompt) => { stepTurn.ask = prompt; const call = await (narrowed
           ? invokeBedrockWithFallback(
             persona,
             [{ role: 'user', content: prompt }],
@@ -1760,15 +2003,17 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
           : invokeBedrockWithFallback(
             systemPrompt,
             consolidateConsecutiveMessages([...roomHistory, { role: 'user', content: withStep(prompt) }]),
-            { ...invokeConfig, tools: def.tools ?? [], userTurnText: '' },
+            { ...invokeConfig, tools: def.tools ?? [], userTurnText: '', ...askedInvites },
             resolution.fallbackModelId,
             { cacheableSystemPrefixLength, enableCompanyContextTool: true },
-          )),
-        claim: (outcome) => claimEventStep({ runKey: req.runKey, channelArn: event.channelArn, step: req.step, outcome }),
+          )); stepTurn.call = call; return call; },
+        claim: (outcome) => claimEventStep({ runKey: req.runKey, channelArn: event.channelArn, step: stepClaim, outcome }),
         // A DRAFT THAT REACHES SOMEONE OUTSIDE THE ROOM carries no link, handle or address (rule 6).
         ...(op ? { vet: (text: string) => !proposalDraftRefusal(text) } : {}),
         postOutput: (content) => (op ? offerProposal(content) : post(content, targetsOf(def.to), 'posted')),
         postFallback: async (outcome) => {
+          // AN ASKED TURN SAYS NOTHING WHERE IT COULD NOT ANSWER: the asking run takes its failure edge, and says so in its words.
+          if (asked) return;
           const send = def.fallback.send;
           // THE FALLBACK LEARNS ITS AUDIENCE AND RESOLVES THROUGH THE TURN'S RESOLVER (ADR-060, slice 1d): a stored
           // template its readers may not read is passed over, and a field bound to a source or a version variable is
@@ -1818,6 +2063,14 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
         }).catch(() => ({ ok: false as const }));
         console.log('[event-step] event task', { machine: def.workflow, to: opened.next, ok: advanced.ok });
       }
+      // AN ASKED TURN IS ITS OWN RUN, AND THIS ONE STEP ENDS IT (WT118), so the owning team reads how its intent went, whoever asked.
+      if (asked && run.won) {
+        await recordRunEnded({
+          channelArn: event.channelArn, runKey: asked.run.runKey, workflow: asked.intent, trigger: req.event,
+          disposition: run.outcome === 'posted' ? 'success' : 'failure', steps: [{ step: 'answer', outcome: run.outcome }],
+          ...(asked.run.origin ? { originConfigId: asked.run.origin.configId } : {}),
+        }).catch((err) => console.warn('[event-step] an asked turn\'s end could not be recorded', { intent: asked.intent, errName: (err as Error)?.name }));
+      }
       // ONLY THE WINNER HANDS THE RUN ON: the invocation whose output or fallback won the step's claim names the
       // continuation back to the router, which claims it once and runs the steps that follow.
       if (run.won) await handBack(run.outcome);
@@ -1846,26 +2099,33 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
       const written = inLanguage(template, req.writtenLanguage);
       const resolved = resolverValues(written, { copy: versionCopy }, audience);
       const persona = baseSystemPrompt + personaAddendumBlock(activeProfile.systemPromptAddendum);
+      const voiceTurn: PlatformTurnRecord = { ...(typeof event.triggerAtMs === 'number' ? { triggerAtMs: event.triggerAtMs } : {}) };
       const voiced = await renderVoice({ written, values: { ...resolved, ...req.values }, target: req.target, sections: ['chat'] }, {
         meter: async () => (await evaluateAbuseGate({ personId: '', rateLimit: 0, isAdmin: false, machineWritten: true })).allowed,
-        invoke: async (prompt) => invokeBedrockWithFallback(
-          persona,
-          [{ role: 'user', content: prompt }],
-          // No tools, and no person's input to screen: the output guardrail runs on what the model wrote.
-          { ...invokeConfig, tools: [], userTurnText: '' },
-          resolution.fallbackModelId,
-          { cacheableSystemPrefixLength: persona.length, enableCompanyContextTool: false },
-        ),
+        invoke: async (prompt) => {
+          voiceTurn.ask = prompt;
+          const call = await invokeBedrockWithFallback(
+            persona,
+            [{ role: 'user', content: prompt }],
+            // No tools, and no person's input to screen: the output guardrail runs on what the model wrote.
+            { ...invokeConfig, tools: [], userTurnText: '' },
+            resolution.fallbackModelId,
+            { cacheableSystemPrefixLength: persona.length, enableCompanyContextTool: false },
+          );
+          voiceTurn.call = call;
+          return call;
+        },
         log: (entry) => console.log('[voice-send]', JSON.stringify({ ...entry, workflow: req.workflow, step: req.step })),
       });
       const content = (voiced.sections.chat ?? '').trim();
       if (!content) return;
       // ONE RESPONSE, IN AS MANY PARTS AS IT NEEDS, every part to the send's audience.
-      await sendInParts(messagingClient, {
+      const sent = await sendInParts(messagingClient, {
         ChannelArn: event.channelArn,
         text: content,
         ChimeBearer: event.botArn,
-        Metadata: JSON.stringify({
+        // A RUN CARD IS HELD WITHIN THE SERVICE'S METADATA CAP as the router's is (`withinMetadataCap`): its oldest moves give way.
+        Metadata: JSON.stringify(withinMetadataCap({
           botResponse: true,
           respPhase: 'final',
           agentType: turnProfileName,
@@ -1878,33 +2138,44 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
           trigger: 'event_step',
           ...(typeof event.triggerAtMs === 'number' ? { triggerAtMs: event.triggerAtMs } : {}),
           entry: turnEntryOf(event.entry, 'event_step'),
-          eventRun: { runKey: req.runKey, transitions: req.transitions ?? [] },
+          eventRun: {
+            runKey: req.runKey, transitions: req.transitions ?? [],
+            ...(req.origin ? { originConfigId: req.origin.configId } : {}), ...(req.workflowHash ? { workflowHash: req.workflowHash } : {}),
+            ...(req.runTrigger ? { trigger: req.runTrigger } : {}),
+          },
           ...(req.to.length ? { targetedSender: req.to[0] } : {}),
-        }),
+        }, CHIME_METADATA_MAX)),
         ...(req.to.length ? { Target: req.to.map((MemberArn) => ({ MemberArn })) } : {}),
       });
+      await recordRunMessageProcess(sent, event.channelArn, req.process, voiceTurn.call ? { ...voiceTurn, ...(typeof event.triggerAtMs === 'number' ? { totalMs: Date.now() - event.triggerAtMs } : {}) } : undefined);
       return;
     }
 
     if (event.welcomePrompt) {
       const request = event.welcomePrompt;
       const template = await loadNamedPromptTemplate({ classification: CLASSIFICATION, assistant: turnProfileName, name: request.template });
+      const welcomeTurn: PlatformTurnRecord = { ...(typeof event.triggerAtMs === 'number' ? { triggerAtMs: event.triggerAtMs } : {}) };
       await runWelcomePromptTurn(request, template, {
         // Metered here, after the opening is already posted, against the global budget only: no person asked.
         meter: async () => (await evaluateAbuseGate({ personId: '', rateLimit: 0, isAdmin: false, machineWritten: true })).allowed,
         people: async () => (await machineTurnRoster(event.channelArn, event.botArn)).filter((m) => !m.isBot).map((m) => m.name),
-        invoke: async (prompt) => invokeBedrockWithFallback(
-          systemPrompt,
-          [{ role: 'user', content: prompt }],
-          // Only the tools the welcome names, never the version's whole list; its own instructions are not a
-          // person's input, so the input guardrail screens nothing (`userTurnText`), and the output guardrail runs.
-          { ...invokeConfig, tools: request.tools, userTurnText: '' },
-          resolution.fallbackModelId,
-          { cacheableSystemPrefixLength, enableCompanyContextTool: true },
-        ),
+        invoke: async (prompt) => {
+          welcomeTurn.ask = prompt;
+          const call = await invokeBedrockWithFallback(
+            systemPrompt,
+            [{ role: 'user', content: prompt }],
+            // Only the tools the welcome names, never the version's whole list; its own instructions are not a
+            // person's input, so the input guardrail screens nothing (`userTurnText`), and the output guardrail runs.
+            { ...invokeConfig, tools: request.tools, userTurnText: '' },
+            resolution.fallbackModelId,
+            { cacheableSystemPrefixLength, enableCompanyContextTool: true },
+          );
+          welcomeTurn.call = call;
+          return call;
+        },
         post: async (content) => {
           // ONE RESPONSE, IN AS MANY PARTS AS IT NEEDS; a refused part throws, and the greeting is recorded as not posted.
-          await sendInParts(messagingClient, {
+          const sent = await sendInParts(messagingClient, {
             ChannelArn: event.channelArn,
             text: content,
             ChimeBearer: event.botArn,
@@ -1916,12 +2187,57 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
               welcomeOutcome: 'posted',
               // A welcome answers no message; the platform started it when the assistant joined (`turnEntryOf`).
               entry: turnEntryOf(event.entry, 'welcome'),
+              ...(typeof event.triggerAtMs === 'number' ? { triggerAtMs: event.triggerAtMs } : {}),
             }),
           });
+          await recordRunMessageProcess(sent, event.channelArn, undefined, { ...welcomeTurn, ...(typeof event.triggerAtMs === 'number' ? { totalMs: Date.now() - event.triggerAtMs } : {}) });
         },
         record: (outcome, detail) => recordWelcomePromptOutcome(outcome, { correlationId: event.correlationId, ...detail }),
         // The tool loop's line for a turn that produced no text is not a greeting.
         emptyReplies: [noticeLine(versionCopy, 'nothingChanged'), noticeLine(versionCopy, 'completedWithoutSummary')],
+      });
+      return;
+    }
+
+    // A RECORDED MEETING'S SUMMARY (SPEC-ASSISTANT-MEETINGS FR66): one turn of the room's owning assistant on its own session,
+    // over the meeting's transcript, measured against the ended card and handed back to the router, which writes it.
+    if (event.meetingSummary) {
+      const req = event.meetingSummary;
+      const conversationId = conversationIdOf(req.meetingArn);
+      await runMeetingSummaryTurn(req, {
+        meter: async () => (await evaluateAbuseGate({ personId: '', rateLimit: 0, isAdmin: false, machineWritten: true })).allowed,
+        segments: () => readMeetingSegments(s3Client, process.env.TRANSCRIPT_BUCKET || '', { classification: event.classification, conversationId, meetingId: req.meetingId }, {
+          list: (input) => new ListObjectsV2Command(input as unknown as ListObjectsV2CommandInput), get: (input) => new GetObjectCommand(input as unknown as GetObjectCommandInput),
+        }),
+        // The summary's instructions and the meeting as data are its one message; no tools, and its own words are not a
+        // person's input, so the input guardrail screens nothing (`userTurnText`) and the output guardrail runs.
+        invoke: async (prompt) => invokeBedrockWithFallback(
+          systemPrompt,
+          [{ role: 'user', content: prompt }],
+          { ...invokeConfig, tools: [], userTurnText: '', maxTokens: Math.max(invokeConfig.maxTokens, MEETING_SUMMARY_MAX_TOKENS) },
+          resolution.fallbackModelId,
+          { cacheableSystemPrefixLength },
+        ),
+        // THE CALL ENDS INSIDE THE INVOCATION: a redelivery of this turn is claimed already, so a turn the platform cut off
+        // would be lost unrecorded, and one its deadline ends is recorded as that.
+        ...(context ? { remainingMs: () => context.getRemainingTimeInMillis() } : {}),
+        // THE TURN IS RECORDED ON THE CARD IT WRITES, before the router rewrites it, so the card's update is archived as
+        // this assistant's `meeting_summary` turn with its model, tokens and time.
+        measure: async (m) => writeMessageAnalytics({
+          messageId: req.card.messageId, channelArn: req.card.room,
+          analytics: {
+            role: 'assistant', agentType: turnProfileName, classification: event.classification,
+            bedrockModel: m.model, inputTokens: m.inputTokens, outputTokens: m.outputTokens, latencyMs: m.modelMs, totalMs: m.totalMs,
+            modelMs: m.modelMs, turnKind: 'meeting_summary', trigger: 'meeting_summary', entry: turnEntryOf(event.entry, 'meeting_summary'),
+            ...(typeof event.triggerAtMs === 'number' ? { triggerAtMs: event.triggerAtMs } : {}),
+            processorEntryMs: startTime,
+          },
+        }),
+        handBack: async (written) => meetingSummaryThroughRouter((await resolveRouterArn(CLASSIFICATION)) ?? '', {
+          ...written, meetingArn: req.meetingArn, meetingId: req.meetingId, botArn: event.botArn,
+        }),
+        record: (outcome, detail) => console.log('[meeting-summary] the turn ended', { outcome, correlationId: event.correlationId, ...detail }),
+        ...(typeof event.triggerAtMs === 'number' ? { triggerAtMs: event.triggerAtMs } : {}),
       });
       return;
     }
@@ -1997,6 +2313,47 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
           }),
         }
         : {}),
+      // PEOPLE FOR THE RUNNING MEETING (SPEC-ASSISTANT-MEETINGS FR42): on a person's turn whose tools allow it.
+      ...(!isTriageTurn && !battleOn ? await meetingInvitesFor(proposalAddresseeOf({ channelArn: event.channelArn, senderArn: event.senderArn }), invokeConfig.tools) : {}),
+      // A NEW REQUEST MID-TASK (ADR-067 G15, WT106): on a person's message to a task already open, the turn may open the
+      // message as its own task under another multi-step intent its pack declares. The task is the sender's, holds their
+      // message, is as private as that message was (its stored Target, read only when a request opens), and awaits its intent's
+      // run, which the router starts.
+      ...(() => {
+        const sender = event.senderArn;
+        if (isTriageTurn || battleOn || event.taskCreated || !turnTaskRow || !sender?.includes('/user/')) return {};
+        // THE REQUEST IS ITS MESSAGE: one whose id this turn does not hold could never be named for its run, so none opens.
+        if (!event.userMessageId) return {};
+        const intents = newRequestIntents(turnPack, { taskType: turnTaskRow.taskType, openingIntent: turnTaskRow.openingIntent });
+        if (!intents.length) return {};
+        return {
+          newRequest: {
+            intents,
+            open: async (intent: string, request: string) => {
+              const opened = await openRequestTask(
+                { inputTranscript: request, requestAttributes: { 'CHIME.channel.arn': event.channelArn, 'CHIME.sender.arn': sender } },
+                DeliveryOption.TASK_MULTI_STEP, intent, event.correlationId,
+                {
+                  assistantId: principalIdFromArn(event.botArn),
+                  // THE ASSISTANT HOLDS ITS FIRST STEP, unless that step awaits the person, so the request is taken up as one
+                  // that arrived alone would be, by this assistant's own pickup.
+                  owner: { id: principalIdFromArn(event.botArn), type: 'assistant' },
+                  requestExcerpt: request,
+                  openingIntent: intent,
+                  ...(event.userMessageId ? { userMessageId: event.userMessageId } : {}),
+                  // AS PRIVATE AS THE MESSAGE: a message sent to the room opens a request the room sees, and a targeted one a
+                  // private request. A message whose Target cannot be read opens a private request (ADR-033's fail-closed
+                  // rule), since recording a private request as the room's cannot be taken back.
+                  visibility: await requestVisibility(messagingClient, event.channelArn, event.userMessageId, event.botArn),
+                  awaitsIntentRun: true,
+                  throwOnWriteFailure: true,
+                },
+              );
+              return opened ? { ...((opened as { taskRef?: number }).taskRef ? { taskRef: (opened as { taskRef?: number }).taskRef } : {}) } : null;
+            },
+          },
+        };
+      })(),
       model: cnBedrockModel ?? effectiveModel,
       ...(stepModel && !cnBedrockModel ? { stepModel } : {}),
       maxTokens: resolveMaxTokens(event, reasoningTurn),
@@ -2074,6 +2431,8 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
     const taskContext = await buildTaskLoopContext({
       taskId: event.taskId,
       taskType: event.taskType,
+      // Who is speaking, so a redirect to another task takes that task's limit for them (the requester's moves).
+      personId: personIdFromArn(event.senderArn) || undefined,
       channelArn: event.channelArn,
       // THE SAME SET THE DELIVERY LOOKUP USES, and it has to be. This resolved independently while
       // another consumer narrowed, which authorized the advance tool over graphs the delivery gate no
@@ -2095,6 +2454,8 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
       // So the loop can tell, from the task row, that this is the turn that opened the task: a step the
       // machine declares `presented` may not be left on that turn.
       ...(event.correlationId ? { turnCorrelationId: event.correlationId } : {}),
+      // A REQUESTER'S MOVE ON A TASK ANOTHER PERSON HOLDS (WT114): the turn may take these moves only.
+      ...(event.requesterMoves?.length ? { requesterMoves: event.requesterMoves } : {}),
       // THE NEW STEP'S INSTRUCTIONS RIDE THE ADVANCE. The prompt above is rendered for the state the
       // turn started in; an advance mid-loop lands the model somewhere else, so the tool result hands
       // it that state's guidance, rendered the same way and from the same machines.
@@ -2121,11 +2482,11 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
     let attachmentTooLarge = false;
     const attachmentsBucket = process.env.ATTACHMENTS_BUCKET;
     // Ownership check (mirrors the presigned-url download path): the fileKey comes from user-controlled
-    // message Metadata, so verify the object is under the SENDER's own storage prefix —
-    // attachments/<conversationId>/<senderSub>/... — before reading it. Without this a crafted fileKey
+    // message Metadata, so verify the object is under the SENDER's own storage prefix IN THIS
+    // CONVERSATION — attachments/<conversationId>/<senderSub>/... — before reading it. Without this a crafted fileKey
     // could read another user's file (the S3 grant spans the whole attachments/* prefix). S3 keys are
     // not path-normalized, so a literal '..' cannot traverse out of the sender's segment.
-    const attachmentOwnedBySender = senderOwnsAttachmentKey(event.attachment?.fileKey, event.senderArn);
+    const attachmentOwnedBySender = senderOwnsAttachmentKey(event.attachment?.fileKey, event.channelArn, event.senderArn);
     if (!battleOn && event.attachment?.fileKey && attachmentsBucket && attachmentOwnedBySender) {
       try {
         const imgFmt = imageFormatFromContentType(event.attachment.contentType);
@@ -2493,8 +2854,8 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
         };
       } else if (visionPlan.action === 'vision') {
         // Ownership check (mirrors the non-battle attachment path + presigned-url path). On a
-        // cross-user reference, fall back to a text-only battle turn.
-        if (!senderOwnsAttachmentKey(imgAtt.fileKey, event.senderArn)) {
+        // cross-user or cross-conversation reference, fall back to a text-only battle turn.
+        if (!senderOwnsAttachmentKey(imgAtt.fileKey, event.channelArn, event.senderArn)) {
           console.warn('[AssistantAsyncProcessor] battle image fileKey not under the sender prefix; ignoring (possible cross-user reference)');
           bedrockResult = await invokeBedrockWithFallback(
             systemPrompt,
@@ -2812,15 +3173,17 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
         // link. Best-effort: the conversation exists either way, and a failed post is logged rather than
         // turning a split that worked into one reported as failed.
         for (const created of outcome.created) {
+          // A PRIVATE SUBJECT'S LINK GOES TO THE PERSON WHO ASKED, alone: its label is taken from what they said privately.
           const link = topicMovedLink(sanitizeTitle(created.label), created.channelArn, versionCopy);
           try {
             await sendInParts(messagingClient, {
               ChannelArn: event.channelArn,
               text: link.content,
-              Metadata: JSON.stringify(link.metadata),
+              Metadata: JSON.stringify({ ...link.metadata, ...(created.private ? { targetedSender: event.senderArn } : {}) }),
               Type: ChannelMessageType.STANDARD,
               Persistence: ChannelMessagePersistenceType.PERSISTENT,
               ChimeBearer: event.botArn,
+              ...(created.private ? { Target: [{ MemberArn: event.senderArn! }] } : {}),
             });
           } catch (err) {
             console.error('[AsyncProcessor][split] the link to a new conversation was not posted', {
@@ -2829,9 +3192,24 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
           }
         }
 
-        if (outcome.refused.length) {
-          const refused = templateLine('split-refused', { copy: versionCopy }, { values: { subjects: outcome.refused.join(', ') } });
-          response += '\n\n' + refused;
+        // WHAT DID NOT MOVE IS SAID, and a private label is said to its person alone: the reply is the room's to read.
+        const refused = refusedByAudience(outcome.refused, pendingSplit.topics);
+        const refusedLine = (subjects: string[]) => templateLine('split-refused', { copy: versionCopy }, { values: { subjects: subjects.join(', ') } });
+        if (refused.room.length) response += '\n\n' + refusedLine(refused.room);
+        if (refused.privately.length) {
+          await sendInParts(messagingClient, {
+            ChannelArn: event.channelArn,
+            text: refusedLine(refused.privately),
+            Metadata: JSON.stringify({ botResponse: true, respPhase: 'final', agentType: turnProfileName, targetedSender: event.senderArn }),
+            Type: ChannelMessageType.STANDARD,
+            Persistence: ChannelMessagePersistenceType.PERSISTENT,
+            ChimeBearer: event.botArn,
+            Target: [{ MemberArn: event.senderArn! }],
+          }).catch((err) => {
+            console.error('[AsyncProcessor][split] a private subject that did not move could not be reported', {
+              correlationId: event.correlationId, message: (err as Error)?.message,
+            });
+          });
         }
       }
     }
@@ -3335,6 +3713,25 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
         }
       }
 
+      // THE STATE'S DECLARED MOVE (ADR-067 decision 2, G39): a task turn of a state that declares `auto` has answered, and the
+      // task is still in it, so the runtime takes that declared edge, once per entry (the move ends the entry). A turn that
+      // already advanced the task left the state, so nothing is taken twice.
+      {
+        const t = taskContext?.task;
+        // The task's own machine, where its row carries one (ADR-067 stage 2), over the turn's.
+        const own = t ? machinesOfTask(t, turnMachines ?? {}) : undefined;
+        const autoTo = t?.taskType && t.taskState ? own?.[t.taskType]?.states?.[t.taskState]?.auto : undefined;
+        // A REQUESTER'S TURN on a task another person holds takes only the requester's moves (WT114), never the holder's.
+        if (t && autoTo && response.trim() && !event.battleContext && !event.requesterMoves?.length) {
+          const moved = await advanceTaskStateTo({
+            task: t, toState: autoTo, by: 'system', reason: 'the state\'s declared automatic move, after its turn answered',
+            machines: own, assistantId: principalIdFromArn(event.botArn),
+          }).catch(() => ({ ok: false as const }));
+          console.log('[AssistantAsyncProcessor] declared automatic move', { taskId: t.taskId, to: autoTo, ok: moved.ok });
+          if (moved.ok) t.taskState = autoTo;
+        }
+      }
+
       // No completion here. The auto-complete-on-delivery door (advanceDeliveredTaskToCompletion,
       // gated on the output-shape heuristic) is REMOVED: it completed a task from `drafting_outline`
       // while the reply was still asking for outline approval, against invariant AT6. Completion has
@@ -3712,7 +4109,15 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
     // returns `already-summarised`, and its insert is `ON CONFLICT DO NOTHING` so even a race
     // between two turns writes one row. The guard was always there; the caller was asking the wrong
     // question in front of it.
-    if (pipeline.earlyInConversation && event.channelArn && event.userMessage && response) {
+    // A TURN THE INPUT GUARDRAIL REFUSED SEEDS NOTHING: its message stays out of every later turn (`lib/refused-message.ts`).
+    // A PRIVATE EXCHANGE SEEDS NOTHING EITHER, the rule the summarizer applies (`target_arn IS NULL`): the summary is read by
+    // every later turn in the room. The exchange is private when its task is private, or when the stored inbound message
+    // carries a Target (the reply mirrors it); a message that cannot be read counts as private (`requestVisibility`).
+    const exchangeIsPrivate = async (): Promise<boolean> =>
+      (!!taskContext?.task && isPrivateVisibility(taskContext.task.visibility))
+      || (await requestVisibility(messagingClient, event.channelArn, event.userMessageId, event.botArn)) === 'private';
+    if (pipeline.earlyInConversation && event.channelArn && event.userMessage && response && !bedrockResult.inputGuardBlocked
+      && !(await exchangeIsPrivate())) {
       await seedConversationSummary({
         channelArn: event.channelArn,
         userMessage: event.userMessage,

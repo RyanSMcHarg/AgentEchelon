@@ -1,6 +1,6 @@
 ---
 title: "ADR-031: A step says what it needs, and an answer is checked against it"
-status: Accepted 2026-08-14 (maintainer). Built and deployed; not verified live.
+status: Accepted 2026-08-14 (maintainer). Built and deployed.
 date: 2026-08-14
 related:
   - "./024-task-ownership.md"
@@ -21,9 +21,9 @@ tracking: |
 
 ## Status
 
-**Accepted (maintainer, 2026-08-14). Built and deployed to the dev deployment. NOT verified live.**
+**Accepted (maintainer, 2026-08-14). Built and deployed to the dev deployment.**
 
-`Verified by:` `test/lib/step-needs-are-checked.test.ts` (12 tests). Those assert the declarations, the validation, and that the rule reaches the model. They cannot assert that a model follows it, and no live e2e exercises a partial answer yet.
+`Verified by:` `test/lib/step-needs-are-checked.test.ts` (24 tests), which asserts the declarations, the validation, and that the rule reaches the model. **Unproven:** that a model follows the rule on a partial answer; no e2e spec sends one.
 
 ## Problem and who it's for
 
@@ -92,7 +92,7 @@ This distinction is the whole reason to read this section, because the two are e
 - The needs are read from the machines the turn is actually running, so a profile that declares its own step is grounded from its own declaration rather than the deployment pack's.
 - The tool name in the instruction comes from the same constant the loop dispatches, so the prompt cannot tell a model to call a tool by a name that no longer exists.
 - Every need is RECORDED WITH ITS SOURCE before the step is left. `advance_task_state` refuses to leave a state that declares `requires` (`requirement_unsourced`) unless each need appears in `collected` with a `source` of `message` (and a short quote of the person's words as `evidence`) or `context` (and the retrieved passage or source id). There is no source for a need the model supplied itself. The check is presence and a closed enum, never a reading of the evidence (tenet D11).
-- A state the workflow declares `presented` is not left on the turn it was entered (`opening_step_must_be_presented`), so the person sees what is being taken and confirms or corrects it before the workflow goes on (SPEC-TASK-STATE-TRANSITIONS sections 3 and 4).
+- A state the workflow declares `presented` is not left on the turn it was entered (`opening_step_must_be_presented`), so the person sees what is being taken and confirms or corrects it before the workflow goes on (DESIGN-TASK-STATE-TRANSITIONS sections 3 and 4).
 
 **Instructed, to the model:** the judgement itself, and all three branches. Whether an answer satisfies the list, what counts as missing, and whether "you pick" was said, are read by the model from the person's text. No structural gate decides whether an answer is sufficient; what is gated is that the judgement is recorded with where each need came from, so a need nobody supplied cannot be recorded as agreed. `applyUserResponseToTask` is UNCHANGED, so a state that is `resolvedByOneResponse` still advances on any reply and a state with several exits still defers to the model exactly as before.
 

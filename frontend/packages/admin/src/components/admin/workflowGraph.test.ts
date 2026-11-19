@@ -7,13 +7,14 @@
  * path, connect replaces a plain edge and the otherwise branch of a conditioned one, rename and remove carry every edge,
  * the deadline edge included.
  */
+import { agentStepOpsRoom } from '../../test/agentStepOpsRoom';
 import { describe, it, expect } from 'vitest';
-import { PLATFORM_EVENT_WORKFLOWS, versionEventWorkflowsErrors, type EventWorkflow } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
+import { versionEventWorkflowsErrors, type EventWorkflow } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
 import { GAP_Y, MARGIN, NODE_H, TRIGGER_H, anchoredErrors, autoLayout, edgesOf, positionsOf, triggerAt } from './workflowGraph';
 import { addStep, connect, disconnect, removeStep, renameStep, startAt } from './workflowEdits';
 
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
-const OPS: EventWorkflow = clone(PLATFORM_EVENT_WORKFLOWS['ops-room']);
+const OPS: EventWorkflow = agentStepOpsRoom();
 const TASK: EventWorkflow = {
   on: 'assistant-joined', initial: 'ask',
   states: {

@@ -14,7 +14,8 @@
  */
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import type { CatalogIntent, ClassificationCatalog, IntentRoute, MachineStep, ProfileModels, RouteError } from '../../services/profileService';
+import type { CatalogIntent, ClassificationCatalog, IntentRoute, MachineStep, ProfileDefinitionBody, ProfileModels, RouteError } from '../../services/profileService';
+import { modelName, stepRunsOn, type StepModelPreview } from './stepModelPreview';
 import { IMAGE_ROUTE_KEY, isImageModelKey } from '../../../../../../backend/lambda/src/lib/image-route.ts';
 
 export { IMAGE_ROUTE_KEY, isImageModelKey };
@@ -134,4 +135,92 @@ export const RouteRefusal: React.FC<{ error: RouteError }> = ({ error }) => {
 export const RouteRefusals: React.FC<{ errors: RouteError[]; testId: string }> = ({ errors, testId }) => {
   if (!errors.length) return null;
   return <ul className="admin-error" role="alert" data-testid={testId}>{errors.map((e) => <RouteRefusal key={`${e.code}:${e.path}`} error={e} />)}</ul>;
+};
+
+/**
+ * WHAT A STEP RUNS ON WITHOUT A MODEL OF ITS OWN, named, with the rule that chose it ("Claude Haiku 4.5, the intent's
+ * model"), read through the runtime's resolution (`stepRunsOn`) with this step's override left out.
+ */
+export function inheritedStepModel(
+  body: Partial<ProfileDefinitionBody> | null | undefined,
+  catalog: ClassificationCatalog | undefined,
+  intent: string,
+  step: Pick<MachineStep, 'key' | 'produces'>,
+): StepModelPreview | undefined {
+  const route = body?.models?.byIntent?.[intent];
+  const without = route?.steps?.[step.key]
+    ? { ...body, models: withRoute(body?.models, intent, withStepModel(route, step.key, undefined)) }
+    : body;
+  return stepRunsOn(without, catalog, intent, step);
+}
+
+/** The words for what a step runs on: the model's name and the rule that chose it. */
+export function useStepModelLabel(): (preview: StepModelPreview | undefined) => string {
+  const { t } = useTranslation();
+  return (preview) => (preview?.modelKey
+    ? t('admin.assistantPage.intentModels.stepRunsOn', { model: modelName(preview.modelKey), rule: t(`admin.assistantPage.intentModels.stepRule.${preview.from}`) })
+    : t('admin.assistantPage.intentModels.stepRunsOnUnknown'));
+}
+
+/**
+ * THE ONE HELP LINE ON WHAT A STEP RUNS ON, for the intent card and the workflow editor alike. The one key that says how
+ * a message is routed against the open task (ADR-064 decision B, amended 2026-11-12) is `stepsOtherIntent`, read here
+ * and nowhere else.
+ */
+export const StepModelsHelp: React.FC<{ testId?: string }> = ({ testId }) => {
+  const { t } = useTranslation();
+  return <span className="admin-field-hint" data-testid={testId}>{t('admin.assistantPage.intentModels.stepsHelp')} {t('admin.assistantPage.intentModels.stepsOtherIntent')}</span>;
+};
+
+/**
+ * A STEP'S MODEL AND FALLBACK, AS THE INTENT CARD AND THE WORKFLOW EDITOR BOTH EDIT IT: `models.byIntent[<intent>].steps
+ * [<state>]`, written through `withStepModel` (one writer, tenet D9). Empty means no override, and names what the step then
+ * runs on. A text step offers the classification's text models; an image step takes no model of its own (the turn's image
+ * route draws it), so it shows the image model it is drawn on. Read-only without `onRoute`.
+ */
+export const StepModelControl: React.FC<{
+  body: Partial<ProfileDefinitionBody> | null | undefined;
+  catalog: ClassificationCatalog | undefined;
+  intent: string;
+  step: Pick<MachineStep, 'key' | 'produces'>;
+  /** The route change; absent, the control is read-only. */
+  onRoute?: (route: IntentRoute | undefined) => void;
+  /** The test id prefix: the card's `draft-step-<intent>-<state>` and `intent-step-<intent>-<state>-model`. */
+  testPrefix?: string;
+}> = ({ body, catalog, intent, step, onRoute, testPrefix }) => {
+  const { t } = useTranslation();
+  const label = useStepModelLabel();
+  const route = body?.models?.byIntent?.[intent];
+  const own = route?.steps?.[step.key];
+  const inherited = label(inheritedStepModel(body, catalog, intent, step));
+  const kind = stepKind(step);
+  const prefix = testPrefix ?? `${intent}-${step.key}`;
+  if (kind === 'image' || !onRoute) {
+    return (
+      <span data-testid={`intent-step-${prefix}-model`}>
+        {own?.primary && kind !== 'image'
+          ? t('admin.assistantPage.intentModels.stepRunsOn', { model: modelName(own.primary), rule: t('admin.assistantPage.intentModels.stepRule.step') })
+          : <span className="admin-muted">{inherited}</span>}
+      </span>
+    );
+  }
+  const setPair = (pair: { primary: string; fallback?: string } | undefined) => onRoute(withStepModel(route, step.key, pair));
+  return (
+    <span className="admin-step-model">
+      <select className="select" aria-label={t('admin.assistantPage.intentModels.stepModelFor', { state: step.key, intent })}
+        data-testid={`draft-step-${prefix}`} value={own?.primary ?? ''}
+        onChange={(e) => setPair(withPrimary(own, e.target.value))}>
+        <option value="">{inherited}</option>
+        {modelsOfKind(kind, catalog).map((m) => <option key={m} value={m}>{modelName(m)}</option>)}
+      </select>
+      {own?.primary && (
+        <select className="select" aria-label={t('admin.assistantPage.intentModels.stepFallbackFor', { state: step.key, intent })}
+          data-testid={`draft-step-${prefix}-fallback`} value={own.fallback ?? ''}
+          onChange={(e) => setPair({ primary: own.primary, ...(e.target.value ? { fallback: e.target.value } : {}) })}>
+          <option value="">{t('admin.assistantPage.intentModels.noFallback')}</option>
+          {fallbacksFor(kind, own.primary, catalog).map((m) => <option key={m} value={m}>{modelName(m)}</option>)}
+        </select>
+      )}
+    </span>
+  );
 };

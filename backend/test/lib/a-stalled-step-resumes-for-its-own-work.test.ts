@@ -100,6 +100,15 @@ describe('the candidate: a step this assistant holds, of the speaker\'s own work
     expect(isStalledStepCandidate({ ...HELD, turnOpensTaskType: 'report_generation', keptHereAs: 'report_generation' })).toBe(false);
     expect(isStalledStepCandidate({ ...HELD, task: null })).toBe(false);
   });
+
+  it('an acknowledgment ("Go ahead.") on a held step of the speaker\'s own work is consent to carry on, so it is a candidate', () => {
+    // The live model-routes run: "Go ahead." was classified ACKNOWLEDGMENT, placed as no work, and declined as running.
+    const asOther = { ...HELD, turnOpensTaskType: 'report_generation', keptHereAs: 'report_generation' };
+    expect(isStalledStepCandidate({ ...asOther, turnIsAcknowledgment: true })).toBe(true);
+    // Still the speaker's own work, on this assistant's step: another person's acknowledgment resumes nothing.
+    expect(isStalledStepCandidate({ ...asOther, turnIsAcknowledgment: true, speakerPersonId: 'person-2' })).toBe(false);
+    expect(isStalledStepCandidate({ ...asOther, turnIsAcknowledgment: true, awaitsAParty: true })).toBe(false);
+  });
 });
 
 describe('the router wires it as decided', () => {
@@ -117,6 +126,7 @@ describe('the router wires it as decided', () => {
     expect(def).toContain('awaitsAParty: !!awaitedPartyOf(');
     expect(def).toContain('selfAssistantId: principalIdFromArn(botArn)');
     expect(def).toContain('speakerPersonId: personId');
+    expect(def).toContain('turnIsAcknowledgment: classification.intent === IntentType.ACKNOWLEDGMENT');
     // The same turn value every caller of the other-work rule reads (`new-work-is-not-the-awaited-answer.test.ts`).
     expect(def).toContain('turnOpensTaskType: turnOpensOtherWorkKey()');
     expect(def).toContain('keptHereAs: turnKeptHereAs()');
@@ -142,8 +152,19 @@ describe('the router wires it as decided', () => {
     expect(block).toContain('resumedWaitingWork = true');
   });
 
+  it('a short acknowledgment that resumes the step is relabeled, so the quick reply does not answer it', () => {
+    // The live model-routes run: "Go ahead." resumed account_brief at `researching`, kept ACKNOWLEDGMENT,
+    // and the quick-acknowledgment template answered instead of the step's turn.
+    const resume = router.indexOf("'[Router] resuming a stalled step of this person\\'s work'");
+    const quick = router.indexOf('const quickResponse = quickReply(');
+    expect(resume).toBeGreaterThan(0);
+    expect(resume).toBeLessThan(quick);
+    expect(router.slice(resume, resume + 600)).toContain('if (shortAcknowledgment) classification.intent = IntentType.GENERAL;');
+  });
+
   it('names the held work to the classifier, so the label can be that work', () => {
     expect(router).toContain('(prefetchedOwnTasks?.live ?? []).filter((t) => t.ownerPersonId === personId)');
-    expect(router).toContain('waitingWork: openWorkForThisPerson.map(');
+    expect(router).toContain('const waitingWork: WaitingWork[] = openWorkForThisPerson.map(');
+    expect(router).toMatch(/refused: refusedIntents,\s*waitingWork,/);
   });
 });

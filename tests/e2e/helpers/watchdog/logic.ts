@@ -235,12 +235,12 @@ export function isTurnFailure(line: string): boolean {
 }
 
 /**
- * The terms the per-file CloudWatch sweep filters on (`?ERROR ?Exception ?AccessDenied ?Denied`), matched
+ * The terms the per-file CloudWatch sweep filters on (`?ERROR ?Exception ?AccessDenied ?AccessDeniedException ?Denied`), matched
  * as whole terms the way a filter pattern matches them, plus the Lambda runtime's own timeout line, which
  * carries no level. The live check and the sweep agree on what an error is, so the live check can only ever
  * report what the sweep would have reported later.
  */
-const ERROR_TERM = /(^|[^A-Za-z0-9])(ERROR|Exception|AccessDenied|Denied)(?=[^A-Za-z0-9]|$)/;
+const ERROR_TERM = /(^|[^A-Za-z0-9])(ERROR|Exception|AccessDenied|AccessDeniedException|Denied)(?=[^A-Za-z0-9]|$)/;
 const RUNTIME_FAILURE = /Task timed out after|Runtime\.(ExitError|ImportModuleError|UnhandledPromiseRejection)/;
 
 /** Whether a log line is a backend failure the current test must answer for. */

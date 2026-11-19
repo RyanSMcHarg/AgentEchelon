@@ -349,8 +349,8 @@ export async function pollFor<T>(
 /**
  * Stamp a plan (title + work items) into the SERVER-ONLY Channel Context store.
  *
- * `domainContext` is written there by the context create, which a one-conversation issuer's people
- * reach and this deployment's trusted-issuer registry does not declare (the same gap `bilingual-conversations.spec.ts`
+ * `domainContext` is written there by the host's membership function, which stands up only where the
+ * trusted-issuer registry declares a one-conversation issuer, and this deployment's does not (the same gap `bilingual-conversations.spec.ts`
  * works around for `userLanguage`). Everything downstream of the store is untouched production code:
  * `assembleHostGrounding` reads it, the router forwards it, and the processor registers the
  * work-item tools on the strength of it (`enableEditTools`).

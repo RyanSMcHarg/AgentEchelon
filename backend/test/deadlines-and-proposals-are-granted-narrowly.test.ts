@@ -180,11 +180,15 @@ describe('the apply endpoint, the exchange and offboarding (deny tests)', () => 
     expect(tokens[0].Condition).toEqual({ 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['proposal#*'] } });
   });
 
-  it('DENY: it reads three attributes of the context row and writes none of it', () => {
+  it('DENY: it reads the holdings and the meeting fields of the context row and writes none of it', () => {
     const ctx = apply.filter((s) => text(s.Resource).includes('ChannelContext'));
     expect(ctx).toHaveLength(1);
     expect(list(ctx[0].Action)).toEqual(['dynamodb:GetItem']);
-    expect(ctx[0].Condition).toEqual({ 'ForAllValues:StringEquals': { 'dynamodb:Attributes': ['channelArn', 'conversationType', 'participantRoles'] } });
+    expect(ctx[0].Condition!['ForAllValues:StringEquals']).toEqual({ 'dynamodb:Attributes': ['channelArn', 'conversationType', 'participantRoles', 'meetingOf', 'meetingConversation', 'activeMeeting'] });
+    // A read with no projection names no attribute and would return the whole row: it is refused.
+    expect(ctx[0].Condition!.Null).toEqual({ 'dynamodb:Attributes': 'false' });
+    expect(ctx[0].Condition!.StringEqualsIfExists).toEqual({ 'dynamodb:Select': 'SPECIFIC_ATTRIBUTES' });
+    expect(text(ctx[0].Condition!['ForAllValues:StringLike']['dynamodb:LeadingKeys'])).toContain('/channel/*');
   });
 
   it('DENY: it invokes the invitations function and the typed creators of member classifications of this instance, and no other function', () => {

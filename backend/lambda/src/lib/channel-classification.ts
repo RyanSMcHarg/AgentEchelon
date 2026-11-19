@@ -68,6 +68,26 @@ export async function readChannelTags(client: TagReader, channelArn: string): Pr
 }
 
 /**
+ * THE ONE ROOM-ELIGIBILITY RULE: code deployed for a classification acts only in a conversation its tags say is that
+ * classification's and not archived. Answers why it does not (`unreadable` for tags that could not be read), or
+ * undefined when it may act there.
+ */
+/** A conversation's `archived` tag says it is archived (read-only, membership frozen). The one reading of that tag. */
+export function isArchived(tags: Record<string, string | undefined> | null | undefined): boolean {
+  return String(tags?.archived) === 'true';
+}
+
+export function conversationClosedTo(
+  tags: Record<string, string | undefined> | null | undefined,
+  classification: string,
+): 'unreadable' | 'classification' | 'archived' | undefined {
+  if (!tags) return 'unreadable';
+  if (tags[CLASSIFICATION_TAG] !== classification) return 'classification';
+  if (isArchived(tags)) return 'archived';
+  return undefined;
+}
+
+/**
  * The channel's classification tag, or `undefined` when it is missing, invalid or unreadable.
  *
  * For a caller where the floor is NOT a safe answer. Answering a turn at the floor classification is

@@ -32,6 +32,7 @@ import {
   battleResourcesOf,
   experimentsResourcesOf,
   EVERY_CLASSIFICATION,
+  anyConversationTagged,
 } from './agent-classification-common';
 import { defaultProfileRegistry as profiles } from '../profile-registry';
 import { utilityModelArns } from '../config/model-strategy';
@@ -61,11 +62,11 @@ export interface ChannelFlowStackProps extends cdk.StackProps {
    *  runs on the message stream (`post-processing-stack.ts`, ADR-041 decision 7), so this stack
    *  grants no `AdminGetUser` and no SES send. */
   userPoolId?: string;
-  /** The bucket an active profile version's persona body lives in (`profiles/*`). The flow resolves the
-   *  active version for the ASSISTANT'S CONFIGURED COPY of the notices it sends itself; absent, a
-   *  version with a persona pointer fails closed to the compiled seed's copy. */
-  attachmentsBucketName?: string;
-  attachmentsBucketArn?: string;
+  /** The profile bucket, where an active profile version's persona body lives (`profiles/*`). The flow resolves
+   *  the active version for the ASSISTANT'S CONFIGURED COPY of the notices it sends itself; absent, a version with
+   *  a persona pointer is unreadable here. */
+  profileBucketName?: string;
+  profileBucketArn?: string;
 }
 
 export class ChannelFlowStack extends cdk.Stack {
@@ -123,20 +124,9 @@ export class ChannelFlowStack extends cdk.Stack {
                 // would simply be told they are not one, and only the duel's initiator could ever end
                 // a battle. A silently narrower authority is exactly the shape that goes unnoticed.
                 'chime:ListChannelModerators',
-                // ENDING A DUEL EDITS A MESSAGE. A side stopped at `WAITING_FOR_USER` holds a question
-                // carrying the `<!--battlewaiting-->` marker the client renders as a live "Replying to:"
-                // control, and `/battle end` has to take it down or an ended duel goes on inviting an
-                // answer nothing is listening for. That clear is a read-then-write on the message.
-                //
-                // Like the moderator check, it fails soft: without these the clear AccessDenies into a
-                // caught warning, reports `false`, and leaves the affordance standing - the precise
-                // defect the shared marker module was extracted to fix, silently reintroduced by a
-                // missing grant rather than by any change to the code.
-                'chime:GetChannelMessage',
-                // A PRIVATE ADDRESS THAT DISAGREES WITH ITS STORED `Target`. After
-                // release the flow reads the stored message back as the assistant to see its `Target`
-                // (GetChannelMessage, above) and tells the sender what happened
-                // (`lib/private-command.ts`).
+                // A PRIVATE ADDRESS THAT DISAGREES WITH ITS STORED `Target`. After release the flow reads
+                // the stored message back as the assistant to see its `Target` (the read below) and tells
+                // the sender what happened (`lib/private-command.ts`).
                 //
                 // NO `chime:DeleteChannelMessage` HERE, and its absence is the enforcement rather than an
                 // omission. The flow used to delete such a message as the app-instance admin; neither
@@ -152,6 +142,17 @@ export class ChannelFlowStack extends cdk.Stack {
                 'chime:ListTagsForResource',
               ],
               resources: [`${props.appInstanceArn}/*`],
+            }),
+            // ONE MESSAGE'S CONTENT: only in a conversation that carries a classification, and only bearing an
+            // assistant that carries one (tenet D12, one shared principal across every conversation). Every
+            // read this role makes bears the assistant: the `Target` above, a handover's own message, the
+            // originating message of a moved subject, and the `<!--battlewaiting-->` marker `/battle end` takes
+            // down, which is a read-then-write on the message and fails soft without this grant.
+            new iam.PolicyStatement({
+              sid: 'ReadOneMessageInAClassifiedConversationAsAClassifiedAssistant',
+              actions: ['chime:GetChannelMessage'],
+              resources: [`${props.appInstanceArn}/channel/*`, `${props.appInstanceArn}/bot/*`],
+              conditions: anyConversationTagged(),
             }),
           ],
         }),
@@ -206,9 +207,9 @@ export class ChannelFlowStack extends cdk.Stack {
               actions: ['ssm:GetParameter', 'ssm:GetParameterHistory'],
               resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/definition`],
             }),
-            ...(props.attachmentsBucketArn ? [new iam.PolicyStatement({
+            ...(props.profileBucketArn ? [new iam.PolicyStatement({
               actions: ['s3:GetObject'],
-              resources: [`${props.attachmentsBucketArn}/profiles/*`],
+              resources: [`${props.profileBucketArn}/profiles/*`],
             })] : []),
           ],
         }),
@@ -316,7 +317,7 @@ export class ChannelFlowStack extends cdk.Stack {
         ...(props.userPoolId && { USER_POOL_ID: props.userPoolId }),
         // The persona body store, so resolving the active profile version for its copy can follow a
         // persona pointer (`hydrateBodies`) instead of failing closed to the seed.
-        ...(props.attachmentsBucketName && { PROFILE_BODY_BUCKET: props.attachmentsBucketName }),
+        ...(props.profileBucketName && { PROFILE_BODY_BUCKET: props.profileBucketName }),
         // Abuse controls: ABUSE_CONTROLS_TABLE + budget/rate/circuit envs, so enforceAbuseGate can
         // meter the @all/battle dispatch paths. No-op until the budget limits are set via context.
         ...abuse.env,

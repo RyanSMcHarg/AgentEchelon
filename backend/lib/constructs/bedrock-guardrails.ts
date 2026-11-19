@@ -43,7 +43,11 @@ export function buildGuardrailPolicy(opts: { name: string; description?: string;
         { type: 'HATE', inputStrength: 'HIGH', outputStrength: 'HIGH' },
         { type: 'INSULTS', inputStrength: 'MEDIUM', outputStrength: 'HIGH' },
         { type: 'MISCONDUCT', inputStrength: 'HIGH', outputStrength: 'HIGH' },
-        { type: 'PROMPT_ATTACK', inputStrength: 'HIGH', outputStrength: 'NONE' },
+        // THE PROMPT-ATTACK FILTER BLOCKS WHAT IT SCORES AT MEDIUM OR HIGH CONFIDENCE. Classic injections (ignore the
+        // previous instructions, reveal the system prompt, act as an unrestricted persona) score MEDIUM or HIGH and stay
+        // blocked; an ordinary request worded as an instruction ("remember this codeword and reply with OK", "keep it
+        // concise") scores LOW and reaches the model (SPEC-MODERATION).
+        { type: 'PROMPT_ATTACK', inputStrength: 'MEDIUM', outputStrength: 'NONE' },
       ],
     },
     sensitiveInformationPolicyConfig: {

@@ -22,6 +22,7 @@ import { aws } from './helpers/aws';
 import { INSTANCE } from './helpers/stack-prefix';
 import { ADMIN_API_URL, adminUrl } from './helpers/api-urls';
 import { guardBackendErrors } from './helpers/turn-guards';
+import { replacingDraft, draftIdOf } from './helpers/profile-draft';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -104,7 +105,8 @@ test.describe.serial('a team creates, opens and moves its own assistant', () => 
     expect(listed.status, JSON.stringify(listed.body).slice(0, 300)).toBe(200);
     const profile = (listed.body.profiles ?? [])[0];
     expect(profile).toMatchObject({ profileName: assistantId, hasDraft: true, activeVersion: null });
-    const activated = await signedCall(adminUrl('assistant-admin', `/admin/assistants/${assistantId}/profiles/activate`), teamSession, 'POST', { profileName: assistantId });
+    // Activated as the draft the listing showed, named by its configId.
+    const activated = await signedCall(adminUrl('assistant-admin', `/admin/assistants/${assistantId}/profiles/activate`), teamSession, 'POST', { profileName: assistantId, configId: profile.draftConfigId });
     expect(activated.status, JSON.stringify(activated.body).slice(0, 400)).toBe(200);
     expect(activated.body.version).toBeGreaterThanOrEqual(1);
   });
@@ -117,20 +119,22 @@ test.describe.serial('a team creates, opens and moves its own assistant', () => 
       draft: adminUrl('assistant-admin', `/admin/assistants/${assistantId}/profiles/draft`),
       activate: adminUrl('assistant-admin', `/admin/assistants/${assistantId}/profiles/activate`),
     })[action];
-    await signedCall(route('version'), teamSession, 'POST', { profileName: assistantId });
+    const started = await signedCall(route('version'), teamSession, 'POST', { profileName: assistantId });
+    expect(started.status, JSON.stringify(started.body).slice(0, 300)).toBe(200);
 
     // A name already shown in the classification, read from the admin listing rather than written here.
     const all = await signedCall(adminUrl('assistant-admin', '/admin/profiles'), adminSession);
     const taken = (all.body.profiles ?? []).find((p: any) => p.classification === classification && p.profileName !== assistantId && p.displayName)?.displayName;
     if (taken) {
-      const dup = await signedCall(route('draft'), teamSession, 'POST', { profileName: assistantId, patch: { displayName: taken } });
+      const dup = await signedCall(route('draft'), teamSession, 'POST', { profileName: assistantId, patch: { displayName: taken }, configId: draftIdOf(started) });
       expect(dup.status, JSON.stringify(dup.body).slice(0, 300)).toBe(409);
       expect(dup.body.code).toBe('ASSISTANT_DISPLAY_NAME_TAKEN');
     }
 
     const renamed = `${displayName} R`;
-    expect((await signedCall(route('draft'), teamSession, 'POST', { profileName: assistantId, patch: { displayName: renamed } })).status).toBe(200);
-    const activated = await signedCall(route('activate'), teamSession, 'POST', { profileName: assistantId });
+    const edited = await signedCall(route('draft'), teamSession, 'POST', { profileName: assistantId, patch: { displayName: renamed }, configId: draftIdOf(started) });
+    expect(edited.status, JSON.stringify(edited.body).slice(0, 300)).toBe(200);
+    const activated = await signedCall(route('activate'), teamSession, 'POST', { profileName: assistantId, configId: draftIdOf(edited) });
     expect(activated.status, JSON.stringify(activated.body).slice(0, 400)).toBe(200);
     expect(activated.body.identityRename, JSON.stringify(activated.body)).toBe('applied');
     const record = JSON.parse(aws(`ssm get-parameter --name /${INSTANCE}/assistant-directory/${assistantId}`).Parameter.Value);

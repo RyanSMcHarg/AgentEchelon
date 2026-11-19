@@ -58,10 +58,10 @@ export class RoomHasNoPrimary extends Error {
  * and before its first version is active the vend refuses it, leaving those conversations with no answer.
  * The declared primary's record says `source: 'declared'`, which carries no runtime seed.
  */
-export async function primaryAssignmentOf(classification: string): Promise<{ assistant: string; botArn: string }> {
+export async function primaryAssignmentOf(classification: string, role: string = PRIMARY_ROLE): Promise<{ assistant: string; botArn: string }> {
   const assistants = await liveAssistantsByHandleOrThrow(classification);
-  const primary = [...assistants.values()].find((s) => s.role === PRIMARY_ROLE && !s.runtimeSeed);
-  if (!primary?.botArn) throw new RoomHasNoPrimary(`classification '${classification}' has no live ${PRIMARY_ROLE} assistant`);
+  const primary = [...assistants.values()].find((s) => s.role === role && !s.runtimeSeed);
+  if (!primary?.botArn) throw new RoomHasNoPrimary(`classification '${classification}' has no live ${role} assistant`);
   return { assistant: primary.handle, botArn: primary.botArn };
 }
 
@@ -123,25 +123,48 @@ export async function primaryAssistantOf(channelArn: string, chime: TagReader, l
   return value;
 }
 
+/** How many conversations' tags one container remembers. */
+export const TAG_MEMO_CAPACITY = 5000;
+
+/** The container's one memo of conversation tags, least recently used evicted first. */
+const tagMemo = new Map<string, Awaited<ReturnType<TagReader['send']>>>();
+
+/** Whether this container already holds the conversation's tags. */
+export function tagMemoHolds(channelArn: string): boolean {
+  return tagMemo.has(channelArn);
+}
+
 /**
- * ONE TAG READ PER CONVERSATION PER CONTAINER, shared by a caller's classification read and the room's
- * primary, which read the same tags. Only a response carrying a recognized classification is kept, so a
- * failed or invalid read is retried rather than pinned. Bounded, because the key is a conversation.
+ * ONE TAG READ PER CONVERSATION PER CONTAINER, shared by every reader in the container: a caller's access
+ * check (`conversation-access.ts`), the room's primary, and the task service. Every instance this returns
+ * reads and fills the same memo, whichever client it wraps: a conversation's classification is one fact
+ * whatever client reads it, and every reader in one bundle reads as the function's own role, so one client's
+ * answer is never one another reader could not have had.
+ *
+ * Safe because a conversation's `classification` tag is written in the create call, and every tag grant on
+ * a channel is conditioned so that a conversation that already carries a classification cannot be given
+ * another ("NO CHANNEL IS RECLASSIFIED", `agent-classification-common.ts`). So only a response carrying a
+ * recognized classification is kept; an absent, unknown or failed read is read again next time rather than
+ * pinned. A tag that does change (`archived`) is read live by the route that decides on it, never from here.
+ * Bounded, because the key is a conversation: a hit refreshes the entry, and the least recently used goes.
  */
-export function memoizedTagReader(client: TagReader, limit = 1000): TagReader {
-  const memo = new Map<string, Awaited<ReturnType<TagReader['send']>>>();
+export function memoizedTagReader(client: TagReader): TagReader {
   return {
     send: async (cmd: ListTagsForResourceCommand) => {
       const arn = cmd.input.ResourceARN || '';
-      const hit = memo.get(arn);
-      if (hit) return hit;
+      const hit = tagMemo.get(arn);
+      if (hit) {
+        tagMemo.delete(arn);
+        tagMemo.set(arn, hit);
+        return hit;
+      }
       const res = await client.send(cmd);
       if (profiles.isKnownClassification(tagMap(res?.Tags)[CLASSIFICATION_TAG])) {
-        if (memo.size >= limit) {
-          const oldest = memo.keys().next().value;
-          if (oldest !== undefined) memo.delete(oldest);
+        tagMemo.set(arn, res);
+        if (tagMemo.size > TAG_MEMO_CAPACITY) {
+          const oldest = tagMemo.keys().next().value;
+          if (oldest !== undefined) tagMemo.delete(oldest);
         }
-        memo.set(arn, res);
       }
       return res;
     },

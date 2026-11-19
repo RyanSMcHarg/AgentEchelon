@@ -5,7 +5,8 @@
  * Two handlers, one way of vending: the caller is read from a verified source only (the authorizer's
  * claims or a console session the gateway authenticated), never from the body; every AssumeRole carries
  * the `person` and `classification` session tags the role trusts; every operator access is recorded
- * before the credential leaves (`accessRecorded`); and a person's identity carries their clearance as a
+ * before the credential leaves (`accessRecorded`); every refusal either exchange answers is recorded
+ * beside the grants (`refusalsRecorded`); and a person's identity carries their clearance as a
  * tag and their IdP name as its cached `Name`.
  */
 import { STSClient } from '@aws-sdk/client-sts';
@@ -18,13 +19,13 @@ import {
 import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry';
 import { ADMIN_ROLE_GROUP, type AdminRole } from '../../../lib/config/admin-capabilities.js';
 import { ADMIN_TWIN_OWNER_TAG, userArnFor } from './person-arn.js';
-import { recordAccess, type AccessAuditLine } from './access-log.js';
+import { recordAccess, recordRefusal, type AccessAuditLine } from './access-log.js';
 import { edgeCallerOf, edgeNamesAnUntrustedIssuer } from './auth.js';
 import { claimValues, groupsOf, holderOfClaims, type TrustedIssuer } from '../../../lib/config/issuers.js';
 import { responder, originsFrom, requestOrigin, DEV_ORIGIN, type HttpResult } from './http-response.js';
 import { chimeIdentityClient, chimeMessagingClient } from './chime/clients.js';
 import { accountStateOfPerson, defaultDirectory, type AccountState, type Directory } from './membership-source.js';
-import { issuerById } from './trusted-issuers.js';
+import { issuerById, trustedIssuers } from './trusted-issuers.js';
 
 export const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 export const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN || '';
@@ -98,6 +99,8 @@ export interface ExchangeResult {
   bound?: { from: 'guest'; channelArn: string; conversationArn: string };
   // A sign-in redemption only: the conversation the invitation was to, which the person is already in.
   invitation?: { channelArn: string };
+  // A dashboard read only (DESIGN-CONVERSATION-DASHBOARDS): the one object the session reads, and where.
+  dashboard?: { bucket: string; key: string; region: string };
   // S3 attachment vend only: the bucket + region the client needs to presign the scoped GetObject with
   // the vended credentials. The session policy already confines the read to one channel's keys, so the
   // bucket name is not itself a grant.
@@ -200,8 +203,8 @@ export interface TokenCaller {
 /**
  * ONE EXCHANGE FOR EVERY ISSUER. The edge authorizer matched the token's `iss` to its entry in the
  * trusted-issuer registry (`lib/config/issuers.ts`). Everything that differs between two people follows from that entry: the
- * subject claim, where their clearance comes from and the classifications it may grant, whether they may hold an admin role,
- * and whether they are vended one conversation. A token from an issuer the registry does not declare
+ * subject claim, where their clearance comes from and the classifications it may grant, and whether they may hold an admin role.
+ * A token from an issuer the registry does not declare
  * reaches nothing.
  */
 export function tokenCallerOf(event: any): TokenCaller | HttpResult {
@@ -234,10 +237,10 @@ export function isRefusal(v: unknown): v is HttpResult {
 /**
  * WHETHER THE CALLER'S ACCOUNT MAY STILL SIGN IN, asked of its issuer now (SPEC-CREDENTIAL-EXCHANGE §4b,
  * "An account disabled at its issuer"). Both exchanges call this right after `tokenCallerOf`, at every
- * vend (the first sign-in and each refresh), before anything is minted, bound or recorded.
+ * vend (the first sign-in and each refresh), before anything is minted, bound or granted.
  *
  *  - The issuer answers the account `active`: null, and the vend goes on.
- *  - `disabled` or `gone`: 403 `PERSON_NOT_ACTIVE`. Nothing is minted and nothing recorded.
+ *  - `disabled` or `gone`: 403 `PERSON_NOT_ACTIVE`. Nothing is minted, and the refusal is recorded (`refusalsRecorded`).
  *  - The directory cannot be read: 503 `DIRECTORY_UNAVAILABLE`, and nothing is vended. FAIL CLOSED: a
  *    failed read is never taken for an enabled account.
  *
@@ -273,7 +276,7 @@ export async function refuseInactiveAccount(
  * (the only issuers a console session is issued through) is asked of that issuer (`accountStateOfPerson`).
  *
  *  - Any of those accounts is active: null, and the vend goes on.
- *  - None is (disabled, or gone): 403 `PERSON_NOT_ACTIVE`. Nothing is assumed and nothing recorded.
+ *  - None is (disabled, or gone): 403 `PERSON_NOT_ACTIVE`. Nothing is assumed, and the refusal is recorded (`refusalsRecorded`).
  *  - `Identities` or an issuer cannot be read: 503 `DIRECTORY_UNAVAILABLE`. FAIL CLOSED.
  *
  * `directory` and `adminIssuer` are injected for tests.
@@ -294,6 +297,38 @@ export async function refuseInactivePerson(
   if (state === 'active') return null;
   console.warn('[AdminCredentialExchange][SecurityEvent] the person\'s admin sign-in is not active; vending nothing', { state });
   return reply(event, 403, { error: 'this sign-in is not active', code: 'PERSON_NOT_ACTIVE' });
+}
+
+/**
+ * THE CONSOLE ROLE IS ASKED AGAIN, not read from the session (DESIGN-REVOCATION-WINDOWS R6). A console session names
+ * the role its holder's groups gave at sign-in; a person removed from `admins` (or from the team group) since then
+ * keeps that session until it expires, but is vended no further per-capability credential: the role is read from the
+ * groups their admin issuers' directories hold now.
+ *
+ *  - The role is still held: null, and the vend goes on.
+ *  - It is not: 403 `CONSOLE_ROLE_LAPSED`, recorded as a refusal.
+ *  - The person signs in through no directory that keeps groups: null. The session's own lifetime bounds them.
+ *  - A directory cannot be read: 503 `DIRECTORY_UNAVAILABLE`. FAIL CLOSED.
+ */
+export async function refuseLapsedConsoleRole(
+  event: any,
+  personArn: string,
+  role: AdminRole,
+  directory: Pick<Directory, 'groupsFor'> = defaultDirectory(),
+  adminIssuers: () => TrustedIssuer[] = () => trustedIssuers().filter((i) => i.admin === true),
+): Promise<HttpResult | null> {
+  let groups: string[] | null;
+  try {
+    groups = await directory.groupsFor(personArn);
+  } catch (err) {
+    console.error("[AdminCredentialExchange] the person's groups could not be read; vending nothing", { err: (err as Error)?.name });
+    return reply(event, 503, { error: 'the identity provider could not be asked which role this sign-in holds; retry', code: 'DIRECTORY_UNAVAILABLE' });
+  }
+  if (groups === null) return null;
+  const held = adminIssuers().map((issuer) => consoleRoleFor(issuer, groups as string[]));
+  if (held.includes(role)) return null;
+  console.warn('[AdminCredentialExchange][SecurityEvent] the console role this session names is no longer held; vending nothing', { role });
+  return reply(event, 403, { error: 'this sign-in no longer holds the console role its session names', code: 'CONSOLE_ROLE_LAPSED' });
 }
 
 /**
@@ -391,4 +426,153 @@ export function literalChannelId(channelArn: string): string | null {
   if (!APP_INSTANCE_ARN || !channelArn.startsWith(CHANNEL_PREFIX)) return null;
   const id = channelArn.slice(CHANNEL_PREFIX.length);
   return /^[A-Za-z0-9._-]+$/.test(id) ? id : null;
+}
+
+/**
+ * WHAT A REFUSED REQUEST ASKED FOR, AND WHO ASKED: the facts a handler resolves as it goes (the person once
+ * it is known, the capability a route names, the assistant a team route names), held per request and read
+ * when the request is answered.
+ */
+export interface RefusalFacts {
+  /** The asker's AppInstanceUser id, once the exchange has resolved it. */
+  personId?: string;
+  /** What the route itself asks for, when the body does not say. */
+  capabilities?: string[];
+  assistant?: string;
+}
+const refusalFacts = new WeakMap<object, RefusalFacts>();
+
+/** Record a fact about the request, for its refusal's record. Later facts add to earlier ones. */
+export function noteRefusalFacts(event: any, facts: RefusalFacts): void {
+  if (!event || typeof event !== 'object') return;
+  refusalFacts.set(event, { ...(refusalFacts.get(event) ?? {}), ...facts });
+}
+
+const bounded = (v: unknown, max: number): string | undefined =>
+  typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : undefined;
+
+/**
+ * The record of one refused request. Only the named fields of the body are read, each bounded, so a body
+ * carrying a token, a refresh credential or an invitation never reaches the log, and a crafted body cannot
+ * make a record unbounded. Who asked is the person the exchange resolved; failing that, the issuer and
+ * subject the edge verified, which is all a sign-in that never became a person is known by.
+ */
+export function refusalLineOf(
+  exchange: 'person' | 'admin',
+  event: any,
+  answer: { statusCode: number; body?: string },
+  asker: string | null | undefined,
+  now: Date = new Date(),
+): AccessAuditLine {
+  let body: Record<string, unknown> = {};
+  try {
+    const parsed = event?.body ? JSON.parse(event.body) : {};
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) body = parsed;
+  } catch {
+    /* a malformed body asked for nothing nameable */
+  }
+  let answered: Record<string, unknown> = {};
+  try {
+    const parsed = answer.body ? JSON.parse(answer.body) : {};
+    if (parsed && typeof parsed === 'object') answered = parsed;
+  } catch {
+    /* an answer with no JSON body carries no code */
+  }
+  const facts = refusalFacts.get(event) ?? {};
+  const edge = edgeCallerOf(event);
+  const personId = facts.personId || asker || edge?.personId || undefined;
+  // Strings only: an entry is never converted, so no value a caller sends can make the record fail to build.
+  const asked = Array.isArray(body.capabilities)
+    ? body.capabilities.slice(0, 20).filter((c): c is string => typeof c === 'string').map((c) => c.slice(0, 64))
+    : [];
+  // A REFUSAL IS FILED UNDER A CONVERSATION ONLY WHEN IT NAMES ONE: a literal channel of this instance. Any
+  // other value is kept in the record's detail and indexes nothing.
+  const askedChannel = bounded(body.channelArn, 512);
+  const channelArn = askedChannel && literalChannelId(askedChannel) ? askedChannel : null;
+  const identity = bounded(body.identity, 32);
+  const ownerId = bounded(body.principalId, 128) ?? bounded(body.ownerId, 128);
+  return {
+    _auditEvent: `${exchange}_credential_refused`,
+    timestamp: now.toISOString(),
+    outcome: 'refused',
+    ...(personId ? { personId } : edge ? { issuer: edge.issuer.id, subject: edge.subject } : {}),
+    channelArn,
+    ...(askedChannel && !channelArn ? { askedChannel } : {}),
+    // What the route names is what was asked for; a body lists capabilities only where the route does not.
+    capabilities: facts.capabilities ?? asked,
+    ...(identity ? { identity } : {}),
+    ...(ownerId ? { ownerId } : {}),
+    ...(facts.assistant ? { assistant: facts.assistant } : {}),
+    reason: bounded(body.reason, MAX_REASON_LENGTH) ?? null,
+    route: String(event?.resource || event?.path || '').slice(0, 200),
+    status: answer.statusCode,
+    code: bounded(answered.code, 64) ?? null,
+    error: bounded(answered.error, 200) ?? null,
+  };
+}
+
+/**
+ * EVERY REFUSAL AN EXCHANGE ANSWERS IS RECORDED, beside the grants (`recordRefusal`, lib/access-log.ts).
+ *
+ * Wraps an exchange's handler: any answer that is not a success, and any throw, is written to the access
+ * log as a refusal before it is returned. The answer is returned unchanged whatever the write does: the
+ * write is bounded in time and never throws, so a log that is down refuses exactly as before. A request
+ * `recorded` excludes is answered without a record.
+ */
+export function refusalsRecorded(
+  exchange: 'person' | 'admin',
+  inner: (event: any) => Promise<HttpResult>,
+  opts: {
+    /** The person a request is signed by, read from what the gateway authenticated. */
+    askerOf?: (event: any) => string | null | undefined;
+    /** Whether a request's refusal is recorded. Every HTTP request but a preflight, by default. */
+    recorded?: (event: any) => boolean;
+    record?: (line: AccessAuditLine) => Promise<boolean>;
+  } = {},
+): (event: any) => Promise<HttpResult> {
+  const write = opts.record ?? ((line: AccessAuditLine) => recordRefusal(line));
+  // The answer never fails with its record: building the line and writing it are both held to never throw.
+  const record = async (event: any, answer: { statusCode: number; body?: string }): Promise<boolean> => {
+    try {
+      let line: AccessAuditLine;
+      try {
+        line = refusalLineOf(exchange, event, answer, askerOf(event));
+      } catch {
+        // A line that cannot be built from the request is still a refusal, recorded with what is certain.
+        line = {
+          _auditEvent: `${exchange}_credential_refused`, timestamp: new Date().toISOString(), outcome: 'refused',
+          channelArn: null, capabilities: [], reason: null, route: String(event?.resource || event?.path || '').slice(0, 200),
+          status: answer.statusCode, code: null, error: null,
+        };
+      }
+      return await write(line);
+    } catch (err) {
+      console.error('[AccessLog][SecurityEvent] a refusal could not be recorded; it is refused all the same', {
+        status: answer.statusCode, err: (err as Error)?.name || 'error',
+      });
+      return false;
+    }
+  };
+  const isRecorded = (event: any): boolean =>
+    typeof event?.httpMethod === 'string' && event.httpMethod !== 'OPTIONS' && (opts.recorded ? opts.recorded(event) : true);
+  const askerOf = (event: any): string | null | undefined => {
+    try {
+      return opts.askerOf?.(event);
+    } catch {
+      return null;
+    }
+  };
+  return async (event: any): Promise<HttpResult> => {
+    let answer: HttpResult;
+    try {
+      answer = await inner(event);
+    } catch (err) {
+      if (isRecorded(event)) await record(event, { statusCode: 500 });
+      throw err;
+    }
+    if (isRecorded(event) && typeof answer?.statusCode === 'number' && answer.statusCode >= 400) {
+      await record(event, answer);
+    }
+    return answer;
+  };
 }

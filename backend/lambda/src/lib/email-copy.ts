@@ -27,7 +27,7 @@ import type { TemplateStoreDeps } from './template-store.js';
  * `language` is the tag the lines are written in.
  */
 export const EMAIL_COPY_KEYS = [
-  'language', 'greeting', 'unnamedRecipient', 'signOff', 'unnamedAssistant', 'openConversation', 'viewItHere',
+  'language', 'greeting', 'unnamedRecipient', 'signOff', 'unnamedAssistant', 'openConversation', 'joinMeeting', 'viewItHere',
   'replyHint', 'manageEmail', 'defaultSubject', 'briefingSubject', 'briefingBody', 'invitationSubject', 'invitationBody', 'openInvitation', 'invitationLinkLine', 'invitationOnce', 'nudgeSubject', 'nudgeBody', 'nudgeNote',
   'claimSubject', 'claimBody', 'openClaim', 'claimLinkLine', 'claimOnce', 'someone', 'untitled', 'preferencesTitle',
   'preferenceKind', 'stopKind', 'resumeKind', 'stopAll', 'saved', 'linkInvalid', 'expiredOffer', 'expiredStopped',
@@ -48,9 +48,20 @@ const FIELD_SPAN = /\[\[\{\{\s*([A-Za-z0-9_]+)\s*\}\}\]\]/g;
 const DOUBLE_BRACE = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g;
 
 /**
+ * The template that words one section: the one in use when it has that section, otherwise the shipped one. A stored
+ * template saved before a section was added to its shipped template still words every line, the new one in the
+ * shipped words.
+ */
+function templateWording(templates: Partial<EmailTemplates> | undefined, home: { name: string; section: string }): ParsedTemplate {
+  const inUse = templates?.[home.name as EmailTemplateName];
+  if (inUse && typeof inUse.messageSections?.[home.section] === 'string') return inUse;
+  return shippedMessageTemplate(home.name);
+}
+
+/**
  * Every key's line, read from the templates in use: each key is the section that words it, with each `{{field}}`
- * written `{field}`, the form a preference page's token carries and `fill` takes. `language` is the wrapper
- * template's.
+ * written `{field}`, the form a preference page's token carries and `fill` takes. A section the template in use
+ * does not have is the shipped template's. `language` is the wrapper template's.
  */
 export function emailCopyFromTemplates(templates: EmailTemplates): EmailCopy {
   const out: Record<string, string> = { language: templates['notification-email'].language || 'en' };
@@ -58,7 +69,7 @@ export function emailCopyFromTemplates(templates: EmailTemplates): EmailCopy {
     if (key === 'language') continue;
     const home = legacyHomeOf(`email.${key}`);
     if (!home) throw new Error(`email-copy: no shipped template words the email line "${key}"`);
-    out[key] = (templates[home.name as EmailTemplateName].messageSections?.[home.section] ?? '').replace(FIELD_SPAN, '{$1}').replace(DOUBLE_BRACE, '{$1}');
+    out[key] = (templateWording(templates, home).messageSections?.[home.section] ?? '').replace(FIELD_SPAN, '{$1}').replace(DOUBLE_BRACE, '{$1}');
   }
   return out as EmailCopy;
 }
@@ -111,8 +122,8 @@ export function fill(template: string, vars: Record<string, string>): string {
  */
 export function emailLine(voice: EmailVoice, key: Exclude<EmailCopyKey, 'language'>, values: Record<string, string> = {}): string {
   const home = legacyHomeOf(`email.${key}`);
-  const template = home && voice.templates?.[home.name as EmailTemplateName];
-  if (!home || !template) return fill(voice.copy[key], values);
+  if (!home || !voice.templates?.[home.name as EmailTemplateName]) return fill(voice.copy[key], values);
+  const template = templateWording(voice.templates, home);
   const rendered = renderMessageTemplate(template, values, { sections: [home.section], refusedValue: 'empty' });
   return rendered.ok ? rendered.sections[home.section] ?? '' : '';
 }

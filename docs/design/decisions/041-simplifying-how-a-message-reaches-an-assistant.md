@@ -173,9 +173,9 @@ A. `InvokedBy` settings and what triggers an assistant. B. What Amazon Lex recei
 | Value | Invokes on | Plain prose, 1:1 | Plain prose, room | `@Atlas`, room | `@all`, room | Status |
 |---|---|---|---|---|---|---|
 | `AUTO` | every message when the assistant has exactly one other member; otherwise a message whose `CHIME.mentions` names it | yes | no | yes | no | measured; a mention alone invokes (2026-09-15) |
-| `MENTIONS` | a message whose `CHIME.mentions` names it | expected no | no | expected yes | no | accepted at create; runtime not measured |
-| `ALL` | every standard message | expected yes | expected yes | expected yes | expected yes | accepted at create; runtime not measured |
-| `NONE` | no standard message | no | no | no | no | accepted at create; the recommendation |
+| `MENTIONS` | a message whose `CHIME.mentions` names it | expected no | no | expected yes | no | accepted at create; not used by AgentEchelon, so its runtime is not measured |
+| `ALL` | every standard message | expected yes | expected yes | expected yes | expected yes | accepted at create; not used by AgentEchelon, so its runtime is not measured |
+| `NONE` | no standard message | no | no | no | no | in use: every assistant on the default instance reads it, recorded 2026-10-11 (ADR-036, Recorded evidence) |
 
 **`TargetedMessages`, one value at a time.**
 
@@ -184,7 +184,7 @@ A. `InvokedBy` settings and what triggers an assistant. B. What Amazon Lex recei
 | `ALL` | invokes Atlas | invokes the assistant that asked | invokes the waiting side | in use; this is how all three reach an assistant today |
 | `NONE` | no | no | no | accepted at create beside a live `StandardMessages`; not proposed |
 
-**`WelcomeIntent`.** When the assistant is added to a channel, Amazon Lex is invoked with `WelcomeIntent` and no transcript, and the handler composes the welcome or starts onboarding (`backend/lambda/src/router-agent-handler.ts:1945` onward). That it fires under `StandardMessages: NONE` is reported 2026-09-16 in ADR-043 and verified 2026-10-11 (ADR-036, Recorded evidence).
+**`WelcomeIntent`.** When the assistant is added to a channel, Amazon Lex is invoked with `WelcomeIntent` and no transcript, and the handler composes the welcome or starts onboarding (`backend/lambda/src/router-agent-handler.ts:5466` onward). That it fires under `StandardMessages: NONE` is reported 2026-09-16 in ADR-043 and verified 2026-10-11 (ADR-036, Recorded evidence).
 
 **Worked example under option A (`AUTO`/`ALL`)**, in a room of Alice, Bob and Atlas:
 
@@ -241,13 +241,13 @@ Both refusals carry `BadRequestException: Either RespondsTo or InvokedBy must be
 
 **What that record establishes.**
 
-- **Exactly three request attributes.** No message id, no `Metadata`, no `Target`, no `CHIME.mentions`. The same holds across fourteen days of these logs on all three classifications (`backend/lambda/src/router-agent-handler.ts:3518-3533`).
+- **Exactly three request attributes.** No message id, no `Metadata`, no `Target`, no `CHIME.mentions`. The same holds across fourteen days of these logs on all three classifications (`backend/lambda/src/router-agent-handler.ts:7859-7874`).
 - **The record has no `messages`**, because this entry stood down (Appendix C). A Lex-entered turn that answers returns its acknowledgment there. The next record in the same log carries `"Understanding your report needs... <!--corr:abefe2fd14670aee-->"`, whose correlation id is the sixteen-hex `turnCorrelationId` hash.
 - **The platform value is `Amazon Chime SDK Messaging`.** The handler never reads it.
 
-**The handler's view of the same event** is the `LexEvent` shape (`backend/lambda/src/router-agent-handler.ts:588-597`): `inputTranscript`, `sessionId`, `sessionState.intent`, `requestAttributes`.
+**The handler's view of the same event** is the `LexEvent` shape (`backend/lambda/src/router-agent-handler.ts:1227-1243`): `inputTranscript`, `sessionId`, `sessionState.intent`, `requestAttributes`.
 
-**What the channel flow hands the handler instead.** The flow invokes the handler with `{ aeTurn: TurnRequest }`, and `bypassToLexEvent` rewrites it into the same `LexEvent` shape so one handler serves both entries (`backend/lambda/src/router-agent-handler.ts:1080-1114`). READ FROM CODE, with the values the Appendix C message carries:
+**What the channel flow hands the handler instead.** The flow invokes the handler with `{ aeTurn: TurnRequest }`, and `bypassToLexEvent` rewrites it into the same `LexEvent` shape so one handler serves both entries (`backend/lambda/src/router-agent-handler.ts:1859-1905`). READ FROM CODE, with the values the Appendix C message carries:
 
 ```json
 {
@@ -270,7 +270,7 @@ A flow caller also sets, when it has them, `AE.attachment`, `AE.bot.arn`, `AE.co
 | Attachment | none; recovered from the channel only for a 1:1 `@all` | `AE.attachment` |
 | `Metadata`, `Target`, mentions | none | the flow holds `Metadata`; it does not receive `Target` |
 | Acknowledgment | returned in `messages`; Amazon Chime SDK posts it as a Lex envelope | posted by the handler as the assistant; `messages` is empty |
-| Stand-down guard | runs (`!isFlowEntry(event)`, `backend/lambda/src/router-agent-handler.ts:1675`) | never runs |
+| Stand-down guard | runs (`!isFlowEntry(event)`, `backend/lambda/src/router-agent-handler.ts:5035`) | never runs |
 
 ## Appendix C. What the channel flow sees
 
@@ -497,7 +497,7 @@ flowchart TD
 
 ## Appendix F. The flow under `NONE`/`ALL`
 
-READ FROM CODE, as the `probe` classification builds it: `turnEntry: 'flow'` in `backend/lib/config/profiles.ts`, read by the flow (`backend/lambda/src/channel-flow-processor.ts:706-724`), by `flowOwnsTheTurn` (`backend/lambda/src/lib/flow-bypass.ts:407-451`) and by the handler's stand-down guard (`backend/lambda/src/router-agent-handler.ts:1754-1766`).
+READ FROM CODE, as the `probe` classification builds it: `turnEntry: 'flow'` in `backend/lib/config/profiles.ts`, read by the flow (`backend/lambda/src/channel-flow-processor.ts:706-724`), by `flowOwnsTheTurn` (`backend/lambda/src/lib/flow-bypass.ts:407-451`) and by the handler's stand-down guard (`backend/lambda/src/router-agent-handler.ts:5123-5139`).
 
 ```mermaid
 flowchart TD
@@ -589,9 +589,9 @@ flowchart TD
 |---|---|---|---|
 | The Amazon Lex leg for untargeted turns | Amazon Chime SDK invokes Amazon Lex, which fulfills into the handler: two hops and a second Lambda invocation | after release, in front of the reply | code |
 | The empty envelope | A silent fulfillment is still a message send, a flow invocation and a `callbackDeny`. Exists only on the Amazon Lex entry | after release; a flow invocation, not the person's wait | MESSAGE-FLOW Appendix A |
-| The stand-aside roster read | A room mention invokes the Lex entry, which reads the roster (`backend/lambda/src/router-agent-handler.ts:1689`) to discover the flow owns the turn. In Appendix C, 194 ms from its invocation log to its decision | after release, on an entry that answers nothing | code, captured |
-| The stand-aside channel read | A `ListChannelMessages` to recover an attachment the flow held (`backend/lambda/src/router-agent-handler.ts:1818`) | after release | code |
-| The content-match lookup | `findInboundMessage` exists because Amazon Lex is handed no message id (`backend/lambda/src/lib/inbound-message.ts:1-12`) | after release, on the turn | code |
+| The stand-aside roster read | A room mention invokes the Lex entry, which reads the roster (`backend/lambda/src/router-agent-handler.ts:5053`) to discover the flow owns the turn. In Appendix C, 194 ms from its invocation log to its decision | after release, on an entry that answers nothing | code, captured |
+| The stand-aside channel read | A `ListChannelMessages` to recover an attachment the flow held (`backend/lambda/src/router-agent-handler.ts:5205`) | after release | code |
+| The content-match lookup | `findInboundMessage` exists because Amazon Lex is handed no message id (`backend/lambda/src/lib/inbound-message.ts:1-13`) | after release, on the turn | code |
 | The size complement | Every check that exists because two components must agree: four test files, the size axis in nine more, the empty-envelope artifact in eight | maintenance | counted |
 | The ordinary population of the duplicate-fulfillment replay | Amazon Lex can fulfill one entry twice; the guard stays for targeted turns and the welcome | after release | code |
 
@@ -630,7 +630,7 @@ flowchart TD
 
 **How it is calculated today.** READ FROM CODE, and LATENCY-TARGETS "Measured and reconstructed pairings".
 
-- **Turn identity.** A flow or bypass turn uses `mention-<MessageId>` (`backend/lambda/src/lib/correlation.ts:345`). An Amazon Lex turn uses `turnCorrelationId`, a hash of channel, sender, text and a 90 second bucket (`backend/lambda/src/lib/correlation.ts:83`), because it has no message id. The precedence is `AE.corr`, then `AE.message.id`, then the hash (`backend/lambda/src/router-agent-handler.ts:3874-3884`).
+- **Turn identity.** A flow or bypass turn uses `mention-<MessageId>` (`backend/lambda/src/lib/correlation.ts:345`). An Amazon Lex turn uses `turnCorrelationId`, a hash of channel, sender, text and a 90 second bucket (`backend/lambda/src/lib/correlation.ts:83`), because it has no message id. The precedence is `AE.corr`, then `AE.message.id`, then the hash (`backend/lambda/src/router-agent-handler.ts:8490-8498`).
 - **Pairing a question to its answer.** `exchanges.paired_by` is `declared` when the answer names the message it answers, `in_batch` when inferred inside one Kinesis batch, and `swept` when a cross-batch pass reconstructs it (`backend/lambda/src/analytics-aurora/kinesis-archival.ts:1245-1246`, `:1482-1486`). A folded queued message pairs `declared` with `queued_as = 'folded'`.
 - **Who votes in the headline TTFF.** TTFF is the placeholder instant less the person's message instant, both on the Amazon Chime SDK clock. The measured predicate excludes `swept` by name (`backend/lambda/src/analytics-aurora/analytics-query.ts:3184-3188`) and counts it as `ttff_reconstructed_count`.
 - **The censoring this produces.** Archival batches with a five second window, so a turn slower than that cannot pair `in_batch`. A flow turn always declares and pairs `declared`. An ordinary Amazon Lex turn on a queue-off deployment declares nothing and is swept whenever it is slow. **So the headline drops slow Amazon Lex turns and almost no flow turns**, a censoring that varies with the very variable an entry comparison is about.
@@ -783,9 +783,9 @@ The entry a message takes is a function of the room's shape and how the message 
 
 ### Reads repeated because Amazon Lex is handed almost nothing
 
-- **The message id.** A Lex-entered turn recovers it by reading the channel and matching the exact text (`backend/lambda/src/lib/inbound-message.ts:1-12`), and `recordWhatThisTurnIsAnswering` runs a second, wider content match later, which ADR-038 bounds.
-- **The attachment.** Recovered from the channel, because only the flow holds `Metadata` (`backend/lambda/src/router-agent-handler.ts:1818`).
-- **The roster, twice on one shape.** A room mention invokes the Lex entry through 5.2a while the flow dispatches it, and the entry reads the roster itself only to discover it must stay silent (`backend/lambda/src/router-agent-handler.ts:1689`). The flow's own roster read is gated on a token (MESSAGE-FLOW §4.18), so ordinary chatter pays none.
+- **The message id.** A Lex-entered turn recovers it by reading the channel and matching the exact text (`backend/lambda/src/lib/inbound-message.ts:1-13`), and `recordWhatThisTurnIsAnswering` runs a second, wider content match later, which ADR-038 bounds.
+- **The attachment.** Recovered from the channel, because only the flow holds `Metadata` (`backend/lambda/src/router-agent-handler.ts:5205`).
+- **The roster, twice on one shape.** A room mention invokes the Lex entry through 5.2a while the flow dispatches it, and the entry reads the roster itself only to discover it must stay silent (`backend/lambda/src/router-agent-handler.ts:5053`). The flow's own roster read is gated on a token (MESSAGE-FLOW §4.18), so ordinary chatter pays none.
 
 ### Tests
 
@@ -851,7 +851,7 @@ Two correlation derivations split exactly along the two entries, and the 2026-08
 
 **A second assistant beside premium measures nothing.** The flow's dispatch target is the router named by the channel's classification tag (`backend/lambda/src/lib/router-arn.ts:21-31`), the answering identity is an SSM parameter keyed by the same classification, and the turn request carries no bot ARN on this path. So the configuration under test has to be a classification's own assistant. The `probe` classification is premium's topology field for field (the probe classification stack (removed 2026-09-17)), with `battleCapable: false` the one deliberate divergence, because `/battle` is claimed by the flow at every size under both configurations and carries no signal about ordinary turns.
 
-**What the build contains.** `flowOwnsTheTurn` claims a 1:1 for `'flow'` and checks a private address before size, so a targeted 1:1 still goes to Amazon Lex under both configurations (`backend/lambda/src/lib/flow-bypass.ts:436-443`), pinned by `backend/test/lib/a-flow-entry-profile-owns-its-one-to-one-turn.test.ts`. The flow reads the roster for every message of a `'flow'` classification. The handler's stand-down reads the same `turnEntry` from its own classification. **Not in the build:** the channel on the `[Router] Invoked` log line (`backend/lambda/src/router-agent-handler.ts:1576-1578`), without which an invocation cannot be attributed to a probe conversation except by timestamp.
+**What the build contains.** `flowOwnsTheTurn` claims a 1:1 for `'flow'` and checks a private address before size, so a targeted 1:1 still goes to Amazon Lex under both configurations (`backend/lambda/src/lib/flow-bypass.ts:436-443`), pinned by `backend/test/lib/a-flow-entry-profile-owns-its-one-to-one-turn.test.ts`. The flow reads the roster for every message of a `'flow'` classification. The handler's stand-down reads the same `turnEntry` from its own classification. **Not in the build:** the channel on the `[Router] Invoked` log line (`backend/lambda/src/router-agent-handler.ts:4942`), without which an invocation cannot be attributed to a probe conversation except by timestamp.
 
 ### What the probe reads
 
@@ -901,7 +901,7 @@ The decision to move to `StandardMessages: NONE` is taken. This appendix exists 
 |---|---|---|
 | The out-of-band fan-out runs after delivery | **BUILT.** `message-post-processing.ts:61` runs `notifyOnDelivery` as a stream rule, and `sendEmailNotifications` and `fanOutChannelNotification` appear zero times in the channel flow, the router and the async processor. Email is the only transport wired; SMS and voice arrive on the same fan-out and inherit the placement | code |
 | A carried turn pays no content-match lookup | **BUILT.** `assistant-async-processor.ts:642` reads `event.userMessageId \|\| await findInboundMessage(...)`, so the billed `ListChannelMessages` is short-circuited whenever the id was carried. Appendix G lists this under Removed; it is already removed for the carried population | code |
-| The id is carried end to end on a dispatched turn | **BUILT.** `channel-flow-processor.ts:977`, `:1608`, `:2288` set `userMessageId`; `router-agent-handler.ts:1091` forwards it as `AE.message.id`; `:3399` reads it back; `async-processor-core.ts:4573` stamps `answersMessageId` | code |
+| The id is carried end to end on a dispatched turn | **BUILT.** `channel-flow-processor.ts:977`, `:1608`, `:2288` set `userMessageId`; `router-agent-handler.ts:1876` forwards it as `AE.message.id`; `:7875` reads it back; `async-processor-core.ts:4573` stamps `answersMessageId` | code |
 
 **So the entry change does not have to build the carrying.** It changes which population gets to use it, which is the point ADR-043 records.
 
@@ -929,21 +929,21 @@ That is two separate harms. It is a live per-message cost on deployments that as
 
 **Passing is not caching, and the distinction is worth stating because the words are close.** Appendix K refuses a STORE with a lifetime, whose danger is that one side answers from a roster taken some seconds ago. Handing the router the roster the flow just read on the same message has no lifetime: it makes both components decide from identical bytes, which is stronger than two live reads seconds apart, not weaker. It is the same shape as `userMessageId`.
 
-There is something to hand over. `resolveChannelSize` is called three times inside `postAsAssistant` (`router-agent-handler.ts:2281`, `:3056`, `:3247`), which runs on every turn that posts, including a turn the flow dispatched moments after reading the same roster. **Whether those reads are reachable together on one dispatched turn is not established here and should be measured before anything is changed**, because the cheapest version of this item is worth nothing if the branches are mutually exclusive in practice.
+There is something to hand over. `resolveChannelSize` is called on the turn path in `runTurn` (`router-agent-handler.ts:5253`, `:6098`, `:6173`, `:7611`), including on a turn the flow dispatched moments after reading the same roster; `postAsAssistant` (`:4806`) reads no roster. **Whether those reads are reachable together on one dispatched turn is not established here and should be measured before anything is changed**, because the cheapest version of this item is worth nothing if the branches are mutually exclusive in practice.
 
 ### What is handed over is the DECISIONS, not the roster
 
 **A roster is the wrong payload, because it has no bound.** A conversation can hold any number of people, and a dispatch that carries every member's ARN, name and bot flag grows with the room. The largest rooms would pay the most to save a read, which is the wrong way round.
 
-**Nor is it the assistants alone.** That is bounded and small, and it would cover resolving `@Atlas` and picking the primary, but it does not cover what the router actually does with the roster: `resolveMentionedMember` (`router-agent-handler.ts:1828`) resolves `@` against ANY member including people, and `resolvePrivateTarget` (`:2279`) resolves `.Alice`. Both need the human names.
+**Nor is it the assistants alone.** That is bounded and small, and it would cover resolving `@Atlas` and picking the primary, but it does not cover what the router actually does with the roster: `resolveMentionedMember` (`router-agent-handler.ts:5201`) resolves `@` against ANY member including people, and `resolvePrivateTarget` (`:6105`) resolves `.Alice`. Both need the human names.
 
 **So hand over the answers instead.** The flow has already computed them by the time it dispatches: whether it owns the turn, which assistant was named, which member a `.` addressed, and the size. Those are a handful of strings and one boolean, bounded no matter how large the conversation is, and the router today RE-DERIVES every one of them from a roster it re-reads for the purpose.
 
-That also removes a duplication this record already prices. `flowOwnsTheTurn` is called twice on each side (`channel-flow-processor.ts:779-780`, `router-agent-handler.ts:1765-1766`, decoded and raw), and each call re-runs `matchCommand`, `resolvePrivateTarget` and `resolveMentionedMember` over the same roster: four evaluations of one question per message. Carrying the answer makes it one.
+That also removes a duplication this record already prices. `flowOwnsTheTurn` is called twice on each side (`channel-flow-processor.ts:779-780`, `router-agent-handler.ts:5138-5139`, decoded and raw), and each call re-runs `matchCommand`, `resolvePrivateTarget` and `resolveMentionedMember` over the same roster: four evaluations of one question per message. Carrying the answer makes it one.
 
 **The complement argument for it is now WEAKER, and saying so is the honest version.** This section originally justified the handover partly as the strongest form of the two-entry complement: both components deciding from identical bytes rather than from two live reads seconds apart. That mattered while an untargeted message could reach either entry. With the Amazon Lex entry for standard messages REMOVED (2026-09-17) the two sides no longer have to be complements for an untargeted turn at all, so that half of the argument is gone.
 
-**What survives is the cost argument, unchanged.** The router still resolves the same facts the flow already holds, and `resolveChannelSize` is still called three times inside `postAsAssistant` (`router-agent-handler.ts:2281`, `:3056`, `:3247`) on every turn that posts. The handover is now a plain efficiency change rather than a correctness one, which also means it is no longer urgent. The optionality keeps the shape of `userMessageId`: absent means the turn was not dispatched by the flow - a targeted message, which still enters through Amazon Lex - so the router resolves for itself exactly as it does today.
+**What survives is the cost argument, unchanged.** The router still resolves the same facts the flow already holds, and `runTurn` still calls `resolveChannelSize` on its own branches (`router-agent-handler.ts:5253`, `:6098`, `:6173`, `:7611`). The handover is now a plain efficiency change rather than a correctness one, which also means it is no longer urgent. The optionality keeps the shape of `userMessageId`: absent means the turn was not dispatched by the flow - a targeted message, which still enters through Amazon Lex - so the router resolves for itself exactly as it does today.
 
 ### What to check on the deployment, so the result is attributable
 
@@ -955,13 +955,13 @@ That also removes a duplication this record already prices. `flowOwnsTheTurn` is
 
 Rule 1 prices the second entry as a multiplier on the routing surface. There is a sharper version of that cost, and it is a correctness one rather than a maintenance one.
 
-**Two components read the roster separately and must reach complementary answers from it.** The flow reads it at `backend/lambda/src/channel-flow-processor.ts`, the Amazon Lex entry reads it again at `backend/lambda/src/router-agent-handler.ts:1693`, and `flowOwnsTheTurn` is written so their answers are complements by construction. That guarantee holds only while both reads return the same thing.
+**Two components read the roster separately and must reach complementary answers from it.** The flow reads it at `backend/lambda/src/channel-flow-processor.ts`, the Amazon Lex entry reads it again at `backend/lambda/src/router-agent-handler.ts:5053`, and `flowOwnsTheTurn` is written so their answers are complements by construction. That guarantee holds only while both reads return the same thing.
 
-**They can differ, and the failure direction is a double answer.** `resolveChannelSize` fails toward "group" (`backend/lambda/src/lib/channel-size.ts:174`), which is the right direction for the flow, because a flow that believes it is in a group dispatches. So a failed read in a real 1:1 makes `flowOwnsTheTurn` fall through to the group return, where `command !== null` is true for a size-branched command, and the flow dispatches. Meanwhile `StandardMessages: AUTO` has independently invoked Amazon Lex, whose own retry at `:1700` may succeed and resolve the same conversation as the 1:1 it really is. Two components, two reads of one fact, one message, two answers.
+**They can differ, and the failure direction is a double answer.** `resolveChannelSize` fails toward "group" (`backend/lambda/src/lib/channel-size.ts:174`), which is the right direction for the flow, because a flow that believes it is in a group dispatches. So a failed read in a real 1:1 makes `flowOwnsTheTurn` fall through to the group return, where `command !== null` is true for a size-branched command, and the flow dispatches. Meanwhile `StandardMessages: AUTO` has independently invoked Amazon Lex, whose own retry at `:5070` may succeed and resolve the same conversation as the 1:1 it really is. Two components, two reads of one fact, one message, two answers.
 
 **Under `NONE` the disagreement is unreachable for an untargeted message, because only one side runs.** This is not a new mechanism and it costs nothing to obtain: it follows from there being one entry. It is recorded here because the entry comparison in Appendix G is about latency, and this is the argument that does not depend on a millisecond figure at all.
 
-**Stated as reasoning from the code, not as a measurement.** No occurrence of the double answer is quoted here, and the retry at `:1690-1700` narrows the window rather than closing it. What is established is that the guarantee rests on two reads agreeing, and that one entry removes the requirement rather than improving the odds.
+**Stated as reasoning from the code, not as a measurement.** No occurrence of the double answer is quoted here, and the retry at `:5069-5078` narrows the window rather than closing it. What is established is that the guarantee rests on two reads agreeing, and that one entry removes the requirement rather than improving the odds.
 
 ### What the size-branched command needed, and what it did not
 

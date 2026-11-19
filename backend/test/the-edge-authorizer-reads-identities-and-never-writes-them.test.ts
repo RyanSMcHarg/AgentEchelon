@@ -14,7 +14,7 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { HttpLambdaIntegration } from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import { Template } from 'aws-cdk-lib/assertions';
 import { ADMIN_SESSION_ROUTE, EXCHANGE_ROUTE, EdgeAuthorizer, type EdgePlane } from '../lib/constructs/edge-authorizer';
-import { GUEST_ROUTES, ONE_CHANNEL_ROUTES } from '../lib/constructs/trusted-issuers';
+import { GUEST_ROUTES } from '../lib/constructs/trusted-issuers';
 import { EDGE_RESULT_TTL_SECONDS } from '../lib/config/edge-verification';
 
 /** A direct OIDC entry is a multi-tenant Entra one: a generic `oidc` entry is refused (it federates into the pool). */
@@ -26,7 +26,7 @@ const APP = 'arn:aws:chime:us-east-1:111122223333:app-instance/test';
 const ALL = ['basic', 'standard', 'premium', 'admin'];
 const ISSUERS = [
   { id: 'deployment', kind: 'cognito-pool', pool: 'self', clearance: { groups: true, classifications: ALL }, admin: true },
-  { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', audience: 'host-client', clearance: { oneChannel: 'basic', classifications: ['basic'] } },
+  { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', audience: 'host-client', clearance: { fixed: ['basic'], classifications: ['basic'] } },
   { id: 'okta', kind: 'oidc-entra', tenants: ENTRA_TENANTS, tokenVersion: 2, discoveryUrl: ENTRA_DISCOVERY, audience: 'okta-client', clearance: { fixed: ['basic'], classifications: ['basic'] } },
 ];
 
@@ -57,11 +57,10 @@ const resources = tpl.toJSON().Resources as Record<string, any>;
 const edgeFn = Object.entries(resources).find(([, r]) => r.Type === 'AWS::Lambda::Function' && r.Properties.Environment?.Variables?.EDGE_ROUTES)!;
 
 describe('the edge authorizer function', () => {
-  it('is handed the route lists as data: the exchange, the one-conversation routes and the guest routes', () => {
+  it('is handed the route lists as data: the exchange and the guest routes', () => {
     expect(JSON.parse(edgeFn[1].Properties.Environment.Variables.EDGE_ROUTES)).toEqual({
       plane: 'person',
       exchange: [EXCHANGE_ROUTE],
-      oneChannel: [...ONE_CHANNEL_ROUTES],
       guest: [...GUEST_ROUTES],
       admin: [],
     });
@@ -73,7 +72,6 @@ describe('the edge authorizer function', () => {
     expect(JSON.parse(fn.Properties.Environment.Variables.EDGE_ROUTES)).toEqual({
       plane: 'admin',
       exchange: [],
-      oneChannel: [],
       guest: [],
       admin: [ADMIN_SESSION_ROUTE],
     });

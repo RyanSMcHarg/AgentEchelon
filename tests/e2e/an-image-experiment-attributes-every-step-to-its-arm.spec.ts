@@ -2,7 +2,7 @@
  * AN IMAGE EXPERIMENT ATTRIBUTES EVERY STEP TO ITS ARM (ADR-064 slice 6), as premium.
  *
  * An `intent` experiment on `image_generation` with `target: { kind: 'image' }` varies only the route's image model
- * (control `stability_image_core`, treatment `stability_image_ultra`). A conversation enrolled in it runs the whole
+ * (control: the live version's image model for the intent, which arming requires; treatment: another Stability model). A conversation enrolled in it runs the whole
  * image task, and every turn of that task (gathering, confirming, revising, whatever each message was classified as)
  * carries the experiment's id and one arm's variant id, because a task's turns count by its type and a task stays on the
  * arm it was opened under while the experiment runs. The request opens incomplete and the brief is completed over a later
@@ -23,7 +23,7 @@ import { channelArnFor } from './helpers/battle-state-backend';
 import { signedCall } from './helpers/admin-api';
 import { adminUrl } from './helpers/api-urls';
 import { messagesSeenBy, openConversation, sleep } from './helpers/workflow-task';
-import { adminSessionOrSkip } from './helpers/model-routes';
+import { activeBody, adminSessionOrSkip } from './helpers/model-routes';
 import { channelTasks, resolveTaskTable } from './helpers/task-backend';
 
 const MARK = `IMGEXP-${Date.now().toString(36)}`;
@@ -32,12 +32,19 @@ const EXPERIMENT_ID = `e2e-image-target-${Date.now().toString(36)}`;
 test.describe.serial('an image experiment attributes every step to its arm', () => {
   guardBackendErrors('an-image-experiment-attributes-every-step-to-its-arm');
   let admin: any;
+  let control = '';
+  let treatment = '';
 
   test.beforeAll(async () => {
     test.skip(process.env.E2E_MODEL_ROUTES !== '1' || process.env.E2E_IMAGE_STEPS !== '1', 'bills real image calls; set E2E_MODEL_ROUTES=1 and E2E_IMAGE_STEPS=1');
     const s = await adminSessionOrSkip();
     test.skip(!!s.skip, s.skip);
     admin = s.admin;
+    // The control is the live version by rule (CONTROL_DIFFERS_FROM_LIVE), so it is read rather than assumed: a run
+    // stopped before another spec's rollback leaves a different image model live.
+    control = (await activeBody(admin))?.models?.byIntent?.image_generation?.image?.primary ?? '';
+    expect(control, 'the live version names an image model for image_generation').toBeTruthy();
+    treatment = control === 'stability_image_ultra' ? 'stability_image_core' : 'stability_image_ultra';
   });
 
   test.afterAll(async () => {
@@ -54,8 +61,8 @@ test.describe.serial('an image experiment attributes every step to its arm', () 
       target: { kind: 'image' }, tiers: ['premium'],
       startDate: now.toISOString(), endDate: new Date(now.getTime() + 2 * 3600_000).toISOString(),
       variants: [
-        { variantId: 'control', modelKey: 'stability_image_core', weight: 50 },
-        { variantId: 'treatment', modelKey: 'stability_image_ultra', weight: 50 },
+        { variantId: 'control', modelKey: control, weight: 50 },
+        { variantId: 'treatment', modelKey: treatment, weight: 50 },
       ],
     });
     expect(created.status, JSON.stringify(created.body).slice(0, 400)).toBe(200);

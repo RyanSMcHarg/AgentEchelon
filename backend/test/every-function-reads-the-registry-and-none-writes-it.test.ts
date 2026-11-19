@@ -2,7 +2,7 @@
  * EVERY FUNCTION READS THE RUNTIME REGISTRY, AND NO ROLE THE APP BUILDS WRITES IT (the classification-independence
  * plan, step 5).
  *
- * Read from C7-custom's synthesized templates (Battle Mode, experiments, a guest issuer, a host's one-conversation
+ * Read from C7-custom's synthesized templates (Battle Mode, experiments, a guest issuer, a host's context
  * issuer, and the admin backend), through the real CDK app:
  *
  *   - every Lambda function is told the registry's path (`PROFILE_REGISTRY_PATH_ENV`), and its role carries the

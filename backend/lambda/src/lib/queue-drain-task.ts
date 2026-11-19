@@ -26,7 +26,7 @@ import { createTask, getTask, advanceTaskStateTo, updateTaskStatus } from './tas
 import { DeliveryOption } from './delivery-options.js';
 import { QUEUED_REQUEST_TASK_TYPE } from './turn-triage-proposal.js';
 import { shouldMarkTaskCompleted, principalIdFromArn, ACTIVE_TASK_STATUSES, type LexEventForTask, type Task } from './task-tracking.js';
-import { taskStateMachines } from './intent-pack.js';
+import { machinesForTask } from './version-machines.js';
 import { BOUNDED_REQUEST_HANDLER } from './bounded-request-handler.js';
 import { sessionClient } from './assistant-session.js';
 
@@ -148,7 +148,7 @@ export async function settleDrainTask(args: {
     // check reading a graph the task is not running on. The drain is platform-declared, so this is
     // narrower than the sibling cases - but "nobody would override that one" is what makes a fixed
     // default look safe everywhere it is wrong.
-    if (shouldMarkTaskCompleted(task.taskType, task.taskState, taskStateMachines())) {
+    if (shouldMarkTaskCompleted(task.taskType, task.taskState, machinesForTask(task))) {
       // A TERMINAL STATE IS NOT A CLOSED ROW (queue review, 2026-09-12). `advanceTaskStateTo` writes the
       // state and never the status, so a settle that advanced the machine and then threw before the
       // status write below left a row in `settled` with `status: pending` - and every later settle

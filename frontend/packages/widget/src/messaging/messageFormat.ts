@@ -7,6 +7,7 @@
  * model said (tenet D11).
  */
 import { decodeMessageText, parseMessageContent } from '@ae/shared/utils/messageParser.ts';
+import { readableAddressText, shownAssistantText } from '@ae/shared/utils/addressTokens.ts';
 
 /**
  * Structurally unwrap a Lex fulfillment envelope (`{"Messages":[{"Content":...}]}`): only an object whose
@@ -26,8 +27,12 @@ export function unwrapLexStructural(s: string): string {
   return s;
 }
 
-/** The text a bubble shows: decoded, unwrapped, markers stripped (and any remaining HTML comment). */
-export function displayText(rawContent: string | undefined): string {
+/**
+ * The text a bubble shows: decoded, unwrapped, markers stripped (and any remaining HTML comment), mentions by name. On a
+ * message an assistant sent, the `@humans` address at its front is not shown, as in the chat app (`shownAssistantText`).
+ */
+export function displayText(rawContent: string | undefined, fromAssistant = false): string {
   const unwrapped = unwrapLexStructural(decodeMessageText(rawContent ?? ''));
-  return parseMessageContent(unwrapped).content.replace(/<!--[\s\S]*?-->/g, '').trim();
+  const content = parseMessageContent(unwrapped).content.replace(/<!--[\s\S]*?-->/g, '');
+  return readableAddressText(fromAssistant ? shownAssistantText(content) : content).trim();
 }

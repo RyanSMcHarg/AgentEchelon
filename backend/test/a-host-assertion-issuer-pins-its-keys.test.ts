@@ -72,7 +72,6 @@ describe('a host-assertion entry', () => {
     ['no allowed origins', { allowedOrigins: undefined }, /lists allowedOrigins/],
     ['provisioning on first sign-in', { provisioning: 'on-first-sign-in' }, /is provisioned-only/],
     ['an ID token', { tokenUse: 'id' }, /tokenUse is "access" or absent/],
-    ['the one-conversation session', { clearance: { oneChannel: 'basic', classifications: ['basic'] } }, /a mapping \(its permission-set claim\) or a fixed set/],
     ['admin: true', { admin: true }, /cannot declare admin: true/],
     ['a mapping outside its classifications', { clearance: { mapping: { claim: 'permsets', values: { X: 'premium' } }, classifications: ['basic', 'standard'] } }, /outside the issuer's classifications/],
   ])('refuses %s', (_label, over, pattern) => {

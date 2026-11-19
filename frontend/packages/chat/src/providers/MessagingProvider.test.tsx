@@ -46,6 +46,12 @@ vi.mock('@ae/shared', async (importOriginal) => ({
   trackEvent: vi.fn(),
 }));
 
+const reportEvents = vi.fn((..._a: unknown[]) => Promise.resolve());
+vi.mock('../services/meetingService', async (importOriginal) => ({
+  meetingCardFromMetadata: (await importOriginal<typeof import('../services/meetingService')>()).meetingCardFromMetadata,
+  isMeetingEnabled: () => true,
+  meetingService: { reportEvents: (...a: unknown[]) => reportEvents(...a) },
+}));
 vi.mock('./AwsClientProvider', () => ({
   useAwsClient: () => ({ isInitialized: true, userArn: 'arn:aws:chime:::user/u1' }),
 }));
@@ -66,6 +72,7 @@ vi.mock('../services/messageLatencyTracker', () => ({
 }));
 
 import { MessagingProvider, useMessaging } from './MessagingProvider';
+import { endSessionEpoch } from '@ae/shared/services/sessionEpoch.ts';
 
 // The mocked tracker, so the assertions below can read what the provider did with a notice.
 import { markResponseReceived, markPlaceholderShown } from '../services/messageLatencyTracker';
@@ -265,7 +272,7 @@ describe('MessagingProvider — a queue notice is not a turn somebody waited for
 });
 
 /**
- * sessionVersion: the communication-hub contract this app now follows. Anything holding data the
+ * sessionVersion: the session contract this app follows. Anything holding data the
  * session would have pushed re-reads when it changes, so it must go up on EVERY
  * start - the first connect and each reconnect - and on nothing else.
  */
@@ -288,5 +295,411 @@ describe('MessagingProvider - sessionVersion counts session starts', () => {
     expect(seen[seen.length - 1]).toBe(1);
     fire('messagingSessionDidStart');
     expect(seen[seen.length - 1]).toBe(2);
+  });
+});
+
+/**
+ * A CONVERSATION THAT IS GONE LEAVES THE CLIENT AT ONCE. A conversation deleted anywhere else (another client,
+ * the console, a demo reset) stayed listed and open until a reload, because nothing handled DELETE_CHANNEL, and a
+ * removal of the viewer's own membership only refreshed the member list.
+ */
+describe('MessagingProvider — a deleted conversation, or the viewer removed from it, is reported', () => {
+  const CHANNEL = 'arn:aws:chime:us-east-1:1:app-instance/i/channel/gone';
+
+  async function mountListening() {
+    const removed: string[] = [];
+    const Probe = () => {
+      const { setGlobalListener } = useMessaging();
+      setGlobalListener({ onRemovedFromChannel: (arn) => removed.push(arn) });
+      return null;
+    };
+    render(<MessagingProvider><Probe /></MessagingProvider>);
+    await act(async () => { await Promise.resolve(); });
+    return removed;
+  }
+
+  it('reports a deleted channel', async () => {
+    const removed = await mountListening();
+    fireMessage('DELETE_CHANNEL', { ChannelArn: CHANNEL });
+    expect(removed).toEqual([CHANNEL]);
+  });
+
+  it('reports the viewer removed from a channel', async () => {
+    const removed = await mountListening();
+    fireMessage('DELETE_CHANNEL_MEMBERSHIP', { ChannelArn: CHANNEL, Member: { Arn: 'arn:aws:chime:::user/u1' } });
+    expect(removed).toEqual([CHANNEL]);
+  });
+
+  it('does not report another member leaving', async () => {
+    const removed = await mountListening();
+    fireMessage('DELETE_CHANNEL_MEMBERSHIP', { ChannelArn: CHANNEL, Member: { Arn: 'arn:aws:chime:::user/someone-else' } });
+    expect(removed).toEqual([]);
+  });
+});
+
+/**
+ * A MEETING'S RING (`meetingRing.ts`): a control message rings the viewer for what is left of it, never reaches the
+ * conversation view or its unread state, and a ring the viewer sent rings nobody here.
+ */
+describe('MessagingProvider: a meeting ring', () => {
+  const CHANNEL = 'arn:aws:chime:us-east-1:1:app-instance/i/channel/c';
+  beforeEach(() => { localStorage.clear(); sessionStorage.clear(); });
+  async function mountRinging() {
+    const seen: { ring: unknown; messages: number } = { ring: null, messages: 0 };
+    const Probe = () => {
+      const { incomingRing, setGlobalListener, setChannelListener } = useMessaging();
+      seen.ring = incomingRing;
+      setGlobalListener({ onMessageInAnyChannel: () => { seen.messages += 1; } });
+      setChannelListener({ onMessage: () => { seen.messages += 1; } } as never);
+      return null;
+    };
+    render(<MessagingProvider><Probe /></MessagingProvider>);
+    await act(async () => { await Promise.resolve(); });
+    return seen;
+  }
+
+  it('lets go of the ring and the meeting news when the session ends, so the next person signed in hears neither', async () => {
+    const BOT_ARN = 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops';
+    let state: { ring: unknown; news: unknown; heard: unknown } = { ring: null, news: null, heard: null };
+    const Probe = () => { const m = useMessaging(); state = { ring: m.incomingRing, news: m.meetingNews, heard: m.ringHeard }; return null; };
+    render(<MessagingProvider><Probe /></MessagingProvider>);
+    await act(async () => { await Promise.resolve(); });
+    fireMessage('CREATE_CHANNEL_MESSAGE', { ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date().toISOString(), Sender: { Arn: BOT_ARN } });
+    const card = JSON.stringify({ meetingCard: { event: 'meeting-started', meetingId: '11111111-2222-3333-4444-555555555555', conversationId: 'meet-1' } });
+    fireMessage('CREATE_CHANNEL_MESSAGE', { ChannelArn: CHANNEL, Type: 'STANDARD', Content: 'started', Metadata: card, Sender: { Arn: BOT_ARN } });
+    expect(state.ring).toMatchObject({ channelArn: CHANNEL });
+    expect(state.news).not.toBeNull();
+    await act(async () => { endSessionEpoch('signed-out'); });
+    expect(state).toEqual({ ring: null, news: null, heard: null });
+  });
+
+  it('keeps every piece of meeting news, so two that land in one render are both read', async () => {
+    const BOT_ARN = 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops';
+    let after: ((seq: number) => Array<{ card?: { conversationId?: string } }>) | undefined;
+    const Probe = () => { after = useMessaging().meetingNewsAfter; return null; };
+    render(<MessagingProvider><Probe /></MessagingProvider>);
+    await act(async () => { await Promise.resolve(); });
+    const card = (id: string) => JSON.stringify({ meetingCard: { event: 'meeting-started', meetingId: '11111111-2222-3333-4444-555555555555', conversationId: id } });
+    act(() => {
+      fireMessage('CREATE_CHANNEL_MESSAGE', { ChannelArn: `${CHANNEL}-a`, Type: 'STANDARD', Content: 'started', Metadata: card('meet-a'), Sender: { Arn: BOT_ARN } });
+      fireMessage('CREATE_CHANNEL_MESSAGE', { ChannelArn: `${CHANNEL}-b`, Type: 'STANDARD', Content: 'started', Metadata: card('meet-b'), Sender: { Arn: BOT_ARN } });
+    });
+    expect(after!(0).map((n) => n.card?.conversationId)).toEqual(['meet-a', 'meet-b']);
+  });
+
+  it('rings for the ring\'s length, then stops on its own, and is never a message', async () => {
+    const seen = await mountRinging();
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date().toISOString(),
+      Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' },
+    });
+    expect(seen.ring).toMatchObject({ channelArn: CHANNEL });
+    expect(seen.messages).toBe(0);
+    act(() => { vi.advanceTimersByTime(10_500); });
+    expect(seen.ring).toBeNull();
+  });
+
+  it("rings for no member: a person's ring rings nobody, and a person's ring-off stops nothing", async () => {
+    const seen = await mountRinging();
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date().toISOString(),
+      Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/user/u2' },
+    });
+    expect(seen.ring).toBeNull();
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date().toISOString(),
+      Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' },
+    });
+    expect(seen.ring).toMatchObject({ channelArn: CHANNEL });
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:off', Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/user/u2' },
+    });
+    expect(seen.ring).toMatchObject({ channelArn: CHANNEL });
+  });
+
+  it('does not ring a person already in the meeting in a window of this browser, their own start among them', async () => {
+    const query = vi.fn(async () => ({ held: [{ name: 'ae-in-meeting-c' }], pending: [] }));
+    vi.stubGlobal('navigator', { ...globalThis.navigator, locks: { query, request: vi.fn(() => new Promise(() => undefined)) } });
+    try {
+      const seen = await mountRinging();
+      fireMessage('CREATE_CHANNEL_MESSAGE', {
+        ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date().toISOString(),
+        Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' },
+      });
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+      expect(query).toHaveBeenCalled();
+      expect(seen.ring).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("still rings after this device's clock steps forward by more than a ring", async () => {
+    const seen = await mountRinging();
+    const BOT = 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops';
+    // A prompt delivery first, which the next ring's lateness is measured against.
+    fireMessage('CREATE_CHANNEL_MESSAGE', { ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'other', CreatedTimestamp: new Date().toISOString(), Sender: { Arn: BOT } });
+    const serverNow = Date.now();
+    // The device clock jumps a minute ahead; the server's does not.
+    vi.setSystemTime(Date.now() + 60_000);
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date(serverNow).toISOString(), Sender: { Arn: BOT },
+    });
+    expect(seen.ring).toMatchObject({ channelArn: CHANNEL });
+  });
+
+  it("tells a meeting window, which shows no ring, that its conversation's meeting rang, so it reads the meeting again", async () => {
+    sessionStorage.setItem('ae.meeting.window', 'c');
+    let heard: unknown = null;
+    const Probe = () => { heard = useMessaging().ringHeard; return null; };
+    render(<MessagingProvider><Probe /></MessagingProvider>);
+    await act(async () => { await Promise.resolve(); });
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date().toISOString(), Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' },
+    });
+    expect(heard).toMatchObject({ channelArn: CHANNEL });
+  });
+
+  it("hears meeting news in any conversation, carrying the card: a meeting card from an assistant, and this person removed from a conversation, not another member or a person's card", async () => {
+    const BOT_ARN = 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops';
+    const news: unknown[] = [];
+    const Probe = () => { const n = useMessaging().meetingNews; if (n && news[news.length - 1] !== n) news.push(n); return null; };
+    render(<MessagingProvider><Probe /></MessagingProvider>);
+    await act(async () => { await Promise.resolve(); });
+    const card = JSON.stringify({ meetingCard: { event: 'meeting-started', meetingId: '11111111-2222-3333-4444-555555555555', conversationId: 'meet-1' } });
+    // A member's message carrying the same metadata is not news: only an assistant posts a meeting card.
+    fireMessage('CREATE_CHANNEL_MESSAGE', { ChannelArn: CHANNEL, Type: 'STANDARD', Content: 'hi', Metadata: card, Sender: { Arn: 'arn:aws:chime:::user/u2' } });
+    // Another member joining is not this person's news.
+    fireMessage('CREATE_CHANNEL_MEMBERSHIP', { ChannelArn: CHANNEL, Member: { Arn: 'arn:aws:chime:::user/u2' } });
+    expect(news).toHaveLength(0);
+    fireMessage('CREATE_CHANNEL_MESSAGE', { ChannelArn: `${CHANNEL}-room`, Type: 'STANDARD', Content: 'started', Metadata: card, Sender: { Arn: BOT_ARN } });
+    expect(news).toHaveLength(1);
+    expect(news[0]).toMatchObject({ channelArn: `${CHANNEL}-room`, card: { event: 'meeting-started', meetingId: '11111111-2222-3333-4444-555555555555', conversationId: 'meet-1' } });
+    // This person added to a conversation is not news: the meeting's own conversation holds the parent conversation's people from its opening.
+    fireMessage('CREATE_CHANNEL_MEMBERSHIP', { ChannelArn: `${CHANNEL}-meet`, Member: { Arn: 'arn:aws:chime:::user/u1' } });
+    expect(news).toHaveLength(1);
+    fireMessage('DELETE_CHANNEL_MEMBERSHIP', { ChannelArn: `${CHANNEL}-meet`, Member: { Arn: 'arn:aws:chime:::user/u1' } });
+    expect(news).toHaveLength(2);
+    expect(news[1]).toMatchObject({ channelArn: `${CHANNEL}-meet`, removed: true });
+  });
+
+  it('stops the ring on a ring-off addressed to this person, who took the meeting elsewhere, and a ring that arrives after it sounds nothing', async () => {
+    const seen = await mountRinging();
+    const ring = () => fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date().toISOString(), Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' },
+    });
+    ring();
+    expect(seen.ring).toMatchObject({ channelArn: CHANNEL });
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:off', Target: [{ MemberArn: 'arn:aws:chime:::user/u1' }], Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' },
+    });
+    expect(seen.ring).toBeNull();
+    // Their own start, taken before its ring went out: the ring comes after the ring-off, and rings nobody.
+    ring();
+    expect(seen.ring).toBeNull();
+  });
+
+  it('rings in one tab of this browser per meeting: a ring another tab claimed shows nothing here', async () => {
+    const seen = await mountRinging();
+    localStorage.setItem('meeting-invite-claim-c', `another-tab@${Date.now()}`);
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date().toISOString(), Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' },
+    });
+    expect(seen.ring).toBeNull();
+  });
+
+  it('rings where another tab\'s claim on the meeting is older than its window', async () => {
+    const seen = await mountRinging();
+    localStorage.setItem('meeting-invite-claim-c', `another-tab@${Date.now() - 31_000}`);
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date().toISOString(), Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' },
+    });
+    expect(seen.ring).toMatchObject({ channelArn: CHANNEL });
+  });
+
+  it('does not ring for a ring already over when it arrives', async () => {
+    const seen = await mountRinging();
+    // The connection delivers promptly, which is what a late ring is measured against.
+    fireMessage('CREATE_CHANNEL_MESSAGE', { ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'other', CreatedTimestamp: new Date().toISOString(), Sender: { Arn: 'arn:aws:chime:::user/u2' } });
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date(Date.now() - 30_000).toISOString(),
+      Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' },
+    });
+    expect(seen.ring).toBeNull();
+  });
+
+  it('reports a ring left to run out once, as the viewer with no attendee, and one stopped by the meeting ending not at all', async () => {
+    reportEvents.mockClear();
+    const seen = await mountRinging();
+    const ring = () => fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date().toISOString(), Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' },
+    });
+    ring();
+    act(() => { vi.advanceTimersByTime(10_500); });
+    expect(seen.ring).toBeNull();
+    expect(reportEvents).toHaveBeenCalledTimes(1);
+    expect(reportEvents).toHaveBeenCalledWith(CHANNEL, null, [expect.objectContaining({ name: 'ringTimedOut' })]);
+    ring();
+    fireMessage('CREATE_CHANNEL_MESSAGE', { ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:off', Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' } });
+    expect(seen.ring).toBeNull();
+    act(() => { vi.advanceTimersByTime(10_500); });
+    expect(reportEvents).toHaveBeenCalledTimes(1);
+  });
+
+  it('rings its whole length on a device whose clock runs ahead of the server by more than the ring', async () => {
+    const seen = await mountRinging();
+    // Every message reads 12 seconds old on arrival: this clock is 12 seconds fast, and the ring is on time.
+    const serverNow = () => new Date(Date.now() - 12_000).toISOString();
+    fireMessage('CREATE_CHANNEL_MESSAGE', { ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'other', CreatedTimestamp: serverNow(), Sender: { Arn: 'arn:aws:chime:::user/u2' } });
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: serverNow(), Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' },
+    });
+    expect(seen.ring).toMatchObject({ channelArn: CHANNEL });
+    act(() => { vi.advanceTimersByTime(9_000); });
+    expect(seen.ring).toMatchObject({ channelArn: CHANNEL });
+  });
+
+  it('reports nothing for a ring another tab of this person already settled, and does not show it', async () => {
+    reportEvents.mockClear();
+    const seen = await mountRinging();
+    localStorage.setItem('ae.meeting.ringSettled', JSON.stringify({ [CHANNEL]: Date.now() + 10_000 }));
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date().toISOString(), Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' },
+    });
+    expect(seen.ring).toBeNull();
+    act(() => { vi.advanceTimersByTime(10_500); });
+    expect(reportEvents).not.toHaveBeenCalled();
+  });
+
+  it('settles a timed-out ring once, so another tab whose ring runs out reports nothing', async () => {
+    reportEvents.mockClear();
+    // Two tabs of one person, sharing the browser's storage, both hear the ring.
+    const first = await mountRinging();
+    const second = await mountRinging();
+    const payload = JSON.stringify({
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date().toISOString(), Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' },
+    });
+    act(() => {
+      for (const o of observers) o.messagingSessionDidReceiveMessage?.({ headers: { 'x-amz-chime-event-type': 'CREATE_CHANNEL_MESSAGE' }, payload });
+    });
+    expect(first.ring).toMatchObject({ channelArn: CHANNEL });
+    expect(second.ring).toMatchObject({ channelArn: CHANNEL });
+    act(() => { vi.advanceTimersByTime(10_500); });
+    expect(reportEvents).toHaveBeenCalledTimes(1);
+  });
+
+  it('takes no ring in a meeting window', async () => {
+    sessionStorage.setItem('ae.meeting.window', 'c');
+    const seen = await mountRinging();
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: CHANNEL, Type: 'CONTROL', Content: 'ae:ring:10', CreatedTimestamp: new Date().toISOString(), Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops' },
+    });
+    expect(seen.ring).toBeNull();
+  });
+});
+
+/**
+ * A CHANNEL UPDATE CARRIES ITS METADATA to the conversation provider, so the archive's `archived` display mirror reaches
+ * a conversation open in front of the person (SPEC-ASSISTANT-MEETINGS FR71).
+ */
+describe('MessagingProvider — a channel update hands over its name and metadata', () => {
+  it('passes the channel Metadata beside its Name', async () => {
+    const CHANNEL = 'arn:aws:chime:us-east-1:1:app-instance/i/channel/meet';
+    const updates: Array<[string, string, string | undefined]> = [];
+    const Probe = () => {
+      const { setChannelListener } = useMessaging();
+      setChannelListener({ onChannelUpdate: (arn, name, metadata) => updates.push([arn, name, metadata]) });
+      return null;
+    };
+    render(<MessagingProvider><Probe /></MessagingProvider>);
+    await act(async () => { await Promise.resolve(); });
+    const metadata = JSON.stringify({ meetingOf: 'room', archived: true });
+    fireMessage('UPDATE_CHANNEL', { ChannelArn: CHANNEL, Name: 'Meeting Room', Metadata: metadata });
+    expect(updates).toEqual([[CHANNEL, 'Meeting Room', metadata]]);
+  });
+});
+
+/**
+ * WHO A MESSAGE IS VISIBLE TO IS THE `Target` AMAZON CHIME SDK SET. Metadata is member-writable, so a message that only
+ * says in its Metadata that it is targeted is an ordinary message the whole room reads.
+ */
+describe('MessagingProvider - a message is targeted only by the Target the service set', () => {
+  const CHANNEL = 'arn:aws:chime:us-east-1:1:app-instance/i/channel/c';
+  const ME = 'arn:aws:chime:::user/u1';
+  async function received(payload: Record<string, unknown>) {
+    const seen: Array<{ targetedToUser?: boolean }> = [];
+    const Probe = () => {
+      const { setChannelListener } = useMessaging();
+      setChannelListener({ onMessageCreate: (_arn: string, m: { targetedToUser?: boolean }) => { seen.push(m); } } as never);
+      return null;
+    };
+    render(<MessagingProvider><Probe /></MessagingProvider>);
+    await act(async () => { await Promise.resolve(); });
+    fireMessage('CREATE_CHANNEL_MESSAGE', { ChannelArn: CHANNEL, MessageId: 'm1', Content: 'hello', Sender: { Arn: 'arn:aws:chime:::user/u2', Name: 'Sam' }, ...payload });
+    return seen;
+  }
+
+  it('DENY: Metadata naming this person does not make a message targeted', async () => {
+    const seen = await received({ Metadata: JSON.stringify({ targetedSender: ME }) });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].targetedToUser).toBeFalsy();
+  });
+
+  it('a Target naming this person does', async () => {
+    const seen = await received({ Target: [{ MemberArn: ME }] });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].targetedToUser).toBe(true);
+  });
+
+  it('an assistant reply arriving with no Target is read by the recipient the platform stamped on it', async () => {
+    const BOT = 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops';
+    const seen = await received({ Sender: { Arn: BOT, Name: 'Ops' }, Metadata: JSON.stringify({ targetedSender: ME }) });
+    expect(seen[0].targetedToUser).toBe(true);
+  });
+
+  it('DENY: an assistant message the service delivered with a Target naming somebody else is not for this person', async () => {
+    const BOT = 'arn:aws:chime:us-east-1:1:app-instance/i/bot/ops';
+    const seen = await received({ Sender: { Arn: BOT, Name: 'Ops' }, Target: [{ MemberArn: 'arn:aws:chime:::user/u3' }], Metadata: JSON.stringify({ targetedSender: ME }) });
+    expect(seen[0].targetedToUser).toBeFalsy();
+  });
+});
+
+describe('MessagingProvider - Metadata that is not an object is read as none', () => {
+  it('a message whose Metadata is the text null is delivered like any other', async () => {
+    const seen: unknown[] = [];
+    const Probe = () => {
+      const { setChannelListener } = useMessaging();
+      setChannelListener({ onMessageCreate: (_arn: string, m: unknown) => { seen.push(m); } } as never);
+      return null;
+    };
+    render(<MessagingProvider><Probe /></MessagingProvider>);
+    await act(async () => { await Promise.resolve(); });
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: 'arn:aws:chime:us-east-1:1:app-instance/i/channel/c', MessageId: 'm-null', Content: 'hello', Metadata: 'null',
+      Sender: { Arn: 'arn:aws:chime:::user/u2', Name: 'Sam' },
+    });
+    expect(seen).toHaveLength(1);
+  });
+});
+
+describe('MessagingProvider - a message that disagrees with its Target is logged under the monitored marker', () => {
+  it('logs an assistant reply stamped for a person its Target does not name, and marks the message', async () => {
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const seen: Array<{ targetMismatch?: string }> = [];
+    const Probe = () => {
+      const { setChannelListener } = useMessaging();
+      setChannelListener({ onMessageCreate: (_arn: string, m: { targetMismatch?: string }) => { seen.push(m); } } as never);
+      return null;
+    };
+    render(<MessagingProvider><Probe /></MessagingProvider>);
+    await act(async () => { await Promise.resolve(); });
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: 'arn:aws:chime:us-east-1:1:app-instance/i/channel/c', MessageId: 'm-mismatch', Content: 'here you go',
+      Metadata: JSON.stringify({ botResponse: true, targetedSender: 'arn:aws:chime:::user/u1' }),
+      Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/b1', Name: 'Advisor' },
+    });
+    expect(seen[0]?.targetMismatch).toBe('assistant');
+    expect(logged.mock.calls.some((c) => String(c[0]).startsWith('[target-mismatch]'))).toBe(true);
+    logged.mockRestore();
   });
 });

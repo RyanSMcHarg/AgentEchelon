@@ -33,6 +33,10 @@
  */
 import type { Classification } from './model-strategy';
 
+/** A CloudWatch alarm's change: its source and its detail type, as EventBridge names them. */
+export const CLOUDWATCH_SOURCE = 'aws.cloudwatch';
+export const ALARM_STATE_CHANGE = 'CloudWatch Alarm State Change';
+
 /** The source the platform's own operations events carry (`scripts/lib/ops-event.cjs` writes the same). */
 export const OPS_EVENT_SOURCE = 'ae.ops';
 /** The detail type of an operations event that opens an `ops` conversation. */
@@ -79,7 +83,43 @@ export interface EventOpener {
   fields?: Partial<Record<OpenerField, string>>;
   /** Per field, a fixed value, for what the event does not carry (the person an alarm opens a room for). */
   values?: Partial<Record<OpenerField, string>>;
+  /**
+   * THE KEY THE CONVERSATION WATCHES (DESIGN-EVENT-TARGETS section 3): the kind is declared here and belongs to this
+   * opener's source alone; the id is read from the event at `path`. A later event carrying the same key reaches the
+   * conversation through a watch trigger.
+   */
+  watches?: { kind: string; path: string };
 }
+
+/** A watched key's kind: declared by the platform, never read from an event. */
+export const REF_KIND = /^[a-z0-9-]{1,40}$/;
+/**
+ * A watched key's id, as read from an event: an incident id, or an ARN read at `$.resources[...]`, so `/` is part of an id and
+ * the length holds a full ARN. `#` separates the parts of the key's watch item, so it never appears in an id.
+ */
+export const REF_ID = /^[A-Za-z0-9._:/-]{1,1024}$/;
+/** The most keys one conversation watches. */
+export const MAX_WATCHED_REFS = 8;
+
+/**
+ * A WATCHED KEY'S ID, NORMALIZED ONE WAY for every reader: the creator reading the opening event and the router reading a
+ * later one. A string is trimmed and a number written in decimal; anything else, or a value outside {@link REF_ID}, is none.
+ */
+export function refId(value: unknown): string | undefined {
+  const s = typeof value === 'string' ? value.trim() : typeof value === 'number' && Number.isFinite(value) ? String(value) : undefined;
+  return s && REF_ID.test(s) ? s : undefined;
+}
+
+/** A key as the conversation's row lists it: `<kind>#<id>`. */
+export const refKey = (kind: string, id: string): string => `${kind}#${id}`;
+
+/** A path a watched key may be read from: a plain path into the event's `detail` or `resources`, nothing in the envelope. */
+export function isRefPath(path: string): boolean {
+  return PATH.test(path) && (path.startsWith('$.detail.') || path.startsWith('$.resources['));
+}
+
+/** The source an event is matched on, with its bus, so one kind belongs to one place. */
+export const openerSourceOf = (opener: Pick<EventOpener, 'eventBus' | 'source'>): string => `${opener.eventBus ?? 'default'}|${opener.source}`;
 
 /** Where the platform's own ops event carries each field (`scripts/lib/ops-event.cjs` writes this shape). */
 export const PLATFORM_EVENT_FIELDS: Readonly<Record<OpenerField, string>> = {
@@ -101,6 +141,8 @@ const PATH = /^\$(\.[A-Za-z0-9_-]+|\[\d+\])+$/;
 export interface OpenedTypeView {
   classifications?: readonly string[];
   initiation?: string;
+  /** A meeting's own conversation, which only a meeting's start opens. */
+  meeting?: unknown;
   openedBy?: readonly EventOpener[];
 }
 
@@ -126,6 +168,8 @@ export interface ResolvedOpener {
 export function resolveEventOpeners(types: Readonly<Record<string, OpenedTypeView>>): ResolvedOpener[] {
   const errors: string[] = [];
   const out: ResolvedOpener[] = [];
+  // ONE SOURCE PER WATCHED KIND, across every type, so one source's events cannot reach another's conversations.
+  const kindSource = new Map<string, string>();
   for (const [typeKey, type] of Object.entries(types)) {
     (type.openedBy ?? []).forEach((opener, index) => {
       const at = `conversation type "${typeKey}" openedBy[${index}]`;
@@ -133,6 +177,8 @@ export function resolveEventOpeners(types: Readonly<Record<string, OpenedTypeVie
       if (!type.initiation || type.initiation === 'user') {
         errors.push(`${at}: a person opens this type (initiation "${type.initiation ?? 'user'}"), so no event may`);
       }
+      // A MEETING'S CONVERSATION IS OPENED BY ITS MEETING'S START, never by an event, which the creator refuses at run time.
+      if (type.meeting) errors.push(`${at}: a meeting's own conversation is opened by its meeting's start, so no event may`);
       if (!opener.source?.trim()) errors.push(`${at}: names no source`);
       if (!opener.detailType?.trim()) errors.push(`${at}: names no detail type`);
       const permitted = type.classifications ?? [];
@@ -165,6 +211,16 @@ export function resolveEventOpeners(types: Readonly<Record<string, OpenedTypeVie
       if (type.initiation !== 'system' && !has('concernedChannelArn')) {
         errors.push(`${at}: the type concerns another conversation, so the opener must say where it comes from (concernedChannelArn)`);
       }
+      if (opener.watches) {
+        if (!REF_KIND.test(opener.watches.kind ?? '')) errors.push(`${at}: watches.kind "${opener.watches.kind}" is not a kind (${REF_KIND.source})`);
+        if (!isRefPath(opener.watches.path ?? '')) errors.push(`${at}: watches.path "${opener.watches.path}" is not a plain path under $.detail. or $.resources[`);
+        else if (opener.source?.trim()) {
+          const source = openerSourceOf(opener);
+          const held = kindSource.get(opener.watches.kind);
+          if (held && held !== source) errors.push(`${at}: watches.kind "${opener.watches.kind}" already belongs to source ${held}; a kind belongs to one source`);
+          else kindSource.set(opener.watches.kind, source);
+        }
+      }
       if (errors.length === before && classification) {
         out.push({ id: `${typeKey}#${index}`, typeKey, classification, opener });
       }
@@ -172,6 +228,26 @@ export function resolveEventOpeners(types: Readonly<Record<string, OpenedTypeVie
   }
   if (errors.length) throw new Error(`Event openers are invalid:\n  - ${errors.join('\n  - ')}`);
   return out;
+}
+
+/**
+ * EACH WATCHED KIND'S ONE SOURCE, as the declared openers bind it: what a watch trigger's attach checks its own source
+ * against, so a trigger on another source cannot deliver events to conversations of that kind.
+ */
+export function watchedKindSources(types: Readonly<Record<string, OpenedTypeView>>): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const o of resolveEventOpeners(types)) if (o.opener.watches) out.set(o.opener.watches.kind, openerSourceOf(o.opener));
+  return out;
+}
+
+/** The key an opener's event names for its conversation to watch: undefined when the opener declares none or the event carries none, null when its value is not an id. */
+export function openerWatchKey(opener: EventOpener, event: unknown): { kind: string; id: string } | null | undefined {
+  if (!opener.watches) return undefined;
+  // AN EVENT THAT CARRIES NO KEY opens a conversation that watches nothing; one that carries a value that is not an id is refused.
+  const raw = rawAtPath(event, opener.watches.path);
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  const id = refId(raw);
+  return id ? { kind: opener.watches.kind, id } : null;
 }
 
 /** The openers whose rules a classification's stack builds. */
@@ -186,6 +262,13 @@ export function openerById(types: Readonly<Record<string, OpenedTypeView>>, id: 
 
 /** The value at a plain JSON path in an event, as a trimmed string, or undefined when absent or not a string. */
 export function valueAtPath(event: unknown, path: string): string | undefined {
+  const at = rawAtPath(event, path);
+  if (typeof at === 'number' || typeof at === 'boolean') return String(at);
+  return typeof at === 'string' && at.trim() ? at.trim() : undefined;
+}
+
+/** The value at a plain JSON path in an event, as it is, or undefined when the path is not plain or leads nowhere. */
+export function rawAtPath(event: unknown, path: string): unknown {
   if (!PATH.test(path)) return undefined;
   let at: unknown = event;
   for (const step of path.slice(1).match(/\.[A-Za-z0-9_-]+|\[\d+\]/g) ?? []) {
@@ -193,8 +276,7 @@ export function valueAtPath(event: unknown, path: string): string | undefined {
     const key = step.startsWith('[') ? Number(step.slice(1, -1)) : step.slice(1);
     at = (at as Record<string | number, unknown>)[key];
   }
-  if (typeof at === 'number' || typeof at === 'boolean') return String(at);
-  return typeof at === 'string' && at.trim() ? at.trim() : undefined;
+  return at;
 }
 
 /** The creator's input an opener fills from one event: each field from its path, else its fixed value. */

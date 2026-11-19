@@ -28,7 +28,6 @@ import type {
   RecordDriftInput,
   ResolveDriftRivalInput,
 } from '../analytics-aurora/drift-detection.js';
-import type { PendingSuggestion, SuggestionKind } from './routing-state.js';
 import type {
   AdminConvSummary,
   AdminConvMessage,
@@ -45,21 +44,7 @@ export type {
   DriftResult,
   RecordDriftInput,
   ResolveDriftRivalInput,
-  PendingSuggestion,
-  SuggestionKind,
 };
-
-/** Input for opening a pending-drift-suggestion task (mirrors routing-state). */
-export interface SavePendingInput {
-  channelArn: string;
-  personId: string;
-  kind: SuggestionKind;
-  rivalConversationArn?: string;
-  originatingMessageId: string;
-  cosineDistance?: number;
-  correlationId: string;
-  driftEventId?: string;
-}
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 /**
@@ -102,9 +87,6 @@ type DataPlaneOp =
   | 'getSummary'
   | 'seedSummary'
   | 'seedDriftTopic'
-  | 'savePendingSuggestion'
-  | 'readPendingSuggestion'
-  | 'resolvePendingSuggestion'
   | 'adminListConversations'
   | 'adminListMessages'
   | 'adminMembershipHistory'
@@ -114,7 +96,9 @@ type DataPlaneOp =
   | 'cleanCopyWrite'
   | 'cleanCopyRecordRun'
   | 'adminCleanConversation'
-  | 'erasePerson';
+  | 'erasePerson'
+  | 'ingestMeetingEvents'
+  | 'readMeetingEvents';
 
 /**
  * Invoke the data-plane Lambda and parse its JSON result. Throws on any infra
@@ -215,7 +199,7 @@ export async function recordDriftFire(input: RecordDriftInput): Promise<string> 
 /** Best-effort drift-outcome record — swallows failure. */
 export async function recordDriftOutcome(input: {
   eventId: string;
-  outcome: 'declined' | 'rejected_in_new_channel' | 'accepted';
+  outcome: 'declined' | 'rejected_in_new_channel' | 'accepted' | 'moved_unasked' | 'not_offered' | 'move_failed';
   newChannelArn?: string;
 }): Promise<void> {
   try {
@@ -306,51 +290,6 @@ export async function seedDriftTopicSummary(input: {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Pending-drift-suggestion task lifecycle (conversation_creation_tasks).
-// Open on detect, read to RESUME on a later turn, close on confirm/decline.
-// Runs via the data plane so the non-VPC handler can persist durable drift
-// state (ADR-013) — a direct query() here fails with DB_SECRET_ARN.
-// ---------------------------------------------------------------------------
-
-/** Open a pending suggestion. Degrades to a stub (taskId='') on failure: the offer is still shown,
- *  but nothing records it, so its answer is read as an ordinary message. */
-export async function savePendingSuggestion(input: SavePendingInput): Promise<PendingSuggestion> {
-  try {
-    return await invoke<PendingSuggestion>('savePendingSuggestion', input);
-  } catch (err) {
-    console.warn('[data-plane-client] savePendingSuggestion failed (non-fatal):', err);
-    return { taskId: '', createdAt: '', ...input };
-  }
-}
-
-/** The open drift offer for (user, channel), read at the start of every drift turn. Returns null on
- *  failure or when there is none, and the turn then proceeds as one with no offer open. */
-export async function readPendingSuggestion(input: {
-  personId: string;
-  channelArn: string;
-}): Promise<PendingSuggestion | null> {
-  try {
-    return await invoke<PendingSuggestion | null>('readPendingSuggestion', input);
-  } catch (err) {
-    console.warn('[data-plane-client] readPendingSuggestion failed (non-fatal):', err);
-    return null;
-  }
-}
-
-/** Close a pending suggestion. Best-effort — swallows failure (the outcome
- *  telemetry is non-critical to the user's turn). */
-export async function resolvePendingSuggestion(input: {
-  taskId: string;
-  outcome: 'confirmed' | 'declined' | 'expired';
-}): Promise<void> {
-  try {
-    await invoke<unknown>('resolvePendingSuggestion', input);
-  } catch (err) {
-    console.warn('[data-plane-client] resolvePendingSuggestion failed (non-fatal):', err);
-  }
-}
-
 // Admin Conversations reads (Aurora mode). Unlike the drift/retrieval wrappers
 // these PROPAGATE errors so the admin handler can surface an archiveError to the
 // console rather than silently returning empty (a read failure is user-visible).
@@ -408,4 +347,26 @@ export async function ingestClientEvents(records: unknown[]): Promise<{ inserted
  */
 export async function erasePersonProjection(personId: string): Promise<{ removed: number; byTable: Record<string, number> }> {
   return invoke<{ removed: number; byTable: Record<string, number> }>('erasePerson', { personId });
+}
+
+/**
+ * Meeting lifecycle events (SPEC-ASSISTANT-MEETINGS FR22). The roster is derived from these rows.
+ *
+ * ERRORS PROPAGATE, deliberately, and this is the one ingest where that matters: the caller is an
+ * EventBridge consumer, so a thrown error is RETRIED by the platform and then sent to the
+ * dead-letter queue. Swallowing it would silently lose an arrival or a departure, and a roster with a
+ * missing join is wrong in a way nothing downstream can detect. `duplicates` is returned rather than
+ * hidden because a redelivery is expected here, not exceptional.
+ */
+export async function ingestMeetingEvents(
+  records: unknown[],
+): Promise<{ inserted: number; duplicates: number }> {
+  return invoke<{ inserted: number; duplicates: number }>('ingestMeetingEvents', { records });
+}
+
+/** The meeting events in a window, for the meeting figures; `truncated` and `unread` say what the answer is missing. */
+export async function readMeetingEvents(input: { fromIso: string; toIso: string; meetingId?: string | null; samples?: boolean }): Promise<{
+  rows: import('./meeting-figures.js').MeetingEventRow[]; truncated: boolean; unread: string[];
+}> {
+  return invoke('readMeetingEvents', input);
 }

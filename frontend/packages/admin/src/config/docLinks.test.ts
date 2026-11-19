@@ -1,11 +1,8 @@
 /**
  * EVERY DOCUMENTATION LINK IN THE CONSOLE POINTS AT A FILE THAT EXISTS.
  *
- * Four of these used to point at blog posts on mcharg.site, and all four were dead. Nobody noticed,
- * and the reason is worth pinning a test on: that site is a client-rendered SPA with a catch-all
- * route, so a slug that does not exist returns HTTP 200 with the site's generic title. Every
- * automated check a link checker performs comes back green. The links were confirmed dead only by
- * comparing the prerendered `<title>` of each against a known-good slug and a deliberately bogus one.
+ * A page on a client-rendered site with a catch-all route answers HTTP 200 for a path that does not exist, so every
+ * automated check a link checker performs comes back green for a dead link there.
  *
  * A link that cannot be verified is a link that rots silently, so the registry now points only at
  * paths in this repo - which this test resolves on disk. The check is cheap and total: it is the
@@ -44,11 +41,10 @@ describe('the documentation registry', () => {
   });
 
   it('links to no host whose 404 is invisible', () => {
-    // mcharg.site serves its SPA shell for any path, so a dead link there is indistinguishable from
-    // a live one without rendering the page. Naming it keeps the reason attached to the rule: this
-    // is not a preference for GitHub, it is a refusal to link somewhere that cannot report a 404.
+    // A host that serves an app shell for any path cannot report a 404, so every link is to the repo, where a
+    // wrong path is a plain 404 anybody can see.
     for (const [, url] of entries) {
-      expect(url).not.toContain('mcharg.site');
+      expect(new URL(url).host).toBe('github.com');
     }
   });
 

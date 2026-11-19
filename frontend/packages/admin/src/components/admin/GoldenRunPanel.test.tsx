@@ -11,7 +11,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import GoldenRunPanel from './GoldenRunPanel';
+import GoldenRunPanel, { runStepsNotWalked } from './GoldenRunPanel';
 import * as svc from '../../services/profileService';
 
 vi.mock('../../services/profileService', async (orig) => ({
@@ -32,6 +32,9 @@ const refused: svc.GoldenResult = {
 // The console session's capabilities, which the panel reads to offer Activate anyway.
 const HELD = { capabilities: new Set<string>(['view-profiles', 'edit-profiles']) };
 vi.mock('../../capabilities', () => ({ useCan: () => (c: string) => HELD.capabilities.has(c) }));
+// THE RUN'S CHANNEL, stood in for: it neither ends nor is lost while a test runs, so every read a test counts is one the
+// panel makes on its own (on loading and on starting), never one the live channel's failure in a test process would add.
+vi.mock('../../services/consoleEvents', () => ({ followBatch: () => () => {} }));
 
 const refusedRun = (): svc.GoldenGateReading => ({
   ...gate({
@@ -183,5 +186,45 @@ describe('the golden run panel', () => {
   it('never waits on a timer', () => {
     const source = fs.readFileSync(path.join(__dirname, 'GoldenRunPanel.tsx'), 'utf8');
     expect(source).not.toMatch(/setInterval|setTimeout/);
+  });
+});
+
+describe('what a run costs', () => {
+  it('counts only the entries a run answers, and says how many it sets aside for using a tool', async () => {
+    const reading = gate(null);
+    vi.mocked(svc.readGoldenGate).mockResolvedValue({ ...reading, gate: { ...reading.gate!, entries: 5, answeredEntries: 3 } });
+    render(<GoldenRunPanel profileName="advisor" draftConfigId="cfg-2" canRun />);
+    expect(await screen.findByTestId('golden-run-start')).toHaveTextContent('Run golden set (3 entries x 3)');
+    const cost = screen.getByTestId('golden-run-cost');
+    expect(cost).toHaveTextContent('About 18 model answers');
+    expect(cost).toHaveTextContent('2 entries used a tool');
+  });
+
+  it('says "up to" where the reading does not count the entries a run answers', async () => {
+    vi.mocked(svc.readGoldenGate).mockResolvedValue(gate(null));
+    render(<GoldenRunPanel profileName="advisor" draftConfigId="cfg-2" canRun />);
+    expect(await screen.findByTestId('golden-run-start')).toHaveTextContent('Run golden set (up to 2 entries x 3)');
+    expect(screen.getByTestId('golden-run-cost')).toHaveTextContent('Up to 12 model answers');
+  });
+
+  it('hands each reading up, so a refusal Activate gave can be cleared once the gate passes', async () => {
+    const onOutcome = vi.fn();
+    vi.mocked(svc.readGoldenGate).mockResolvedValueOnce({ ...gate(null), outcome: { proceed: false, code: 'GOLDEN_RUN_REQUIRED', params: { count: 2 }, error: 'x' } })
+      .mockResolvedValueOnce({ ...gate(null), outcome: { proceed: true, note: 'passed' } });
+    render(<GoldenRunPanel profileName="advisor" draftConfigId="cfg-2" canRun onOutcome={onOutcome} />);
+    await waitFor(() => expect(onOutcome).toHaveBeenLastCalledWith(false));
+    fireEvent.click(screen.getByRole('button', { name: 'Check again' }));
+    await waitFor(() => expect(onOutcome).toHaveBeenLastCalledWith(true));
+  });
+});
+
+describe('the run around a walked task (ADR-067)', () => {
+  it('names, per intent, the workflow steps its walks did not exercise, each once', () => {
+    expect(runStepsNotWalked([
+      { intent: 'report_generation', runSteps: ['tell', 'approve'] },
+      { intent: 'report_generation', runSteps: ['approve'] },
+      { intent: 'support_request' },
+    ])).toEqual([{ intent: 'report_generation', steps: ['tell', 'approve'] }]);
+    expect(runStepsNotWalked(undefined)).toEqual([]);
   });
 });

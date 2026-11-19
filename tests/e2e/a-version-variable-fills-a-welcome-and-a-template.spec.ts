@@ -33,6 +33,7 @@ import { idTokenFor, personArnOf } from './helpers/person';
 import { guardBackendErrors } from './helpers/turn-guards';
 import { aws } from './helpers/aws';
 import { ADMIN_API_URL, PERSON_API_URL, adminUrl, personUrl } from './helpers/api-urls';
+import { replacingDraft, draftIdOf } from './helpers/profile-draft';
 
 const PROFILE = 'advisor';
 const OPENING_TEMPLATE = 'e2e-variable-opening';
@@ -106,7 +107,7 @@ test.describe.serial('one version variable fills a welcome and a targeted templa
       templatesSaved.push(name);
     }
 
-    const created = await signedCall(adminUrl('assistant-admin', '/admin/profiles/version'), admin, 'POST', { profileName: PROFILE });
+    const created = await replacingDraft((b) => signedCall(adminUrl('assistant-admin', '/admin/profiles/version'), admin, 'POST', b), { profileName: PROFILE });
     expect(created.status, JSON.stringify(created.body).slice(0, 400)).toBe(200);
     const patch = {
       variables: { kind: { source: 'conversation:type', fallback: 'general' } },
@@ -122,11 +123,11 @@ test.describe.serial('one version variable fills a welcome and a targeted templa
         },
       },
     };
-    const edited = await signedCall(adminUrl('assistant-admin', '/admin/profiles/draft'), admin, 'POST', { profileName: PROFILE, patch });
+    const edited = await signedCall(adminUrl('assistant-admin', '/admin/profiles/draft'), admin, 'POST', { profileName: PROFILE, patch, configId: draftIdOf(created) });
     expect(edited.status, JSON.stringify(edited.body).slice(0, 400)).toBe(200);
     const valid = await signedCall(adminUrl('assistant-admin', '/admin/profiles/validate'), admin, 'POST', { profileName: PROFILE });
     expect(valid.body?.errors ?? [], JSON.stringify(valid.body).slice(0, 600)).toEqual([]);
-    const activated = await signedCall(adminUrl('assistant-admin', '/admin/profiles/activate'), admin, 'POST', { profileName: PROFILE });
+    const activated = await signedCall(adminUrl('assistant-admin', '/admin/profiles/activate'), admin, 'POST', { profileName: PROFILE, configId: draftIdOf(edited) });
     expect(activated.status, JSON.stringify(activated.body).slice(0, 400)).toBe(200);
   });
 

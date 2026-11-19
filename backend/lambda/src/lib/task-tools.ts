@@ -5,7 +5,8 @@
  * dispatch logic is unit-testable without a Bedrock round-trip.
  */
 // TASKS GO THROUGH THE STORE SEAM, not the table. Same signatures; the boundary is inside.
-import { deliversDocument } from './task-state-machines.js';
+import { deliversDocument, machineRecords, taskConditionValues } from './task-state-machines.js';
+import { OPEN_NEW_REQUEST_TOOL_NAME } from './new-request-tool.js';
 import { advanceTaskStateTo } from './task-store.js';
 import { type Task, type AdvanceResult, deliveringContract, requiredToolsNotRun } from './task-tracking.js';
 // The shape the delivering check reads back. Imported rather than re-declared so the writer and the
@@ -25,11 +26,13 @@ import {
   recordedTemplateChoice,
   templateRefKey,
   machineConditions,
+  legalTransitionsFrom,
+  stepIsTheAssistants,
   type StepAction,
   type TaskStateDef,
 } from './task-state-machines.js';
 import { parseBinding, resolveBinding } from './step-bindings.js';
-import { decidingValues, insertValue, sourceKindOf, type SourceLookup, type VariableValue } from './variables.js';
+import { decidingValues, insertValue, sourceKindOf, whenKeys, type SourceLookup, type VariableValue } from './variables.js';
 import type { CallSiteCapabilities } from './context-source-shapes.js';
 import { fillTemplate, isLoadedTemplate, type TurnTemplates, type LoadedTemplate } from './document-template.js';
 
@@ -73,6 +76,11 @@ export interface TaskLoopContext {
    * anything they typed. Empty or absent means there was nothing to choose between.
    */
   referentCandidateIds?: string[];
+  /**
+   * THE ONLY MOVES THIS TURN MAY TAKE (ADR-067 G8, WT114): the requester's message reached a task another person holds,
+   * and its step declares what the requester may ask for. Absent on every other turn, and nothing about the loop changes.
+   */
+  requesterMoves?: string[];
   /** THE TURN'S MACHINES, definite (ADR-047). Optional once, which let a consumer read a different
    *  set - the compiled platform defaults - without anything at runtime noticing the substitution. */
   machines: Record<string, TaskStateMachine>;
@@ -152,10 +160,16 @@ export interface TurnVariables {
  * for it, so a fact about that person may decide it. Plain data, carried to the task service with the move.
  */
 export function turnConditionValues(ctx: Pick<TaskLoopContext, 'task' | 'machines' | 'variables'>): Record<string, VariableValue> {
-  const whens = machineConditions(ctx.machines[ctx.task.taskType ?? '']);
-  if (!whens.length || !ctx.variables) return {};
+  const machine = ctx.machines[ctx.task.taskType ?? ''];
+  const whens = machineConditions(machine);
+  // WHAT THE TASK ITSELF HOLDS (WT22): entry counts and typed values, the platform's data, read with no resolver, and only
+  // those a condition of the machine names, so the store is handed the deciding values its machine reads and no more.
+  const named = new Set(whens.flatMap((w) => whenKeys(w)));
+  const own = Object.fromEntries(Object.entries(taskConditionValues(ctx.task as Parameters<typeof taskConditionValues>[0], machine))
+    .filter(([source]) => named.has(source)));
+  if (!whens.length || !ctx.variables) return own;
   const v = ctx.variables;
-  return decidingValues(whens, { lookup: v.lookup, values: v.values, site: { callSite: v.callSite, audience: 'addressed' } });
+  return { ...decidingValues(whens, { lookup: v.lookup, values: v.values, site: { callSite: v.callSite, audience: 'addressed' } }), ...own };
 }
 
 /**
@@ -262,7 +276,7 @@ export const DELIVER_DOCUMENT_TOOL_SPEC = {
 } as const;
 
 /** The set of task tool names, so the loop can recognize a task-tool call cheaply. */
-export const TASK_TOOL_NAMES = new Set<string>([ADVANCE_TASK_STATE_TOOL_NAME, DELIVER_DOCUMENT_TOOL_NAME]);
+export const TASK_TOOL_NAMES = new Set<string>([ADVANCE_TASK_STATE_TOOL_NAME, DELIVER_DOCUMENT_TOOL_NAME, OPEN_NEW_REQUEST_TOOL_NAME]);
 
 /** True if the task type has a machine (i.e. task tools should be registered this turn). */
 export function taskHasMachine(
@@ -530,6 +544,11 @@ export function taskToolSpecsFor(
                   // Looks good, but can you make it 1-2 pages?...". The label is asked for separately
                   // rather than extracted, because extracting it would be a pattern reading English
                   // (tenet D11); absent, the numbers are shown instead.
+                  // A TYPED VALUE (WT22), ONLY FOR A NEED THIS STEP RECORDS AS ONE: the model reads the answer once
+                  // and records it as data, and a condition compares the data, never the words (tenet D11).
+                  number: { type: 'number', description: 'Only when this step records this need as a number: the value as a number.' },
+                  boolean: { type: 'boolean', description: 'Only when this step records this need as yes or no: the value as true or false.' },
+                  time: { type: 'string', description: 'Only when this step records this need as a time: the instant, ISO 8601 with its offset, such as 2026-11-07T14:00:00-05:00.' },
                   sizeLabel: {
                     type: 'string',
                     description: 'Only with minWords/maxWords: how to NAME that size to the person, in '
@@ -638,10 +657,13 @@ export function collectedRequirements(
   requirements: Record<string, string>;
   sourced: Record<string, CollectedRequirement>;
   lengthTarget?: RecordedLengthTarget;
+  /** The typed values given (WT22), by need; kept only where the step records that need as that type. */
+  typed?: Record<string, number | boolean | string>;
 } | undefined {
   if (!Array.isArray(input)) return undefined;
   const requirements: Record<string, string> = {};
   const sourced: Record<string, CollectedRequirement> = {};
+  const typed: Record<string, number | boolean | string> = {};
   let lengthTarget: RecordedLengthTarget | undefined;
 
   for (const entry of input) {
@@ -652,6 +674,11 @@ export function collectedRequirements(
     if (typeof requirement !== 'string' || typeof value !== 'string') continue;
     if (!requirement.trim() || !value.trim()) continue;
     requirements[requirement.trim()] = value.trim();
+    const e = entry as Record<string, unknown>;
+    if (typeof e.number === 'number' && Number.isFinite(e.number)) typed[requirement.trim()] = e.number;
+    else if (typeof e.boolean === 'boolean') typed[requirement.trim()] = e.boolean;
+    // A TIME, as an instant the model read once from the person's words: kept as ISO 8601, refused where it does not parse.
+    else if (typeof e.time === 'string' && Number.isFinite(Date.parse(e.time))) typed[requirement.trim()] = new Date(e.time).toISOString();
     if (
       typeof source === 'string' && (REQUIREMENT_SOURCES as readonly string[]).includes(source)
       && typeof evidence === 'string' && evidence.trim()
@@ -698,7 +725,7 @@ export function collectedRequirements(
     }
   }
   if (!Object.keys(requirements).length) return undefined;
-  return { requirements, sourced, ...(lengthTarget ? { lengthTarget } : {}) };
+  return { requirements, sourced, ...(Object.keys(typed).length ? { typed } : {}), ...(lengthTarget ? { lengthTarget } : {}) };
 }
 
 /**
@@ -801,6 +828,8 @@ export async function handleAdvanceTaskStateTool(args: {
   templates?: TurnTemplates;
   /** What the turn's resolver holds (`TaskLoopContext.variables`): the machine's conditions decide on it. */
   variables?: TurnVariables;
+  /** The only moves this turn may take, where the requester's message reached a task another person holds (WT114). */
+  requesterMoves?: string[];
 }): Promise<{
   payload: Record<string, unknown>;
   result: AdvanceResult;
@@ -823,6 +852,16 @@ export async function handleAdvanceTaskStateTool(args: {
     const result: AdvanceResult = { ok: false, error: 'unknown_state', from: args.task.taskState };
     return {
       payload: { ok: false, error: 'unknown_state', message: 'to_state is required' },
+      result,
+    };
+  }
+
+  // A REQUESTER'S TURN ON A TASK ANOTHER PERSON HOLDS (WT114) takes only the moves the step declares for the requester: the
+  // rest of the step is the worker's, so a move the step leaves to them is refused here, before anything is written.
+  if (args.requesterMoves && !args.requesterMoves.includes(toState)) {
+    const result: AdvanceResult = { ok: false, error: 'illegal_transition', from: args.task.taskState };
+    return {
+      payload: { ok: false, error: 'illegal_transition', message: `This task is held by someone else. The person who asked for it may only ask for: ${args.requesterMoves.join(', ')}.` },
       result,
     };
   }
@@ -871,6 +910,13 @@ export async function handleAdvanceTaskStateTool(args: {
       // a new size replaces it; one that agrees none leaves the earlier agreement standing, which
       // is what a person would expect from having said it once.
       ...(collected?.lengthTarget ? { lengthTarget: collected.lengthTarget } : {}),
+      // THE TYPED VALUES (WT22), kept only for a need the machine records as that type: a value given for any other
+      // need, or of another type, decides nothing and is not kept.
+      ...(() => {
+        const declared = machineRecords(machine);
+        const kept = Object.entries(collected?.typed ?? {}).filter(([need, value]) => (declared[need] === 'time' ? typeof value === 'string' : declared[need] === typeof value));
+        return kept.length ? { typed: { ...(args.task.details?.typed as Record<string, number | boolean | string> ?? {}), ...Object.fromEntries(kept) } } : {};
+      })(),
     }
     : undefined;
   // What the task will have recorded once this advance lands: what a delivering step reads its template
@@ -1162,6 +1208,58 @@ export function bindActionArgs(
     args[param] = value;
   }
   return { ok: true, args };
+}
+
+/** What a turn that ends on a step it owes a move out of is told: the step, what it required, and where it may go. */
+export interface OwedTransition {
+  state: string;
+  label?: string;
+  /** The step's `requiresTool`, every one of which returned success since the task entered the step. */
+  requiredTools: string[];
+  /** The moves the step offers (`legalTransitionsFrom`). */
+  next: string[];
+}
+
+/**
+ * WHETHER THE TURN'S TASK OWES A MOVE OUT OF ITS STEP AS THE MODEL ENDS ITS ANSWER (SPEC-TASK-STATE-TRANSITIONS §7a),
+ * read from the machine and the task row alone, never from what the reply says (tenet D11).
+ *
+ * Owed when the step is the assistant's (it awaits nobody and is not terminal), the platform does not move it itself (no
+ * `auto`, no `action`, it does not `rest`), and it declares `requiresTool`, every one of which returned success since
+ * the task entered it. That requirement is the step's own record that its work ran; a step that declares none has no
+ * such record, so a turn that ends in it is left where it is, as is a step waiting on a person. Null when nothing is owed.
+ */
+export function owedTransitionOf(
+  task: Pick<Task, 'taskType' | 'taskState' | 'status' | 'actionRuns' | 'stateHistory' | 'taskId' | 'channelArn'> | undefined,
+  machines: Record<string, TaskStateMachine>,
+): OwedTransition | null {
+  if (!task?.taskType || !task.taskState) return null;
+  if (task.status && task.status !== 'in_progress' && task.status !== 'pending') return null;
+  const def = machines[task.taskType]?.states?.[task.taskState];
+  if (!def || !stepIsTheAssistants(machines, task.taskType, task.taskState)) return null;
+  if (def.auto !== undefined || def.action || def.rests) return null;
+  const required = def.requiresTool ?? [];
+  if (!required.length || requiredToolsNotRun(task as Task, task.taskState, required).length) return null;
+  const next = legalTransitionsFrom(task.taskType, task.taskState, machines);
+  if (!next.length) return null;
+  return { state: task.taskState, ...(def.label ? { label: def.label } : {}), requiredTools: [...required], next };
+}
+
+/**
+ * THE CONTINUATION A TURN THAT OWES A MOVE IS GIVEN, once, in the same turn: the recorded facts (the step, its required
+ * tools ran, no move was taken) and what to do with them. The model decides whether the step's work is done; the
+ * platform never infers it from the reply. What the model already wrote is posted as written.
+ */
+export function owedTransitionPrompt(owed: OwedTransition): string {
+  return [
+    'Platform note (not from the person): this turn is ending with the task still at the step '
+      + `"${owed.state}"${owed.label ? ` (${owed.label})` : ''}. The tools that step requires have run `
+      + `(${owed.requiredTools.join(', ')}), and the task has not left it.`,
+    `If the work of this step is done, call ${ADVANCE_TASK_STATE_TOOL_NAME} now with one of: ${owed.next.join(', ')}. `
+      + 'If your reply above already did the work of the step that move enters, take that step\'s move too.',
+    'Your reply above is posted to the person as written: do not repeat or rewrite it. Write nothing more unless a step '
+      + 'you move into asks for work your reply has not done. If this step\'s work is not done, end without calling a tool.',
+  ].join('\n');
 }
 
 /**

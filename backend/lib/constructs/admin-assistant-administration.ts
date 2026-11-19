@@ -26,22 +26,36 @@ import { TEMPLATES_PREFIX } from '../../lambda/src/lib/template-store';
 import type { RouteMethod, RouteSpec } from './http-api';
 import {
   SSM_ROOT, STACK_PREFIX, ASSISTANT_OWNERSHIP_FUNCTION_NAME, ASSISTANT_PROVISIONER_FUNCTION_NAME, OWNER_TEAM_TAG,
-  assistantRolePath, alertEmitterWiring,
+  assistantRolePath, alertEmitterWiring, DEPLOY_OWNED_ASSISTANT_KEYS, EVERY_CLASSIFICATION, ownInstanceFunctions,
 } from '../stacks/agent-classification-common';
 import { invokeTheProvisioner, claimWriteFor } from './assistant-provisioner';
 import { defaultProfileRegistry } from '../profile-registry';
 import { goldenRunInvoke, CLASSIFIER_REPLAY_PARAM_ROOT } from './classification-archive-functions';
+import type { ProfileDirectCaller } from '../../lambda/src/lib/profile-direct-callers';
+import { TeamWriterRole, TEAM_ASSISTANT, TEAM_ALT, WHEN_TAGGED_WITH_AN_ALT } from './team-writer-role';
+import { TEAM_EXPERIMENT_ID_SEPARATOR } from '../../lambda/src/lib/team-writer-tags';
+
+/**
+ * The keys a DEPLOY publishes under `${SSM_ROOT}/assistant/<classification>/`, which the console's profile role reads and
+ * never writes. Named once, where the stack publishes them (`DEPLOY_OWNED_ASSISTANT_KEYS` in agent-classification-common).
+ * The `*-arn` keys are refused to every role by the registry aspect (`routingKeyWriteDenial`).
+ */
+const DEPLOY_OWNED_KEY_NAMES: readonly string[] = Object.values(DEPLOY_OWNED_ASSISTANT_KEYS);
 
 export interface AdminAssistantAdministrationProps extends cdk.NestedStackProps {
+  /** Whether the deployment declares the `notifications` capability, so a workflow can offer email. */
+  emailConfigured?: boolean;
   appInstanceArn: string;
   userPoolId: string;
   /** The Identity stack's table, by reference, for the team-scope check (`grantAssistantScopeCheck`). */
   identities?: { tableName: string; tableArn: string };
+  /** The company bucket's name, where the company-context prefixes an assistant's page shows are keys. */
+  companyBucketName: string;
   /**
-   * The attachments bucket ARN, which doubles as the profile BODY store (SPEC-PORTABLE-PROFILES, "Bodies
-   * are S3"). A construct reference from the Conversations stack.
+   * The profile bucket ARN, the profile BODY store (SPEC-PORTABLE-PROFILES, "Bodies are S3"), which also holds
+   * intent packs and templates. A construct reference from the Conversations stack.
    */
-  attachmentsBucketArn: string;
+  profileBucketArn: string;
   /** The Experiments stack's table, when `experiments` is declared. Absent: no experiment routes. */
   experimentsTable?: dynamodb.ITable;
 }
@@ -71,16 +85,42 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
     // /assistant/*; here we grant read + write + label, scoped to this instance's assistant namespace.
     // The profile BODY store: personas live in S3 under `profiles/*` and the SSM definition carries a
     // pointer, so a persona is bounded by MAX_PERSONA_LENGTH rather than by the 4096-character parameter.
-    const profileBodyBucketArn = props.attachmentsBucketArn;
+    const profileBodyBucketArn = props.profileBucketArn;
     const profileBodyBucketName = cdk.Fn.select(5, cdk.Fn.split(':', profileBodyBucketArn));
+    // A golden-set upload is handed over in the profile bucket, under `golden-uploads/`, beside what it evaluates.
+    const goldenUploadBucketName = profileBodyBucketName;
     const manageProfilesRole = new iam.Role(this, 'ManageProfilesRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       inlinePolicies: {
         ProfileDefinitionsSSM: new iam.PolicyDocument({
           statements: [
             new iam.PolicyStatement({
-              actions: ['ssm:GetParameter', 'ssm:GetParameterHistory', 'ssm:PutParameter', 'ssm:LabelParameterVersion'],
+              actions: ['ssm:GetParameter', 'ssm:GetParameterHistory'],
               resources: [`arn:aws:ssm:${region}:${account}:parameter${SSM_ROOT}/assistant/*`],
+            }),
+            // WRITES NAME WHAT THIS ROLE OWNS: an assistant's versions (`definition`, labeled `active`), its draft,
+            // and the advertisement an activation projects from the version. Everything else under
+            // `/assistant/*` is written by a deploy (the classification's guardrails, context sources, pack,
+            // persona, intake and orientation) or by another role (templates), and this role only reads it.
+            new iam.PolicyStatement({
+              actions: ['ssm:PutParameter'],
+              resources: ['definition', 'draft', 'advertisement'].map(
+                (key) => `arn:aws:ssm:${region}:${account}:parameter${SSM_ROOT}/assistant/*/${key}`,
+              ),
+            }),
+            new iam.PolicyStatement({
+              actions: ['ssm:LabelParameterVersion'],
+              resources: [`arn:aws:ssm:${region}:${account}:parameter${SSM_ROOT}/assistant/*/definition`],
+            }),
+            // AND THE DEPLOY'S KEYS ARE REFUSED BY NAME, as template pointers are below, so no later Allow on
+            // `/assistant/*` can hand the console a classification's guardrails, catalog or pack.
+            new iam.PolicyStatement({
+              sid: 'NoDeployOwnedAssistantKeyWrites',
+              effect: iam.Effect.DENY,
+              actions: ['ssm:PutParameter', 'ssm:DeleteParameter', 'ssm:LabelParameterVersion'],
+              resources: DEPLOY_OWNED_KEY_NAMES.map(
+                (key) => `arn:aws:ssm:${region}:${account}:parameter${SSM_ROOT}/assistant/*/${key}`,
+              ),
             }),
             // Activation consumes the draft it promoted. Delete is scoped to DRAFTS ONLY: a definition
             // parameter is the served version history, and deleting it would erase every rollback target.
@@ -120,12 +160,15 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
               resources: [`arn:aws:ssm:${region}:${account}:parameter${SSM_ROOT}/channel-flow-arn`],
             }),
             // Read-only: each profile's live processor and router configuration, so the console can deep-link
-            // to the guardrail, role and function (`lib/profile-infra.ts`). SCOPED TO THIS DEPLOYMENT:
-            // `GetFunctionConfiguration` returns the environment, so `function:*` would expose every
-            // unrelated function's configuration in a multi-product account.
+            // to the guardrail, role and function (`lib/profile-infra.ts`). SCOPED TO THIS DEPLOYMENT'S
+            // CLASSIFICATION FUNCTIONS: `GetFunctionConfiguration` returns the environment, and what it reads is a
+            // classification's processor, router and vend, each tagged with its classification and this instance, so the
+            // tags bound the read to them and no other function's configuration is reachable.
             new iam.PolicyStatement({
+              sid: 'ReadAClassificationsFunctionConfiguration',
               actions: ['lambda:GetFunctionConfiguration'],
               resources: [`arn:aws:lambda:${region}:${account}:function:${STACK_PREFIX}*`],
+              conditions: ownInstanceFunctions(EVERY_CLASSIFICATION),
             }),
             // ── FINDING A RUNTIME ASSISTANT BY NAME, READ ONLY (ADR-048) ─────────────────────────
             new iam.PolicyStatement({
@@ -158,6 +201,11 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
         // Without this the lifecycle keeps personas INLINE and silently re-imposes the 4096-character
         // definition cap (profile-body-store-grant.test.ts).
         PROFILE_BODY_BUCKET: profileBodyBucketName,
+        // Where a golden-set upload's entries and a run's input are handed over: the profile bucket, under golden-uploads/.
+        GOLDEN_UPLOAD_BUCKET: goldenUploadBucketName,
+        // Where the company-context prefixes an assistant's page names are keys.
+        CONTEXT_BUCKET: props.companyBucketName,
+        EMAIL_CONFIGURED: props.emailConfigured ? 'true' : 'false',
         // The experiment a variant-version candidate is derived for, when experiments are declared.
         ...(experimentsTable ? { EXPERIMENTS_TABLE: experimentsTable.tableName } : {}),
         // WHETHER AN IDLE ASSISTANT TAKES UP ITS TASKS HERE (ADR-063 decision H1): a version whose workflow assigns work to
@@ -226,6 +274,12 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
     }));
     runtimeNameApplier.grantInvoke(manageProfilesRole);
     manageProfilesFn.addEnvironment('RUNTIME_NAME_APPLIER_ARN', runtimeNameApplier.functionArn);
+    // ONE ALIAS PER DIRECT CALLER (`profile-direct-callers.ts`): each caller is granted the invoke on its own alias
+    // alone, and the handler serves an alias only the operations that caller asks for.
+    const profileAlias = (caller: ProfileDirectCaller): lambda.Alias => new lambda.Alias(this, `ManageProfilesFor-${caller}`, {
+      aliasName: caller,
+      version: manageProfilesFn.currentVersion,
+    });
     // `variant-version` publishes the UNLABELLED candidate a battle variant runs (§3.7): an experiment's,
     // so it exists with the experiments.
     // `preview-run` walks one draft workflow with sample values and writes nothing (ADR-061 decision 7).
@@ -233,7 +287,8 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
     // `golden-run` starts a draft's run against the golden set and `golden-gate` reads its result (ADR-065).
     // `golden-set-import` adds a deployment's own entries and `golden-set-retire-upload` retires one upload (decision 7);
     // `golden-set-generate` writes entries from the draft's intent pack and `golden-set-retire-generation` retires one (decision 8).
-    const profileActions = ['version', 'draft', 'validate', 'preview-run', 'activate', 'rollback', 'export', 'import', 'discard', 'golden-run', 'golden-gate', 'golden-set-import', 'golden-set-retire-upload', 'golden-set-generate', 'golden-set-retire-generation', 'golden-set-batch'];
+    // `process-export` and `process-import` move one process as its own manifest (SPEC-PROCESSES P13).
+    const profileActions = ['version', 'draft', 'validate', 'preview-run', 'activate', 'rollback', 'export', 'import', 'process-export', 'process-import', 'discard', 'golden-run', 'golden-gate', 'golden-set-import', 'golden-set-retire-upload', 'golden-set-generate', 'golden-set-retire-generation', 'golden-set-batch'];
     route('GET', '/admin/profiles', manageProfilesFn);
     for (const action of profileActions) route('POST', `/admin/profiles/${action}`, manageProfilesFn);
     if (experimentsTable) route('POST', '/admin/profiles/variant-version', manageProfilesFn, 'experiments');
@@ -245,6 +300,64 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
     route('GET', '/admin/assistants/{assistant}/profiles', manageProfilesFn);
     for (const action of profileActions) route('POST', `/admin/assistants/{assistant}/profiles/${action}`, manageProfilesFn);
     if (experimentsTable) route('POST', '/admin/assistants/{assistant}/profiles/variant-version', manageProfilesFn, 'experiments');
+    // A TEAM ROUTE WRITES AS ITS PATH'S ASSISTANT (`team-writer-role.ts`): its versions, draft and advertisement, its
+    // bodies and its golden-set hand-overs, and, when an experiment's candidate is published, its role's alt's version and
+    // bodies. The execution role above keeps every assistant's reach for an administrator's routes.
+    const ssmAssistant = (name: string, key: string) => `arn:aws:ssm:${region}:${account}:parameter${SSM_ROOT}/assistant/${name}/${key}`;
+    new TeamWriterRole(this, 'ProfilesTeamWriter', {
+      assumedBy: manageProfilesRole,
+      alt: true,
+      description: "What a team route of manage-profiles writes: the path's assistant's profile, and its role's alt's candidate",
+      statements: () => [
+        new iam.PolicyStatement({
+          sid: 'WriteTheTeamsAssistantsVersions',
+          actions: ['ssm:PutParameter'],
+          resources: ['definition', 'draft', 'advertisement'].map((key) => ssmAssistant(TEAM_ASSISTANT, key)),
+        }),
+        new iam.PolicyStatement({
+          sid: 'ActivateTheTeamsAssistantsVersions',
+          actions: ['ssm:LabelParameterVersion'],
+          resources: [ssmAssistant(TEAM_ASSISTANT, 'definition')],
+        }),
+        new iam.PolicyStatement({
+          sid: 'ConsumeTheTeamsAssistantsDraft',
+          actions: ['ssm:DeleteParameter'],
+          resources: [ssmAssistant(TEAM_ASSISTANT, 'draft')],
+        }),
+        new iam.PolicyStatement({
+          sid: 'WriteTheTeamsAssistantsBodies',
+          actions: ['s3:PutObject'],
+          resources: [`${profileBodyBucketArn}/profiles/${TEAM_ASSISTANT}/*`, `${profileBodyBucketArn}/golden-uploads/*/${TEAM_ASSISTANT}/*`],
+        }),
+        // AN EXPERIMENT'S CANDIDATE, published in the alt of the assistant's own role, which the handler derives from the
+        // path's assistant. Only on a session tagged with an alt, and an unlabelled version alone.
+        new iam.PolicyStatement({
+          sid: 'PublishTheTeamsCandidateInItsAlt',
+          actions: ['ssm:PutParameter'],
+          resources: [ssmAssistant(TEAM_ALT, 'definition')],
+          conditions: WHEN_TAGGED_WITH_AN_ALT,
+        }),
+        new iam.PolicyStatement({
+          sid: 'WriteTheTeamsCandidatesBodies',
+          actions: ['s3:PutObject'],
+          resources: [`${profileBodyBucketArn}/profiles/${TEAM_ALT}/*`],
+          conditions: WHEN_TAGGED_WITH_AN_ALT,
+        }),
+        // THE DEPLOY'S KEYS AND THE TEMPLATE POINTERS ARE REFUSED BY NAME, as on the execution role.
+        new iam.PolicyStatement({
+          sid: 'NoDeployOwnedAssistantKeyWrites',
+          effect: iam.Effect.DENY,
+          actions: ['ssm:PutParameter', 'ssm:DeleteParameter', 'ssm:LabelParameterVersion'],
+          resources: DEPLOY_OWNED_KEY_NAMES.map((key) => ssmAssistant('*', key)),
+        }),
+        new iam.PolicyStatement({
+          sid: 'NoTemplatePointerWrites',
+          effect: iam.Effect.DENY,
+          actions: ['ssm:PutParameter', 'ssm:DeleteParameter', 'ssm:LabelParameterVersion'],
+          resources: [ssmAssistant('*', 'templates/*')],
+        }),
+      ],
+    }).wire(manageProfilesFn);
 
     // ── AN ASSISTANT'S OWN MESSAGE TEMPLATES (ADR-062 decision 2) ──────────────────────────────────
     //
@@ -312,6 +425,24 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
       actions: ['ssm:PutParameter', 'ssm:DeleteParameter', 'ssm:LabelParameterVersion'],
       resources: [`arn:aws:ssm:${region}:${account}:parameter${SSM_ROOT}/assistant/*/templates/*`],
     }));
+    // A TEAM ROUTE WRITES AS ITS PATH'S ASSISTANT (`team-writer-role.ts`): that assistant's family in every
+    // classification, and no other assistant's. The grants above keep every family's reach for an administrator's routes.
+    new TeamWriterRole(this, 'TemplatesTeamWriter', {
+      assumedBy: messageTemplatesFn.role!,
+      description: "What a team route of the message templates writes: the path's assistant's own family",
+      statements: () => [
+        new iam.PolicyStatement({
+          sid: 'WriteTheTeamsAssistantsTemplates',
+          actions: ['s3:PutObject'],
+          resources: [`${profileBodyBucketArn}/${TEMPLATES_PREFIX}/*/_assistants/${TEAM_ASSISTANT}/*`],
+        }),
+        new iam.PolicyStatement({
+          sid: 'ActivateTheTeamsAssistantsTemplates',
+          actions: ['ssm:PutParameter'],
+          resources: [`arn:aws:ssm:${region}:${account}:parameter${SSM_ROOT}/assistant/*/templates/_assistants/${TEAM_ASSISTANT}/*`],
+        }),
+      ],
+    }).wire(messageTemplatesFn);
     route('GET', '/admin/templates', messageTemplatesFn);
     route('POST', '/admin/templates/save', messageTemplatesFn);
     route('POST', '/admin/templates/rollback', messageTemplatesFn);
@@ -368,6 +499,9 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
       memorySize: 256,
       role: ownershipRole,
       environment: {
+        // THIS INSTANCE'S CONSOLE ROLES, by name, so the handler admits only sessions this instance minted.
+        ...adminAuthEnv(this),
+        ADMIN_IAM_ENFORCEMENT: 'true',
         APP_INSTANCE_ARN: props.appInstanceArn,
         USER_POOL_ID: props.userPoolId,
         ALLOWED_ORIGIN: adminAppUrl,
@@ -423,6 +557,7 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
     // classification (the guest's) is served by the assistant its stack declares, and adding a runtime assistant to
     // anonymous visitors' conversations is **NOT BUILT**.
     const ssmArn = (p: string) => `arn:aws:ssm:${region}:${account}:parameter${SSM_ROOT}/${p}`;
+    const profilesForBuilds = profileAlias('assistant-builds');
     const manageAssistantsRole = new iam.Role(this, 'ManageAssistantsRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')],
@@ -459,12 +594,12 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
               resources: [ownershipFn.functionArn],
             }),
             // A NEW ASSISTANT'S FIRST DRAFT is written by `manage-profiles`, the one writer of the profile
-            // namespace (SPEC-PORTABLE-PROFILES §7): this role asks it, naming the assistant and nothing else,
-            // and holds no write under `/assistant/*` itself.
+            // namespace (SPEC-PORTABLE-PROFILES §7): this role asks it through its own alias, which serves the
+            // starting-point check and the first draft and nothing else, and holds no write under `/assistant/*` itself.
             new iam.PolicyStatement({
               sid: 'AskForTheFirstDraft',
               actions: ['lambda:InvokeFunction'],
-              resources: [manageProfilesFn.functionArn],
+              resources: [profilesForBuilds.functionArn],
             }),
             // The names assistants show, for a create's uniqueness check: an active version may have renamed
             // one. Read only, the definitions alone.
@@ -493,7 +628,7 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
         APP_INSTANCE_ARN: props.appInstanceArn,
         PROVISIONER_FUNCTION_NAME: ASSISTANT_PROVISIONER_FUNCTION_NAME,
         OWNERSHIP_FUNCTION_NAME: ownershipFn.functionName,
-        MANAGE_PROFILES_FUNCTION_NAME: manageProfilesFn.functionName,
+        MANAGE_PROFILES_FUNCTION_NAME: profilesForBuilds.functionArn,
         ADMIN_IAM_ENFORCEMENT: 'true',
       },
       bundling: { minify: false, forceDockerBundling: false },
@@ -518,7 +653,7 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
 
     // ── EXPERIMENT ADMINISTRATION, ONLY WITH THE `experiments` CAPABILITY ──────────────────────────
     if (experimentsTable) {
-      this.experimentRoutes(route, experimentsTable, manageProfilesFn, props, adminAppUrl);
+      this.experimentRoutes(route, experimentsTable, manageProfilesFn, profileAlias('experiments'), props, adminAppUrl);
     }
   }
 
@@ -526,6 +661,7 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
     route: (method: RouteMethod, path: string, handler: lambda.IFunction, capability?: string) => void,
     experimentsTable: dynamodb.ITable,
     manageProfilesFn: lambda.Function,
+    profilesForExperiments: lambda.Alias,
     props: AdminAssistantAdministrationProps,
     adminAppUrl: string,
   ): void {
@@ -592,12 +728,37 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
       bundling: { minify: false, forceDockerBundling: false },
     });
     grantAssistantScopeCheck(adminExperimentsFn, props.appInstanceArn, props.userPoolId, props.identities);
+    // A TEAM ROUTE WRITES AS ITS PATH'S ASSISTANT (`team-writer-role.ts`): the rows whose partition key, the experiment
+    // id, begins with that assistant (`<assistant>.<id>`, `teamExperimentId`). The table is keyed by the id, so the key
+    // itself names the owner and no other row is reachable. Reads stay on the execution role, which keeps every row
+    // for an administrator's routes.
+    new TeamWriterRole(this, 'ExperimentsTeamWriter', {
+      assumedBy: adminExperimentsRole,
+      description: "What a team route of the experiments writes: the experiments stored under the path's assistant",
+      statements: () => [
+        new iam.PolicyStatement({
+          sid: 'WriteTheTeamsAssistantsExperiments',
+          actions: ['dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem'],
+          resources: [experimentsTable.tableArn],
+          // `Null: false` as well: `ForAllValues` alone holds for a request that carries no key at all.
+          conditions: {
+            'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': [`${TEAM_ASSISTANT}${TEAM_EXPERIMENT_ID_SEPARATOR}*`] },
+            Null: { 'dynamodb:LeadingKeys': 'false' },
+          },
+        }),
+      ],
+    }).wire(adminExperimentsFn);
     // READ ONE ITEM, NOTHING ELSE: the candidate route checks the experiment it derives for.
     manageProfilesFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:GetItem'], resources: [experimentsTable.tableArn] }));
     // ARMING A BATTLE DERIVES BOTH SIDES' VERSIONS: the experiments handler asks the profile writer to
-    // derive them (`deriveBattleSides`), so manage-profiles stays the only writer to the profile namespace.
-    manageProfilesFn.grantInvoke(adminExperimentsFn);
-    adminExperimentsFn.addEnvironment('MANAGE_PROFILES_FUNCTION_NAME', manageProfilesFn.functionName);
+    // derive them (`deriveBattleSides`), so manage-profiles stays the only writer to the profile namespace. It
+    // asks through its own alias, which serves the experiment operations and nothing else.
+    adminExperimentsFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'AskTheProfileWriterForExperiments',
+      actions: ['lambda:InvokeFunction'],
+      resources: [profilesForExperiments.functionArn],
+    }));
+    adminExperimentsFn.addEnvironment('MANAGE_PROFILES_FUNCTION_NAME', profilesForExperiments.functionArn);
 
     const fn = adminExperimentsFn;
     const e = (method: RouteMethod, path: string): void => route(method, path, fn, 'experiments');

@@ -25,14 +25,14 @@ const WorkflowGroups: React.FC<{ workflows: readonly Workflow[]; testId?: string
   return (
     <div className="admin-workflow-groups" data-testid={testId}>
       <section aria-labelledby={`${testId}-required`} data-testid={`${testId}-required`}>
-        <h6 id={`${testId}-required`}>
+        <h5 id={`${testId}-required`}>
           {t('admin.workflows.required')} <span className="admin-badge">{t('admin.assistantPage.platform.badge')}</span>
-        </h6>
+        </h5>
         <p className="admin-field-hint">{t('admin.workflows.requiredHelp')}</p>
         <div>{required.length ? required.map((w) => <code key={w.key} className="admin-chip">{w.key}</code>) : t('admin.assistantPage.none')}</div>
       </section>
       <section aria-labelledby={`${testId}-optional`} data-testid={`${testId}-optional`}>
-        <h6 id={`${testId}-optional`}>{t('admin.workflows.optional')}</h6>
+        <h5 id={`${testId}-optional`}>{t('admin.workflows.optional')}</h5>
         <p className="admin-field-hint">{t('admin.workflows.optionalHelp')}</p>
         <div>
           {optional.length ? optional.map((w) => (

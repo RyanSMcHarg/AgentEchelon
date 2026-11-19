@@ -95,6 +95,10 @@ const V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}
 
 function loadHandler(signedIn = true) {
   jest.resetModules();
+  // The console role is read from the person's groups now at every admin vend (R6). This suite is about the vend, so the
+  // person signs in through no directory that keeps groups and the session's role stands; the recheck itself is
+  // `test/lib/a-removed-admin-is-vended-nothing-more.test.ts`.
+  (jest.requireMock('../lambda/src/lib/membership-source') as { __accountStateForTests: { groupsFor: jest.Mock } }).__accountStateForTests.groupsFor.mockResolvedValue(null);
   signedInFirst = signedIn;
   process.env.APP_INSTANCE_ARN = APP;
   process.env.ACCESS_LOG_TABLE = 'access-log';
@@ -118,13 +122,13 @@ function loadHandler(signedIn = true) {
   process.env.ADMIN_CONSOLE_ROLE_ARN = 'arn:aws:iam::111:role/agent-echelon-admin-console';
   process.env.TEAM_CONSOLE_ROLE_ARN = 'arn:aws:iam::111:role/agent-echelon-team-console';
   process.env.EXCHANGE_EXECUTE_API_TASKS_READ_ARN =
-    'arn:aws:execute-api:us-east-1:111:api123/*/GET/admin/tasks/channel/{id}';
+    'arn:aws:execute-api:us-east-1:111:{apiId}/*/GET/admin/tasks/channel/{id}';
   process.env.EXCHANGE_EXECUTE_API_TASKS_MANAGE_ARN =
-    'arn:aws:execute-api:us-east-1:111:api123/*/POST/admin/tasks/channel/{id}/cancel';
+    'arn:aws:execute-api:us-east-1:111:{apiId}/*/POST/admin/tasks/channel/{id}/cancel';
   process.env.EXCHANGE_EXECUTE_API_TASKS_OWNED_BY_ARN =
-    'arn:aws:execute-api:us-east-1:111:api123/*/GET/admin/tasks/owned-by/{id}';
+    'arn:aws:execute-api:us-east-1:111:{apiId}/*/GET/admin/tasks/owned-by/{id}';
   process.env.EXCHANGE_EXECUTE_API_MESSAGES_ARN =
-    'arn:aws:execute-api:us-east-1:111:api123/*/GET/admin/conversations/{id}/messages';
+    'arn:aws:execute-api:us-east-1:111:{apiId}/*/GET/admin/conversations/{id}/messages';
   process.env.EXCHANGE_ATTACHMENTS_BUCKET_ARN_PARAM = '/agentechelon/shared/attachments-bucket-arn';
   delete process.env.EXCHANGE_ATTACHMENTS_BUCKET_ARN; // force the SSM resolve path in tests
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -152,7 +156,8 @@ function adminVend(capability: string, body: Record<string, unknown> = {}, opts:
   return {
     httpMethod: 'POST',
     path: `/exchange-credentials/admin/${capability}`,
-    requestContext: { identity: { userArn: `arn:aws:sts::111:assumed-role/${role}/console-${opts.sub ?? ADMIN_SUB}` } },
+    // Every vend arrives through this instance's admin API, whose id completes the archive plane's templates.
+    requestContext: { apiId: 'api123', identity: { userArn: `arn:aws:sts::111:assumed-role/${role}/console-${opts.sub ?? ADMIN_SUB}` } } as Record<string, any>,
     body: JSON.stringify({ reason: 'unit test', ...body }),
   };
 }
@@ -346,6 +351,40 @@ describe('a task vend is narrowed to the subject it names', () => {
     expect(stmt.Resource[0]).not.toMatch(/\/admin\/tasks\/channel\/?$/);
   });
 
+  it('names the admin API that carried the request, never any API in the account', async () => {
+    const { handler } = loadHandler();
+    const res = await handler(adminVend('tasks-manage', { channelArn: CHANNEL }));
+
+    expect(res.statusCode).toBe(200);
+    const stmt = JSON.parse(mockStsSend.mock.calls[0][0].input.Policy).Statement
+      .find((st: { Sid: string }) => st.Sid === 'ArchiveApiInvoke');
+    for (const r of stmt.Resource) {
+      expect(r).toMatch(/^arn:aws:execute-api:us-east-1:111:api123\//);
+      expect(r).not.toContain('{apiId}');
+    }
+  });
+
+  it.each([
+    ['no API id', undefined],
+    ['a wildcard API id', '*'],
+    ['an API id carrying a path', 'api123/*/GET/admin'],
+  ])('refuses an archive vend with %s, and assumes nothing', async (_label, apiId) => {
+    const { handler } = loadHandler();
+    const ev = adminVend('tasks-read', { channelArn: CHANNEL });
+    if (apiId === undefined) delete ev.requestContext.apiId; else ev.requestContext.apiId = apiId;
+    const res = await handler(ev);
+
+    expect(res.statusCode).toBe(500);
+    expect(mockStsSend).not.toHaveBeenCalled();
+  });
+
+  it('refuses a template that does not name the API by id', () => {
+    const { archiveResourceFor } = loadHandler();
+    expect(archiveResourceFor('arn:aws:execute-api:us-east-1:111:*/*/GET/admin/tasks/channel/{id}', 'api123', 'room-1')).toBe('');
+    expect(archiveResourceFor('arn:aws:execute-api:us-east-1:111:{apiId}/*/GET/admin/tasks/channel/{id}', 'api123', 'room-1'))
+      .toBe('arn:aws:execute-api:us-east-1:111:api123/*/GET/admin/tasks/channel/room-1');
+  });
+
   it('pins the owner id for the cross-channel read, and takes no channel', async () => {
     const { handler } = loadHandler();
     const res = await handler(adminVend('tasks-read-owned-by', { principalId: 'owner-7' }));
@@ -458,6 +497,22 @@ describe('admin console sessions and per-capability vends', () => {
     expect(out.role).toBe('admins');
     expect(out.capabilities).toContain('redact');
     expect(out.capabilities).toContain('view-analytics');
+  });
+
+  it('issues no console session to a person whose live groups no longer hold the role the token names (R6)', async () => {
+    const { handler } = loadHandler();
+    (jest.requireMock('../lambda/src/lib/membership-source') as { __accountStateForTests: { groupsFor: jest.Mock } }).__accountStateForTests.groupsFor.mockResolvedValue(['premium']);
+    const res = await handler(event({ sub: ADMIN_SUB, 'cognito:groups': 'admins' }, { identity: 'console' }));
+    expect({ status: res.statusCode, code: JSON.parse(res.body).code }).toEqual({ status: 403, code: 'CONSOLE_ROLE_LAPSED' });
+    expect(mockStsSend).not.toHaveBeenCalled();
+  });
+
+  it('issues no console session when the live groups cannot be read', async () => {
+    const { handler } = loadHandler();
+    (jest.requireMock('../lambda/src/lib/membership-source') as { __accountStateForTests: { groupsFor: jest.Mock } }).__accountStateForTests.groupsFor.mockRejectedValue(new Error('directory down'));
+    const res = await handler(event({ sub: ADMIN_SUB, 'cognito:groups': 'admins' }, { identity: 'console' }));
+    expect({ status: res.statusCode, code: JSON.parse(res.body).code }).toEqual({ status: 503, code: 'DIRECTORY_UNAVAILABLE' });
+    expect(mockStsSend).not.toHaveBeenCalled();
   });
 
   it('names which granted capabilities are vended on request, from the catalog, and how long one vend lasts', async () => {
@@ -771,7 +826,9 @@ describe('every admin vend asks the issuer, not the console session', () => {
       expect([cap, res.statusCode, JSON.parse(res.body).code]).toEqual([cap, 403, 'PERSON_NOT_ACTIVE']);
     }
     expect(mockStsSend).not.toHaveBeenCalled();
-    expect(mockDocSend.mock.calls.filter((c) => c[0]?.input?.TableName === 'access-log')).toEqual([]);
+    // No grant is recorded; each refusal is, with its code (a-refusal-is-recorded-beside-the-grants.test.ts).
+    const written = mockDocSend.mock.calls.filter((c) => c[0]?.input?.TableName === 'access-log').map((c) => c[0].input.Item);
+    expect(written.map((i) => [i.outcome, i.code])).toEqual([['refused', 'PERSON_NOT_ACTIVE'], ['refused', 'PERSON_NOT_ACTIVE'], ['refused', 'PERSON_NOT_ACTIVE']]);
   });
 
   it('refuses 503 and assumes nothing when the issuer cannot be asked (fail closed)', async () => {

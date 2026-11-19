@@ -18,6 +18,7 @@ import * as path from 'path';
 
 const SRC = path.join(__dirname, '..', 'lambda', 'src');
 const STACKS = path.join(__dirname, '..', 'lib', 'stacks');
+const CONSTRUCTS = path.join(__dirname, '..', 'lib', 'constructs');
 const CHAT = path.join(__dirname, '..', '..', 'frontend', 'packages', 'chat', 'src');
 
 const read = (base: string, rel: string) => fs.readFileSync(path.join(base, rel), 'utf8');
@@ -255,24 +256,25 @@ describe('tenet D15 - lifecycle is scoped to the prefix it is named for', () => 
   // rule it was written about, so a brand-new un-prefixed expiry added to any of these four stacks
   // stayed green - the opposite of "so this guard binds on the NEXT one". A rule with no `id` keys as
   // `(unnamed)`, and the suppression count below is what stops two unnamed rules sharing one entry.
-  const BUCKET_WIDE_EXPIRY: Record<string, string> = {
-    'notification-stack.ts::(unnamed)':
-      'OK. Dedicated briefings bucket, one key family (`briefings/*`), and the objects are ephemeral by '
-      + 'design - the presigned link TTL is 7 days and the rule is 30. Name and effect agree.',
-    'conversations-stack.ts::DeleteOldAttachments':
-      'FINDING. `DeleteOldAttachments`, 90 days, deployed with `Prefix: ""` over FOUR families: the '
-      + 'seeded company corpus, platform self-knowledge, assistant deliverables and member uploads. '
-      + 'Not yet fired because re-seeding resets the clock.',
-    'archive-stack-aurora.ts::(unnamed)':
-      'FINDING, and the most serious of the three. This is the CONVERSATION ARCHIVE, which tenet D7 '
-      + 'calls "the system of record. Append-only, survives channel deletion, holds the full event '
-      + 'sequence". Read back from the deployed bucket: `Expiration: 90 days`, `Filter: {Prefix: ""}`. '
-      + 'A system of record with a 90-day expiry is a 90-day window.',
-    'archive-stack.ts::(unnamed)':
-      'FINDING. The Athena-mode archive carries the same 90-day bucket-wide rule, beside a correctly '
-      + 'scoped 7-day rule on `client_events/event_type=unknown/` - so the file already knows how to '
-      + 'write a scoped rule.',
-  };
+  // Empty: every bucket-wide expiry this list once carried is scoped now (the attachments bucket by family, both
+  // conversation archives with the system of record left unexpired, the Aurora archive bucket by its one family),
+  // and the briefings entry named a rule that had already been given its prefix. An entry added here needs the
+  // same justification the two kinds above describe.
+  const BUCKET_WIDE_EXPIRY: Record<string, string> = {};
+
+  /**
+   * WHERE A LIFECYCLE RULE CAN BE WRITTEN: the stacks AND the constructs. A bucket defined in a construct is
+   * as real as one in a stack, and the Aurora-mode conversation archive (`lib/constructs/conversation-archive.ts`)
+   * carried a bucket-wide 90-day expiry on the system of record for as long as this guard read stacks alone.
+   */
+  const SOURCE_DIRS = [STACKS, CONSTRUCTS];
+  const sourceFiles = (): Array<{ file: string; full: string }> => SOURCE_DIRS.flatMap((dir) =>
+    fs.readdirSync(dir).filter((f) => f.endsWith('.ts') && !f.endsWith('.d.ts')).map((file) => ({ file, full: path.join(dir, file) })));
+
+  it("scans the constructs as well as the stacks, and finds the archive construct's rules there", () => {
+    const files = sourceFiles().map((f) => f.file);
+    expect(files).toEqual(expect.arrayContaining(['conversation-archive.ts', 'archive-stack.ts']));
+  });
 
   it('no lifecycle rule in a multi-family bucket expires objects without naming its prefix', () => {
     const offenders: string[] = [];
@@ -280,8 +282,8 @@ describe('tenet D15 - lifecycle is scoped to the prefix it is named for', () => 
     // for ONE rule: `(unnamed)` is not a name, so without this a second unnamed un-prefixed expiry in
     // an already-listed file would be absorbed by the first one's entry and reported clean.
     const suppressed = new Map<string, number>();
-    for (const file of fs.readdirSync(STACKS).filter((f) => f.endsWith('.ts') && !f.endsWith('.d.ts'))) {
-      const src = fs.readFileSync(path.join(STACKS, file), 'utf8');
+    for (const { file, full } of sourceFiles()) {
+      const src = fs.readFileSync(full, 'utf8');
       // EVERY `lifecycleRules:` IN THE FILE, not the first. No stack declares two today - each of the
       // four names exactly one - so this is not fixing an observed miss; it is removing the reason a
       // second bucket would be invisible, which is the cheaper half of the two.
@@ -346,7 +348,7 @@ describe('tenet D15 - lifecycle is scoped to the prefix it is named for', () => 
     const stale: string[] = [];
     for (const key of Object.keys(BUCKET_WIDE_EXPIRY)) {
       const [file, id] = key.split('::');
-      const full = path.join(STACKS, file);
+      const full = SOURCE_DIRS.map((dir) => path.join(dir, file)).find((f) => fs.existsSync(f)) ?? path.join(STACKS, file);
       if (!fs.existsSync(full)) { stale.push(`${key}: listed but the file is gone`); continue; }
       const src = fs.readFileSync(full, 'utf8');
       if (!/lifecycleRules:/.test(src)) {

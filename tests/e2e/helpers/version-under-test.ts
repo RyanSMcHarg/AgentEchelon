@@ -10,6 +10,7 @@
 import { expect } from '@playwright/test';
 import { signedCall, type VendedCredentials } from './admin-api';
 import { adminUrl } from './api-urls';
+import { replacingDraft, draftIdOf } from './profile-draft';
 
 /** The served version is cached by the router and the processor for 30 seconds; a spec waits this long after activating. */
 export const SERVED_VERSION_TTL_MS = 35_000;
@@ -34,17 +35,17 @@ export async function activateVersionWith(
   const previous = (listing.body?.profiles ?? []).find((p: any) => p.profileName === profileName)?.activeVersion;
   expect(previous, `${profileName} has no active version to return to`).toBeDefined();
 
-  const created = await signedCall(adminUrl('assistant-admin', '/admin/profiles/version'), admin, 'POST', { profileName });
+  const created = await replacingDraft((b) => signedCall(adminUrl('assistant-admin', '/admin/profiles/version'), admin, 'POST', b), { profileName });
   expect(created.status, JSON.stringify(created.body).slice(0, 400)).toBe(200);
   const exported = await signedCall(adminUrl('assistant-admin', '/admin/profiles/export'), admin, 'POST', { profileName, draft: true });
   expect(exported.status, JSON.stringify(exported.body).slice(0, 400)).toBe(200);
   const patch = patchFor((exported.body?.manifest?.body ?? {}) as VersionBody);
 
-  const edited = await signedCall(adminUrl('assistant-admin', '/admin/profiles/draft'), admin, 'POST', { profileName, patch });
+  const edited = await signedCall(adminUrl('assistant-admin', '/admin/profiles/draft'), admin, 'POST', { profileName, patch, configId: draftIdOf(created) });
   expect(edited.status, JSON.stringify(edited.body).slice(0, 400)).toBe(200);
   const valid = await signedCall(adminUrl('assistant-admin', '/admin/profiles/validate'), admin, 'POST', { profileName });
   expect(valid.body?.errors ?? [], JSON.stringify(valid.body).slice(0, 600)).toEqual([]);
-  const activated = await signedCall(adminUrl('assistant-admin', '/admin/profiles/activate'), admin, 'POST', { profileName });
+  const activated = await signedCall(adminUrl('assistant-admin', '/admin/profiles/activate'), admin, 'POST', { profileName, configId: draftIdOf(edited) });
   expect(activated.status, JSON.stringify(activated.body).slice(0, 400)).toBe(200);
   return previous as number;
 }

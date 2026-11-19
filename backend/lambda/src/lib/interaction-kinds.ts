@@ -72,6 +72,11 @@ export const INTERACTION_KINDS = [
    * the primary's own session, which posts nothing and which nobody is waiting on.
    */
   'name_room',
+  /**
+   * A recorded meeting's summary (`lib/meeting-summary-turn.ts`): the room's owning assistant reads the transcript once the
+   * meeting has ended and writes its summary and action items onto the ended card. Nobody asked and nobody is waiting on it.
+   */
+  'meeting_summary',
 ] as const;
 
 /**
@@ -147,7 +152,7 @@ export function normaliseLegacyTrigger(v: string | null | undefined): Interactio
  * A rebuttal is deliberately absent: it pairs with the person's message the duel began from, as its own
  * round, and is measured from its own trigger (migration 071).
  */
-export const ANSWERS_NO_MESSAGE_KINDS: readonly InteractionKind[] = ['join_recap', 'welcome', 'event_step', 'task_step'];
+export const ANSWERS_NO_MESSAGE_KINDS: readonly InteractionKind[] = ['join_recap', 'welcome', 'event_step', 'task_step', 'meeting_summary'];
 const ANSWERS_NO_MESSAGE: ReadonlySet<string> = new Set<string>(ANSWERS_NO_MESSAGE_KINDS);
 
 /** True when a turn of this kind answers no message, so it is never an exchange. */

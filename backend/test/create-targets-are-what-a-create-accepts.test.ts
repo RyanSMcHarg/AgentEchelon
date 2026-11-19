@@ -56,7 +56,7 @@ function signed(kind: 'team' | 'admin', path: string, clearance: string): APIGat
     httpMethod: 'GET',
     path,
     headers: { origin: 'http://localhost:5173' },
-    requestContext: { identity: { userArn: `arn:aws:sts::1:assumed-role/ae-${kind}-console/${session}` } },
+    requestContext: { identity: { userArn: `arn:aws:sts::1:assumed-role/agent-echelon-${kind}-console/${session}` } },
   } as unknown as APIGatewayProxyEvent;
 }
 

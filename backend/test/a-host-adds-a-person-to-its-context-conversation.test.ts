@@ -3,10 +3,9 @@
  *
  * The host's membership change (`membershipHandler` in `conversation-management.ts`, its own function,
  * invoked directly by the host behind IAM) names the person by issuer and subject, resolved through the
- * trusted-issuer registry and `Identities`. Same guarantee as the context create: the private host grounding (participantProfile, domainContext,
+ * trusted-issuer registry and `Identities`. The private host grounding (participantProfile, domainContext,
  * otherContexts) and the model-ROUTING signals (userLanguage, segment) go to the SERVER-ONLY Channel
- * Context store and never into member-readable channel Metadata. add-member does NOT store userName
- * (it uses it only for the greeting).
+ * Context store and never into member-readable channel Metadata, as does the person's userName.
  */
 const mockMessagingSend = jest.fn();
 const mockSsmSend = jest.fn();
@@ -44,7 +43,7 @@ const ADMIN = `${APP}/user/ae-admin`;
 const ADMIN_PARAM = '/agent-echelon/app-instance-admin-arn';
 const FLOW_PARAM = '/agent-echelon/channel-flow-arn';
 const FLOW = `${APP}/channel-flow/f`;
-const CHANNEL = `${APP}/channel/ctx-basic-plan-p1`;
+const CHANNEL = `${APP}/channel/ctx-basic-plan-p1-39c35d1995e89cf9`;
 /** The host app's pool, declared in the registry. */
 const HOST_ISS = 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_HostApp';
 // The person the host's (issuer, sub) signs in as, through the registry and Identities: this suite's resolver answers the
@@ -67,7 +66,7 @@ beforeAll(async () => {
   process.env.APP_INSTANCE_ARN = APP;
   process.env.CONTEXT_CLASSIFICATION = 'basic';
   process.env.TRUSTED_ISSUERS = JSON.stringify([
-    { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', iss: HOST_ISS, subject: ['sub'], clearance: { oneChannel: 'basic', classifications: ['basic'] }, admin: false, groupsClaim: 'cognito:groups' },
+    { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', iss: HOST_ISS, subject: ['sub'], clearance: { fixed: ['basic'], classifications: ['basic'] }, admin: false, groupsClaim: 'cognito:groups' },
   ]);
   process.env.SSM_ROOT = '/agent-echelon';
   process.env.CHANNEL_CONTEXT_TABLE = 'ChannelContextTest';
@@ -116,48 +115,56 @@ describe('a host\'s add keeps the P1 privacy promise', () => {
     expect(meta.topic).toBe('My Plan');
   });
 
-  it('writes the private fields (not userName) and the routing signals to the server-only store', async () => {
+  it('writes the private fields, userName and the routing signals to the server-only store', async () => {
     await handler({ ...event(), segment: { country: 'CN' } });
     const upd = mockDdbSend.mock.calls.map((c) => c[0]).find((c) => c.__type === 'Update');
     expect(upd).toBeDefined();
     expect(upd.input.TableName).toBe('ChannelContextTest');
-    expect(upd.input.Key).toEqual({ channelArn: `${APP}/channel/ctx-basic-plan-p1` });
+    expect(upd.input.Key).toEqual({ channelArn: `${APP}/channel/ctx-basic-plan-p1-39c35d1995e89cf9` });
     const vals = upd.input.ExpressionAttributeValues;
     expect(vals[':participantProfile']).toBe('recruiter at Stratum Technologies');
     expect(vals[':domainContext']).toEqual({ items: [{ title: 'JD' }] });
     expect(vals[':otherContexts']).toEqual([{ title: 'other plan' }]);
-    expect(vals).not.toHaveProperty(':userName');
+    expect(vals[':userName']).toBe('Priya');
     expect(vals[':userLanguage']).toBe('en');
     expect(vals[':segment']).toEqual({ country: 'CN' });
   });
 
-  it('records the new member\'s ISSUER hint, appended rather than written over the existing roster', async () => {
-    // Without this the person just added is the only member nothing can resolve: their
-    // AppInstanceUser id is a one-way hash of (iss, sub), so the notification fan-out falls back to
-    // the default pool, fails to find them, and skips them — added on purpose, then silently never
-    // notified — while host grounding can name everyone in the conversation except them.
+  /** The context row's member list as the add wrote it. */
+  const memberWrite = () => mockDdbSend.mock.calls
+    .map((c) => c[0])
+    .filter((c) => c.__type === 'Update' && /#memberIdentities/.test(String(c.input.UpdateExpression)));
+
+  it('records the new member\'s ISSUER hint on the conditional replace', async () => {
+    // Without this the person just added is the only member nothing can resolve: the notification fan-out
+    // falls back to the default pool, fails to find them, and skips them. Two hosts can add two people at
+    // once, so the replace holds on the list being what was read.
     await handler(event());
-    const appends = mockDdbSend.mock.calls
-      .map((c) => c[0])
-      .filter((c) => c.__type === 'Update' && /list_append/.test(String(c.input.UpdateExpression)));
-    expect(appends).toHaveLength(1);
-    const vals = appends[0].input.ExpressionAttributeValues;
-    expect(vals[':entry']).toEqual([{ sub: 'foreign-sub', iss: HOST_ISS }]);
-    // list_append, not a bare SET: two hosts can add two people at once, and a read-modify-write
-    // would lose one of them.
-    expect(String(appends[0].input.UpdateExpression)).toMatch(/list_append\(if_not_exists\(/);
+    expect(memberWrite()).toHaveLength(1);
+    const [write] = memberWrite();
+    expect(write.input.ExpressionAttributeValues[':list']).toEqual([{ sub: 'foreign-sub', iss: HOST_ISS }]);
+    expect(write.input.ConditionExpression).toBe('attribute_not_exists(#memberIdentities)');
   });
 
   it('carries the host-supplied role, which exists nowhere else', async () => {
     // Membership can report who is here and the IdP owns their name; the role on THIS conversation is
     // the host's statement and has no other source.
     await handler({ ...event(), role: 'reviewer' });
-    const append = mockDdbSend.mock.calls
-      .map((c) => c[0])
-      .find((c) => c.__type === 'Update' && /list_append/.test(String(c.input.UpdateExpression)));
-    expect(append.input.ExpressionAttributeValues[':entry']).toEqual([
+    expect(memberWrite()[0].input.ExpressionAttributeValues[':list']).toEqual([
       { sub: 'foreign-sub', iss: HOST_ISS, role: 'reviewer' },
     ]);
+  });
+
+  it('a re-add replaces the person\'s entry and keeps everybody else\'s', async () => {
+    const before = [{ sub: 'somebody', iss: HOST_ISS }, { sub: 'foreign-sub', iss: HOST_ISS, role: 'old' }];
+    mockDdbSend.mockImplementation(async (c: { __type: string }) => (c.__type === 'Get' ? { Item: { memberIdentities: before } } : {}));
+    await handler({ ...event(), role: 'reviewer' });
+    const [write] = memberWrite();
+    expect(write.input.ExpressionAttributeValues[':list']).toEqual([
+      { sub: 'somebody', iss: HOST_ISS }, { sub: 'foreign-sub', iss: HOST_ISS, role: 'reviewer' },
+    ]);
+    expect(write.input.ExpressionAttributeValues[':read']).toEqual(before);
+    expect(write.input.ConditionExpression).toBe('#memberIdentities = :read');
   });
 });
 
@@ -208,6 +215,154 @@ describe('creation through the shared creator', () => {
       { Key: 'conversationType', Value: 'general' },
       { Key: 'contextType', Value: 'plan' },
     ]));
+  });
+
+  it('creates at the deterministic id, named by the host, and the service admin leaves the room it assembled', async () => {
+    const run = await freshHandler(true);
+    await run(event());
+    const calls = mockMessagingSend.mock.calls.map((c) => c[0] as { __type: string; input: Record<string, string> });
+    const create = calls.find((c) => c.__type === 'CreateChannel')!;
+    expect(create.input.ChannelId).toBe('ctx-basic-plan-p1-39c35d1995e89cf9');
+    expect(create.input.Name).toBe('My Plan');
+    expect(calls.find((c) => c.__type === 'DeleteMembership')?.input.MemberArn).toBe(ADMIN);
+    expect(calls.find((c) => c.__type === 'DeleteModerator')?.input.ChannelModeratorArn).toBe(ADMIN);
+  });
+
+  it('writes the context row once the channel is known to be new, before the assistant is added', async () => {
+    const run = await freshHandler(true);
+    await run(event());
+    const types = mockMessagingSend.mock.calls.map((c) => (c[0] as { __type: string }).__type);
+    const createAt = mockMessagingSend.mock.invocationCallOrder[types.indexOf('CreateChannel')];
+    const botAddAt = mockMessagingSend.mock.invocationCallOrder[types.indexOf('CreateMembership')];
+    const firstWrite = mockDdbSend.mock.invocationCallOrder[0];
+    expect(firstWrite).toBeGreaterThan(createAt);
+    expect(firstWrite).toBeLessThan(botAddAt);
+  });
+
+  /** A room that exists from a first creation, whose flow this read reports. */
+  const existingRoom = (flow: string | undefined, associate: () => unknown = () => ({})) => {
+    mockMessagingSend.mockReset().mockImplementation(async (cmd: { __type: string }) => {
+      if (cmd.__type === 'CreateChannel') throw Object.assign(new Error('channel exists'), { name: 'ConflictException' });
+      if (cmd.__type === 'ListTags') return { Tags: [{ Key: 'classification', Value: 'basic' }] };
+      if (cmd.__type === 'DescribeChannel') return { Channel: { Metadata: '{}', ...(flow ? { ChannelFlowArn: flow } : {}) } };
+      if (cmd.__type === 'AssociateFlow') return associate();
+      return {};
+    });
+  };
+
+  it('a retried add on a room whose first creation stopped before its flow attaches the flow before any member', async () => {
+    const run = await freshHandler(true);
+    existingRoom(undefined);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    expect((await run(event())).ok).toBe(true);
+    warn.mockRestore();
+    const calls = mockMessagingSend.mock.calls.map((c) => c[0] as { __type: string; input: Record<string, string> });
+    const order = calls.map((c) => c.__type);
+    expect(calls.find((c) => c.__type === 'AssociateFlow')?.input).toMatchObject({ ChannelArn: CHANNEL, ChannelFlowArn: FLOW, ChimeBearer: ADMIN });
+    expect(order.indexOf('AssociateFlow')).toBeLessThan(order.indexOf('CreateMembership'));
+  });
+
+  it('a room that carries its flow keeps it: nothing is re-attached', async () => {
+    const run = await freshHandler(true);
+    existingRoom(FLOW);
+    expect((await run(event())).ok).toBe(true);
+    expect(mockMessagingSend.mock.calls.map((c) => (c[0] as { __type: string }).__type)).not.toContain('AssociateFlow');
+  });
+
+  it('adds nobody to a room whose flow cannot be attached', async () => {
+    const run = await freshHandler(true);
+    existingRoom(undefined, () => { throw Object.assign(new Error('denied'), { name: 'ForbiddenException' }); });
+    const quiet = [jest.spyOn(console, 'warn').mockImplementation(() => undefined), jest.spyOn(console, 'error').mockImplementation(() => undefined)];
+    expect((await run(event())).ok).toBe(false);
+    quiet.forEach((s) => s.mockRestore());
+    const order = mockMessagingSend.mock.calls.map((c) => (c[0] as { __type: string }).__type);
+    expect(order).not.toContain('CreateMembership');
+    expect(order).not.toContain('CreateModerator');
+  });
+
+  it('DENY: a flow parameter that cannot be read refuses the add and creates nothing, and is read again next time', async () => {
+    const run = await freshHandler(true);
+    mockSsmSend.mockImplementation(async (cmd: { input: { Name: string } }) => {
+      if (cmd.input.Name === FLOW_PARAM) throw Object.assign(new Error('throttled'), { name: 'ThrottlingException' });
+      return { Parameter: { Value: cmd.input.Name === ADMIN_PARAM ? ADMIN : BOT } };
+    });
+    const quiet = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    expect((await run(event())).ok).toBe(false);
+    quiet.mockRestore();
+    expect(mockMessagingSend.mock.calls.map((c) => (c[0] as { __type: string }).__type)).not.toContain('CreateChannel');
+    answerSsm();
+    expect((await run(event())).ok).toBe(true);
+    expect(mockMessagingSend.mock.calls.map((c) => (c[0] as { __type: string }).__type)).toContain('AssociateFlow');
+  });
+
+  it('DENY: a new room whose flow cannot be attached adds nobody, and the service admin leaves', async () => {
+    const run = await freshHandler(true);
+    mockMessagingSend.mockReset().mockImplementation(async (cmd: { __type: string }) => {
+      if (cmd.__type === 'AssociateFlow') throw Object.assign(new Error('denied'), { name: 'AccessDeniedException' });
+      return { ChannelArn: CHANNEL };
+    });
+    const quiet = [jest.spyOn(console, 'warn').mockImplementation(() => undefined), jest.spyOn(console, 'error').mockImplementation(() => undefined)];
+    expect((await run(event())).ok).toBe(false);
+    quiet.forEach((s) => s.mockRestore());
+    const calls = mockMessagingSend.mock.calls.map((c) => c[0] as { __type: string; input: Record<string, string> });
+    expect(calls.filter((c) => c.__type === 'CreateMembership')).toEqual([]);
+    expect(calls.find((c) => c.__type === 'DeleteMembership')?.input.MemberArn).toBe(ADMIN);
+  });
+
+  it('a room carrying another flow is left as it is, and said so loudly', async () => {
+    const run = await freshHandler(true);
+    existingRoom(`${APP}/channel-flow/other`);
+    const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    expect((await run(event())).ok).toBe(true);
+    expect(error.mock.calls.some((c) => String(c[0]).includes('carries a different channel flow'))).toBe(true);
+    error.mockRestore();
+    expect(mockMessagingSend.mock.calls.map((c) => (c[0] as { __type: string }).__type)).not.toContain('AssociateFlow');
+  });
+
+  it('a room whose read failed keeps its name: nothing is written over it', async () => {
+    const run = await freshHandler(true);
+    existingRoom(undefined);
+    const inner = mockMessagingSend.getMockImplementation()!;
+    mockMessagingSend.mockImplementation(async (cmd: { __type: string }) => {
+      if (cmd.__type === 'DescribeChannel') throw Object.assign(new Error('throttled'), { name: 'ThrottlingException' });
+      return inner(cmd);
+    });
+    const quiet = [jest.spyOn(console, 'warn').mockImplementation(() => undefined), jest.spyOn(console, 'error').mockImplementation(() => undefined)];
+    await run(event());
+    quiet.forEach((s) => s.mockRestore());
+    expect(mockMessagingSend.mock.calls.map((c) => (c[0] as { __type: string }).__type)).not.toContain('UpdateChannel');
+  });
+
+  describe('the greeting', () => {
+    const say = jest.fn(async () => undefined);
+    const joined = jest.fn(async () => new Set<string>());
+    beforeEach(() => {
+      say.mockClear();
+      joined.mockClear();
+      jest.doMock('../lambda/src/lib/say-through-router', () => ({ sayThroughRouter: say, personJoinedThroughRouter: joined, cancelDeadlinesThroughRouter: jest.fn() }));
+    });
+    afterEach(() => jest.dontMock('../lambda/src/lib/say-through-router'));
+
+    it('announces and welcomes a person this add made a member', async () => {
+      const run = await freshHandler(true);
+      existingRoom(FLOW);
+      expect((await run(event())).ok).toBe(true);
+      expect((say.mock.calls as unknown as Array<[string, { kind: string }]>).map((c) => c[1].kind)).toEqual(['memberJoined', 'memberWelcome']);
+      expect(joined).toHaveBeenCalledTimes(1);
+    });
+
+    it('says nothing when the person was already a member', async () => {
+      const run = await freshHandler(true);
+      existingRoom(FLOW);
+      const inner = mockMessagingSend.getMockImplementation()!;
+      mockMessagingSend.mockImplementation(async (cmd: { __type: string; input: Record<string, string> }) => {
+        if (cmd.__type === 'CreateMembership' && cmd.input.MemberArn.startsWith(TARGET_PREFIX)) throw Object.assign(new Error('member'), { name: 'ConflictException' });
+        return inner(cmd);
+      });
+      expect((await run(event())).ok).toBe(true);
+      expect(say).not.toHaveBeenCalled();
+      expect(joined).not.toHaveBeenCalled();
+    });
   });
 
   it('adds the target as a member and never makes them a moderator', async () => {
@@ -286,10 +441,8 @@ describe('creation through the shared creator', () => {
 /**
  * Adding a member must not wipe the conversation's grounding (maintainer, 2026-08-10).
  *
- * WHY THIS DIFFERS FROM THE CREATE PATH. Create/edit re-stamps the whole plan, so a field the host stops
- * sending has genuinely been removed and clearing it is right. Add-member create-or-GETS an EXISTING
- * conversation and adds one person - the host is saying "this member joins", not "and here is the
- * complete grounding again".
+ * Add-member create-or-GETS an EXISTING conversation and adds one person - the host is saying "this member
+ * joins", not "and here is the complete grounding again".
  *
  * Treating omission as removal meant a call carrying only the four required fields wiped the private
  * grounding AND the model/language routing. Nothing errored; the next turn just answered worse, in the
@@ -308,7 +461,7 @@ describe('add-member preserves what it was not asked to change', () => {
     // No REMOVE at all: the previous grounding and routing survive somebody being added.
     if (upd) {
       expect(upd.input.UpdateExpression).not.toContain('REMOVE');
-      for (const f of ['participantProfile', 'domainContext', 'otherContexts', 'userLanguage', 'segment']) {
+      for (const f of ['userName', 'participantProfile', 'domainContext', 'otherContexts', 'userLanguage', 'segment']) {
         expect(upd.input.UpdateExpression).not.toContain(`#${f} =`);
       }
     }
@@ -317,13 +470,14 @@ describe('add-member preserves what it was not asked to change', () => {
   it('an EXPLICIT null still clears — a host that wants a field gone can still remove it', async () => {
     await handler({
       op: 'add', contextType: 'plan', contextId: 'p1', iss: HOST_ISS, sub: 'foreign-sub',
-      participantProfile: null, userLanguage: null,
+      participantProfile: null, userLanguage: null, userName: null,
     });
     const upd = contextUpdate();
     expect(upd).toBeDefined();
     expect(upd.input.UpdateExpression).toContain('REMOVE');
     expect(upd.input.ExpressionAttributeNames).toHaveProperty('#participantProfile');
     expect(upd.input.ExpressionAttributeNames).toHaveProperty('#userLanguage');
+    expect(upd.input.ExpressionAttributeNames).toHaveProperty('#userName');
   });
 
   it('a SUPPLIED value is still written', async () => {
@@ -377,7 +531,7 @@ describe('add-member preserves channel metadata it did not set', () => {
           },
         };
       }
-      return { ChannelArn: `${APP}/channel/ctx-basic-plan-p1` };
+      return { ChannelArn: `${APP}/channel/ctx-basic-plan-p1-39c35d1995e89cf9` };
     });
     answerSsm();
     mockDdbSend.mockReset().mockResolvedValue({});
@@ -413,7 +567,7 @@ describe('add-member preserves channel metadata it did not set', () => {
       if (c.__type === 'DescribeChannel') {
         return { Channel: { Metadata: JSON.stringify({ hostGroundingHint: 'x'.repeat(1000) }) } };
       }
-      return { ChannelArn: `${APP}/channel/ctx-basic-plan-p1` };
+      return { ChannelArn: `${APP}/channel/ctx-basic-plan-p1-39c35d1995e89cf9` };
     });
     answerSsm();
     mockDdbSend.mockReset().mockResolvedValue({});

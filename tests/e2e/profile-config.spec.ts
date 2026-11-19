@@ -27,6 +27,7 @@ import { signedAnalyticsPost } from './helpers/signed-analytics';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 import { SSM_ROOT } from './helpers/stack-prefix';
 import { ADMIN_API_URL, adminUrl, profileActionUrl } from './helpers/api-urls';
+import { replacingDraft, draftIdOf } from './helpers/profile-draft';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
 guardConsoleErrors();
@@ -163,7 +164,7 @@ test.describe.serial('profile configuration takes effect (copy → edit → acti
     ).toBe(false);
 
     // COPY: clone the active version into a fresh draft.
-    const copied = await post('/version', { profileName: PROFILE });
+    const copied = await replacingDraft((b) => post('/version', b), { profileName: PROFILE });
     expect(copied.draftConfigId, `copy (clone active→draft): ${JSON.stringify(copied)}`).toBeTruthy();
     // Whether a draft THIS TEST WROTE is still pending. Activation consumes a draft, so this is false
     // after each successful /activate and true after each write that creates one (/version, /import).
@@ -177,7 +178,7 @@ test.describe.serial('profile configuration takes effect (copy → edit → acti
       // NO `machines` IN THE PATCH. Task graphs are global workflows (2026-09-20): a version cannot
       // declare one, and `editDraft` refuses a patch that tries - so sending it here would fail this
       // test at the edit step, before it reached anything it is actually about.
-      const edited = await post('/draft', { profileName: PROFILE, patch: { guardrailId: strict!.guardrailId, persona: PERSONA } });
+      const edited = await post('/draft', { profileName: PROFILE, patch: { guardrailId: strict!.guardrailId, persona: PERSONA }, configId: copied.draftConfigId });
       expect(edited.draftConfigId, `edit draft: ${JSON.stringify(edited)}`).toBeTruthy();
 
       // VALIDATE — schema + graph + §7 model boundary all pass.
@@ -185,7 +186,7 @@ test.describe.serial('profile configuration takes effect (copy → edit → acti
       expect(validated.valid, `validate: ${JSON.stringify(validated.errors)}`).toBe(true);
 
       // ACTIVATE — promote the draft to a new active version.
-      const activated = await post('/activate', { profileName: PROFILE });
+      const activated = await post('/activate', { profileName: PROFILE, configId: draftIdOf(edited) });
       expect(activated.version, `activate: ${JSON.stringify(activated)}`).toBeTruthy();
       fixtureDraftPending = false;
 
@@ -212,12 +213,12 @@ test.describe.serial('profile configuration takes effect (copy → edit → acti
       expect(manifest.body?.persona, 'manifest carries the versioned persona (persona is part of the versioned bundle)').toBe(PERSONA);
 
       // UPLOAD (import) the raw manifest back as a draft, then activate — a full round-trip of the config.
-      const imported = await post('/import', { manifest, targetProfileName: PROFILE });
+      const imported = await replacingDraft((b) => post('/import', b), { manifest, targetProfileName: PROFILE });
       fixtureDraftPending = true;
       expect(imported.configId, `import: ${JSON.stringify(imported)}`).toBeTruthy();
       const reValidated = await post('/validate', { profileName: PROFILE });
       expect(reValidated.valid, `re-validate imported: ${JSON.stringify(reValidated.errors)}`).toBe(true);
-      const reActivated = await post('/activate', { profileName: PROFILE });
+      const reActivated = await post('/activate', { profileName: PROFILE, configId: draftIdOf(imported) });
       expect(reActivated.version, `activate imported: ${JSON.stringify(reActivated)}`).toBeTruthy();
       fixtureDraftPending = false;
 
@@ -269,7 +270,7 @@ test.describe.serial('profile configuration takes effect (copy → edit → acti
       // There is no route that deletes a draft, and `/version` overwrites it with a clone of what is
       // serving, which carries none of this test's content. A clean pending draft is left in place of
       // the fixture; that is visible in the console and harmless to activate.
-      if (fixtureDraftPending) await attempt('/version', { profileName: PROFILE });
+      if (fixtureDraftPending) await replacingDraft((b) => attempt('/version', b), { profileName: PROFILE });
 
       // Read back through the `active` LABEL - the pointer the async processor resolves. Reading the
       // bare parameter returns the LATEST version, which after this test is the test's own, so the

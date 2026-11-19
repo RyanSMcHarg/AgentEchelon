@@ -42,6 +42,12 @@ export interface TurnRouting {
    */
   channelArn?: string;
   /**
+   * THE CONVERSATIONS THIS ONE THREADS WITH (DESIGN-WORKFLOWS-AND-TASKS section 6), as the router read them from the turn's
+   * server-side row: the only other conversations whose latest summary the turn data plane serves this turn. The
+   * processor reads one only after checking that its members include every person here.
+   */
+  threadRelatives?: string[];
+  /**
    * What a running experiment or battle variant adds to this turn: its model, image model, and for a
    * `profileRef` variant its whole definition. The vend narrows the session to the variant's reach
    * rather than the assistant's, because the variant is what the turn serves (`assistant-grant.ts`).
@@ -55,7 +61,7 @@ export interface TurnRouting {
 export async function recordTurnRouting(
   client: Pick<DynamoDBClient, 'send'>,
   tableName: string,
-  input: { correlationId: string; botArn: string; classification: string; channelArn?: string; variant?: GrantVariant; now?: number },
+  input: { correlationId: string; botArn: string; classification: string; channelArn?: string; threadRelatives?: string[]; variant?: GrantVariant; now?: number },
 ): Promise<void> {
   if (!tableName) throw new Error('recordTurnRouting: no routing table configured');
   if (!input.correlationId || !input.botArn || !input.classification) {
@@ -70,6 +76,7 @@ export async function recordTurnRouting(
         botArn: { S: input.botArn },
         classification: { S: input.classification },
         ...(input.channelArn ? { channelArn: { S: input.channelArn } } : {}),
+        ...(input.threadRelatives?.length ? { threadRelatives: { SS: [...new Set(input.threadRelatives)] } } : {}),
         ...(input.variant ? { variant: { S: JSON.stringify(input.variant) } } : {}),
         createdAt: { S: new Date(now).toISOString() },
         expiresAt: { N: String(Math.floor(now / 1000) + TURN_ROUTING_TTL_SECONDS) },
@@ -110,6 +117,7 @@ export async function readTurnRouting(
     botArn: item.botArn.S,
     classification: item.classification.S,
     ...(item.channelArn?.S ? { channelArn: item.channelArn.S } : {}),
+    ...(item.threadRelatives?.SS?.length ? { threadRelatives: item.threadRelatives.SS } : {}),
     ...(item.variant?.S ? { variant: parseVariant(item.variant.S) } : {}),
     createdAt: item.createdAt?.S || '',
     expiresAt,

@@ -54,10 +54,10 @@ const FrustrationPanel: React.FC<{
 
   return (
     <div className="admin-section" role="region" aria-label={t('admin.frustration.title')}>
-      <h4>
+      <h3>
         {t('admin.frustration.title')}{' '}
         <InfoTooltip label={t('admin.frustration.title')} content={t('admin.frustration.tip')} />
-      </h4>
+      </h3>
       {error && <p className="admin-error" role="alert">{error}</p>}
       {!error && rows === null && <p className="admin-help-text">{t('admin.frustration.loading')}</p>}
       {!error && rows !== null && summary.length === 0 && <p className="admin-tab-empty">{t('admin.frustration.empty')}</p>}
@@ -79,7 +79,7 @@ const FrustrationPanel: React.FC<{
       )}
       {conversations.length > 0 && (
         <>
-          <h5>{t('admin.frustration.conversations')}</h5>
+          <h4>{t('admin.frustration.conversations')}</h4>
           <DataTable
             data={conversations}
             columns={[

@@ -32,6 +32,10 @@ const classificationProps = {
   appInstanceArn,
   attachmentsBucketName: 'agent-echelon-attachments-test',
   attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
+  companyBucketName: 'agent-echelon-company-test',
+  companyBucketArn: 'arn:aws:s3:::agent-echelon-company-test',
+  profileBucketName: 'agent-echelon-profile-test',
+  profileBucketArn: 'arn:aws:s3:::agent-echelon-profile-test',
 };
 
 /** Every stack that creates an `AWS::Lambda::Permission`, each synthesized in its own app. */

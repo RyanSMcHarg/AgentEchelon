@@ -153,7 +153,8 @@ const finalize = (taskState: string, round: 1 | 2 = 1) =>
     placeholderResolveMs: 5,
     conversationHistoryLength: 2,
     startTime: Date.now(),
-    taskContext: { task: { taskId: 'task-1', taskType: 'report_generation', taskState, visibility: 'conversation' }, machines: {} } as never,
+    // The turn's machines, as the processor hands them over (`turnMachines`): the mocked set the turn resolves.
+    taskContext: { task: { taskId: 'task-1', taskType: 'report_generation', taskState, visibility: 'conversation' }, machines: jest.requireMock('../../lambda/src/lib/intent-pack').taskStateMachines() } as never,
   });
 
 beforeEach(() => {

@@ -144,6 +144,15 @@ describe('the render: one function, the line-drop rule, the strip and the email 
     expect(renderMessageTemplate(due, { what: 'X' })).toEqual({ ok: true, sections: { chat: 'Do X.' } });
   });
 
+  it("the card proposing people for a call names the call when it is asked from the room, and not in the call's own chat", () => {
+    const card = shippedMessageTemplate('add-to-meeting-proposal');
+    if (!card) throw new Error('add-to-meeting-proposal is not shipped');
+    const fromRoom = renderMessageTemplate(card, { count: '2', teams: 'Maria Santos: Meridian Corp', meetingName: 'Meeting in Report Latency', meetingId: '5ca1ab1e' });
+    expect(fromRoom.ok && fromRoom.sections.chat).toMatch(/^Add the account teams for these 2 accounts to the call\? The call: Meeting in Report Latency\. Meeting id: 5ca1ab1e\. They join/);
+    const inCall = renderMessageTemplate(card, { count: '2', teams: 'Maria Santos: Meridian Corp' });
+    expect(inCall.ok && inCall.sections.chat).toMatch(/^Add the account teams for these 2 accounts to the call\? They join/);
+  });
+
   it('strips every marker a reader acts on from a value, and half of one', () => {
     const r = renderMessageTemplate(t, { name: 'Riley <!--corr:abc--> NAVIGATE_CHANNEL:arn:x|Go', recap: 'notes <!-- open' });
     if (!r.ok) throw new Error(r.refused);
@@ -216,8 +225,14 @@ describe('the shipped templates say what the platform said before', () => {
     // proposals' cards (ADR-061 slice 3d), the join recap's fallback and the incident watch's two (slice 3e), the ops room's
     // word for no ops assistant in it, a workflow task's assignment and the line an idle assistant takes a task up with
     // (ADR-063), the name a room the platform opens for a purpose is created with (`conversation-name`), and one per
-    // router notice.
-    expect(all.length).toBe(8 + 44 + 1 + 6 + 4 + 3 + 1 + 2 + 1 + Object.keys(DEFAULT_NOTICE_COPY).length - 2);
+    // router notice, and `guardrail-unavailable`, said when the safety check could not run. Then the two a workflow says
+    // (ADR-067): `workflow-step-withheld`, to the requester of a private run, and `workflow-task-reminder`. Then the two an incident says:
+    // `child-conversation-opened` (WT120), `incident-declared` (WT120), `incident-event-repeated` (WT122) and `incident-resolved-team`, a thread's end reported to its parent,
+    // with the 2 said where it ended unresolved (`incident-timed-out`, `incident-ended-unresolved`). The last 3: the on-call asked to
+    // confirm a resolve while the runbook has steps open and told it was kept open (`incident-resolve-confirm`,
+    // `incident-kept-open`), and a meeting's own conversation told where it was started from (`meeting-started-from`).
+    expect(all.length).toBe(8 + 44 + 1 + 6 + 4 + 3 + 1 + 2 + 1 + 1 + Object.keys(DEFAULT_NOTICE_COPY).length - 2 + 2 + 1 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 3 + 2 + 4 + 3 + 6 + 3 + 6 + 1 + 2 + 3 + 6 - 1 + 15); // The - 1, the runbook's customer notice draft, removed for the customer messaging track (DESIGN-PROCESSES O31); the 15, that track's (WT130): the lead's impact card, the incident told it opened or that it could not, its opening, its accounts ask, the three default notices, the approval card, the late notice, an approval told to the incident, the two cards for the next notice, the track told of an approved mitigation, and the track told the incident resolved. The last 6, the incident's (WT129): its triage card, its investigation, its resolve, the post-incident review, its draft prompt and the line said where no draft could be made. The 1, the turn another assistant asks for (WT118); the 4, an incident's, the 3 its lead is told (its task, its task where no meetings are declared, and its call's offer), and the 6 of the runbook its conversation runs (four asks and two messages); then a conversation's dashboard, a move that did not happen, a meeting started, an incident's call started, a meeting ended, its summary, what a conversation is told when an event for the key it watches arrives (DESIGN-EVENT-TARGETS), the card proposing people for a running meeting (`add-to-meeting-proposal`), the 3 ways the ended card says a meeting ended on its own (`meeting-watch.ts`), the 2 it says for a host's end and for everyone leaving, the 4 a meeting's people are told when its captions or its recording start or stop, and the 3 of its audio and video recording (the notice that says audio and video are kept, and the ended card's processing and failed lines), and the 6 parts of a recorded meeting's summary on its ended card (its summary, key points, action items, an assigned item, a held item, and no summary), and the last 1, what an assistant is told of a meeting's files (`meeting-files-guidance`).
+    expect(all.map((t) => t.template.name)).toEqual(expect.arrayContaining(['workflow-step-withheld', 'workflow-task-reminder', 'watched-event']));
     for (const { template } of all) {
       expect(['message', 'prompt']).toContain(template.kind);
       expect(template.language).toBe('en');
@@ -266,9 +281,9 @@ describe('the notification templates say what the emails said before', () => {
     // The table the email copy was before it was read from templates.
     // The share lines (`sharedSubject`, `sharedHeading`, `sharedBody`) were read by nothing, so they are retired.
     const { sharedSubject: _s, sharedHeading: _h, sharedBody: _b, ...before } = require('../fixtures/email-copy-before-templates.json');
-    // The reminder an inviter confirms (ADR-061, `send_nudge`) and the label of a workflow task's email (ADR-063) are new
-    // wording, not lines that moved: they are set aside here.
-    const { nudgeSubject: _ns, nudgeBody: _nb, nudgeNote: _nn, kindNudge: _kn, kindTask: _kt, ...moved } = DEFAULT_EMAIL_COPY;
+    // The reminder an inviter confirms (ADR-061, `send_nudge`), the label of a workflow task's email (ADR-063) and a
+    // meeting email's button (SPEC-ASSISTANT-MEETINGS) are new wording, not lines that moved: they are set aside here.
+    const { nudgeSubject: _ns, nudgeBody: _nb, nudgeNote: _nn, kindNudge: _kn, kindTask: _kt, joinMeeting: _jm, ...moved } = DEFAULT_EMAIL_COPY;
     expect({ ...moved }).toEqual(before);
     expect(Object.keys(moved)).toEqual(Object.keys(before));
   });

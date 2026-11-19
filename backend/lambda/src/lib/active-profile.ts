@@ -14,11 +14,14 @@
  * separately — a version's modelKey must resolve within the deployment's `bedrock:InvokeModel`
  * allowlist (validated at write time in P1; here an out-of-catalog key simply fails closed to the seed).
  *
- * FAIL-CLOSED. Any failure — the param/label is absent (no version seeded yet), unreadable, malformed,
- * or fails validation — falls back to the compiled seed (`defaultProfileRegistry.profileByName`), never
- * to "no profile". A deployment that never seeds a definition behaves EXACTLY as today (the P0 acceptance
- * bar: behavior diff empty on the seed). Result is cached per warm container for a short TTL so an
- * activation converges within the TTL without a redeploy.
+ * THE SEED SERVES ONLY WHERE NO VERSION IS ACTIVE. A profile with no active version (the parameter or the
+ * label is absent) resolves to the compiled seed (`defaultProfileRegistry.profileByName`), so a deployment
+ * that never seeds a definition behaves exactly as the compiled profile (the P0 acceptance bar: behavior
+ * diff empty on the seed). A version that EXISTS and is unreadable, malformed or invalid never resolves to
+ * the seed, which is wider than any version (no tool allowlist, the deployment default guardrail): the last
+ * version this container read answers, else `ProfileVersionUnreadableError` fails the turn into its
+ * degraded reply. A resolution is cached per warm container for a short TTL so an activation converges
+ * within the TTL without a redeploy.
  *
  * SCOPE. A version carries the whole of what SPEC-PORTABLE-PROFILES calls a profile:
  * the model bundle, the tool allowlist, the guardrail selection, the persona, the INTENT PACK, the
@@ -49,19 +52,22 @@ import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { createHash } from 'node:crypto';
 import { defaultProfileRegistry } from '../../../lib/profile-registry';
 import type { AssistantProfile } from '../../../lib/config/profiles.js';
-import { INTENT_ROUTE_STRATEGY, getModelCatalog } from '../../../lib/config/model-strategy.js';
 import type { IntentRouteDefinition, RouteKey, BackendModelKey } from '../../../lib/config/model-strategy.js';
 import { ALL_TOOL_NAMES, unknownTools } from './tool-registry.js';
 import { IMAGE_GEN_MODELS, type ImageGenModelKey } from './image-gen-models.js';
 import { IMAGE_ROUTE_KEY, imagePrimaryOf, isImageModelKey, isImageRoute, routeKindError, textRoutesOf } from './image-route.js';
 import { stepShapeErrors, type IntentRoute } from './step-models.js';
-import { type TaskStateMachine, type ConfirmPolicy, CONFIRM_POLICIES } from './task-state-machines.js';
-import { validateIntentPackBody, intentKeysOf, needsOf, resolveStoredPack, UNIVERSAL_INTENT_KEYS, WORK_MANAGEMENT_INTENT_KEYS, type IntentPack, type StoredIntentPack } from './intent-pack.js';
+import { type TaskStateMachine, type ConfirmPolicy, CONFIRM_POLICIES, PLATFORM_MACHINE_KEYS, isPlatformMachineKey } from './task-state-machines.js';
+import { validateIntentPackBody, versionMachinesErrors, intentKeysOf, needsOf, resolveStoredPack, UNIVERSAL_INTENT_KEYS, WORK_MANAGEMENT_INTENT_KEYS, type IntentPack, type StoredIntentPack } from './intent-pack.js';
 import { parseIntakeConfig, type IntakeConfig } from './onboarding-intake.js';
-import { retiredRouteKeyError, routesAsServedByTheFloor, TRIVIAL_ROUTE_KEYS } from './model-resolver.js';
+import { platformRoutesServedOn, retiredRouteKeyError, seedByIntentFromGlobalStrategy, TRIVIAL_ROUTE_KEYS } from './model-resolver.js';
 import { hydrateBodies, type ProfileBodyRef } from './profile-bodies.js';
+import { rememberVersionMachines, __clearVersionMachines } from './version-machines.js';
+// The configId hash is stable regardless of insertion order: the `models.byIntent` map and `tools` list canonicalize deterministically.
+import { canonicalize } from './canonical-json.js';
 import type { WorkflowLayout } from './workflow-layout.js';
 import { isNoActiveVersion } from './active-label.js';
+import { isTransientReadError, readWithRetry as retryTransient } from './transient-retry.js';
 import { modelFits, outputOf } from '../../../lib/config/model-availability.js';
 import { buildSourceTable, sourceLookup, whenErrors, withUnreadCatalog } from './variables.js';
 import { GOLDEN_SET_CAPACITY } from './golden-upload.js';
@@ -89,6 +95,25 @@ export const DEFAULT_IMAGE_FALLBACK_MODEL: ImageGenModelKey = 'stability_image_u
 export function withImageParts(routes: Record<string, IntentRoute>, images: Record<string, IntentRoute>): Record<string, IntentRoute> {
   const out: Record<string, IntentRoute> = { ...routes };
   for (const [key, part] of Object.entries(images)) out[key] = { ...(out[key] ?? {}), ...part };
+  return out;
+}
+
+/**
+ * THE PROFILE'S DECLARED ROUTES OVER THE ROUTES A SEED CARRIES (`AssistantProfile.routes`, ADR-064 decisions C and D):
+ * each declared route's text model and step overrides take the place of the platform's for its intent, and an image
+ * part the seed carries is kept. An intent with no route in `routes` (the seeded pack does not declare it) is left out,
+ * so a seed never routes an intent its classifier cannot resolve.
+ */
+export function withDeclaredRoutes(
+  routes: Record<string, IntentRoute>,
+  declared: Record<string, IntentRoute> | undefined,
+): Record<string, IntentRoute> {
+  const out: Record<string, IntentRoute> = { ...routes };
+  for (const [intent, route] of Object.entries(declared ?? {})) {
+    if (!out[intent]) continue;
+    const { fallback: _platformFallback, steps: _platformSteps, ...rest } = out[intent];
+    out[intent] = { ...rest, ...route };
+  }
   return out;
 }
 
@@ -584,6 +609,7 @@ export interface AssistantCopy {
   memberJoined?: string;
   memberWelcome?: string;
   briefingReady?: string;
+  meetingArrivalBrief?: string;
   battleEnded?: string;
   battleEndedReplyInFlight?: string;
   battleStarterUnknown?: string;
@@ -631,12 +657,8 @@ export interface ProfileDefinitionBody {
   /** Selection among deployment-provisioned guardrails (a version selects, never points at an arbitrary
    *  resource — §7 boundary). */
   guardrailId?: string;
-  /** Per-assistant task state machines (SPEC-CONFIGURABLE-ASSISTANTS 4.5), keyed by taskType. Preferred
-   *  over the deployment intent-pack machines at loop time, so a triage assistant and a report assistant
-   *  can carry DIFFERENT task lifecycles. Absent ⇒ inherit the deployment pack (byte-identical). Validated
-   *  (validateTaskStateMachines) at the write path AND here (shape/graph). A state says who it awaits with
-   *  `awaits: { party: 'requester' }`; the deprecated `awaitsUser: true` a version stored earlier is
-   *  accepted and means the same (SPEC-TASK-STATE-TRANSITIONS §12.6), so an older version still activates. */
+  /** A legacy top-level field. A version's machines are declared in its intent pack (`intentPack.machines`, ADR-066);
+   *  `bodyFrom` drops this one on read and `editDraft` refuses a patch that sends it, naming the field that is read. */
   machines?: Record<string, TaskStateMachine>;
   /**
    * THE INTENT TAXONOMY THIS ASSISTANT RECOGNIZES, and the behavior each intent carries.
@@ -715,11 +737,23 @@ export interface ProfileDefinitionBody {
   messages?: import('./message-template.js').VersionMessages;
   /**
    * THE EVENT WORKFLOWS THIS ASSISTANT DECLARES (ADR-061 decision 1, as built): by name, in the event workflow format.
-   * Unlike task machines, which stay global and are only selected, an event workflow is the assistant's own. Its
+   * An event workflow is the assistant's own, as an intent's machine is (`intentPack.machines`, ADR-066). Its
    * `assistant-joined` workflows are its WELCOME (W1), which `WelcomeIntent` starts, selected by the room's conversation
    * type (`welcomeWorkflowOf`); every other event selects its own.
    */
   eventWorkflows?: Record<string, import('./event-workflow.js').EventWorkflow>;
+  /**
+   * WHAT A PERSON'S REQUEST RUNS, BY INTENT (ADR-067 decision 1, OPEN 1): a multi-step intent's workflow, in the event
+   * workflow format with `on: { intent }`, its own task step opening the intent's machine (`intentPack.machines`) and
+   * the steps after it running once on its ending. An intent this map does not name runs the canonical workflow, today's
+   * rule (`canonicalIntentWorkflow`, intent-workflow.ts). Part of what the version does, so hashed into `configId`.
+   */
+  intentWorkflows?: Record<string, import('./intent-workflow.js').IntentWorkflow>;
+  /**
+   * THE PROCESSES THIS ASSISTANT'S TEAM OWNS (SPEC-PROCESSES P1): each one's label, the workflows it links by id, and its
+   * declared metrics. Inline on the definition, never offloaded.
+   */
+  processes?: Record<string, import('./event-workflow.js').VersionProcess>;
   /**
    * THE VALUES THIS ASSISTANT NAMES (ADR-060 decision 1): a variable's name to the source it reads and the
    * fallback inserted when that value is unresolved or held back, `{ "firstName": { "source": "person:displayName" } }`.
@@ -755,11 +789,11 @@ export interface ProfileDefinitionBody {
    */
   displayName?: string;
   /**
-   * WHICH GLOBAL WORKFLOWS THIS ASSISTANT MAY OPEN - a SELECTION of keys, never a definition.
+   * WHICH WORKFLOWS THIS ASSISTANT MAY OPEN - a SELECTION of keys, never a definition.
    *
-   * The graphs themselves are the platform's, with a classification able to add its own on its intent
-   * pack (2.9). What a version says is which of the available ones this assistant uses: a
-   * classification can declare a workflow and an assistant in it can be configured to use it or not.
+   * The graphs are the platform's, the classification's (its intent pack, 2.9) and the version's own
+   * (`intentPack.machines`, ADR-066). What this field says is which of the available ones this assistant
+   * opens: a workflow can exist and an assistant can be configured to use it or not.
    *
    * NARROWS, NEVER WIDENS - the same direction every other per-assistant selection runs. A key that
    * names no available workflow is refused on the write path rather than silently never firing, which
@@ -833,6 +867,22 @@ export interface ProfileDefinition extends ProfileDefinitionBody {
    * store does not re-key its analytics or invalidate an exported manifest.
    */
   intentPackRef?: ProfileBodyRef;
+  /** WHERE THE INTENT WORKFLOWS' BODY IS STORED (`offloadBodies`): envelope, not body, on the same terms as `intentPackRef`. */
+  intentWorkflowsRef?: ProfileBodyRef;
+  /**
+   * THE TASKS THE OFFLOADED INTENT WORKFLOWS GIVE TO AN ASSISTANT ROLE (WT78), names only, kept beside `intentWorkflowsRef` so
+   * the listing reads them without the body. ENVELOPE, NOT BODY: never hashed, and derived again whenever the body is written.
+   */
+  intentRoleTasks?: Array<{ workflow: string; step: string; role: string; machine: string }>;
+  /** WHERE THE EVENT WORKFLOWS' BODY IS STORED (`offloadBodies`): envelope, not body, on the same terms as `intentWorkflowsRef`. */
+  eventWorkflowsRef?: ProfileBodyRef;
+  /**
+   * THE OFFLOADED EVENT WORKFLOWS AS THE LISTING NAMES THEM (name, trigger, types) and the tasks they give an assistant role,
+   * kept beside `eventWorkflowsRef` so the console lists a version without reading its body. ENVELOPE, NOT BODY: never
+   * hashed, and derived again whenever the body is written.
+   */
+  eventWorkflowsListed?: Array<{ name: string; on: string; types?: string[] }>;
+  eventRoleTasks?: Array<{ workflow: string; step: string; role: string; machine: string }>;
   /**
    * WHERE THE CONSOLE DRAWS EACH WORKFLOW STEP (ADR-061 decision 7): inline only on a definition the console reads or is about
    * to write, and stored as `layoutRef` (`offloadBodies`), never inline in the parameter. ENVELOPE, NOT BODY: absent from
@@ -842,6 +892,14 @@ export interface ProfileDefinition extends ProfileDefinitionBody {
   layout?: WorkflowLayout;
   /** The pointer to the layout's body (`layoutKey`), read by the console's draft and export reads alone (`withLayout`). */
   layoutRef?: ProfileBodyRef;
+  /**
+   * A WELCOME WORKFLOW THE CONSOLE KEEPS while the welcome says a template or a prompt (`kept-welcome.ts`, ADR-067 G40).
+   * ENVELOPE, NOT BODY, on the layout's terms: absent from `RUNTIME_EDITABLE_KEYS`, so never hashed; stripped by
+   * `bodyFrom`, so no runtime read and no validation of what the version does sees it; stored as `keptWelcomeWorkflowRef`.
+   */
+  keptWelcomeWorkflow?: import('./event-workflow.js').EventWorkflow;
+  /** The pointer to the kept welcome's body (`keptWelcomeKey`), read by the console's draft and export reads alone. */
+  keptWelcomeWorkflowRef?: ProfileBodyRef;
   /**
    * PROVENANCE: this version was DERIVED by an experiment rather than authored by an operator - the
    * live assistant's active body at arm time plus one variant's delta (DESIGN-SEPARATE-ASSISTANTS
@@ -927,8 +985,8 @@ const RUNTIME_EDITABLE_KEYS: ReadonlyArray<keyof ProfileDefinitionBody> = [
   'models',
   'tools',
   'guardrailId',
-  // 'machines' was here. It is no longer something a version can say, so it cannot be part of what a
-  // version is identified BY - leaving it would hash a field that is always absent.
+  // The legacy top-level `machines` is not hashed: `bodyFrom` drops it. A version's machines live in its
+  // pack (`intentPack.machines`, ADR-066), which `intentPack` below hashes whole.
   'persona',
   // WHAT THE ASSISTANT SAYS IS PART OF WHAT IT IS. `copy` is on the body and `bodyFrom` keeps it,
   // but it was missing here - so a copy-only edit hashed to the SAME configId, and the new version
@@ -942,6 +1000,10 @@ const RUNTIME_EDITABLE_KEYS: ReadonlyArray<keyof ProfileDefinitionBody> = [
   'messages',
   // HOW IT GREETS AN EVENT is part of what it does, so a changed event workflow is a new version.
   'eventWorkflows',
+  // WHAT A REQUEST RUNS is part of what it does, on the same terms (ADR-067 decision 1).
+  'intentWorkflows',
+  // WHICH PROCESSES IT OWNS, their labels, the workflows they link and their metrics, on the same terms.
+  'processes',
   // WHICH VALUES IT READS, and what it says when one is missing, are part of what it says.
   'variables',
   // WHAT IT MUST BE MEASURED ON is a statement about this assistant, changed through a version like the rest of it.
@@ -978,21 +1040,6 @@ const RUNTIME_EDITABLE_KEYS: ReadonlyArray<keyof ProfileDefinitionBody> = [
   // configIds for the same behavior. Dropping them re-keys any profile whose stored version carried
   // them, once, to the id its actual behavior earns.
 ];
-
-/** Recursively key-sort an object/array so the configId hash is stable regardless of insertion order
- *  (the `models.byIntent` map + `tools` list must canonicalize deterministically). */
-function canonicalize(v: unknown): unknown {
-  if (Array.isArray(v)) return v.map(canonicalize);
-  if (v && typeof v === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const k of Object.keys(v as Record<string, unknown>).sort()) {
-      const val = (v as Record<string, unknown>)[k];
-      if (val !== undefined) out[k] = canonicalize(val);
-    }
-    return out;
-  }
-  return v;
-}
 
 /** Deterministic, key-ordered JSON of just the behavioral body — the hash + equality basis. */
 function canonicalBody(body: ProfileDefinitionBody): string {
@@ -1047,6 +1094,49 @@ export function goldenSetErrors(goldenSet: unknown): string[] {
     return [`goldenSet.minRegressionPerIntent must be a whole number from 1 to ${GOLDEN_SET_CAPACITY}`];
   }
   return [];
+}
+
+/**
+ * THE MACHINES A VERSION DECLARES (ADR-066 decisions 1, 2 and 6), checked with the version: a platform key
+ * (`PLATFORM_MACHINE_KEYS`) is refused by name, the rest are held to the graph validation a classification's pack runs
+ * (`versionMachinesErrors`), and where the version names its tools, every tool a step offers (`tools`) or requires
+ * (`requiresTool`) is one of them (tenet D4: a step narrows the version's tools, never widens them). A step's `action`
+ * is the platform's to run and is checked against the turn's grant when it runs. The shape of the block itself is
+ * `validateIntentPackBody`'s.
+ */
+export function versionMachineErrors(pack: { machines?: unknown } | undefined, tools?: readonly string[]): string[] {
+  const machines = pack?.machines;
+  if (!machines || typeof machines !== 'object' || Array.isArray(machines)) return [];
+  const errs: string[] = [];
+  for (const key of Object.keys(machines).filter(isPlatformMachineKey)) {
+    errs.push(
+      `intentPack.machines['${key}'] is a platform machine, which every assistant runs as the platform declares it; `
+      + `a version may not declare or override one (${PLATFORM_MACHINE_KEYS.join(', ')})`,
+    );
+  }
+  const own = Object.fromEntries(Object.entries(machines as Record<string, unknown>).filter(([k]) => !isPlatformMachineKey(k)));
+  if (!Object.keys(own).length) return errs;
+  errs.push(...versionMachinesErrors(own));
+  if (Array.isArray(tools)) {
+    const allowed = new Set(tools);
+    for (const [name, m] of Object.entries(own as Record<string, Partial<TaskStateMachine>>)) {
+      const states = m && typeof m === 'object' && m.states && typeof m.states === 'object' ? m.states : {};
+      for (const [state, def] of Object.entries(states)) {
+        const named = [
+          ...(Array.isArray(def?.tools) ? def.tools : []),
+          ...(Array.isArray(def?.requiresTool) ? def.requiresTool : []),
+        ];
+        const outside = [...new Set(named)].filter((t) => typeof t === 'string' && !allowed.has(t));
+        if (outside.length) {
+          errs.push(
+            `intentPack.machines['${name}'].states['${state}'] names tool(s) this version does not allow: ${outside.join(', ')}. `
+            + "A step narrows the version's tools and can never widen them; add the tool to `tools` first, or drop it from the step.",
+          );
+        }
+      }
+    }
+  }
+  return errs;
 }
 
 export function validateDefinitionBody(
@@ -1122,18 +1212,6 @@ export function validateDefinitionBody(
   // keys is checked with the model bundle below, because that needs both halves in hand.
   if (body.intentPack !== undefined) {
     errs.push(...validateIntentPackBody(body.intentPack));
-    // ONE PLACE TO DECLARE MACHINES, and this refuses the second one.
-    //
-    // A pack may carry a `machines` block, and on the per-deployment SSM pack it is read:
-    // `taskStateMachines()` merges it over the platform defaults. On a VERSION it is read by nothing -
-    // every machines consumer takes the body's top-level `machines`, and none of them ever calls
-    // `taskStateMachines(resolved.intentPack)`. Bringing the pack onto the version therefore created a
-    // second, identical-looking place to declare task machines where only one of them does anything.
-    //
-    // Refused rather than folded into `machines`, because folding would make the same field mean
-    // "merged over the defaults" in one location and "the version's override" in another, and an
-    // operator reading a stored definition could not tell which graph a task would run. The message
-    // names the field that works.
     // AN INTENT NARROWS THE PROFILE'S TOOLS; IT MAY NOT WIDEN THEM (tenet D4).
     //
     // Checked here rather than in `validateIntentPackBody`, because only this function holds both
@@ -1153,14 +1231,7 @@ export function validateDefinitionBody(
         }
       }
     }
-    if ((body.intentPack as { machines?: unknown }).machines !== undefined) {
-      errs.push(
-        'intentPack.machines is not read from a profile version. Task graphs are GLOBAL WORKFLOWS: '
-        + "declare them on the CLASSIFICATION's assistant-intent-pack parameter, or use the platform "
-        + "set. A version selects from what exists with `workflows`; it cannot declare one, so the "
-        + "version's own top-level `machines` is refused too.",
-      );
-    }
+    errs.push(...versionMachineErrors(body.intentPack as { machines?: unknown }, body.tools));
   }
   // SPEC-ASSISTANT-CONFIG §4: the per-profile model bundle (shape only — the InvokeModel-allowlist
   // boundary for each model is enforced at the write path, §7, where the catalog is available).
@@ -1291,15 +1362,10 @@ export function validateDefinitionBody(
       }
     }
   }
-  // MACHINES ARE NOT REFUSED HERE, and that is deliberate rather than an omission.
-  //
-  // This validator also runs on the READ path, and a failure there fails CLOSED to the compiled seed -
-  // so refusing a stored version that carries a legacy `machines` block would not drop the block, it
-  // would discard the whole version: its persona, its models, its tools, everything, replaced by the
-  // seed on the next turn. A narrowing must not be able to delete a deployment's configuration.
-  //
-  // The refusal belongs on the WRITE patch, where the operator is present to be told (`editDraft`),
-  // and `bodyFrom` drops the field on read so a legacy version simply normalizes away.
+  // THE LEGACY TOP-LEVEL `machines` IS NOT REFUSED HERE. This validator also runs on the READ path, where
+  // a refusal would stop the whole version from serving; `bodyFrom` drops the field on read instead, and
+  // the WRITE patch refuses it, naming `intentPack.machines` (`editDraft`). A version's own machines are
+  // checked above, with its pack (`versionMachineErrors`).
 
   return errs;
 }
@@ -1345,15 +1411,11 @@ export function bodyFrom(obj: Partial<ProfileDefinitionBody>): ProfileDefinition
     ...(obj.models !== undefined ? { models: modelsFrom(obj.models) } : {}),
     ...(obj.tools !== undefined ? { tools: obj.tools } : {}),
     ...(obj.guardrailId !== undefined ? { guardrailId: obj.guardrailId } : {}),
-    // MACHINES ARE THE PLATFORM'S, NOT A VERSION'S. Dropped here, which is the
-    // whitelist that decides what a stored body may carry, so a version that still holds one from
-    // before this normalizes away on its next read instead of quietly out-ranking the platform graphs.
-    //
-    // WHAT THIS PROTECTS. Every assistant's ability to manage work has to be the same ability: a task
-    // graph decides what states exist, which moves are legal and when a person is awaited, and an
-    // assistant that redefined `queue_drain` for itself was running a different contract for the same
-    // named workflow. Nothing else about a profile is narrowed - the persona, models, tools, context
-    // and its own intents stay per assistant.
+    // THE LEGACY TOP-LEVEL `machines` IS DROPPED HERE, the whitelist that decides what a stored body may
+    // carry. A version's machines ride its pack (`intentPack.machines`, ADR-066), kept whole below, so they
+    // survive every read, edit, export and import with the rest of the taxonomy. A platform key in them is
+    // refused on write (`versionMachineErrors`) and never resolved from a version at runtime
+    // (`machinesForVersion`), so every assistant runs the queue and the work items the same way.
     ...(obj.intentPack !== undefined ? { intentPack: obj.intentPack } : {}),
     ...(obj.onboarding !== undefined ? { onboarding: obj.onboarding } : {}),
     ...(obj.boundary !== undefined ? { boundary: obj.boundary } : {}),
@@ -1362,6 +1424,8 @@ export function bodyFrom(obj: Partial<ProfileDefinitionBody>): ProfileDefinition
     ...(obj.copy !== undefined ? { copy: obj.copy as AssistantCopy } : {}),
     ...(obj.messages !== undefined ? { messages: obj.messages as import('./message-template.js').VersionMessages } : {}),
     ...(obj.eventWorkflows !== undefined ? { eventWorkflows: obj.eventWorkflows as ProfileDefinitionBody['eventWorkflows'] } : {}),
+    ...(obj.intentWorkflows !== undefined ? { intentWorkflows: obj.intentWorkflows as ProfileDefinitionBody['intentWorkflows'] } : {}),
+    ...(obj.processes !== undefined ? { processes: obj.processes as ProfileDefinitionBody['processes'] } : {}),
     ...(obj.variables !== undefined ? { variables: obj.variables as ProfileDefinitionBody['variables'] } : {}),
     ...(obj.welcome !== undefined ? { welcome: obj.welcome as LegacyWelcome } : {}),
     // THIS IS A WHITELIST, so a field absent from it is SILENTLY DROPPED from every stored body -
@@ -1379,50 +1443,12 @@ export function bodyFrom(obj: Partial<ProfileDefinitionBody>): ProfileDefinition
   };
 }
 
-/**
- * Build the per-intent route strategy (`IntentRouteDefinition[]`, what `resolveModelForIntent` consumes)
- * from a profile version's `models.byIntent`. `resolveModelForIntent` reads only `intent`/`primaryModel`/
- * `fallbackModel`, so the other fields are placeholders. Returns null when the profile has no per-intent
- * routing, so the caller falls back to the (legacy) global strategy. THIS is what moves per-intent model
- * routing off the global table and onto the profile (U2 / SPEC-ASSISTANT-CONFIG §4).
- */
-export function buildIntentStrategy(models: ProfileModels | undefined): IntentRouteDefinition[] | null {
-  const byIntent = models?.byIntent;
-  if (!byIntent || Object.keys(byIntent).length === 0) return null;
-  // A per-intent route whose primary is the `'default'` sentinel means "no override — use the base model
-  // for this intent", so it is DROPPED from the strategy (the resolver then falls back to base). Only
-  // routes that name a concrete primary become strategy entries. An IMAGE route never does: the text
-  // resolver is never handed an image model, and an image-routed intent takes the image path instead.
-  const entries = Object.entries(textRoutesOf(byIntent)).filter(([, route]) => concreteModel(route.primary));
-  if (entries.length === 0) return null;
-  return entries.map(([intent, route]) => ({
-    intent: intent as RouteKey,
-    label: intent,
-    primaryModel: route.primary as BackendModelKey,
-    fallbackModel: (concreteModel(route.fallback) ?? route.primary) as BackendModelKey,
-    rationale: 'per-profile version (SPEC-ASSISTANT-CONFIG §4)',
-  }));
-}
+// THE PER-INTENT ROUTE STRATEGY OF A VERSION (`buildIntentStrategy`) is pure and lives beside the resolver, so the
+// console's step preview builds it the same way the processor does.
+export { buildIntentStrategy } from './model-resolver.js';
 
-/**
- * THE PLATFORM ROUTES AS A VERSION ON `baseModelKey` SERVES THEM, explicitly: each route the retired
- * classification floor would have raised says the base model, and a standalone greeting or acknowledgment
- * keeps the route it was answered on (`routesAsServedByTheFloor`). A seed and a body with no routes carry
- * these, so what a version says is what it serves. With no concrete base model the routes are as written.
- */
-export function platformRoutesServedOn(baseModelKey: string | undefined): Record<string, { primary: string; fallback?: string }> {
-  const routes = seedByIntentFromGlobalStrategy();
-  // Cost classes are the catalog's own and do not depend on the region or account.
-  return routesAsServedByTheFloor(routes, baseModelKey, getModelCatalog('us-east-1', '') as Record<string, { costClass: 'low' | 'medium' | 'high' }>).byIntent ?? routes;
-}
-
-/** Seed a profile's `models.byIntent` from the legacy global strategy — a per-profile COPY, so building
- *  the strategy back from it is byte-identical to feeding `INTENT_ROUTE_STRATEGY` directly. */
-function seedByIntentFromGlobalStrategy(): Record<string, { primary: string; fallback?: string }> {
-  const out: Record<string, { primary: string; fallback?: string }> = {};
-  for (const r of INTENT_ROUTE_STRATEGY) out[r.intent] = { primary: r.primaryModel, fallback: r.fallbackModel };
-  return out;
-}
+// THE PLATFORM ROUTES AS A VERSION SERVES THEM (`platformRoutesServedOn`) are pure and live beside the resolver.
+export { platformRoutesServedOn } from './model-resolver.js';
 
 /**
  * Backfill a COMPLETE `models` bundle onto a (possibly legacy) body so export/edit surfaces the ACTUAL
@@ -1457,8 +1483,9 @@ export function ensureModelsBundle(body: ProfileDefinitionBody): ProfileDefiniti
 /** Extract the runtime-editable body from a full (seed) AssistantProfile. The seed carries the new
  *  `models` bundle: `default` = the profile's base modelKey, and `byIntent` seeded per-profile from the
  *  legacy global strategy so U2's per-profile resolution is byte-identical to the old global path. */
-/** The pack as a version stores it: everything except the `machines` block, which a version does not
- *  read (the deployment pack parameter remains its only live home). */
+/** A classification's pack without its `machines` block. A draft carries the machines its own intents run, copied as a
+ *  starting point (`withStartingMachines`, profile-lifecycle.ts), never the classification's block whole: that block may
+ *  name a platform key, which a version is refused. */
 export function packWithoutMachines(pack: StoredIntentPack): StoredIntentPack {
   if (pack.machines === undefined) return pack;
   const { machines: _dropped, ...rest } = pack;
@@ -1590,10 +1617,14 @@ function bodyOf(profile: AssistantProfile, intentPack?: StoredIntentPack): Profi
   const seededModels = confineModelsToClassification({
     default: profile.modelKey,
     classifier: DEFAULT_MODEL,
-    byIntent: withImageParts(
-      seedByIntentReachableIn(intentPack, profile.modelKey),
-      // The default image part for every intent of the pack this version carries that needs an image.
-      defaultImageRoute(classificationOfProfile(profile.name), imageIntentRouteKeysOf(intentPack)),
+    byIntent: withDeclaredRoutes(
+      withImageParts(
+        seedByIntentReachableIn(intentPack, profile.modelKey),
+        // The default image part for every intent of the pack this version carries that needs an image.
+        defaultImageRoute(classificationOfProfile(profile.name), imageIntentRouteKeysOf(intentPack)),
+      ),
+      // The routes the profile declares, with the steps it runs on a model of their own (`AssistantProfile.routes`).
+      profile.routes,
     ),
   }, classificationOfProfile(profile.name)).models;
   return {
@@ -1611,11 +1642,9 @@ function bodyOf(profile: AssistantProfile, intentPack?: StoredIntentPack): Profi
     // Omitted by the callers that want the pure compiled default (the lifecycle reset baseline, the
     // manifest's seed comparison), exactly as `persona` is.
     //
-    // THE PACK'S `machines` BLOCK IS LEFT BEHIND on purpose. A deployment pack may carry one and
-    // `taskStateMachines()` reads it there; a VERSION's copy is read by nothing, and the body's
-    // top-level `machines` is the field that works (see validateDefinitionBody). Carrying it across
-    // would seed every profile with a block that looks authoritative and decides nothing - and the
-    // validator would then refuse the seed it just produced.
+    // THE PACK'S `machines` BLOCK IS LEFT BEHIND: it may name a platform key, which a version is refused.
+    // A compiled seed declares no machines and so runs `taskStateMachines()` (`machinesForVersion`); a
+    // draft is given its intents' machines as a starting point when it is made (`withStartingMachines`).
     ...(intentPack ? { intentPack: packWithoutMachines(intentPack) } : {}),
     // classifier is seeded EXPLICITLY as the `'default'` sentinel (not absent, not the concrete Haiku key):
     // the profile records "follow the classification-set classifier" as a choice that tracks the platform
@@ -1740,8 +1769,8 @@ export function definitionParamName(ssmRoot: string, profileName: string): strin
 export { isNoActiveVersion };
 
 /**
- * Validate a parsed definition against the schema + the §7 cut. Throws on any violation so the caller
- * fails closed to the seed rather than serving an unvalidated (possibly hostile) definition.
+ * Validate a parsed definition against the schema + the §7 cut. Throws on any violation, so an unvalidated
+ * (possibly hostile) definition is never served: the reader treats it as an unreadable version.
  */
 function parseDefinition(raw: string, expectedName: string): ProfileDefinition {
   const d = JSON.parse(raw) as Partial<ProfileDefinition>;
@@ -1753,7 +1782,7 @@ function parseDefinition(raw: string, expectedName: string): ProfileDefinition {
   }
   // A RETIRED `models` FIELD IS READ AS ABSENT. A version stored while `models.externalProviderAllowed`
   // existed still carries it. It enables nothing (the classification's selection decides an external model),
-  // so it is removed here rather than failing the read closed to the seed.
+  // so it is removed here rather than failing the read.
   if (d.models && typeof d.models === 'object' && 'externalProviderAllowed' in d.models) {
     const { externalProviderAllowed: _retired, ...models } = d.models as ProfileModels & { externalProviderAllowed?: unknown };
     d.models = models;
@@ -1796,8 +1825,8 @@ export interface ResolvedActiveProfile {
   /** The active version's per-profile tool ALLOWLIST. Undefined when it fell back to the seed (no active
    *  version) — the loop then offers all runtime-available tools (byte-identical to the pre-allowlist path). */
   tools?: string[];
-  /** WHICH GLOBAL WORKFLOWS this assistant may open. Undefined ⇒ every available one. A SELECTION over
-   *  the platform + classification graphs, never a definition of one (see ProfileDefinitionBody). The
+  /** WHICH WORKFLOWS this assistant may open. Undefined ⇒ every available one. A SELECTION over the platform,
+   *  classification and version graphs, never a definition of one (see ProfileDefinitionBody). The
   workflows?: string[];
   /** Per workflow, when its confirmed step is put to the person (`ProfileDefinitionBody.confirmBrief`). Undefined: each
    *  workflow's declared value. */
@@ -1835,6 +1864,10 @@ export interface ResolvedActiveProfile {
   messages?: import('./message-template.js').VersionMessages;
   /** The event workflows this version declares (`ProfileDefinitionBody.eventWorkflows`). */
   eventWorkflows?: ProfileDefinitionBody['eventWorkflows'];
+  /** The intent workflows this version declares (`ProfileDefinitionBody.intentWorkflows`, ADR-067 decision 1). */
+  intentWorkflows?: ProfileDefinitionBody['intentWorkflows'];
+  /** The processes this version declares (`ProfileDefinitionBody.processes`, SPEC-PROCESSES P1). */
+  processes?: ProfileDefinitionBody['processes'];
   /** The variables this version names (`ProfileDefinitionBody.variables`). */
   variables?: ProfileDefinitionBody['variables'];
   contextSources?: string[];
@@ -1854,25 +1887,64 @@ export interface ResolveActiveProfileOptions {
    * Cached apart from a full resolution, so a turn never gets a version stripped of its bodies.
    */
   withoutBodies?: boolean;
+  /** Pause before the first retry of a transiently unreadable version, doubled for the second. Default 200ms; tests pass 0. */
+  retryDelayMs?: number;
 }
+
+/**
+ * A profile HAS a version and it cannot be read: the parameter or a body read failed, or the stored definition
+ * does not validate. Thrown rather than answered with the compiled seed, because the seed is wider than any
+ * version (no tool allowlist, the deployment default guardrail): a turn either runs on the version that was
+ * approved or does not run. The turn processor answers the person with its degraded reply (`turnFailed`) and
+ * raises the operator alert.
+ */
+export class ProfileVersionUnreadableError extends Error {
+  readonly profileName: string;
+  /** The pinned version, when the read was of one exact version rather than the `active` label. */
+  readonly version?: number;
+  constructor(profileName: string, cause: unknown, version?: number) {
+    const what = version === undefined ? `the active version of '${profileName}'` : `version ${version} of '${profileName}'`;
+    super(`${what} could not be read (${(cause as { name?: string })?.name ?? String(cause)})`);
+    this.name = 'ProfileVersionUnreadableError';
+    this.profileName = profileName;
+    if (version !== undefined) this.version = version;
+  }
+}
+
+/**
+ * The last VERSION resolution each cache key served, kept past its TTL. A version that becomes unreadable is
+ * answered with the version that was last read, which is one the operator approved, rather than the seed.
+ * Only a resolution of a real version is kept here: the seed is never a stand-in for a version.
+ */
+const lastGoodVersion = new Map<string, ResolvedActiveProfile>();
+
+/**
+ * A failure another read may not repeat (`lib/transient-retry.ts`, the one rule every retrying caller asks). A version
+ * that is not active answers the same however often it is read, so it is never read again.
+ */
+export { isTransientReadError };
+
+/** Run `read`, and again after a pause while it fails transiently. */
+const readWithRetry = <T>(read: () => Promise<T>, delayMs: number): Promise<T> => retryTransient(read, delayMs, { final: isNoActiveVersion });
+
+/**
+ * HOW LONG AN UNREADABLE ANSWER STANDS. One turn resolves a profile several times (intake, the classifier, the pack,
+ * the workflows, the words), so an unreadable version is answered from memory for a few seconds rather than read and
+ * retried at each: a turn pays for the retries once. Short, so the next turn reads again.
+ */
+const UNREADABLE_MEMO_MS = 5_000;
+const unreadable = new Map<string, { err: unknown; until: number }>();
 
 /**
  * Resolve the ACTIVE version of a profile, merged over its compiled seed. Boundary fields
  * (name, contextScope) always come from the seed; only the §7 runtime-editable subset is taken from
- * the active version. Fail-closed to the pure seed on any error. Cached per container for `ttlMs`.
+ * the active version. Cached per container for `ttlMs`.
+ *
+ * The compiled seed serves only a profile with NO active version (`isNoActiveVersion`). A version that exists
+ * and cannot be read is read again while the failure is transient (`isTransientReadError`); still unreadable,
+ * the last version this container served for the profile answers, and with none, `ProfileVersionUnreadableError`
+ * is thrown. Either outcome stands for a few seconds (`UNREADABLE_MEMO_MS`), so the next turn reads again.
  */
-/**
- * The event workflows ANOTHER assistant's active version declares: the run's owner, read where a step names a role
- * (`as: { role }`) and this assistant takes it. Not the serving profile: this turn is still resolved once, by
- * `resolveActiveProfile` with its variant. Undefined when the owner's version cannot be read, so no step is taken.
- */
-export async function ownerEventWorkflows(
-  ownerProfileName: string,
-  opts: ResolveActiveProfileOptions,
-): Promise<ResolvedActiveProfile['eventWorkflows'] | undefined> {
-  return (await resolveActiveProfile(ownerProfileName, opts).catch(() => undefined))?.eventWorkflows;
-}
-
 export async function resolveActiveProfile(
   profileName: string,
   opts: ResolveActiveProfileOptions,
@@ -1920,33 +1992,47 @@ export async function resolveActiveProfile(
       ? { imageModelKey: DEFAULT_IMAGE_MODEL }
       : {}),
   };
+  const retryDelayMs = opts.retryDelayMs ?? 200;
+  const memoMs = Math.min(ttlMs, UNREADABLE_MEMO_MS);
+  const memo = unreadable.get(cacheKey);
+  if (memo && memo.until > now()) throw new ProfileVersionUnreadableError(profileName, memo.err);
   try {
-    const resp = await opts.ssm.send(
-      new GetParameterCommand({ Name: `${definitionParamName(opts.ssmRoot, profileName)}:active` }),
-    );
-    const raw = resp.Parameter?.Value;
-    if (raw) {
+    resolved = await readWithRetry(async () => {
+      const resp = await opts.ssm.send(
+        new GetParameterCommand({ Name: `${definitionParamName(opts.ssmRoot, profileName)}:active` }),
+      );
+      const raw = resp.Parameter?.Value;
+      if (!raw) throw new Error('the active version carries no value');
       const def = parseDefinition(raw, profileName);
-      // WHICH VERSION THIS IS, kept rather than discarded. The response has always carried it and
-      // nothing read it, so `profileVersion` was declared on the analytics metadata, rendered as a
-      // column in the console's L1 view, and never written by a live turn - the only writer was the
-      // manual backfill tool. An operator asking "which version produced this" got a blank.
-      //
       // The SSM parameter version is the operator's handle ("v3"): monotonic, per deployment, and the
       // same number the Profiles tab lists and rolls back to. It sits ALONGSIDE `configId`, which
       // identifies what the version SAYS and is comparable across deployments - two answers to two
       // questions rather than a choice between them.
-      // Follow the persona pointer, if this version has one. INSIDE the try and INSIDE the cache: an
-      // unreadable body takes the same fail-closed path as an unreadable parameter (serve the compiled
-      // seed, loudly) rather than serving a version stripped of the persona it declares, and a warm
-      // container pays for the S3 read once per TTL, not once per turn.
-      resolved = { ...resolveFromDefinition(opts.withoutBodies ? withoutBodyPointers(def) : await hydrateBodies(def), profileName), version: resp.Parameter?.Version };
-    }
+      // The persona and pack pointers are followed INSIDE the read: an unreadable body is an unreadable
+      // version, never a version served without the persona it declares, and a warm container pays for
+      // the S3 read once per TTL, not once per turn.
+      return {
+        ...resolveFromDefinition(opts.withoutBodies ? withoutBodyPointers(def) : await hydrateBodies(def), profileName),
+        version: resp.Parameter?.Version,
+      };
+    }, retryDelayMs);
+    lastGoodVersion.set(cacheKey, resolved);
+    unreadable.delete(cacheKey);
   } catch (err) {
-    // Absent label/param (nothing activated yet) is the COMMON, expected path — log at debug volume;
-    // a parse/validation failure is louder but still fail-closed to the seed.
+    // NOTHING ACTIVATED YET is the common, expected path, and the one path that serves the compiled seed.
     if (!isNoActiveVersion(err)) {
-      console.warn(`[active-profile] '${profileName}' active version unresolved; serving seed:`, (err as { name?: string })?.name ?? err);
+      // A VERSION EXISTS AND CANNOT BE READ. The seed is wider than any version (every runtime tool, the
+      // deployment default guardrail), so it never stands in for one: the last version this container
+      // served answers, else the turn fails. Neither is cached, so the next turn reads again.
+      const lastGood = lastGoodVersion.get(cacheKey);
+      if (lastGood) {
+        console.warn(`[active-profile] '${profileName}' active version unreadable; serving the last version read (${lastGood.configId}):`, (err as { name?: string })?.name ?? err);
+        cache.set(cacheKey, { ...lastGood, expires: now() + memoMs });
+        return lastGood;
+      }
+      console.error(`[active-profile] '${profileName}' active version unreadable; refusing to serve the seed in its place:`, (err as { name?: string })?.name ?? err);
+      unreadable.set(cacheKey, { err, until: now() + memoMs });
+      throw new ProfileVersionUnreadableError(profileName, err);
     }
   }
 
@@ -1960,8 +2046,8 @@ export async function resolveActiveProfile(
  * prefix the session does not hold, so the turn reads the version, not the label.
  *
  * A version is immutable, so it is cached for the container rather than for a TTL. A version that
- * cannot be read falls back to the label, the same answer `resolveActiveProfile` gives, and the
- * session's grants still bound whatever that turns out to ask for.
+ * cannot be read is read again while the failure is transient and then refused with `ProfileVersionUnreadableError`: neither the
+ * label (which may name a version with more tools) nor the seed (which names every tool) answers for it.
  */
 const versionCache = new Map<string, ResolvedActiveProfile>();
 
@@ -1973,21 +2059,26 @@ export async function resolveProfileVersion(
   const key = `${profileName}:${version}`;
   const hit = versionCache.get(key);
   if (hit) return hit;
+  const now = opts.now ?? Date.now;
+  const memo = unreadable.get(key);
+  if (memo && memo.until > now()) throw new ProfileVersionUnreadableError(profileName, memo.err, version);
   try {
-    const resp = await opts.ssm.send(
-      new GetParameterCommand({ Name: `${definitionParamName(opts.ssmRoot, profileName)}:${version}` }),
-    );
-    const raw = resp.Parameter?.Value;
-    if (raw) {
+    const resolved = await readWithRetry(async () => {
+      const resp = await opts.ssm.send(
+        new GetParameterCommand({ Name: `${definitionParamName(opts.ssmRoot, profileName)}:${version}` }),
+      );
+      const raw = resp.Parameter?.Value;
+      if (!raw) throw new Error('the version carries no value');
       const def = parseDefinition(raw, profileName);
-      const resolved = { ...resolveFromDefinition(await hydrateBodies(def), profileName), version: resp.Parameter?.Version };
-      versionCache.set(key, resolved);
-      return resolved;
-    }
+      return { ...resolveFromDefinition(await hydrateBodies(def), profileName), version: resp.Parameter?.Version };
+    }, opts.retryDelayMs ?? 200);
+    versionCache.set(key, resolved);
+    return resolved;
   } catch (err) {
-    console.warn(`[active-profile] '${key}' unreadable; serving the active label:`, (err as { name?: string })?.name ?? err);
+    console.error(`[active-profile] '${key}' unreadable; refusing to serve another version in its place:`, (err as { name?: string })?.name ?? err);
+    unreadable.set(key, { err, until: now() + Math.min(opts.ttlMs ?? UNREADABLE_MEMO_MS, UNREADABLE_MEMO_MS) });
+    throw new ProfileVersionUnreadableError(profileName, err, version);
   }
-  return resolveActiveProfile(profileName, opts);
 }
 
 /**
@@ -2003,7 +2094,7 @@ export async function resolveProfileVersion(
  */
 /** A stored definition with its body pointers dropped, for a `withoutBodies` read: its persona and pack fall to the seed. */
 function withoutBodyPointers(def: ProfileDefinition): ProfileDefinition {
-  const { personaRef: _persona, intentPackRef: _pack, ...rest } = def;
+  const { personaRef: _persona, intentPackRef: _pack, intentWorkflowsRef: _workflows, eventWorkflowsRef: _events, ...rest } = def;
   return rest as ProfileDefinition;
 }
 
@@ -2032,8 +2123,22 @@ export function resolveFromDefinition(
       + 'unhydrated would classify against the deployment pack while reporting this version.',
     );
   }
-  // Same fail-closed seed rule as resolveActiveProfile, resolved HERE rather than by the caller: an
-  // experiment variant must not be the place where a different (or absent) fallback creeps in.
+  // AND FOR THE INTENT WORKFLOWS: unhydrated, a request would run with none of the steps the version declares.
+  if (def.intentWorkflowsRef && def.intentWorkflows === undefined) {
+    throw new Error(
+      `[active-profile] '${profileName}' version ${def.configId} was resolved without hydrating its `
+      + 'intent-workflows pointer; call hydrateBodies on a stored definition before serving it.',
+    );
+  }
+  // AND FOR THE EVENT WORKFLOWS: unhydrated, every event would run the platform's built-in workflows while reporting this version.
+  if (def.eventWorkflowsRef && def.eventWorkflows === undefined) {
+    throw new Error(
+      `[active-profile] '${profileName}' version ${def.configId} was resolved without hydrating its `
+      + 'event-workflows pointer; call hydrateBodies on a stored definition before serving it.',
+    );
+  }
+  // The seed this merges over is resolved HERE rather than by the caller: an experiment variant must not
+  // be the place where a different (or absent) seed creeps in.
   const seed = seedFor(profileName);
   if (!seed) throw new Error(`active-profile: no seed profile named '${profileName}'`);
   const seedProfile = seed;
@@ -2070,9 +2175,7 @@ export function resolveFromDefinition(
     workflows: def.workflows,
     confirmBrief: def.confirmBrief,
     imageModelKey: imagePrimaryOf(def.models),
-    // `machines` is no longer carried: `bodyFrom` drops it, so this would always be undefined, and a
-    // field that is structurally always absent reads as a capability that merely happens to be unset.
-    // Task graphs are global; what a version says about them is `workflows` above, a SELECTION.
+    // THE VERSION'S MACHINES RIDE ITS PACK (`intentPack.machines`, ADR-066), read through `machinesForVersion`.
     // RESOLVED here, once, at the boundary between what is STORED and what is SERVED. Every reader
     // downstream then takes a pack it can use directly and none of them has to know `extends` exists -
     // which is what keeps the inheritance rule in one place instead of at each point of use.
@@ -2085,13 +2188,22 @@ export function resolveFromDefinition(
     displayName: def.displayName,
     messages: def.messages,
     eventWorkflows: def.eventWorkflows,
+    intentWorkflows: def.intentWorkflows,
+    processes: def.processes,
     variables: def.variables,
     contextSources: def.contextSources,
   };
+  // EVERY VERSION THIS CONTAINER SERVES IS ONE A TASK MAY HAVE STARTED ON, so its machines are recorded by configId
+  // (`machinesForTask`, ADR-066 decision 5): an active version, a pinned duel side and an experiment's arm alike.
+  rememberVersionMachines({ configId: def.configId, intentPack: out.intentPack });
   return out;
 }
 
-/** Test seam: drop the warm-container cache. */
+/** Test seam: drop the warm-container caches, the last version read included. */
 export function __clearActiveProfileCache(): void {
   cache.clear();
+  lastGoodVersion.clear();
+  unreadable.clear();
+  versionCache.clear();
+  __clearVersionMachines();
 }

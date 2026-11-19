@@ -67,7 +67,9 @@ interface ParsedMessage {
   battleWaiting: BattleWaiting | null;
 }
 
-const NAVIGATE_CHANNEL_PATTERN = /NAVIGATE_CHANNEL:([^|\s]+)\|([^\n]+)/;
+// The label runs to the end of the line or to the next marker: a reply that moves a subject declares the move
+// after its link (`<!--turn:kind=drift;moves=...-->`), and that declaration is not part of the label a person reads.
+const NAVIGATE_CHANNEL_PATTERN = /NAVIGATE_CHANNEL:([^|\s]+)\|([^\n<]+)/;
 const BATTLE_MARKER_PATTERN = /<!--battle:([^>]+)-->/;
 const BATTLESTATS_MARKER_PATTERN = /<!--battlestats:([^>]+)-->/;
 const BATTLEWAITING_MARKER_PATTERN = /<!--battlewaiting:([^>]+)-->/;
@@ -168,7 +170,7 @@ export function declaresFinalAnswer(rawContent: string | undefined | null): bool
     // always last - and a crafted marker travelling in composed model text therefore sits BEFORE it.
     // Reading the first match handed that forged one the answer: a finished DIRECT turn read as an
     // unfinished placeholder, and its timings were dropped. Global match, last entry.
-    const all = [...form.matchAll(/<!--turn:([A-Za-z0-9._;=-]{1,512})-->/g)];
+    const all = [...form.matchAll(/<!--turn:([A-Za-z0-9._;=-]{1,1024})-->/g)];
     const declaration = all.length ? all[all.length - 1] : null;
     if (declaration && declaration[1].split(';').includes('phase=final')) return true;
   }
@@ -324,7 +326,7 @@ export function parseMessageContent(rawContent: string): ParsedMessage {
   //
   // The pattern is the writer's, bounded and character-classed, so it cannot run away on crafted
   // input - the same rule `declaresFinalAnswer` matches with.
-  content = content.replace(/<!--turn:[A-Za-z0-9._;=-]{1,512}-->/g, '');
+  content = content.replace(/<!--turn:[A-Za-z0-9._;=-]{1,1024}-->/g, '');
 
   // Strip the guardrail MASK TOKEN, which is what Amazon Bedrock Guardrails leaves where it masked
   // one of the markers above: an ANONYMIZE match is replaced by the literal `{FILTER_NAME}`, so a

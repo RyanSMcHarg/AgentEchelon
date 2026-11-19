@@ -145,11 +145,11 @@ const connectors = connectorRegistry(app.node.tryGetContext('connectors'), conne
       }
     }
   }
-  // A HOST'S CONTEXT CONVERSATIONS ARE CREATED BY THEIR CLASSIFICATION'S CREATOR, which exists for a
+  // A HOST'S CONTEXT CONVERSATIONS NEED THEIR CLASSIFICATION'S ASSISTANTS, which exist for a
   // classification with an assistant stack only.
   const context = issuers.contextClassification();
   if (context && !assistantClassificationValues.includes(context)) {
-    throw new Error(`issuers: oneChannel names "${context}", which this deployment creates no assistant stack for`);
+    throw new Error(`issuers: contextClassification names "${context}", which this deployment creates no assistant stack for`);
   }
 }
 
@@ -294,7 +294,7 @@ const identityStack = new IdentityStack(app, stackId('Identity'), {
   connectorGrantsFunction: connectors.withGrants().length ? connectorGrantsFunctionName() : undefined,
   // Who may pre-assign a provisioned-only issuer's subject (P-13): the admin backend, and the connector receiver.
   subjectProvisioners: provisionerIssuers(issuers, connectors, capabilities),
-  // Replies by email (M-8): the reply poster posts on the one-conversation role, so its role is created here.
+  // Replies by email (M-8): the reply poster posts on the `restricted` role, so its role is created here.
   emailReplies: capabilities.has('notifications') && Boolean(String(app.node.tryGetContext('replyDomain') || '').trim()),
   // Offboarding erases the person named on a conversation's battle setting (the Battle stack's table) with `battle`.
   battle: capabilities.has('battle'),
@@ -407,6 +407,8 @@ const conversationsStack = new ConversationsStack(app, stackId('Conversations'),
   invitationLinkReach: identityStack.invitationLinkReach,
   // The invitation and claim emails are sent by Notifications, named to the functions that issue them with `notifications`.
   transactionalMail: capabilities.has('notifications'),
+  dashboardPages: capabilities.has('dashboard-pages'),
+  meetings: capabilities.has('meetings'),
   description: 'Conversations: task, profile, context, turn and feedback tables, attachments, and their routes',
 });
 
@@ -424,6 +426,8 @@ if (analyticsMode === 'aurora') {
     userPoolArn: identityStack.userPool?.userPoolArn,
     // Eval runner scores image turns by fetching the generated image from the attachments bucket.
     attachmentsBucketArn: conversationsStack.attachmentsBucket.bucketArn,
+    // The RAG corpus (`rag/`) is the company's knowledge, in the company bucket.
+    companyBucketArn: conversationsStack.companyBucket.bucketArn,
     membershipAuditEnforce,
     senderEmail: app.node.tryGetContext('senderEmail') as string | undefined,
     // Cost sleep mode (opt-in): auto-pause Aurora after inactivity + admin wake.
@@ -554,6 +558,10 @@ const assistantsSharedProps = {
   appInstanceArn: messagingStack.appInstanceArn,
   attachmentsBucketName: conversationsStack.attachmentsBucket.bucketName,
   attachmentsBucketArn: conversationsStack.attachmentsBucket.bucketArn,
+  companyBucketName: conversationsStack.companyBucket.bucketName,
+  companyBucketArn: conversationsStack.companyBucket.bucketArn,
+  profileBucketName: conversationsStack.profileBucket.bucketName,
+  profileBucketArn: conversationsStack.profileBucket.bucketArn,
   // The battle and experiments tables are NAMED to the functions that use them when those capabilities are
   // declared (`CAPABILITY_RESOURCES`); their stacks deploy after this one and attach the grants.
   battle: capabilities.has('battle'),
@@ -607,9 +615,9 @@ const channelFlowStack = new ChannelFlowStack(app, stackId('ChannelFlow'), {
   // classification (`channel-flow-processor.ts`), so the flow reads no sender's groups. The notification
   // fan-out runs on the message stream (ADR-041 decision 7), on the post-processing stack.
   // The flow resolves the active profile version for the copy of the notices it sends itself, and a
-  // version's persona body lives under `profiles/*` in this bucket.
-  attachmentsBucketName: conversationsStack.attachmentsBucket.bucketName,
-  attachmentsBucketArn: conversationsStack.attachmentsBucket.bucketArn,
+  // version's persona body lives under `profiles/*` in the profile bucket.
+  profileBucketName: conversationsStack.profileBucket.bucketName,
+  profileBucketArn: conversationsStack.profileBucket.bucketArn,
   description: 'Channel Flow Processor for @all and /battle routing',
 });
 channelFlowStack.addDependency(messagingStack);
@@ -628,8 +636,8 @@ const postProcessingStack = new PostProcessingStack(app, stackId('PostProcessing
   env,
   appInstanceArn: messagingStack.appInstanceArn,
   messageStream: messagingStack.messageStream,
-  attachmentsBucketName: conversationsStack.attachmentsBucket.bucketName,
-  attachmentsBucketArn: conversationsStack.attachmentsBucket.bucketArn,
+  profileBucketName: conversationsStack.profileBucket.bucketName,
+  profileBucketArn: conversationsStack.profileBucket.bucketArn,
   description: 'Post-processing on the message stream: the rules that act on messages delivery did not route',
 });
 postProcessingStack.addDependency(messagingStack); // the stream it consumes

@@ -1,0 +1,122 @@
+/* The Processes tab: a process's stages in run order, as cards that wrap and stack on a phone, and where each run spent its
+   time, as a grid of one hue, darker where longer (four steps, with a key), text always in text tokens. Both themes follow
+   from the tokens alone: the shades are the first chart color mixed into the surface. */
+
+.admin-process-stages {
+  list-style: none; margin: 0 0 var(--space-3); padding: 0;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--space-2);
+}
+.admin-process-stage {
+  display: flex; flex-direction: column; gap: 2px; min-width: 0;
+  padding: var(--space-2) var(--space-3); border: 1px solid var(--surface-200); border-radius: 8px; background: var(--surface-0);
+}
+.admin-process-stage-n { font-size: var(--text-xs); color: var(--text-tertiary); }
+.admin-process-stage-label { font-weight: 600; color: var(--text-primary); overflow-wrap: anywhere; }
+.admin-process-stage-workflow { font-size: var(--text-xs); color: var(--text-secondary); overflow-wrap: anywhere; }
+.admin-process-stage-reached { font-size: var(--text-sm); color: var(--text-secondary); }
+.admin-process-stage-time { font-size: var(--text-sm); color: var(--text-primary); font-variant-numeric: tabular-nums; }
+
+.admin-process-legend { display: flex; flex-wrap: wrap; gap: var(--space-3); margin: 0 0 var(--space-2); font-size: var(--text-sm); color: var(--text-secondary); }
+.admin-process-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.admin-process-swatch { display: inline-block; width: 14px; height: 14px; border-radius: 3px; }
+
+.admin-process-grid-wrap { overflow-x: auto; max-width: 100%; margin-bottom: var(--space-3); }
+.admin-process-grid { border-collapse: separate; border-spacing: 2px; font-size: var(--text-sm); }
+.admin-process-grid th { text-align: left; font-weight: 600; color: var(--text-secondary); padding: 4px 6px; white-space: nowrap; }
+.admin-process-grid td { padding: 0; }
+
+.admin-process-cell {
+  display: block; min-width: 64px; padding: 6px 8px; border-radius: 4px; text-align: center;
+  color: var(--text-primary); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.admin-process-cell-0 { background: var(--surface-50); color: var(--text-tertiary); }
+.admin-process-cell-1 { background: color-mix(in srgb, var(--chart-1) 14%, var(--surface-0)); }
+.admin-process-cell-2 { background: color-mix(in srgb, var(--chart-1) 30%, var(--surface-0)); }
+.admin-process-cell-3 { background: color-mix(in srgb, var(--chart-1) 50%, var(--surface-0)); }
+.admin-process-cell-4 { background: color-mix(in srgb, var(--chart-1) 72%, var(--surface-0)); }
+.admin-process-cell-open { background: var(--surface-0); outline: 2px solid var(--text-primary); outline-offset: -2px; font-weight: 600; }
+
+.admin-process-run-cards { list-style: none; margin: 0 0 var(--space-3); padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.admin-process-run-card { border: 1px solid var(--surface-200); border-radius: 8px; padding: var(--space-2) var(--space-3); }
+.admin-process-run-stages { list-style: none; margin: var(--space-2) 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.admin-process-run-stages li { display: flex; justify-content: space-between; align-items: center; gap: var(--space-2); }
+.admin-process-run-stages .admin-process-cell { min-width: 72px; }
+
+.admin-process-drill-summary { margin: var(--space-2) 0 var(--space-3); color: var(--text-primary); }
+.admin-process-drill-run { margin-bottom: var(--space-4); }
+.admin-process-drill-run h5 { margin: 0 0 var(--space-2); }
+.admin-process-drill-stages { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.admin-process-drill-stage {
+  display: grid; grid-template-columns: minmax(140px, 1.2fr) minmax(200px, 2fr) minmax(64px, auto) minmax(100px, 1fr); gap: var(--space-2);
+  align-items: baseline; padding: 6px 8px; border-bottom: 1px solid var(--surface-200); font-size: var(--text-sm); color: var(--text-secondary);
+}
+
+@media (max-width: 640px) {
+  .admin-process-stages { grid-template-columns: 1fr; }
+  .admin-process-drill-stage { grid-template-columns: 1fr auto; }
+  .admin-process-drill-stage > :nth-child(2), .admin-process-drill-stage > :nth-child(4) { grid-column: 1 / -1; }
+}
+
+/* ONE PROCESS: its description and key figures, then each section as a card. */
+.admin-process-description { margin: 0 0 var(--space-1); color: var(--text-primary); max-width: 80ch; }
+.admin-process-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: var(--space-2); margin: var(--space-3) 0; }
+.admin-process-kpi { display: flex; flex-direction: column; gap: 4px; padding: var(--space-3); border: 1px solid var(--surface-200); border-radius: 8px; background: var(--surface-0); }
+.admin-process-kpi-label { font-size: var(--text-xs); font-weight: 600; color: var(--text-secondary); }
+.admin-process-kpi-value { font-size: 1.6rem; font-weight: 700; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.admin-process-kpi-note { font-size: var(--text-xs); color: var(--text-secondary); }
+.admin-process-card { margin: 0 0 var(--space-3); padding: var(--space-3); border: 1px solid var(--surface-200); border-radius: 8px; background: var(--surface-0); }
+.admin-process-card h5 { margin: 0 0 4px; }
+.admin-process-card-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: var(--space-2); margin-bottom: var(--space-2); }
+.admin-process-picks { display: flex; flex-wrap: wrap; gap: 6px; }
+.admin-process-pick-runs { list-style: none; margin: var(--space-2) 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.admin-process-run-links { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
+
+/* THE FLOW: one box per stage, in order, wrapping; open runs here now outlined in the warning tone, an unreached stage dashed. */
+.admin-process-nodes { list-style: none; margin: var(--space-2) 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--space-2); counter-reset: none; }
+.admin-process-node { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: var(--space-2) var(--space-3); border-radius: 8px; border: 1px solid var(--surface-200); background: var(--surface-0); }
+.admin-process-node-reached, .admin-process-node-passed { border-color: var(--chart-1); background: color-mix(in srgb, var(--chart-1) 10%, var(--surface-0)); }
+.admin-process-node-now { border: 2px solid var(--warning); background: color-mix(in srgb, var(--warning) 12%, var(--surface-0)); }
+.admin-process-node-unreached { border-style: dashed; background: var(--surface-50); color: var(--text-tertiary); }
+.admin-process-node-big { font-size: 1.3rem; font-weight: 700; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.admin-process-node-small { font-size: var(--text-xs); color: var(--text-secondary); }
+.admin-process-node-flag { align-self: flex-start; font-size: var(--text-xs); font-weight: 700; color: var(--text-primary); }
+.admin-process-legend .admin-process-node-now, .admin-process-legend .admin-process-node-reached, .admin-process-legend .admin-process-node-unreached { display: inline-block; width: 14px; height: 14px; padding: 0; }
+
+/* EACH STAGE: what it is for, what runs, and the workflow that runs it. */
+.admin-process-stage-list { margin: var(--space-2) 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; }
+.admin-process-stage-list > li { padding: var(--space-2) 0; border-bottom: 1px solid var(--surface-200); }
+.admin-process-stage-list > li:last-child { border-bottom: 0; }
+.admin-process-stage-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2); }
+.admin-process-stage-about { margin: 4px 0 0; color: var(--text-primary); }
+.admin-process-stage-runs { margin: 4px 0 0; font-size: var(--text-sm); color: var(--text-secondary); }
+.admin-process-stage-list .admin-process-stage-workflow { margin: 4px 0 0; }
+
+.admin-process-run-name { display: block; }
+
+/* TIME WAITING ON EACH TEAM: a bar per team against the longest. */
+.admin-process-bars { list-style: none; margin: var(--space-2) 0 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.admin-process-bars li { display: grid; grid-template-columns: minmax(120px, 180px) minmax(0, 1fr) 72px; gap: var(--space-2); align-items: center; }
+.admin-process-bar { display: block; height: 12px; border-radius: 4px; background: var(--surface-100, var(--surface-50)); overflow: hidden; }
+.admin-process-bar > span { display: block; height: 100%; border-radius: 4px; background: var(--chart-1); }
+
+@media (max-width: 640px) {
+  .admin-process-nodes { grid-template-columns: 1fr; }
+  .admin-process-bars li { grid-template-columns: 1fr auto; }
+  .admin-process-bars .admin-process-bar { grid-column: 1 / -1; grid-row: 2; }
+}
+
+/* WHO IS ANSWERABLE, on each stage of the flow and in the stage table. */
+.admin-process-node-who { font-size: var(--text-xs); color: var(--text-secondary); }
+.admin-process-stage-table { border-collapse: collapse; width: 100%; font-size: var(--text-sm); }
+.admin-process-stage-table th, .admin-process-stage-table td { text-align: left; vertical-align: top; padding: var(--space-2); border-bottom: 1px solid var(--surface-200); }
+.admin-process-stage-table thead th { font-weight: 600; color: var(--text-secondary); white-space: nowrap; }
+.admin-process-stage-table tbody th { font-weight: 400; min-width: 240px; }
+.admin-process-stage-table tbody th > span { display: block; }
+.admin-process-stage-table tbody th > .admin-process-stage-n { display: inline; }
+.admin-process-stage-table tbody th > .admin-process-stage-label { display: inline; }
+.admin-process-stage-table td { color: var(--text-primary); font-variant-numeric: tabular-nums; }
+
+/* THE STAGE TABLE'S ROWS: where open runs are now, tinted in the warning tone; a stage no run reached, muted. */
+.admin-process-stage-table tr.admin-process-row-now > * { background: color-mix(in srgb, var(--warning) 12%, var(--surface-0)); }
+.admin-process-stage-table tr.admin-process-row-unreached > * { color: var(--text-tertiary); }
+.admin-process-stage-table .admin-process-node-flag { display: block; margin-top: 2px; }

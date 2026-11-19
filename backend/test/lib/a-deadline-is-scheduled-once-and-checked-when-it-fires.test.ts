@@ -17,15 +17,15 @@ import {
   EVENTS_SELECTING_THEIR_WORKFLOW,
   EVENT_WORKFLOW_EVENTS,
   MAX_DEADLINE_MINUTES,
-  PLATFORM_EVENT_WORKFLOWS,
+  SHIPPED_EVENT_WORKFLOWS,
   declaredWorkflowOn,
-  eventNaturalKey,
   eventRunKey,
   eventWorkflowErrors,
   versionEventWorkflowsErrors,
   workflowSendEmailKind,
   type EventWorkflow,
 } from '../../lambda/src/lib/event-workflow';
+import { eventNaturalKey } from '../../lambda/src/lib/event-natural-key';
 import {
   atExpression, createDeadlineSchedule, deadlineAt, deadlineCancelOf, deadlineFiringOf, deadlineScheduleName, deleteDeadlineSchedule,
   DEADLINE_EXPIRY_MARGIN_SECONDS,
@@ -46,7 +46,7 @@ const ID = '0b7f2a52-0000-4000-8000-000000000001';
 const NOW_MS = 1_800_000_000_000;
 const WIRING = { group: 'ae-standard-event-deadlines', roleArn: 'arn:aws:iam::111122223333:role/standard-deadlines', routerArn: 'arn:aws:lambda:us-east-1:111122223333:function:standard-router' };
 
-const CHASE = PLATFORM_EVENT_WORKFLOWS['chase-unredeemed'];
+const CHASE = SHIPPED_EVENT_WORKFLOWS['chase-unredeemed'];
 
 describe('the deadline event (ADR-061 decision 1)', () => {
   it('invitation-unredeemed is a built event that names the invitee, selects its own workflow, and is marked by a deadline', () => {
@@ -68,7 +68,7 @@ describe('the deadline event (ADR-061 decision 1)', () => {
     delete none.deadline;
     expect(eventWorkflowErrors('x', none).join()).toMatch(/deadline\.afterMinutes is a whole number of minutes from 5 to 43200/);
     expect(eventWorkflowErrors('x', { ...clone(CHASE), deadline: { afterMinutes: MAX_DEADLINE_MINUTES + 1 } }).join()).toMatch(/deadline\.afterMinutes/);
-    expect(eventWorkflowErrors('x', { ...clone(PLATFORM_EVENT_WORKFLOWS['opening-and-subject']), deadline: { afterMinutes: 60 } }).join())
+    expect(eventWorkflowErrors('x', { ...clone(SHIPPED_EVENT_WORKFLOWS['opening-and-subject']), deadline: { afterMinutes: 60 } }).join())
       .toMatch(/deadline is declared only on a deadline event \(invitation-unredeemed\)/);
   });
 
@@ -204,7 +204,7 @@ describe('the router schedules it once, only where a workflow declares the deadl
   it('handling invitation-sent schedules the deadline after the invitation is verified, whether or not an invitation-sent workflow runs', () => {
     const router = read('router-agent-handler.ts');
     const fn = router.slice(router.indexOf('export async function handleInvitationSent('), router.indexOf('export async function handleDeadlineFired('));
-    const order = ['verifyInvitationEvent(channelArn, invitationId, invitationKey)', 'primaryAssistantOf(', 'servedWelcomeVersion(', 'scheduleInvitationDeadline(record', "declaredWorkflowOn(served?.version.eventWorkflows, 'invitation-sent')"].map((t) => fn.indexOf(t));
+    const order = ['verifyInvitationEvent(channelArn, invitationId, invitationKey)', 'eventWorkflowOwner(', 'servedWelcomeVersion(', 'scheduleInvitationDeadline(record', "declaredWorkflowOn(served?.version.eventWorkflows, 'invitation-sent')"].map((t) => fn.indexOf(t));
     expect(order.every((i) => i > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
   });
@@ -216,12 +216,12 @@ describe('on fire, the record decides, before any model call', () => {
     expect(await handleDeadlineFired({ event: 'person-joined', channelArn: CHANNEL, invitationId: ID })).toEqual({ ran: false, reason: 'malformed' });
   });
 
-  it('checks the classification, the archive, the invitation, the primary, the workflow and the members, in that order, before the run', () => {
+  it('checks the classification, the archive, the invitation, the owning assistant, its workflow and the members, in that order, before the run', () => {
     const router = read('router-agent-handler.ts');
     const fn = router.slice(router.indexOf('export async function handleDeadlineFired('), router.indexOf('export async function handleDeadlineCancel('));
     const order = [
-      'deadlineFiringOf(raw)', 'readChannelTags(chimeClient, channelArn)', "tags[CLASSIFICATION_TAG] !== STATIC_CLASSIFICATION", "tags.archived === 'true'",
-      'verifyInvitationEvent(channelArn, invitationId)', 'primaryAssistantOf(', 'declaredWorkflowOn(served?.version.eventWorkflows, firing.event)',
+      'deadlineFiringOf(raw)', 'roomRefusal(await readChannelTags(chimeClient, channelArn)',
+      'verifyInvitationEvent(channelArn, invitationId)', 'eventWorkflowOwner(', 'declaredWorkflowOn(served?.version.eventWorkflows, firing.event)',
       'resolveChannelSize(', 'verifiedJoiners([record.inviterArn, record.personArn], roster)', 'runWorkflowFor(',
     ].map((t) => fn.indexOf(t));
     expect(order.every((i) => i > -1)).toBe(true);
@@ -264,6 +264,18 @@ describe('resolving the thing it times deletes the schedule (ADR-061 decision 1,
     } finally {
       if (prev === undefined) delete process.env.CLASSIFICATION; else process.env.CLASSIFICATION = prev;
     }
+  });
+
+  it('an archive settles its open tasks even where its invitations cannot be read, and throws so it is tried again', async () => {
+    const del = jest.fn().mockResolvedValue('deleted');
+    const settle = jest.fn().mockResolvedValue(['task-1']);
+    const unreadable = jest.fn().mockRejectedValue(new Error('throttled'));
+    await expect(handleDeadlineCancel({ channelArn: CHANNEL }, { wiring: WIRING, del, list: unreadable, settle })).rejects.toThrow(/invitations could not be read/);
+    expect(settle).toHaveBeenCalledWith(CHANNEL);
+    const unsettled = jest.fn().mockResolvedValue(null);
+    await expect(handleDeadlineCancel({ channelArn: CHANNEL }, { wiring: WIRING, del, list: jest.fn().mockResolvedValue([]), settle: unsettled }))
+      .rejects.toThrow(/could not be settled/);
+    expect(await handleDeadlineCancel({ channelArn: CHANNEL }, { wiring: WIRING, del, list: jest.fn().mockResolvedValue([]), settle })).toEqual({ deleted: 0 });
   });
 
   it('a malformed cancel or an unwired classification deletes nothing, and a failed delete never throws', async () => {

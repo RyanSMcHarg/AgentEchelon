@@ -1,7 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useCan } from '../../capabilities';
-import { listPeople, namesByPersonId, userManagementUrl } from '../../services/peopleService';
+import { usePersonNames } from './usePersonNames';
 import DataTable from './DataTable';
 import MetricCard from './MetricCard';
 import Sparkline from './Sparkline';
@@ -132,28 +131,6 @@ export function successesOutsideFunnel(steps: FunnelStep[], successId: string): 
   return steps.find((s) => s.id === successId)?.outsideSessions || 0;
 }
 
-/**
- * THE LEADERBOARD'S NAMES. The analytics read returns a person id and never a name: the analytics data
- * plane has no route to an identity provider. The names come from the console's list of people
- * (`GET /users`, user-management.ts), whose names are the directory's (`displayNameFor`) and are given
- * only to a caller who may be told who a person is. So they are asked for only by a role holding both
- * `view-users` and `see-user-identity`; anyone else, and any person the list does not name, sees the id.
- */
-function useSenderNames(): Map<string, string> {
-  const can = useCan();
-  const mayName = can('view-users') && can('see-user-identity');
-  const [names, setNames] = useState<Map<string, string>>(new Map());
-  useEffect(() => {
-    if (!mayName || !userManagementUrl()) return;
-    let live = true;
-    listPeople()
-      .then((list) => { if (live) setNames(namesByPersonId(list.users)); })
-      .catch((err) => console.warn('[UsersTab] the senders could not be named; their ids are shown', (err as Error)?.message));
-    return () => { live = false; };
-  }, [mayName]);
-  return names;
-}
-
 const UsersTab: React.FC<UsersTabProps> = ({
   data,
   activeUsersData,
@@ -177,7 +154,8 @@ const UsersTab: React.FC<UsersTabProps> = ({
       window.history.replaceState(null, '', `${window.location.pathname}${withFormOnly(window.location.search, next)}${window.location.hash}`);
     } catch { /* the view stands; only sharing it is lost */ }
   };
-  const names = useSenderNames();
+  // The leaderboard's names: the analytics read returns a person id and never a name (usePersonNames).
+  const names = usePersonNames('UsersTab');
   if (isLoading) {
     return (
       <div className="admin-tab">
@@ -345,7 +323,7 @@ const UsersTab: React.FC<UsersTabProps> = ({
 
       {/* Funnels */}
       <div className="admin-section">
-        <h3>{t('admin.users.signUpFunnel')}</h3>
+        <h2>{t('admin.users.signUpFunnel')}</h2>
         <FunnelChart
           steps={signupSteps}
           successStepId="signup_confirmation_completed"
@@ -358,7 +336,7 @@ const UsersTab: React.FC<UsersTabProps> = ({
         )}
       </div>
       <div className="admin-section">
-        <h3>{t('admin.users.signInFunnel')}</h3>
+        <h2>{t('admin.users.signInFunnel')}</h2>
         <FunnelChart
           steps={signinSteps}
           successStepId="signin_succeeded"
@@ -376,7 +354,7 @@ const UsersTab: React.FC<UsersTabProps> = ({
 
       {/* Per-user leaderboard */}
       <div className="admin-section">
-        <h3>{t('admin.users.topSendersMessagesThisWindow')}</h3>
+        <h2>{t('admin.users.topSendersMessagesThisWindow')}</h2>
         {userRows.length === 0 ? (
           <p className="admin-tab-description">
             No <code>message_sent</code> {t('admin.users.eventsIngestedYetPopulatesOnce')} <code>/events</code> {t('admin.users.endpointReceivesTraffic')}
@@ -398,7 +376,7 @@ const UsersTab: React.FC<UsersTabProps> = ({
       {/* Athena partition-only fallback */}
       {showLegacyFallback && (
         <div className="admin-section">
-          <h3>
+          <h2>
             {t('admin.users.activityByTierLegacyPartition')}
             <InfoTooltip
               label={t('admin.users.whyThisSectionIsShown')}
@@ -410,7 +388,7 @@ const UsersTab: React.FC<UsersTabProps> = ({
                 </>
               }
             />
-          </h3>
+          </h2>
           <p className="admin-tab-description">
             {t('admin.users.trafficPerTierFromThe')}
           </p>

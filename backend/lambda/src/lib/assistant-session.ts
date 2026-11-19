@@ -126,6 +126,22 @@ export function releaseAssistantSession(): void {
   epoch += 1;
 }
 
+/**
+ * Work that may act as another assistant or on another route, after which the turn goes on as it was: a run that goes on inside
+ * a person's turn adopts the run's assistant, and the turn's own reply is still the turn's assistant's to post.
+ */
+export async function keepingTheTurnsSession<T>(work: () => Promise<T>): Promise<T> {
+  const held = current;
+  const heldScope = scope;
+  try {
+    return await work();
+  } finally {
+    current = held;
+    scope = heldScope;
+    epoch += 1;
+  }
+}
+
 /** The session this turn is acting as, or null when none is held. */
 export function currentAssistantSession(): AssistantSession | null {
   return current;

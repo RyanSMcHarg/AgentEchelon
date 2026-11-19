@@ -127,10 +127,12 @@ describe('the second completion door stays removed (source ratchets)', () => {
     // narrowing; both are gone. The selection gates what may be OPENED, in the router, so the processor
     // resolves the turn's machines ONCE and every consumer reads that value - which is the property
     // worth holding here, because the defect this file guards is two consumers disagreeing.
-    // The version's confirmation setting is applied to that one resolution (ADR-064 decision G), so every consumer still
-    // reads the single value `taskStateMachines()` returns, resolved once.
-    expect(processorSrc).toMatch(/const turnMachines = withConfirmBrief\(taskStateMachines\(\), activeProfile\.confirmBrief\)/);
-    expect(processorSrc.match(/taskStateMachines\(\)/g)).toHaveLength(1);
+    // The version's confirmation setting is applied to that one resolution (ADR-064 decision G), and the resolution is the
+    // task's own version's machines where the turn continues a task (ADR-066 decision 5), so every consumer still reads one
+    // value, resolved once.
+    expect(processorSrc).toMatch(/const turnMachines = withConfirmBrief\(\s*turnTaskRow \? await resolveTaskMachines\(turnTaskRow, \{ profileName: turnProfileName, fallback: servedMachines \}\) : servedMachines,\s*activeProfile\.confirmBrief,\s*\)/);
+    expect(processorSrc.match(/const turnMachines =/g)).toHaveLength(1);
+    expect(processorSrc).not.toMatch(/taskStateMachines\(\)/);
     expect(processorSrc).toMatch(/mergedMachines = turnMachines/);
     expect(processorSrc).toMatch(/filter\(\(\[, d\]\) => deliversDocument\(d\)\)/);
   });
@@ -266,6 +268,13 @@ describe('every task-state writer is a DECLARATION (the exclusivity test §8 nev
     // gated on the machine being one an event may open (`EVENT_TASK_MACHINES`), whose first step awaits
     // nobody, so there is no person whose answer could be annexed; on a fallback it advances nothing; and
     // a first step with two ways on is a choice the runtime does not make. Its premise is asserted below.
+    //
+    //   assistant-async-processor.ts +1    a state's declared automatic move (`auto`, ADR-067 decision 2, G39)
+    //
+    // THE ARGUMENT. The edge is one the machine declares on the state (`auto`), never one the runtime chose, and the
+    // validator admits `auto` only on a state the assistant works: one that awaits nobody and does not rest, so there
+    // is no person whose answer could be annexed. It is taken once per entry, after a turn of that state answered (an
+    // observed fact about the platform's own work), and not on a duel side. Its premise is asserted below.
     const SRC = path.join(__dirname, '../lambda/src');
     const counts: Record<string, number> = {};
     const walk = (dir: string): void => {
@@ -342,10 +351,25 @@ describe('every task-state writer is a DECLARATION (the exclusivity test §8 nev
       .flatMap(([m, def]) => Object.entries(def.states).filter(([, st]) => st.choices && !awaitedPartyOf(st)).map(([s]) => `${m}.${s}`));
     expect({ premise: 'a choice is put to the party a step awaits', unawaitedChoices }).toEqual({ premise: 'a choice is put to the party a step awaits', unawaitedChoices: [] });
 
+    // THE AUTOMATIC MOVE'S ENTRY CHECKS ITS OWN PREMISE: every shipped state that declares `auto` awaits nobody and does
+    // not rest, and names one of its own transitions.
+    const autoStates = Object.entries(DEFAULT_TASK_STATE_MACHINES as Record<string, { states: Record<string, { auto?: string; rests?: boolean; transitions: string[] }> }>)
+      .flatMap(([m, def]) => Object.entries(def.states).filter(([, st]) => st.auto).map(([s, st]) => ({ at: `${m}.${s}`, ok: !awaitedPartyOf(st) && !st.rests && st.transitions.includes(st.auto!) })));
+    expect(autoStates.length).toBeGreaterThan(0);
+    expect(autoStates.filter((a) => !a.ok)).toEqual([]);
+
+    // A DRIFT OFFER'S WRITTEN ANSWER IS THE CARD'S ROUTE, NOT A NEW WRITER (WT89): the router relays the person's reply, read by
+    // the classifier model, through the task service's `advanceAsAssignee`, which takes it only for the assignee along a choice
+    // the state declares. So the router names no state of its own.
+    const router = stripComments(fs.readFileSync(path.join(SRC, 'router-agent-handler.ts'), 'utf8'));
+    const answering = router.slice(router.indexOf('async function answerSubjectOffer('), router.indexOf('async function openChildConversation('));
+    expect(answering).toMatch(/await advanceAsAssignee\(\{/);
+    expect(answering).not.toMatch(/advanceTaskStateTo\(/);
+
     // What is left is the DECLARED set, unchanged.
     expect(counts).toEqual({
       'lib/task-tools.ts': 2,
-      'assistant-async-processor.ts': 2,
+      'assistant-async-processor.ts': 3,
       'lib/queue-drain-task.ts': 4,
       'lib/async-processor-core.ts': 1,
       'lib/state-actions.ts': 1,

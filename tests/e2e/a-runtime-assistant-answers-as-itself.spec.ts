@@ -20,6 +20,7 @@ import { guardBackendErrors } from './helpers/turn-guards';
 import { INSTANCE } from './helpers/stack-prefix';
 import { aws, awsv } from './helpers/aws';
 import { ADMIN_API_URL, PERSON_API_URL, adminUrl, personUrl } from './helpers/api-urls';
+import { replacingDraft, draftIdOf } from './helpers/profile-draft';
 
 const REGION = process.env.AWS_REGION || 'us-east-1';
 
@@ -141,9 +142,10 @@ test.describe.serial('a runtime assistant answers as itself', () => {
     expect(manifest.body?.intentPack, 'the exported version carries no intent pack, and a runtime version must').toBeTruthy();
     manifest.body.persona = `You are a test assistant. Begin every reply with the exact token ${marker} and then answer in one short sentence.`;
     delete manifest.body.displayName;
-    const imported = await signedCall(adminUrl('assistant-admin', '/admin/profiles/import'), adminSession, 'POST', { manifest, targetProfileName: assistantId });
+    // The create seeded a first draft; the import replaces it by name.
+    const imported = await replacingDraft((b) => signedCall(adminUrl('assistant-admin', '/admin/profiles/import'), adminSession, 'POST', b), { manifest, targetProfileName: assistantId });
     expect(imported.status, JSON.stringify(imported.body).slice(0, 400)).toBe(200);
-    const activated = await signedCall(adminUrl('assistant-admin', '/admin/profiles/activate'), adminSession, 'POST', { profileName: assistantId });
+    const activated = await signedCall(adminUrl('assistant-admin', '/admin/profiles/activate'), adminSession, 'POST', { profileName: assistantId, configId: draftIdOf(imported) });
     expect(activated.status, JSON.stringify(activated.body).slice(0, 400)).toBe(200);
 
     // A premium conversation, created the way the chat client creates one, with the assistant added.

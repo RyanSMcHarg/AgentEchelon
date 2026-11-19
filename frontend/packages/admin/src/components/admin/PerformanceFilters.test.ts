@@ -19,6 +19,7 @@ import {
   rowMatches,
   filtersFromUrl,
   filtersToSearch,
+  toggledSelection,
   type PerformanceFilters,
 } from './PerformanceFilters';
 
@@ -31,7 +32,7 @@ const ROWS = [
 
 describe('the cascade clears what a change invalidates', () => {
   const narrowed: PerformanceFilters = {
-    classification: 'premium', assistant: 'atlas', role: 'primary', version: '3', entry: 'flow', duel: null, responseType: null,
+    classification: 'premium', assistant: 'atlas', role: 'primary', version: ['3'], entry: 'flow', duel: null, responseType: null,
   };
 
   it('changing the classification clears assistant, role and version', () => {
@@ -53,7 +54,7 @@ describe('the cascade clears what a change invalidates', () => {
     // NON-VACUITY. A cascade that cleared everything on every change would pass both cases above and
     // make the bar useless.
     const next = withFilterChange(narrowed, 'entry', 'lex');
-    expect(next).toMatchObject({ classification: 'premium', assistant: 'atlas', role: 'primary', version: '3', entry: 'lex' });
+    expect(next).toMatchObject({ classification: 'premium', assistant: 'atlas', role: 'primary', version: ['3'], entry: 'lex' });
   });
 
   it('clearing one axis to "all" does not disturb the others', () => {
@@ -95,11 +96,11 @@ describe('the options offered are the ones that exist', () => {
 
 describe('one predicate, so both surfaces cut identically', () => {
   it('keeps a row on every axis it matches', () => {
-    expect(rowMatches(ROWS[0], { ...EMPTY_FILTERS, classification: 'premium', assistant: 'atlas', version: '3' })).toBe(true);
+    expect(rowMatches(ROWS[0], { ...EMPTY_FILTERS, classification: 'premium', assistant: 'atlas', version: ['3'] })).toBe(true);
   });
 
   it('drops a row that differs on any single axis', () => {
-    expect(rowMatches(ROWS[0], { ...EMPTY_FILTERS, version: '4' })).toBe(false);
+    expect(rowMatches(ROWS[0], { ...EMPTY_FILTERS, version: ['4'] })).toBe(false);
     expect(rowMatches(ROWS[0], { ...EMPTY_FILTERS, entry: 'lex' })).toBe(false);
   });
 
@@ -118,7 +119,7 @@ describe('one predicate, so both surfaces cut identically', () => {
 describe('the filters travel in the URL, so a narrowed view can be sent to somebody', () => {
   it('round-trips every axis', () => {
     const f: PerformanceFilters = {
-      classification: 'premium', assistant: 'atlas', role: 'primary', version: '3', entry: 'lex', duel: '1', responseType: 'TASK_STEP',
+      classification: 'premium', assistant: 'atlas', role: 'primary', version: ['3'], entry: 'lex', duel: '1', responseType: 'TASK_STEP',
     };
     expect(filtersFromUrl(filtersToSearch(f, ''))).toEqual(f);
   });
@@ -217,5 +218,26 @@ describe('the bar keeps a chosen value even when the rows do not offer it', () =
     ];
     expect(opts(rows, EMPTY_FILTERS).classifications).toEqual(['premium', 'standard']);
     expect(opts(rows, { ...EMPTY_FILTERS, classification: 'premium' }).assistants).toEqual(['advisor']);
+  });
+});
+
+describe('a version filter holds any number of versions', () => {
+  const options = ['3', '4', '5'];
+
+  it('keeps the rows of every version chosen', () => {
+    const f: PerformanceFilters = { ...EMPTY_FILTERS, version: ['3', '4'] };
+    expect(ROWS.filter((r) => rowMatches(r, f)).map((r) => r.profile_version)).toEqual(['3', '4']);
+  });
+
+  it('adds and removes a version, and returns to every version instead of none', () => {
+    expect(toggledSelection(null, '3', options)).toEqual(['3']);
+    expect(toggledSelection(['3'], '4', options)).toEqual(['3', '4']);
+    expect(toggledSelection(['3'], '3', options)).toBeNull();
+    expect(toggledSelection(['3', '4'], '5', options)).toBeNull();
+  });
+
+  it('round-trips through the URL', () => {
+    const search = filtersToSearch({ ...EMPTY_FILTERS, assistant: 'atlas', version: ['3', '4'] }, '');
+    expect(filtersFromUrl(search).version).toEqual(['3', '4']);
   });
 });

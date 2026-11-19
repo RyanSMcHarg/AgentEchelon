@@ -194,13 +194,13 @@ describe('the handler stands down exactly when the flow claims the turn', () => 
     expect(res.messages).toEqual([]);
   });
 
-  it('stands down for an @all with no space in front of it, which the prefilter alone misses', async () => {
+  it('stands down for an @all with punctuation in front of it, which the prefilter alone misses', async () => {
     // The other half of the same defect. This guard used to fire on `flowBypassToken`; widening it to
-    // the `@` prefilter without keeping that term NARROWED it, because `matchesAtAll` has no leading
-    // boundary and the prefilter requires one. Every such form skipped the guard and this entry ran a
+    // the `@` prefilter without keeping that term NARROWED it, because `matchesAtAll` takes punctuation
+    // before the token and the prefilter requires a space. Every such form skipped the guard and this entry ran a
     // full turn for a message the flow was claiming at the same moment. A guard that grows has to be
     // a superset of the one it replaces.
-    const res = await handler(lexEvent('hey@all what is the billing policy?'));
+    const res = await handler(lexEvent('(@all) what is the billing policy?'));
 
     expect(res.messages).toEqual([]);
   });

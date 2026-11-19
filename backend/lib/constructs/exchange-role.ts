@@ -1,7 +1,7 @@
 /**
  * A PERSON'S VEND ROLE (SPEC-CREDENTIAL-EXCHANGE §5a), one per classification a person may be vended at,
  * built by the stack that owns that classification: `Assistants-<classification>` for a conversational one,
- * `Identity` for the admin plane and the one-conversation (`restricted`) role. So declaring a classification
+ * `Identity` for the admin plane and the `restricted` role. So declaring a classification
  * adds its vend role with its own stack and changes no other stack (the classification-independence plan,
  * step 4).
  *
@@ -17,6 +17,7 @@
  *     at call time (`lambda/src/lib/exchange-role-arn.ts`), and its name is fixed (`exchangeRoleName`), so the
  *     admin backend's role-to-scope map names it without a reference to the stack that owns it.
  */
+import { dashboardPrefix } from '../../lambda/src/lib/dashboard-keys';
 import * as cdk from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
@@ -29,7 +30,7 @@ import { INSTANCE_TAG } from '../tagging';
 import { ADMIN_PLANE_SESSION_TAG, defaultProfileRegistry as profiles } from '../profile-registry';
 import { issuerClassificationsOf, type IssuerRegistry } from '../config/issuers';
 
-/** What a vend role is minted for: one conversation, a classification, or the admin plane's chat identity. */
+/** What a vend role is minted for: an email reply, a classification, or the admin plane's chat identity. */
 export type VendToken = 'restricted' | Classification | 'admin';
 
 /** The IAM path every vend role is on. The exchange may assume a role on it, and on no other path. */
@@ -98,7 +99,7 @@ const EXCHANGE_MSG_ACTIONS = [
  * pinned to `${appInstanceArn}/user/${aws:PrincipalTag/person}`; the action set and the channel scope differ by
  * token.
  */
-export function exchangeVendStatements(appInstanceArn: string, token: VendToken): iam.PolicyStatement[] {
+export function exchangeVendStatements(appInstanceArn: string, token: VendToken, dashboardsBucketArn?: string): iam.PolicyStatement[] {
   // Built by concatenation so the `${aws:PrincipalTag/person}` policy variable is emitted literally.
   const pinnedUser = `${appInstanceArn}/user/` + '${aws:PrincipalTag/person}';
   const out: iam.PolicyStatement[] = [
@@ -107,11 +108,11 @@ export function exchangeVendStatements(appInstanceArn: string, token: VendToken)
     new iam.PolicyStatement({ effect: iam.Effect.ALLOW, actions: ['chime:Connect'], resources: [pinnedUser] }),
   ];
   if (token === 'restricted') {
-    // restricted: scoped by ADMISSION (a member of one channel; Amazon Chime SDK enforces membership), with no
-    // classification tag condition.
+    // restricted: the email reply poster, which posts one message as the person. Sending is all the role holds,
+    // Amazon Chime SDK membership decides the channel, and each session policy names that channel and its tag.
     out.push(
-      new iam.PolicyStatement({ effect: iam.Effect.ALLOW, actions: EXCHANGE_MSG_ACTIONS, resources: [`${appInstanceArn}/channel/*`] }),
-      new iam.PolicyStatement({ effect: iam.Effect.ALLOW, actions: EXCHANGE_MSG_ACTIONS, resources: [pinnedUser] }),
+      new iam.PolicyStatement({ effect: iam.Effect.ALLOW, actions: ['chime:SendChannelMessage'], resources: [`${appInstanceArn}/channel/*`] }),
+      new iam.PolicyStatement({ effect: iam.Effect.ALLOW, actions: ['chime:SendChannelMessage'], resources: [pinnedUser] }),
       // An archived channel is read-only for every chat-plane identity (ADR-017); the classification roles get
       // the same Deny through `classificationChannelScopedAllow`.
       archivedChannelReadOnlyDeny(appInstanceArn),
@@ -145,7 +146,15 @@ export function exchangeVendStatements(appInstanceArn: string, token: VendToken)
       }));
     }
   }
-  // The one-conversation role stops here: no discovery, no self-membership management, no profile writes.
+  // The `restricted` role stops here: no discovery, no self-membership management, no profile writes.
+  // THE DASHBOARDS OF THE CLASSIFICATIONS IT GRANTS, TO READ (DESIGN-CONVERSATION-DASHBOARDS section 5), and nothing else in S3. A
+  // vend carries it only when it asks for one conversation's dashboard, after the exchange checked the caller is in it.
+  if (dashboardsBucketArn && token !== 'restricted') {
+    // EVERY CLASSIFICATION THE TOKEN GRANTS, as the role's conversation grant reaches them: a member reads a dashboard in any
+    // conversation they are in, and the exchange narrows each vend to that one conversation's snapshot.
+    const granted = profiles.grantsFor(token as Classification);
+    out.push(new iam.PolicyStatement({ sid: 'ItsOwnClassificationsDashboards', effect: iam.Effect.ALLOW, actions: ['s3:GetObject'], resources: granted.map((c) => `${dashboardsBucketArn}/${dashboardPrefix(c)}*`) }));
+  }
   if (token !== 'restricted') {
     out.push(
       new iam.PolicyStatement({ effect: iam.Effect.ALLOW, actions: ['chime:DescribeAppInstanceUser', 'chime:UpdateAppInstanceUser'], resources: [pinnedUser] }),
@@ -191,14 +200,16 @@ export class ExchangeRole extends Construct {
     token: VendToken;
     /** The credential exchange's own execution role, the only principal that may assume this one. */
     exchangeRoleArn: string;
+    /** The bucket a conversation's dashboard is read from, for a member classification's role. */
+    dashboardsBucketArn?: string;
   }) {
     super(scope, id);
     const { token } = props;
-    const statements = exchangeVendStatements(props.appInstanceArn, token);
+    const statements = exchangeVendStatements(props.appInstanceArn, token, props.dashboardsBucketArn);
     // THE BOUNDARY IS TODAY'S REACH: the role's own statements, so a grant attached to it later, by this stack
     // or another, reaches nothing it does not already, and a session vended on it is bounded the same.
     const boundary = permissionsBoundary(this, 'Boundary',
-      `The boundary of the ${token} vend role: its bearer-pinned messaging set, and nothing else`, exchangeVendStatements(props.appInstanceArn, token));
+      `The boundary of the ${token} vend role: its bearer-pinned messaging set, and nothing else`, exchangeVendStatements(props.appInstanceArn, token, props.dashboardsBucketArn));
     this.role = new iam.Role(this, 'Role', {
       roleName: exchangeRoleName(token),
       path: EXCHANGE_ROLE_PATH,

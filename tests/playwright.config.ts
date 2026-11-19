@@ -97,6 +97,9 @@ export default defineConfig({
       mode: 'on',
       size: { width: 1280, height: 720 },
     },
+    // SILENT: a run's browsers play no sound on the machine running it (a meeting's ring, its spoken recording notice,
+    // the other attendee's audio). Chromium mutes its own output; what a page plays is still exercised.
+    launchOptions: { args: ['--mute-audio'] },
   },
   // PER PHASE when validate.mjs names one (E2E_OUTPUT_DIR). Playwright clears its output folder at the
   // start of every run, and validate runs one invocation per phase, so a single shared folder let each

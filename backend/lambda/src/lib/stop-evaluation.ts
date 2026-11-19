@@ -257,7 +257,8 @@ export function restartedRequest(args: {
  * acknowledged by the time this runs, so a failure here costs the follow-up question and never the
  * stop: the work is already cancelled, and the person can simply ask for it again.
  */
-export async function dispatchStopEvaluationTurn(args: {
+/** Everything the evaluation turn is dispatched with. Stored as is when the dispatch waits on the acknowledgement. */
+export interface StopEvaluationDispatch {
   channelArn: string;
   botArn: string;
   classification: string;
@@ -275,7 +276,9 @@ export async function dispatchStopEvaluationTurn(args: {
    * to the inference, and nobody buys a channel read on the escape hatch's own path to avoid it.
    */
   userMessageId?: string;
-}): Promise<boolean> {
+}
+
+export async function dispatchStopEvaluationTurn(args: StopEvaluationDispatch): Promise<boolean> {
   const {
     channelArn, botArn, classification, correlationId, senderArn, cancelledLabels, precedingMessage,
   } = args;

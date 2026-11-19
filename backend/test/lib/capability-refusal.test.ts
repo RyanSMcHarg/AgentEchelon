@@ -40,7 +40,7 @@ import { turnDeclarationOf, withTurnDeclaration } from '../../lambda/src/lib/tur
 import { DeliveryOption } from '../../lambda/src/lib/delivery-options';
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
 import { DEFAULT_PROFILES_CONFIG, validateProfilesConfig } from '../../lib/config/profiles';
-import { stratumIntentPack } from '../../demo/intent-packs';
+import { stratumIntentPack } from '../../../demo/stratum-company/intent-packs';
 import { ownWords } from '../helpers/own-templates';
 
 /** Basic's demo pack, resolved the way a reader resolves it: no `extends`, so it replaces. */
@@ -157,13 +157,13 @@ describe('what the person is told', () => {
   it('lists the classifications the person reaches that produce the output', () => {
     const r = composeRefusal({ ...base, need: 'document', userClearance: 'premium' });
     expect(r.refusal).toBe("I don't produce report documents in this conversation.");
-    expect(r.access).toBe(`${DEFAULT_REFUSAL_COPY.capabilityHasAccess}\n- Standard\n- Premium\n\n${DEFAULT_REFUSAL_COPY.capabilityHasAccessClose}`);
+    expect(r.access).toBe(`${DEFAULT_REFUSAL_COPY.capabilityHasAccess}\n- Internal\n- Confidential\n\n${DEFAULT_REFUSAL_COPY.capabilityHasAccessClose}`);
   });
 
   it('lists only the classifications that produce THAT output', () => {
     const r = composeRefusal({ ...base, need: 'image', userClearance: 'premium' });
-    expect(r.access).toContain('- Premium');
-    expect(r.access).not.toContain('Standard');
+    expect(r.access).toContain('- Confidential');
+    expect(r.access).not.toContain('Internal');
   });
 
   it('sends a person who reaches none to their administrator, naming no classification', () => {

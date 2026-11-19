@@ -99,7 +99,8 @@ describe('a task path is measured against its own machine', () => {
     const block = core.slice(core.indexOf('let taskTrajectory'), core.indexOf('const taskAnalytics'));
     expect(block).toMatch(/await getTask\(event\.taskId, event\.channelArn\)/);
     expect(block).toMatch(/stateHistory: persisted\.stateHistory/);
-    expect(block).toMatch(/machines: taskStateMachines\(\)/);
+    // The machines the turn ran the task under: its own version's (ADR-066 decision 5).
+    expect(block).toMatch(/machines: turnTaskMachines,/);
     expect(core).toMatch(/\.\.\.\(taskTrajectory && \{ taskTrajectory \}\)/);
   });
 

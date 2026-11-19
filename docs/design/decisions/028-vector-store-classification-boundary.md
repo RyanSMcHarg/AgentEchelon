@@ -1,6 +1,6 @@
 ---
 title: "ADR-028: The vector store's classification boundary is a database privilege, not a query"
-status: Implemented 2026-08-12 (built, deployed, and verified live - 7/7 boundary checks)
+status: Implemented 2026-08-12 (built, deployed, and verified live - 7/7 boundary checks on 2026-08-12, 9/9 on 2026-11-05)
 date: 2026-08-12
 related:
   - "../../specs/interaction/governance/SPEC-CONVERSATION-SECURITY.md"
@@ -20,6 +20,8 @@ related:
 **Implemented 2026-08-12.** All seven owed checks pass against the deployed cluster, and retrieval still returns content, which is the other half of the claim.
 
 **Verified by:** the `verifyClassificationBoundary` data-plane op, run against the dev deployment (Aurora PostgreSQL 15.10) on 2026-08-12: `ok: true`, seven of seven. It seeds a probe row at each classification, asserts, and removes them, so it does not depend on what the corpus happens to hold. The checks are the negative test, the defeat test with the classification filter deleted, the defeat test as the connecting identity with no role assumed, non-vacuity, and the pooled-connection role leak. Paired with a live `retrieve` op returning 4 chunks at both `basic` and `premium` with `signalAvailable: true`, which is what distinguishes a boundary that holds from one that has gone blind. Unit coverage of the generated SQL is `backend/test/analytics-aurora/classification-boundary.test.ts`, each of whose load-bearing assertions was confirmed to fail when the property it pins is removed.
+
+**Re-run on dev on 2026-11-05:** `node scripts/backfill-channel-classifications.mjs --dry-run --verify` from `backend/`, with `APP_INSTANCE_ARN`, `AURORA_DATA_PLANE_ARN` and `CHIME_ADMIN_ARN` set, held nine of nine: `probes-seeded`; negative `low-reader-cannot-see-high-row`; `high-reader-can-see-high-row`; defeat `unfiltered-query-as-low-reader-still-sees-only-its-own`; defeat `owner-without-a-role-sees-nothing`; non-vacuity `in-scope-read-still-returns-rows`; role-leak `a-second-query-on-the-same-connection-is-not-still-privileged`; and the golden-set checks `golden:low-reader-cannot-see-high-entry` and `golden:low-reader-cannot-see-high-run` (ADR-065).
 
 **The first run of this verification FAILED**, and the record of what that cost and what it changed is in "Verification: what the run found" below. It is kept rather than tidied away: the design as originally written did not hold, and the reason was not any of the three things it looked like.
 

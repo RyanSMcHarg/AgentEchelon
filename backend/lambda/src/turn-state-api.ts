@@ -25,8 +25,9 @@
  * The queued ids of a conversation are a fact about who is talking to whom. Membership is enforced by
  * Amazon Chime SDK, which owns it, and never from an archived copy - a copy lags exactly when
  * membership has just changed. So the read is performed AS THE CALLER: their own bearer, their own
- * membership. A non-member's `DescribeChannel` fails and this returns 403 without ever touching the
- * queue record.
+ * membership, and their clearance against the conversation's classification tag
+ * (`lib/conversation-access.ts`). A non-member, or a member no longer cleared for it, is answered 403
+ * without the queue record ever being touched.
  *
  * ── AND A TARGETED MESSAGE IS NOT IN THE ANSWER ──────────────────────────────────────────────────
  *
@@ -43,12 +44,12 @@
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import {
   ChimeSDKMessagingClient,
-  DescribeChannelCommand,
   GetChannelMessageCommand,
 } from '@aws-sdk/client-chime-sdk-messaging';
 import { readTurnState, readDispatchFailure, type DispatchFailureReason } from './lib/turn-lock.js';
 import { userArnFor } from './lib/person-arn.js';
 import { callerPersonId } from './lib/auth.js';
+import { callerReachesConversation, refusalAnswer } from './lib/conversation-access.js';
 import { responder, originsFrom, DEV_ORIGIN } from './lib/http-response.js';
 import { chimeMessagingClient } from './lib/chime/clients.js';
 import { loadProfileRegistry } from '../../lib/profile-registry';
@@ -150,13 +151,15 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
   const callerArn = userArnFor(APP_INSTANCE_ARN, sub);
 
-  // MEMBERSHIP, FROM THE SERVICE THAT OWNS IT. A non-member's describe fails, and this returns before
-  // the queue record is touched - so a caller who is not in the conversation learns nothing about it,
-  // not even that it is busy.
-  try {
-    await chime.send(new DescribeChannelCommand({ ChannelArn: channelArn, ChimeBearer: callerArn }));
-  } catch {
-    return respond(403, { error: 'Not a member of this conversation' }, origin);
+  // MEMBERSHIP AND CLEARANCE, FROM THE SERVICE THAT OWNS THEM. A caller who is not a member, or is no
+  // longer cleared for the conversation, is refused before the queue record is touched, so they learn
+  // nothing about it, not even that it is busy. Anything that cannot be answered refuses.
+  // This role's membership read is tag-conditioned (`anyClassificationTagged`), so a denied read is a conversation that
+  // is gone or never was: the caller is told they are not a member, not to retry.
+  const access = await callerReachesConversation(event, channelArn, { appInstanceArn: APP_INSTANCE_ARN, client: chime, membershipGrantCoversClassifiedOnly: true });
+  if (!access.ok) {
+    const { statusCode, body } = refusalAnswer(access);
+    return respond(statusCode, body, origin);
   }
 
   try {

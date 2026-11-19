@@ -18,6 +18,7 @@ import { queryAnalytics } from '../../services/analyticsService';
 import { useCan } from '../../capabilities';
 import { MODEL_STRATEGY_MODELS, classificationName, memberConversationalClassifications } from '@ae/shared';
 import type { AnalyticsDateRange } from '@ae/shared';
+import { useUrlView, viewParam } from './consoleViewUrl';
 
 /** The gate verdicts the backend can return. */
 type GateVerdict =
@@ -132,7 +133,9 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
   // Each control renders only for a role holding its capability (SPEC-ADMIN-CONSOLE FR0f, FR36).
   const can = useCan();
   const [runs, setRuns] = useState<ReplayRun[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(() => viewParam('gateRun'));
+  // THE RUN OPEN IS THE ADDRESS (`&gateRun=`): a link opens its detail, and Back closes it.
+  useUrlView('gateRun', selected, setSelected);
   const [detail, setDetail] = useState<{ run: ReplayRun; gate: GateResult } | null>(null);
   const [queue, setQueue] = useState<QueueRow[]>([]);
   const [queueTotal, setQueueTotal] = useState(0);
@@ -169,7 +172,7 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
   }, [dateRange]);
 
   useEffect(() => { loadRuns(); }, [loadRuns]);
-  useEffect(() => { if (selected) loadDetail(selected); }, [selected, loadDetail]);
+  useEffect(() => { if (selected) loadDetail(selected); else setDetail(null); }, [selected, loadDetail]);
 
   /**
    * Wait for a just-started run's ROW to exist.
@@ -250,7 +253,7 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
 
   return (
     <div className="admin-section cgate">
-      <h4>{t('admin.classifierGate.classifierAccuracyGate')}</h4>
+      <h3>{t('admin.classifierGate.classifierAccuracyGate')}</h3>
       <p className="admin-tab-description">
         Replays archived messages through two classifier candidates and compares them on the pairs
         where they disagree. No user is exposed: nothing here runs on a live turn. A passing gate
@@ -284,7 +287,7 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
           value={form.incumbentModel}
           onChange={(e) => setForm({ ...form, incumbentModel: e.target.value })}
         >
-          <option value="">{t('admin.classifierGate.incumbentModel')}</option>
+          <option value="" className="select-placeholder" disabled hidden>{t('admin.classifierGate.incumbentModel')}</option>
           {MODEL_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
         </select>
         <select
@@ -293,7 +296,7 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
           value={form.challengerModel}
           onChange={(e) => setForm({ ...form, challengerModel: e.target.value })}
         >
-          <option value="">{t('admin.classifierGate.challengerModel')}</option>
+          <option value="" className="select-placeholder" disabled hidden>{t('admin.classifierGate.challengerModel')}</option>
           {MODEL_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
         </select>
         <input
@@ -396,10 +399,10 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
 
           {gate.summary.pending > 0 ? (
             <>
-              <h5 className="cgate-queue-title">
+              <h4 className="cgate-queue-title">
                 Adjudication queue · {gate.summary.pending.toLocaleString()} pending
                 {queueTotal > queue.length && t('admin.classifierGate.showingOf', { queue: queue.length, queueTotal: queueTotal.toLocaleString() })}
-              </h5>
+              </h4>
               <p className="admin-tab-description">
                 {t('admin.classifierGate.onlyTheDisagreementsAreHere')}
               </p>

@@ -75,6 +75,8 @@ const WHO_RECORDS_THE_ENTRY: Record<InteractionKind, 'router' | 'platform'> = {
   task_step: 'platform',
   // The room's primary naming a room another assistant answered first (`askRoomToBeNamed`), answering no message.
   name_room: 'platform',
+  // A recorded meeting's summary, dispatched when its transcript is written (`dispatchMeetingSummaryTurn`), answering no message.
+  meeting_summary: 'platform',
 };
 
 describe('every interaction kind has a path that records its entry', () => {

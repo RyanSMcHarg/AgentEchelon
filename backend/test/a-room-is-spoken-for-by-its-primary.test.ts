@@ -131,6 +131,10 @@ describe('a classification always has its primary assistant assigned', () => {
       appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
       attachmentsBucketName: 'test-bucket',
       attachmentsBucketArn: 'arn:aws:s3:::test-bucket',
+      companyBucketName: 'test-company-bucket',
+      companyBucketArn: 'arn:aws:s3:::test-company-bucket',
+      profileBucketName: 'test-profile-bucket',
+      profileBucketArn: 'arn:aws:s3:::test-profile-bucket',
     } as never);
     const tpl = Template.fromStack(stack);
     const params = Object.values(tpl.findResources('AWS::SSM::Parameter')) as any[];

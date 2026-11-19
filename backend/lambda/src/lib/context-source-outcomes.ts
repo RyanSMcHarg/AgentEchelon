@@ -17,6 +17,8 @@
  *   ContextSourceResolved   Outcome=resolved                        the value reached the prompt
  *   ContextSourceFailed     Outcome=denied|absent|timeout|error     it was selected and did not
  *   ContextSourceSkipped    Outcome=not-in-catalog|unavailable      it was never attempted
+ *                           Outcome=not-readable-by-role            company context the assistant's
+ *                                                                   role is not scoped to
  *                           Outcome=no-record                       a per-person source has no
  *                                                                   record for this person yet
  *
@@ -45,13 +47,17 @@ export type ContextSourceFailure = 'denied' | 'absent' | 'timeout' | 'error';
  *                  removal, a standing defect otherwise - it recurs on EVERY turn.
  * `unavailable`    `availability` is unmet at this call site. Normal, and the reason it is measured is
  *                  that a source unavailable on every turn is a mislabelled source.
+ * `not-readable-by-role` a company-context source (`s3-prefix` under `context/`) that none of the acting
+ *                  assistant role's prefixes covers. IAM would refuse the read, so it is not attempted; it
+ *                  recurs on every turn of that assistant until the version stops selecting it, and
+ *                  Validate warns about it before activation (`context-source-reach.ts`).
  * `no-record`      the catalog declares the source `perPerson`, it was read, and the requesting person
  *                  has no record in it yet. That is the normal state of everyone who has not completed
  *                  onboarding, so it stays out of the failure rate; counted as `absent`, every turn by a
  *                  new person reads as a broken source. A SHARED source that is not there remains
  *                  `absent`, because a company document is expected to exist for everyone.
  */
-export type ContextSourceSkip = 'not-in-catalog' | 'unavailable' | 'no-record';
+export type ContextSourceSkip = 'not-in-catalog' | 'unavailable' | 'not-readable-by-role' | 'no-record';
 
 export type ContextSourceOutcome = 'resolved' | ContextSourceFailure | ContextSourceSkip;
 
@@ -75,6 +81,7 @@ const METRIC_BY_OUTCOME: Record<ContextSourceOutcome, string> = {
   error: 'ContextSourceFailed',
   'not-in-catalog': 'ContextSourceSkipped',
   unavailable: 'ContextSourceSkipped',
+  'not-readable-by-role': 'ContextSourceSkipped',
   'no-record': 'ContextSourceSkipped',
 };
 

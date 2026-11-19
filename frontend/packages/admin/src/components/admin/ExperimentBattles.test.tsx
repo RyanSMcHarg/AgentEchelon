@@ -149,7 +149,7 @@ describe('the Battles section', () => {
     const onOpenConversation = vi.fn();
     render(<ExperimentBattles dateRange={range} experiment={experiment} rollup={rollup} onOpenConversation={onOpenConversation} />);
     const list = await screen.findByTestId('battles-list');
-    expect(within(list).getAllByRole('columnheader').map((h) => h.textContent?.replace('ⓘ', ''))).toEqual(['When', 'Room', 'Outcome', 'Picked by', 'Conversation']);
+    expect(within(list).getAllByRole('columnheader').map((h) => h.textContent?.replace('ⓘ', ''))).toEqual(['When', 'Classification', 'Outcome', 'Picked by', 'Conversation']);
     // The When heading says what the time is.
     fireEvent.focus(within(list).getByRole('button', { name: /When/ }));
     expect(await screen.findByText('When the battle started')).toBeInTheDocument();
@@ -208,7 +208,7 @@ describe('the Battles section', () => {
   it('says what to do when there are no battles yet', async () => {
     prime([]);
     render(<ExperimentBattles dateRange={range} experiment={experiment} rollup={[]} />);
-    expect(await screen.findByTestId('battles-empty')).toHaveTextContent('Turn on Battle Mode for Premium in Settings below, then run /battle');
+    expect(await screen.findByTestId('battles-empty')).toHaveTextContent('Turn on Battle Mode for Confidential in Settings below, then run /battle');
     expect(screen.queryByRole('table')).toBeNull();
   });
 

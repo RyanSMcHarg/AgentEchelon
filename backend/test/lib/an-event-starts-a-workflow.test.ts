@@ -11,7 +11,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import {
-  PLATFORM_EVENT_WORKFLOWS,
+  SHIPPED_EVENT_WORKFLOWS,
   eventWorkflowErrors,
   eventRunKey,
   inertMention,
@@ -31,16 +31,30 @@ import { welcomeWorkflowErrors } from '../../lambda/src/lib/profile-lifecycle';
 import { TURN_KINDS } from '../../lambda/src/lib/turn-declaration';
 import { ANSWERS_NO_MESSAGE_KINDS } from '../../lambda/src/lib/interaction-kinds';
 import { classificationChannelScopedAllow, routerByNameStatements } from '../../lib/stacks/agent-classification-common';
+import { AGENT_STEP_OPS_ROOM } from '../helpers/agent-step-ops-room';
 
 const SRC = path.join(__dirname, '..', '..', 'lambda', 'src');
 const read = (f: string) => fs.readFileSync(path.join(SRC, f), 'utf8');
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
-const OPS = PLATFORM_EVENT_WORKFLOWS['ops-room'];
+// The ops room with its first look as an agent step that opens an event task: the stored shape this file's agent-step
+// rules and runs are proven on (the shipped first look is a request to the ops role, `a-request-to-another-assistant-runs-its-own-workflow`).
+const OPS = AGENT_STEP_OPS_ROOM;
+// The same room as a draft may declare it: its agent step opens no task, because `agent.workflow` is retired and refused
+// on a draft, and it is the room's own assistant's turn, because a step naming another assistant's role (`as`) is retired
+// too (WT118). The validation rules of an agent step (tools, deadline, fallback) are proven on this one.
+const AGENT_OPS: EventWorkflow = (() => {
+  const wf = clone(OPS) as any;
+  delete wf.states['first-look'].agent.workflow;
+  delete wf.states['first-look'].agent.as;
+  delete wf.states['first-look'].agent.fallback.absent;
+  return wf;
+})();
 
 describe('validation (ADR-061 decision 8, slice 1)', () => {
   it('every platform workflow validates, and every template it names is shipped with the kind its step needs', () => {
     const shipped = shippedMessageTemplates();
-    for (const [name, wf] of Object.entries(PLATFORM_EVENT_WORKFLOWS)) {
+    // The agent-step ops room a draft may declare is held to the same rules, so the shape this file proves on stays a valid one.
+    for (const [name, wf] of [...Object.entries(SHIPPED_EVENT_WORKFLOWS), ['agent-step-ops-room', AGENT_OPS] as const]) {
       expect(eventWorkflowErrors(name, wf)).toEqual([]);
       for (const def of Object.values(wf.states)) {
         if (def.send) expect(shipped.get(def.send.template)?.template.kind ?? 'message').toBe('message');
@@ -53,7 +67,7 @@ describe('validation (ADR-061 decision 8, slice 1)', () => {
     }
   });
 
-  const refused = (mutate: (wf: any) => void, pattern: RegExp, base: EventWorkflow = OPS) => {
+  const refused = (mutate: (wf: any) => void, pattern: RegExp, base: EventWorkflow = AGENT_OPS) => {
     const wf = clone(base);
     mutate(wf);
     expect(eventWorkflowErrors('x', wf).join('\n')).toMatch(pattern);
@@ -71,22 +85,21 @@ describe('validation (ADR-061 decision 8, slice 1)', () => {
     refused((wf) => { delete wf.states['first-look'].agent.fallback; }, /fallback must be a send/);
   });
 
-  it('refuses a state-changing tool, an unknown tool, a proposal and a task the step would open', () => {
+  it('refuses a state-changing tool, an unknown tool, a proposal, and the retired task an agent step would open', () => {
     refused((wf) => { wf.states['first-look'].agent.tools = ['advance_task_state']; }, /"advance_task_state", which changes state/);
     refused((wf) => { wf.states['first-look'].agent.tools = ['no_such_tool']; }, /not a registered tool/);
     // A proposal is built (slice 3d), held to the events its op is proposed at and to its one addressee.
     refused((wf) => { wf.states['first-look'].agent.propose = ['send_nudge']; }, /propose names send_nudge, which is proposed only at invitation-unredeemed/);
-    refused((wf) => { wf.states['first-look'].agent.workflow = 'guided_troubleshooting'; }, /workflow names a task machine an event may open: incident_first_look/);
+    // `agent.workflow` is retired: a draft opens the task with a task step, so an agent step naming a machine is refused.
+    refused(() => {}, /states\.first-look\.agent\.workflow is retired: open the task with a task step \(task: \{ machine, by, continue: opened \}\)/, OPS);
   });
 
   it('holds a participant role to the types the workflow declares, on a send and on an agent step alike (ADR-061 slice 3)', () => {
     refused((wf) => { wf.states['greet-lead'].send.to = { participantRole: 'organizer' }; }, /participant role organizer, which type ops does not declare/);
     refused((wf) => { wf.states.opening.send.mention = { lead: 'participantRole:organizer' }; }, /participant role organizer, which type ops does not declare/);
     refused((wf) => { wf.states['first-look'].agent.to = { participantRole: 'organizer' }; }, /participant role organizer, which type ops does not declare/);
-    const agentToLead = clone(OPS) as any;
+    const agentToLead = clone(AGENT_OPS) as any;
     agentToLead.states['first-look'].agent.to = { participantRole: 'lead' };
-    // A step that opens a task the room works on posts to the room, so a step addressed to the lead opens none.
-    delete agentToLead.states['first-look'].agent.workflow;
     agentToLead.states['first-look'].agent.fallback.send = { to: { participantRole: 'lead' }, template: 'ops-first-look-unavailable', mention: { lead: 'participantRole:lead' } };
     expect(eventWorkflowErrors('x', agentToLead)).toEqual([]);
   });
@@ -94,11 +107,11 @@ describe('validation (ADR-061 decision 8, slice 1)', () => {
   it('holds a conditioned edge to its shape: its last alternative alone is unconditioned (ADR-060 slice 1d)', () => {
     refused((wf) => { wf.states.opening.onSuccess = [{ to: 'greet-lead', when: { 'conversation:type': 'ops' } }]; }, /last alternative, which carries no when/);
     refused((wf) => { wf.states.opening.onSuccess = [{ to: 'greet-lead' }, { to: 'first-look' }]; }, /carries no when, so the alternatives after it/);
-    expect(eventWorkflowErrors('x', ((): EventWorkflow => { const wf = clone(OPS); (wf.states.opening as any).onSuccess = [{ to: 'greet-lead' }]; return wf; })())).toEqual([]);
+    expect(eventWorkflowErrors('x', ((): EventWorkflow => { const wf = clone(AGENT_OPS); (wf.states.opening as any).onSuccess = [{ to: 'greet-lead' }]; return wf; })())).toEqual([]);
   });
 
   it('holds each event to what it carries and where it runs', () => {
-    refused((wf) => { wf.on = 'assistant-joined'; delete wf.types; wf.states['greet-lead'].send.to = { people: 'event:person' }; }, /event:person, which only conversation-opened, person-joined, invitation-sent, invitation-unredeemed carry/);
+    refused((wf) => { wf.on = 'assistant-joined'; delete wf.types; wf.states['greet-lead'].send.to = { people: 'event:person' }; }, /event:person, which only conversation-opened, person-joined, invitation-sent, invitation-unredeemed, task-reopened, subject-changed carry/);
     refused((wf) => { delete wf.types; }, /declares the types an event opens/);
     refused((wf) => { wf.types = ['general']; }, /names general, which no event opens/);
     // Meeting-sourced events are NOT BUILT: their sources wait on the meetings code.
@@ -107,9 +120,9 @@ describe('validation (ADR-061 decision 8, slice 1)', () => {
 });
 
 describe('a welcome that runs a workflow (ADR-061 decision 9, FR22, FR25, W1)', () => {
-  const opened = { 'ops-room': PLATFORM_EVENT_WORKFLOWS['ops-room'] };
+  const opened = { 'ops-room': SHIPPED_EVENT_WORKFLOWS['ops-room'] };
   it('the version\'s own assistant-joined workflow is the welcome, and the room\'s type selects a conversation-opened one', () => {
-    const own = { 'opening-and-subject': PLATFORM_EVENT_WORKFLOWS['opening-and-subject'], ...opened };
+    const own = { 'opening-and-subject': SHIPPED_EVENT_WORKFLOWS['opening-and-subject'], ...opened };
     expect(welcomeWorkflowOf(own, undefined).name).toBe('opening-and-subject');
     expect(welcomeWorkflowOf(own, 'ops').name).toBe('opening-and-subject');
     expect(welcomePlan(welcomeWorkflowOf(own, undefined).workflow).runs).toBe(true);
@@ -119,15 +132,20 @@ describe('a welcome that runs a workflow (ADR-061 decision 9, FR22, FR25, W1)', 
 
   it('a conversation-opened workflow declares types an event opens, and one workflow answers for a type', () => {
     expect(welcomeWorkflowErrors({ modelKey: 'x', eventWorkflows: opened } as any)).toEqual([]);
-    expect(welcomeWorkflowErrors({ modelKey: 'x', eventWorkflows: { mine: { ...PLATFORM_EVENT_WORKFLOWS['ops-room'], types: ['general'] } } } as any))
+    expect(welcomeWorkflowErrors({ modelKey: 'x', eventWorkflows: { mine: { ...SHIPPED_EVENT_WORKFLOWS['ops-room'], types: ['general'] } } } as any))
       .toEqual(expect.arrayContaining([expect.stringMatching(/types names general, which no event opens/)]));
-    expect(welcomeWorkflowErrors({ modelKey: 'x', eventWorkflows: { ...opened, mine: PLATFORM_EVENT_WORKFLOWS['ops-room'] } } as any).join())
+    expect(welcomeWorkflowErrors({ modelKey: 'x', eventWorkflows: { ...opened, mine: SHIPPED_EVENT_WORKFLOWS['ops-room'] } } as any).join())
       .toMatch(/both run on conversation-opened in ops conversations/);
   });
 
-  it('an agent step\'s tools are the own tools of the assistant that takes it', () => {
-    // The ops room's first look is taken by the room's ops assistant (`as: { role: ops }`) with its own tools, so a primary
-    // holding no health read is not refused for it (`a-step-that-reads-health-is-taken-by-the-ops-assistant.test.ts`).
+  it('an agent step\'s tools are the own tools of the assistant that takes it, which is always the run\'s own', () => {
+    // AN AGENT STEP IS THE RUN'S OWN ASSISTANT'S TURN (WT118), so a version without the health read is refused a step that
+    // names it, and one holding it is not. Work that needs another assistant's tools is a request
+    // (`a-request-to-another-assistant-runs-its-own-workflow.test.ts`).
+    expect(welcomeWorkflowErrors({ modelKey: 'x', tools: ['load_company_context'], eventWorkflows: { 'ops-room': AGENT_OPS } } as any).join('\n'))
+      .toMatch(/first-look uses read_deployment_health, which this assistant's tools do not include/);
+    expect(welcomeWorkflowErrors({ modelKey: 'x', tools: ['read_deployment_health'], eventWorkflows: { 'ops-room': AGENT_OPS } } as any)).toEqual([]);
+    // The shipped first look is a task the ops assistant holds, so the primary's tools are not asked of it either.
     expect(welcomeWorkflowErrors({ modelKey: 'x', tools: ['load_company_context'], eventWorkflows: opened } as any)).toEqual([]);
   });
 });
@@ -195,7 +213,7 @@ describe('a run (ADR-061 decisions 2 and 5)', () => {
   });
 
   it('a subject send in a group conversation posts nothing and takes onSuccess', async () => {
-    const wf = PLATFORM_EVENT_WORKFLOWS['opening-and-subject'];
+    const wf = SHIPPED_EVENT_WORKFLOWS['opening-and-subject'];
     const { d, sent } = deps();
     const out = await runEventWorkflow('opening-and-subject', wf, { event: 'assistant-joined', channelArn, values: {} }, d);
     expect(sent.map((s) => s.template)).toEqual(['workflow-opening']);
@@ -351,7 +369,7 @@ describe('the run record (ADR-061 decision 5)', () => {
     // Two assistants opening one conversation each run their own.
     expect(await claimEventRun({ runKey: eventRunKey('assistant-joined', 'ch-1', 'ops'), channelArn: 'c', workflow: 'w' }, t.deps)).toEqual({ claimed: true });
     const item = [...t.items.values()][0];
-    expect(item).toMatchObject({ taskId: 'event-run#assistant-joined#ch-1#advisor', eventRun: true, status: EVENT_RUN_STATUS, ttl: 1_700_000_000 + 7 * 24 * 3600 });
+    expect(item).toMatchObject({ taskId: 'event-run#assistant-joined#ch-1#advisor', eventRun: true, status: EVENT_RUN_STATUS, ttl: 1_700_000_000 + 45 * 24 * 3600 });
   });
 
   it('a step is claimed once whatever its outcome: one conditional write decides output or fallback', async () => {
@@ -381,14 +399,14 @@ describe('where it runs', () => {
 
   it('conversation-opened is verified before any workflow is read: the classification, then a type an event opens', () => {
     const fn = router.slice(router.indexOf('export async function handleConversationOpened('), router.indexOf('async function noticeSelection('));
-    const order = ['resolveChannelClassificationTag(channelArn)', 'openedBy', 'primaryAssistantOf(', 'servedWelcomeVersion(', 'runWorkflowFor('].map((t) => fn.indexOf(t));
+    const order = ['resolveChannelClassificationTag(channelArn)', 'opensWithARun(type)', 'eventWorkflowOwner(', 'servedWelcomeVersion(', 'runWorkflowFor('].map((t) => fn.indexOf(t));
     expect(order.every((i) => i > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
   });
 
   it('the creator names the event and sends no separate welcome where a run greeted the room', () => {
     const creator = read('typed-conversation-from-event.ts');
-    expect(creator).toMatch(/nameEventThroughRouter\(DEPLOYED_CLASSIFICATION, \{\n\s+event: 'conversation-opened'[\s\S]{0,200}\.catch\(\(\): \{ ran: boolean; people\?: string\[\] \} => \(\{ ran: false \}\)\)/);
+    expect(creator).toMatch(/nameEventThroughRouter\(DEPLOYED_CLASSIFICATION, \{\n\s+event: 'conversation-opened'[\s\S]{0,700}\.catch\(\(\): \{ ran: boolean; people\?: string\[\] \} => \(\{ ran: false \}\)\)/);
     expect(creator).toMatch(/const welcomed = opened\.ran \? \{ said: 0, notSaid: 0 \} : await welcomeIntoOpenedConversation/);
   });
 
@@ -512,13 +530,13 @@ describe('steps after an agent step (ADR-061 decision 5)', () => {
   it('only the invocation that won the step hands the run back, and the router recomputes the run key', () => {
     const processor = read('assistant-async-processor.ts');
     const branch = processor.slice(processor.indexOf('if (event.eventStep) {'), processor.indexOf('if (event.welcomePrompt) {'));
-    expect(branch).toMatch(/await run\.settled;[\s\S]{0,1200}if \(run\.won\) await handBack\(run\.outcome\);/);
+    expect(branch).toMatch(/await run\.settled;[\s\S]{0,2200}if \(run\.won\) await handBack\(run\.outcome\);/);
     expect(branch).toMatch(/const handBack = async \(outcome: string\) => continueEventRunThroughRouter\(/);
-    expect(branch).toMatch(/eventRun: \{ runKey: req\.runKey, transitions:/);
+    expect(branch).toMatch(/eventRun: \{\s*runKey: req\.runKey, transitions:/);
     const router = read('router-agent-handler.ts');
     const fn = router.slice(router.indexOf('export async function handleEventContinuation('));
     // The natural key is recomputed from the conversation and, at person-joined, the person (`eventNaturalKey`).
-    expect(fn).toMatch(/const naturalKey = eventNaturalKey\(wf\.on, channelArn, person\(req\.eventPerson\), str\(req\.invitationId\), alarm\);/);
+    expect(fn).toMatch(/const naturalKey = runNaturalKey\(wf\.on, channelArn, \{\s*eventPerson: person\(req\.eventPerson\), invitationId: str\(req\.invitationId\), alarm, ruleEvent,/);
     expect(fn).toMatch(/const runKey = eventRunKey\(wf\.on, naturalKey, assistant\.profile\.name\);\n\s+if \(str\(req\.runKey\) !== runKey\) return refuse/);
     expect(fn.indexOf('resolveChannelClassificationTag(channelArn)')).toBeLessThan(fn.indexOf('continueAfter('));
   });
@@ -579,5 +597,14 @@ describe('IAM deny tests the slice-1 rows call for', () => {
     const channel = statements.find((st) => JSON.stringify(st.Resource).includes('/channel/'));
     expect(JSON.stringify(channel.Condition)).toMatch(/"premium"/);
     expect(JSON.stringify(channel.Condition)).not.toMatch(/"basic"|"standard"/);
+  });
+});
+
+describe('a run\'s records outlive every wait it may hold (ADR-067 WT26)', () => {
+  it('live 45 days, past the longest task step deadline, and no longer', async () => {
+    const { EVENT_RUN_TTL_SECONDS } = await import('../../lambda/src/lib/event-run-store');
+    const { MAX_TASK_DEADLINE_MINUTES } = await import('../../lambda/src/lib/task-step');
+    expect(EVENT_RUN_TTL_SECONDS).toBe(45 * 24 * 3600);
+    expect(EVENT_RUN_TTL_SECONDS).toBeGreaterThan(MAX_TASK_DEADLINE_MINUTES * 60);
   });
 });

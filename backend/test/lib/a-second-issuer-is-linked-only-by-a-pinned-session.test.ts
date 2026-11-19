@@ -4,8 +4,8 @@
  *
  * The §16.5 deny-tests, as units: a second issuer is added only with a session pinned to the person
  * (the pinned side is the edge's resolution, never the body); a second AppInstanceUser is never created
- * for a subject that already has a row; a subject that is somebody else's is never moved; a guest, a host
- * assertion and a one-conversation issuer are never linked. The live proof is `scripts/deny-test-upgrade.mjs`.
+ * for a subject that already has a row; a subject that is somebody else's is never moved; a guest and a host
+ * assertion are never linked. The live proof is `scripts/deny-test-upgrade.mjs`.
  */
 import { linkRequestOf, linkSecondIssuer, LinkRefused } from '../../lambda/src/lib/issuer-link';
 import { TokenRefused } from '../../lambda/src/lib/token-verification';
@@ -89,7 +89,6 @@ describe('linking a second issuer', () => {
   it.each([
     ['a guest', pool('guest', { kind: 'guest' } as never)],
     ['a host assertion', pool('host', { kind: 'host-assertion', provisioning: 'provisioned-only' } as never)],
-    ['a one-conversation issuer', pool('embed', { clearance: { oneChannel: 'standard', classifications: ['standard'] } } as never)],
   ])('never links %s, on either side', async (_name, issuer) => {
     await expect(linkSecondIssuer({ personArn: PERSON, issuer }, 't', { doc: store(), identitiesTable: 'ids', verify: verifying(STAFF) }))
       .rejects.toBeInstanceOf(LinkRefused);

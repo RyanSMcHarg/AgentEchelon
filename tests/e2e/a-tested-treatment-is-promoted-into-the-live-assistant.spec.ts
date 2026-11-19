@@ -51,6 +51,7 @@ import { liveAssistantFor } from './helpers/battle-setup';
 import { ConsoleMonitor } from './helpers/console-monitor';
 import { activeProfileVersion, altAssignmentRecord, storedProfileVersion } from './helpers/profile-versions';
 import { ADMIN_API_URL, adminApiServes, adminUrl, profileActionUrl } from './helpers/api-urls';
+import { replacingDraft, draftIdOf } from './helpers/profile-draft';
 
 guardConsoleErrors();
 
@@ -238,15 +239,21 @@ suite('an operator promotes a tested treatment into the live assistant (SPEC-BAT
     return { ctx, console: consolePage, monitor };
   }
 
-  /** Click Promote on the experiment's row and confirm it; returns the confirmation dialog. */
+  /**
+   * Open the experiment's page from its row, click Promote there and confirm it. Promote is on the experiment's own
+   * page, beside its results, and the row is found by the id its name button carries (`data-experiment-id`), since
+   * a row is named by the description when there is one. Returns the dialog and the page's status badge.
+   */
   async function promoteInConsole(consolePage: Page, id: string) {
-    const row = consolePage.locator('tr', { hasText: id }).first();
-    await expect(row, `the console lists ${id} among running experiments`).toBeVisible({ timeout: 60_000 });
-    await row.getByRole('button', { name: 'Promote', exact: true }).click();
+    const open = consolePage.locator(`[data-experiment-id="${id}"]`).first();
+    await expect(open, `the console lists ${id} among running experiments`).toBeVisible({ timeout: 60_000 });
+    await open.click();
+    const experimentPage = consolePage.locator('[data-testid="experiment-page"]');
+    await experimentPage.getByRole('button', { name: 'Promote', exact: true }).click();
     const dialog = consolePage.locator('[role="dialog"]', { hasText: id });
     await expect(dialog, 'Promote asks for confirmation, naming the experiment').toBeVisible();
     await dialog.getByRole('button', { name: 'Promote', exact: true }).click();
-    return { row, dialog };
+    return { status: experimentPage.locator('.experiment-page-title .status-badge'), dialog };
   }
 
   /** No console error on the admin page other than the ones the caller expects. */
@@ -267,8 +274,8 @@ suite('an operator promotes a tested treatment into the live assistant (SPEC-BAT
     const { candidate } = await arm(id, originalVersion!);
 
     // MOVE THE LIVE VERSION: activate a clone of the active version. Same behavior, a new version number.
-    await profileAction('/version', { profileName: live });
-    const activated = await profileAction('/activate', { profileName: live });
+    const clone = await replacingDraft((b) => profileAction('/version', b), { profileName: live });
+    const activated = await profileAction('/activate', { profileName: live, configId: draftIdOf(clone) });
     expect(typeof activated?.version, `activate a clone of ${live}: ${JSON.stringify(activated).slice(0, 300)}`).toBe('number');
     const moved = activated.version as number;
     expect(moved, 'the clone is a new version').toBeGreaterThan(originalVersion!);
@@ -359,10 +366,10 @@ suite('an operator promotes a tested treatment into the live assistant (SPEC-BAT
     // PROMOTE FROM THE CONSOLE.
     const { ctx, console: consolePage, monitor } = await openConsole(browser);
     try {
-      const { row, dialog } = await promoteInConsole(consolePage, id);
+      const { status, dialog } = await promoteInConsole(consolePage, id);
       await expect(dialog, 'the dialog closes when the promotion is accepted').toBeHidden({ timeout: 90_000 });
-      // The list re-reads: a completed experiment leaves the running filter.
-      await expect(row, 'the promoted experiment leaves the running experiments').toBeHidden({ timeout: 60_000 });
+      // The page re-reads the experiment: a promotion completes it.
+      await expect(status, 'the promoted experiment reads completed').toHaveText('completed', { timeout: 60_000 });
       expectCleanConsole(monitor);
     } finally {
       await ctx.close().catch(() => undefined);

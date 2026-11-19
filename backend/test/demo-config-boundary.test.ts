@@ -33,7 +33,7 @@ function sourceFiles(dir: string): string[] {
 }
 
 describe('demo configuration stays out of the generic product', () => {
-  it('no core source imports from backend/demo', () => {
+  it('no core source imports from the demo/ folders', () => {
     const offenders: string[] = [];
     for (const root of CORE_ROOTS) {
       for (const file of sourceFiles(path.join(BACKEND, root))) {
@@ -48,7 +48,7 @@ describe('demo configuration stays out of the generic product', () => {
     // expect(), and a bare `toEqual([])` failure would print the paths without saying what to do.
     if (offenders.length > 0) {
       throw new Error(
-        'Core code must not import demo configuration. Move the demo-specific value into backend/demo/ '
+        'Core code must not import demo configuration. Move the demo-specific value into its demo\'s folder under demo/ '
           + 'and have the SEEDER apply it (into a profile definition or an SSM parameter), so the shipped '
           + `product stays generic. Offenders:\n  ${offenders.join('\n  ')}`,
       );
@@ -59,6 +59,17 @@ describe('demo configuration stays out of the generic product', () => {
   it('scans a non-trivial surface (a guard that scans nothing passes vacuously)', () => {
     const count = CORE_ROOTS.reduce((n, r) => n + sourceFiles(path.join(BACKEND, r)).length, 0);
     expect(count).toBeGreaterThan(50);
+  });
+
+  // EACH DEMO IS ITS OWN FOLDER under demo/, so someone trying one finds everything it needs in one place
+  // and nothing private: the top level holds the index README and the demo folders, and each folder says how to run it.
+  it('keeps each demo in a folder of its own, each with a README, under an index', () => {
+    const DEMO = path.join(BACKEND, '..', 'demo');
+    const top = fs.readdirSync(DEMO, { withFileTypes: true });
+    expect(top.filter((e) => e.isFile()).map((e) => e.name)).toEqual(['README.md']);
+    const folders = top.filter((e) => e.isDirectory()).map((e) => e.name);
+    expect(folders.length).toBeGreaterThan(1);
+    for (const f of folders) expect(fs.existsSync(path.join(DEMO, f, 'README.md'))).toBe(true);
   });
 
   it('detects an offending import when one is present (the guard actually fires)', () => {

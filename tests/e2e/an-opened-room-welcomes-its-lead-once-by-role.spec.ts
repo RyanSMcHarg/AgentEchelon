@@ -8,17 +8,20 @@
  * the path end to end:
  *  - the premium creator opens an `ops` room for the lead it is named, records the lead as the holder of `lead` on the
  *    room's context row, and names `conversation-opened` to the router;
- *  - the primary's version welcomes `ops` rooms in `workflow` mode, so the router runs the platform's `ops-room`, and the
- *    primary's own join posts nothing: every message the primary posts in the room is a step of that run;
+ *  - the ops assistant, the owner of the `ops` room's workflows (`workflowOwner`), runs the platform's `ops-room` from its
+ *    version: every message it posts in the room is a step of that run or its first look;
+ *  - the ops assistant's join posts nothing, since its version runs the room's `conversation-opened` workflow; the room's
+ *    primary, the classification's (the Advisor), whose own version declares none for `ops`, says its one line at its
+ *    join, to the room and addressed to nobody (`arrivalWelcomeOwner` reads the joining assistant's own version);
  *  - the run's `greet-lead` step, a send to `{ participantRole: 'lead' }`, is addressed to the lead alone and is absent
  *    from the view of a member who holds no role but the default `responder`;
  *  - the lead is welcomed once.
  *
  * SETTLED BEFORE IT IS READ. The run's last step is the first look, taken by the room's ops assistant; every assertion
  * reads the room once a message of that step is posted, its output or its fallback, so the run has ended and the
- * primary's join, which fires when the room is created, has long since answered.
+ * ops assistant's join, which fires when the room is created, has long since answered.
  *
- * THE RUN OWNS WHAT IT CHANGES. The primary gets a version whose welcome runs the platform's `ops-room` for `ops`
+ * THE RUN OWNS WHAT IT CHANGES. The ops assistant gets a version whose welcome runs the platform's `ops-room` for `ops`
  * conversations; the version that was active is activated again afterwards. Both rooms it opens, the operations team's
  * standing room and the `ops` room, are deleted with their context rows.
  *
@@ -38,7 +41,8 @@ import { unmarshalItem } from './helpers/task-backend';
 import { SSM_ROOT, physicalIdsInClassificationStacks } from './helpers/stack-prefix';
 import { awsv, awsvText } from './helpers/aws';
 import { SERVED_VERSION_TTL_MS, activateVersionWith, returnToVersion, withWorkflowFor } from './helpers/version-under-test';
-import { PLATFORM_EVENT_WORKFLOWS } from '../../backend/lambda/src/lib/event-workflow';
+import { SHIPPED_EVENT_WORKFLOWS } from '../../backend/lambda/src/lib/event-workflow';
+import { looksLikeTaskPlaceholder } from './helpers/agent-helpers';
 import { isJoinGreeting, isWelcomeTo, roomMessagesSeenBy, stepOf, type RoomMessage, roomMessagesUntil } from './helpers/event-run-messages';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -91,7 +95,10 @@ test.describe.serial('a room an event opens welcomes its lead once, by role (wel
   guardBackendErrors('an-opened-room-welcomes-its-lead-once-by-role');
 
   let admin: VendedCredentials | undefined;
-  let primary = '';
+  /** The ops assistant: the owner of the room's workflows, whose version runs `ops-room` and whose bot posts its steps. */
+  let owner = '';
+  let ownerBot = '';
+  /** The room's primary, the classification's: a member by creation, whose join posts nothing in a room its owner's run opens. */
   let primaryBot = '';
   let previousVersion: number | undefined;
   let creator = '';
@@ -125,9 +132,14 @@ test.describe.serial('a room an event opens welcomes its lead once, by role (wel
     test.skip(!ssmValue(`${SSM_ROOT}/assistant-assignments/premium/ops/assistants/ops-premium`),
       'premium has no ops assistant on this deployment; the ops type needs ops-premium in profiles (npm run add-assistant-role)');
 
-    primary = liveAssistantFor('premium');
+    // THE OWNER OF THE ROOM'S WORKFLOWS: the ops assistant (`workflowOwner` on `ops`). THE ROOM'S PRIMARY: the classification's.
+    owner = liveAssistantFor('premium', 'ops');
+    ownerBot = botOf(ssmValue(`${SSM_ROOT}/assistant-assignments/premium/ops/assistants/${owner}`));
+    expect(ownerBot, `the assignment record of ${owner} names no bot`).toContain('/bot/');
+    const primary = liveAssistantFor('premium');
     primaryBot = botOf(ssmValue(`${SSM_ROOT}/assistant-assignments/premium/primary/assistants/${primary}`));
     expect(primaryBot, `the assignment record of ${primary} names no bot`).toContain('/bot/');
+    expect(primaryBot, 'the room\'s primary and the owner of its workflows are two assistants').not.toBe(ownerBot);
     contextTable = ssmValue(`${SSM_ROOT}/shared/tables/channel-context-name`);
     serviceAdmin = ssmValue(`${SSM_ROOT}/app-instance-admin-arn`);
     expect(contextTable, `${SSM_ROOT}/shared/tables/channel-context-name names no table`).toBeTruthy();
@@ -144,7 +156,7 @@ test.describe.serial('a room an event opens welcomes its lead once, by role (wel
   });
 
   test.afterAll(async () => {
-    if (admin && previousVersion !== undefined) await returnToVersion(admin, primary, previousVersion);
+    if (admin && previousVersion !== undefined) await returnToVersion(admin, owner, previousVersion);
     const tryTo = (what: string, fn: () => void) => {
       try { fn(); } catch (err) { console.warn(`cleanup: could not ${what}: ${(err as Error).message.slice(0, 200)}`); }
     };
@@ -154,18 +166,18 @@ test.describe.serial('a room an event opens welcomes its lead once, by role (wel
     }
   });
 
-  test('the primary activates a version whose ops conversations open with ops-room', async () => {
+  test('the ops assistant activates a version whose ops conversations open with ops-room', async () => {
     test.setTimeout(180_000);
-    previousVersion = await activateVersionWith(admin!, primary, (body) => ({
+    previousVersion = await activateVersionWith(admin!, owner, (body) => ({
       // THE ROOM'S TYPE SELECTS ITS conversation-opened WORKFLOW (W1): the platform's ops-room, copied into the version.
-      eventWorkflows: withWorkflowFor(body, 'ops-room', JSON.parse(JSON.stringify(PLATFORM_EVENT_WORKFLOWS['ops-room']))),
+      eventWorkflows: withWorkflowFor(body, 'ops-room', JSON.parse(JSON.stringify(SHIPPED_EVENT_WORKFLOWS['ops-room']))),
       // A version that selects its task workflows offers the one the first look opens.
       ...(Array.isArray(body.workflows) && body.workflows.length && !body.workflows.includes('incident_first_look')
         ? { workflows: [...body.workflows, 'incident_first_look'] } : {}),
     }));
   });
 
-  test('the opened room\'s run welcomes the lead once, by role, and the primary\'s join posts nothing', async () => {
+  test('the opened room\'s run welcomes the lead once, by role, and neither assistant\'s join posts', async () => {
     test.setTimeout(420_000);
     test.skip(previousVersion === undefined, 'the version was not activated');
     await new Promise((r) => setTimeout(r, SERVED_VERSION_TTL_MS));
@@ -189,11 +201,19 @@ test.describe.serial('a room an event opens welcomes its lead once, by role (wel
     test.skip(!people.includes(responderArn), 'the ops engineer is not in the ops group, so the room holds no member without the lead role (provision-test-users --only opsEngineerUser)');
     expect(holdings, 'the responder holds no role a source names').not.toContain(responderArn.split('/user/')[1]);
 
-    // SETTLED: the run's last step, the first look, has posted its output or its fallback.
-    const lastStep = (ms: RoomMessage[]) => ms.find((m) => stepOf(m) === 'first-look');
+    // SETTLED: the first look is a request the ops assistant's own run works (WT118), so it has posted its answer, as that
+    // assistant, or the run has said it could not be had.
+    // The answer is told from the assistant's own welcome by the task it carries, a marker the platform writes.
+    const firstLook = (ms: RoomMessage[]) => ms.find((m) => m.content.includes('incident_first_look') && m.text && !looksLikeTaskPlaceholder(m.text));
+    const lastStep = (ms: RoomMessage[]) => firstLook(ms) ?? ms.find((m) => stepOf(m) === 'tell-absent' || stepOf(m) === 'tell-unavailable');
     const seenByLead = await roomMessagesUntil(room, leadArn, (ms) => Boolean(lastStep(ms)), { timeoutMs: 300_000 });
     const brief = (ms: RoomMessage[]) => JSON.stringify(ms.filter((m) => m.senderArn.includes('/bot/')).map((m) => ({ step: stepOf(m), to: m.target.length, text: m.text.slice(0, 80) })));
     expect(lastStep(seenByLead), `the ops-room run never reached its first look; seen ${brief(seenByLead)}`).toBeTruthy();
+    // WHAT THE ROOM ACTUALLY READS, IN FULL, as its lead sees it.
+    console.log(`[what the room reads] the opened room:\n${seenByLead.filter((m) => m.senderArn.includes('/bot/')).map((m) => `--- ${m.senderArn === ownerBot ? 'ops' : m.senderArn === primaryBot ? 'primary' : 'another assistant'}${m.target.length ? ' [targeted]' : ''} ${stepOf(m) ?? ''}\n${m.text}`).join('\n')}`);
+    // THE FIRST LOOK REPORTS WHAT IT READ: figures, not a line about standing by.
+    expect(firstLook(seenByLead)?.text, `the room got no first look from the ops assistant; seen ${brief(seenByLead)}`).toMatch(/\d/);
+    expect(firstLook(seenByLead)?.text).not.toMatch(/standing by/i);
     const seenByResponder = roomMessagesSeenBy(room, responderArn);
 
     // THE OPENING IS THE ROOM'S, and both members read it.
@@ -206,7 +226,7 @@ test.describe.serial('a room an event opens welcomes its lead once, by role (wel
     const greet = seenByLead.filter((m) => stepOf(m) === 'greet-lead');
     expect(greet.length, `one greeting to the lead; seen ${brief(seenByLead)}`).toBe(1);
     expect(greet[0].target, 'a send to participantRole lead is addressed to the role\'s holders').toEqual([leadArn]);
-    expect(greet[0].senderArn, 'the greeting is the primary\'s').toBe(primaryBot);
+    expect(greet[0].senderArn, 'the greeting is the workflow owner\'s').toBe(ownerBot);
     expect(seenByResponder.some((m) => m.messageId === greet[0].messageId), 'a member who does not hold lead does not receive the role\'s message').toBe(false);
     expect(seenByResponder.some((m) => stepOf(m) === 'greet-lead'), 'no greet-lead message reaches the responder in any form').toBe(false);
 
@@ -214,11 +234,18 @@ test.describe.serial('a room an event opens welcomes its lead once, by role (wel
     expect(seenByLead.filter((m) => isWelcomeTo(m, leadArn)).map((m) => ({ step: stepOf(m), kind: m.meta?.turnKind ?? '', text: m.text.slice(0, 80) })),
       'the lead is welcomed by the run alone').toEqual([{ step: 'greet-lead', kind: 'notification', text: greet[0].text.slice(0, 80) }]);
 
-    // THE PRIMARY'S JOIN POSTS NOTHING: no greeting of the primary's join is in the room, and whatever the primary posted
-    // that the lead reads is a step of the run, or the room's line that somebody joined.
-    expect(seenByLead.filter((m) => m.senderArn === primaryBot && isJoinGreeting(m)).map((m) => m.text.slice(0, 120)),
-      'the primary\'s WelcomeIntent posted in a room its conversation-opened run owns').toEqual([]);
-    const offRun = seenByLead.filter((m) => m.senderArn === primaryBot && !stepOf(m) && m.meta?.systemAnnouncement !== 'member_joined');
-    expect(offRun.map((m) => ({ kind: m.meta?.turnKind ?? '', text: m.text.slice(0, 120) })), 'the primary posted outside its conversation-opened run').toEqual([]);
+    // EACH JOIN AS ITS OWN VERSION DECIDES (`arrivalWelcomeOwner`): the owner's version runs the room's conversation-opened
+    // workflow, so its join posts nothing; the primary's declares none for `ops`, so its join says its one line, to the room
+    // and addressed to nobody, and so is never a second welcome of the lead. Whatever else either posted that the lead reads
+    // is a step of the owner's run, its first look, or the room's line that somebody joined.
+    const bots = [primaryBot, ownerBot];
+    const joinGreetings = seenByLead.filter((m) => bots.includes(m.senderArn) && isJoinGreeting(m));
+    expect(joinGreetings.filter((m) => m.senderArn === ownerBot).map((m) => m.text.slice(0, 120)),
+      'the workflow owner\'s WelcomeIntent posted in a room its conversation-opened run owns').toEqual([]);
+    const primaryLine = joinGreetings.filter((m) => m.senderArn === primaryBot);
+    expect(primaryLine.map((m) => ({ to: m.target, text: m.text.slice(0, 120) })), `the primary says one line at its join, to the room; seen ${brief(seenByLead)}`)
+      .toEqual([{ to: [], text: expect.any(String) }]);
+    const offRun = seenByLead.filter((m) => bots.includes(m.senderArn) && !stepOf(m) && !isJoinGreeting(m) && m.meta?.systemAnnouncement !== 'member_joined' && m !== firstLook(seenByLead) && !looksLikeTaskPlaceholder(m.text));
+    expect(offRun.map((m) => ({ by: m.senderArn === ownerBot ? 'ops' : 'primary', kind: m.meta?.turnKind ?? '', text: m.text.slice(0, 120) })), 'an assistant posted outside the room\'s conversation-opened run').toEqual([]);
   });
 });

@@ -44,15 +44,17 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { requireAuth, parseJsonBody, respond, callerPersonId, isAdminConsoleSession, type AuthorizedClaims } from './lib/auth.js';
+import { callerReachesConversation, refusalAnswer } from './lib/conversation-access.js';
 import { cancelDeadlinesThroughRouter, personJoinedThroughRouter, sayThroughRouter } from './lib/say-through-router.js';
 import { defaultProfileRegistry } from '../../lib/profile-registry';
 import { primaryAssignmentOf, primaryAssistantOf } from './lib/conversation-primary.js';
 import { addContextMember, contextChannelId, createConversationForContext } from './lib/channel-creation.js';
+import { conversationNameText } from './lib/conversation-name.js';
 import { resolvePerson } from './lib/person-identity.js';
 import { accountStateOfPerson, defaultDirectory } from './lib/membership-source.js';
 import { issuerIdOf } from './lib/trusted-issuers.js';
-import { DEFAULT_CONVERSATION_TYPE, typeAdmitsIssuers } from '../../lib/config/conversation-types.js';
-import { putChannelContext, recordMemberIdentity, type ChannelContextPatch } from './lib/channel-context-client.js';
+import { DEFAULT_CONVERSATION_TYPE, meetingSettingsOf, typeAdmitsIssuers } from '../../lib/config/conversation-types.js';
+import { putChannelContext, readChannelContext, recordMemberIdentity, type ChannelContextPatch } from './lib/channel-context-client.js';
 import { boundedDomainContext, boundedOtherContexts } from './lib/host-grounding.js';
 import { resolveServiceAdminBearer } from './lib/service-admin-bearer.js';
 import { readChannelClassificationTag, readChannelTags } from './lib/channel-classification.js';
@@ -229,8 +231,11 @@ async function archive(
  */
 async function archiveConversation(a: {
   actorSub: string;
-  /** Whose name the notice carries: the moderator, or the administrator's administration identity. */
-  actorArn: string;
+  /**
+   * Whose name the notice carries: the moderator, or the administrator's administration identity. Absent for the
+   * platform's own archive of an ended meeting's conversation, which posts no notice.
+   */
+  actorArn?: string;
   channelArn: string;
   adminArn: string;
   moderators: string[];
@@ -242,7 +247,7 @@ async function archiveConversation(a: {
   // Order matters (spec §Archive): 1) the notice BEFORE the tag, because the archived Deny refuses the
   // assistant's post once the tag is set; then 2) set the tag; then 3) remove all moderators to lock it.
   try {
-    await postArchiveNotice(channelArn, callerArn, new Date().toISOString().slice(0, 10));
+    if (callerArn) await postArchiveNotice(channelArn, callerArn, new Date().toISOString().slice(0, 10));
   } catch (err) {
     console.warn('[conversation-management] archive notice failed (non-fatal):', err);
   }
@@ -408,9 +413,42 @@ async function adminArchive(event: APIGatewayProxyEvent, origin: string): Promis
   });
 }
 
+/**
+ * AN ENDED MEETING'S CONVERSATION IS ARCHIVED (SPEC-ASSISTANT-MEETINGS FR27), invoked by the router of its classification
+ * once the meeting has ended (`archiveEndedMeeting`, `router-agent-handler.ts`), through the one archive sequence
+ * (`archiveConversation`). The invoke grant is the router's alone, and the request decides nothing: the conversation must
+ * be a meeting's own conversation (its type, from its server-only row), its last meeting the one named, and none running
+ * in it, by that row. No person archived it, so no notice names one; the ended card in its room already says it ended.
+ */
+export interface MeetingArchiveRequest {
+  aeMeetingArchive: { channelArn: string; meetingId: string };
+}
+
+export async function archiveEndedMeetingConversation(req: MeetingArchiveRequest): Promise<{ archived: boolean; reason?: string }> {
+  const channelArn = typeof req?.aeMeetingArchive?.channelArn === 'string' ? req.aeMeetingArchive.channelArn : '';
+  const meetingId = typeof req?.aeMeetingArchive?.meetingId === 'string' ? req.aeMeetingArchive.meetingId : '';
+  if (!APP_INSTANCE_ARN || !channelArn.startsWith(`${APP_INSTANCE_ARN}/channel/`) || !meetingId) return { archived: false, reason: 'invalid' };
+  const row = await readChannelContext(channelArn, { consistent: true });
+  if (!meetingSettingsOf(row?.conversationType)) return { archived: false, reason: 'not a meeting conversation' };
+  if (row?.lastMeeting?.meetingId !== meetingId) return { archived: false, reason: 'not its last meeting' };
+  if (row.activeMeeting) return { archived: false, reason: 'a meeting runs in it' };
+  if ((await readChannelTags(messagingClient, channelArn).catch(() => null))?.archived === 'true') return { archived: false, reason: 'already archived' };
+  const adminArn = await getAdminArn();
+  if (!adminArn) return { archived: false, reason: 'not configured' };
+  const moderators = await listModeratorArns(channelArn, adminArn);
+  await archiveConversation({ actorSub: 'platform:meeting-ended', channelArn, adminArn, moderators, origin: '', reason: 'meeting-ended' });
+  return { archived: true };
+}
+
 export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
-  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts), before any path reads a
+  // classification: a meeting's archive deletes its classification's deadline schedules too.
   await loadProfileRegistry();
+  if ((event as unknown as Partial<MeetingArchiveRequest>)?.aeMeetingArchive) {
+    const out = await archiveEndedMeetingConversation(event as unknown as MeetingArchiveRequest);
+    console.log(JSON.stringify({ event: 'meeting_conversation_archive', ...out }));
+    return respond(out.archived ? 200 : 409, out, '');
+  }
   const origin = pickOrigin(ALLOWED_ORIGINS, requestOrigin(event));
 
   const fromConsole = await adminArchive(event, origin);
@@ -437,14 +475,32 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
   // Route on the resource path (…/conversations/<action>).
   const path = event.resource || event.path || '';
   try {
-    if (path.endsWith('/archive')) {
-      return await archive(claims, channelArn, adminArn, origin);
-    }
-    if (path.endsWith('/remove-member')) {
+    // ARCHIVE AND REMOVE ACT AS THE SERVICE ADMIN ON THE CALLER'S BEHALF, so the caller's own boundary
+    // comes first: a current member of the conversation, proven as them, and cleared for its classification
+    // (`lib/conversation-access.ts`). The moderator check that follows is the second condition, never the
+    // only one. Leave is not gated here: it removes only the caller's own membership, which a member whose
+    // clearance no longer reaches the conversation must still be able to do.
+    //
+    // A PROVEN MEMBER MAY ACT ON A CONVERSATION WITH NO RECOGNIZED CLASSIFICATION (`CLASSIFICATION_UNREADABLE`):
+    // archive and remove only take access away, nobody can be cleared for such a conversation to clean it up
+    // otherwise, and archive already proceeds without a classification. A non-member, an uncleared member and
+    // an outage are refused.
+    //
+    // Both act on the conversation as the check named it: its full channel ARN, whatever form the body used.
+    if (path.endsWith('/archive') || path.endsWith('/remove-member')) {
+      const access = await callerReachesConversation(event, channelArn, { appInstanceArn: APP_INSTANCE_ARN, client: messagingClient });
+      if (!access.ok && access.code !== 'CLASSIFICATION_UNREADABLE') {
+        const { statusCode, body } = refusalAnswer(access);
+        return respond(statusCode, body, origin);
+      }
+      const conversationArn = access.channelArn ?? channelArn;
+      if (path.endsWith('/archive')) {
+        return await archive(claims, conversationArn, adminArn, origin);
+      }
       if (!memberArn || typeof memberArn !== 'string') {
         return respond(400, { error: 'memberArn is required' }, origin);
       }
-      return await removeMember(claims, channelArn, memberArn, adminArn, origin);
+      return await removeMember(claims, conversationArn, memberArn, adminArn, origin);
     }
     if (path.endsWith('/leave')) {
       return await leave(claims, channelArn, adminArn, origin);
@@ -460,22 +516,19 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
 /**
  * The classification a host's context conversations are created at: the one the trusted-issuer
- * registry's oneChannel issuers name (`lib/config/issuers.ts`), set by the stack. NO FLOOR (ADR-046): an
+ * registry's `contextClassification` names (`lib/config/issuers.ts`), set by the stack. NO FLOOR (ADR-046): an
  * unset or undeclared value refuses every call rather than naming a classification nobody configured.
  */
 const CONTEXT_CLASSIFICATION = (process.env.CONTEXT_CLASSIFICATION || '').trim();
 const CHANNEL_FLOW_ARN_PARAM = process.env.CHANNEL_FLOW_ARN_PARAM || '';
 
-let cachedFlowArn: string | null = null;
+let cachedFlowArn = '';
+/** The deployment's channel flow, read once it is known. A failed read throws, so the add is refused rather than made flowless. */
 async function contextFlowArn(): Promise<string> {
-  if (cachedFlowArn !== null) return cachedFlowArn;
-  if (!CHANNEL_FLOW_ARN_PARAM) return (cachedFlowArn = '');
-  try {
-    cachedFlowArn = (await ssmClient.send(new GetParameterCommand({ Name: CHANNEL_FLOW_ARN_PARAM }))).Parameter?.Value || '';
-  } catch {
-    cachedFlowArn = '';
-  }
-  return cachedFlowArn;
+  if (cachedFlowArn || !CHANNEL_FLOW_ARN_PARAM) return cachedFlowArn;
+  const value = (await ssmClient.send(new GetParameterCommand({ Name: CHANNEL_FLOW_ARN_PARAM }))).Parameter?.Value || '';
+  if (!value) throw new Error(`the channel flow parameter ${CHANNEL_FLOW_ARN_PARAM} is empty`);
+  return (cachedFlowArn = value);
 }
 
 let cachedEvictBot: string | null = null;
@@ -512,6 +565,11 @@ export interface MembershipEvent {
   /** The role the host granted. Informational only. */
   role?: string;
   title?: string;
+  /**
+   * The grounding and routing fields below (`userName`, `userLanguage`, `participantProfile`, `domainContext`,
+   * `otherContexts`, `segment`) are patches on an existing conversation: omitted leaves the field as the conversation
+   * has it, and `null` clears it (SPEC-FEDERATED-PARTICIPANTS, "Grounding on an add").
+   */
   userName?: string;
   userLanguage?: string;
   participantProfile?: string;
@@ -624,11 +682,11 @@ async function addContextMemberFor(
 ): Promise<MembershipResult> {
   const { contextType, contextId, conversationArn, userArn } = c;
   // Display context (drives metadata and the greeting only; not authoritative).
-  const title = String(event.title || contextId).slice(0, 80);
+  const title = conversationNameText(String(event.title || contextId), 80) || contextId.slice(0, 80);
   const userName = String(event.userName || '').slice(0, 80);
   const userLanguage = String(event.userLanguage || '').slice(0, 8);
   const participantProfile = String(event.participantProfile || '').slice(0, 600);
-  // Bounded, for the same reason and by the same helper as the creation path.
+  // Bounded, so one host's context cannot outgrow the context row.
   const domainContext = boundedDomainContext<DomainContext>(event.domainContext, '[conversation-membership]');
   const otherContexts = boundedOtherContexts(event.otherContexts);
   const segCountry = event.segment && typeof event.segment === 'object'
@@ -654,6 +712,7 @@ async function addContextMemberFor(
   // conversation and adds one person to it - "this member joins", not "here is the complete grounding
   // again" - so a field the host did not send is left as the conversation has it.
   const grounding: ChannelContextPatch = {
+    ...(event.userName === undefined ? {} : { userName: event.userName === null ? null : userName }),
     ...(event.participantProfile === undefined ? {} : { participantProfile: event.participantProfile === null ? null : participantProfile }),
     ...(event.domainContext === undefined ? {} : { domainContext: event.domainContext === null ? null : domainContext }),
     ...(event.otherContexts === undefined ? {} : { otherContexts: event.otherContexts === null ? null : otherContexts }),
@@ -678,6 +737,7 @@ async function addContextMemberFor(
     //    moderator), and the admin leaves. An existing conversation throws ConflictException before
     //    anything is written, and is refreshed and joined below instead.
     let existed = false;
+    let attachedFlowArn: string | null | undefined;
     try {
       await createConversationForContext({
         appInstanceArn: APP_INSTANCE_ARN,
@@ -691,7 +751,6 @@ async function addContextMemberFor(
         contextExtras: grounding,
         channelFlowArn: flowArn || undefined,
         creatorBearerArn: serviceAdmin,
-        openerModerator: false,
       });
     } catch (err) {
       if ((err as { name?: string }).name !== 'ConflictException') throw err;
@@ -708,11 +767,13 @@ async function addContextMemberFor(
         // OMISSION PRESERVES HERE TOO: our four keys win, everything else the channel carries survives.
         // A failed read is not an empty channel, and a merge over the cap is not written.
         // THE NAME IS KEPT AS IT IS: the room was named when it was created, and after that only its primary assistant
-        // renames it (SPEC-CONVERSATION-TYPES FR32). So the name written back is the one this read found.
+        // renames it (SPEC-CONVERSATION-TYPES FR32). So the name written back is the one this read found, and with no
+        // read there is nothing to write.
         let currentName: string | undefined;
         const existing = await messagingClient.send(new DescribeChannelCommand({ ChannelArn: conversationArn, ChimeBearer: serviceAdmin }))
           .then((r) => {
             currentName = r.Channel?.Name;
+            attachedFlowArn = r.Channel?.ChannelFlowArn ?? null;
             return parseChannelMetadata(r.Channel?.Metadata) ?? {};
           })
           .catch((readErr) => {
@@ -726,13 +787,15 @@ async function addContextMemberFor(
             bytes: metadataBytes(JSON.stringify({ ...existing, ...patch })), cap: CHANNEL_METADATA_CAP_BYTES,
           });
         }
-        await messagingClient.send(new UpdateChannelCommand({
-          ChannelArn: conversationArn,
-          Name: currentName || title,
-          Mode: 'RESTRICTED',
-          ...(merged === null ? {} : { Metadata: merged }),
-          ChimeBearer: serviceAdmin,
-        }));
+        if (existing !== null) {
+          await messagingClient.send(new UpdateChannelCommand({
+            ChannelArn: conversationArn,
+            Name: currentName || title,
+            Mode: 'RESTRICTED',
+            ...(merged === null ? {} : { Metadata: merged }),
+            ChimeBearer: serviceAdmin,
+          }));
+        }
       } catch (uerr) {
         console.warn('[conversation-membership] metadata refresh failed (non-fatal):', uerr);
       }
@@ -745,7 +808,11 @@ async function addContextMemberFor(
     await recordMemberIdentity(conversationArn, { sub: c.sub, iss: c.iss, role: event.role });
     // 2. In an EXISTING conversation, enrol the assistant and the target through the shared creator's
     //    helper, as the service admin. A new conversation already has both.
-    if (existed) await addContextMember({ channelArn: conversationArn, botArn, userArn, bearerArn: serviceAdmin });
+    const joined = !existed || await addContextMember({
+      channelArn: conversationArn, botArn, userArn, bearerArn: serviceAdmin, channelFlowArn: flowArn || undefined, attachedFlowArn,
+    });
+    // A MEMBERSHIP THAT ALREADY EXISTED SAYS NOTHING: an add that found the person a member greets nobody and emails nobody.
+    if (!joined) return { ok: true, conversationArn, userArn, contextType, contextId };
 
     // 3. Greet: a room-wide join notice and a recap targeted to the new member, said by the room's
     //    primary through its router. This function speaks as no assistant.

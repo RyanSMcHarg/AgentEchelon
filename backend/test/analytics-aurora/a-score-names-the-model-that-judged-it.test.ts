@@ -47,7 +47,11 @@ process.env.FEEDBACK_TABLE = 'UserFeedbackTest';
 process.env.BATTLE_OUTCOME_TABLE = 'BattleOutcomeTest';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const { handler } = require('../../lambda/src/analytics-aurora/analytics-query');
+const { handler, __setContentReadRecorder } = require('../../lambda/src/analytics-aurora/analytics-query');
+// Every content read is recorded in the access log before it is served; the record itself is tested elsewhere.
+__setContentReadRecorder(async () => undefined);
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { analyticsPathFor } = require('../helpers/analytics-path');
 
 const DAY = 24 * 60 * 60 * 1000;
 const RANGE = {
@@ -62,7 +66,8 @@ const NEXT_JUDGE = 'anthropic.claude-sonnet-4-5-20250929-v1:0';
 function postEvent(body: unknown): APIGatewayProxyEvent {
   return {
     httpMethod: 'POST',
-    path: '/query',
+    // The resource the console posts to: the evaluated exchanges are content, on the content resource.
+    path: analyticsPathFor(body),
     body: JSON.stringify(body),
     requestContext: { authorizer: edgeContext({ claims: { sub: 'test-admin-sub', 'cognito:groups': 'admins' } }) },
   } as unknown as APIGatewayProxyEvent;
@@ -325,7 +330,7 @@ describe('evaluation_exchanges carries the judge with the verdict', () => {
         agent_response: 'hi',
       }],
     });
-    const body = await call({ queryType: 'evaluation_exchanges' });
+    const body = await call({ queryType: 'evaluation_exchanges', accessReason: 'judge audit' });
 
     expect(body.data[0].evaluator_model).toBe(JUDGE);
     // The verdict and its judge travel together; a classification whose judge is unknown cannot be
@@ -335,7 +340,7 @@ describe('evaluation_exchanges carries the judge with the verdict', () => {
 
   it('exposes the column on the join it is read from', async () => {
     mockDbQuery.mockResolvedValueOnce({ rows: [] });
-    await call({ queryType: 'evaluation_exchanges' });
+    await call({ queryType: 'evaluation_exchanges', accessReason: 'judge audit' });
 
     const sql = statementContaining('COALESCE(am.updated_content, am.content) AS agent_response');
     expect(sql).toContain('er.evaluator_model');
@@ -346,7 +351,7 @@ describe('evaluation_exchanges carries the judge with the verdict', () => {
     mockDbQuery.mockResolvedValueOnce({
       rows: [{ id: 'ex1', classification: 'good', evaluator_model: null, user_message: 'a', agent_response: 'b' }],
     });
-    const body = await call({ queryType: 'evaluation_exchanges' });
+    const body = await call({ queryType: 'evaluation_exchanges', accessReason: 'judge audit' });
 
     expect(body.data[0].evaluator_model).toBeNull();
   });

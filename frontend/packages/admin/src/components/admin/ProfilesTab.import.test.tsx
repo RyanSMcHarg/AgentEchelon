@@ -109,7 +109,8 @@ describe("the Versions group's import", () => {
     const loads = vi.mocked(svc.listProfilesAndTools).mock.calls.length;
     fireEvent.click(screen.getByRole('button', { name: 'Import as draft' }));
     await waitFor(() => expect(svc.importProfile).toHaveBeenCalledTimes(1));
-    expect(svc.importProfile).toHaveBeenCalledWith(ADVISOR_MANIFEST, 'finance-advisor');
+    // No draft to replace, so none is named.
+    expect(svc.importProfile).toHaveBeenCalledWith(ADVISOR_MANIFEST, 'finance-advisor', undefined);
     expect(await screen.findByText('Imported as a draft of Finance. Activate the draft to use it.')).toBeTruthy();
     expect(screen.queryByTestId('import-preview')).toBeNull();
     // The view reloads, so the landed draft shows.
@@ -121,6 +122,58 @@ describe("the Versions group's import", () => {
     await openFinance();
     choose(JSON.stringify(ADVISOR_MANIFEST));
     expect(await screen.findByTestId('import-replaces-draft')).toHaveTextContent('Finance already has a draft. Importing replaces it.');
+    // The import names the draft the preview warned about, the one it may replace.
+    fireEvent.click(screen.getByRole('button', { name: 'Import as draft' }));
+    await waitFor(() => expect(svc.importProfile).toHaveBeenCalledWith(ADVISOR_MANIFEST, 'finance-advisor', 'd1'));
+  });
+
+  it('says nothing was imported when the draft changed after the preview, and reloads to it', async () => {
+    vi.mocked(svc.importProfile).mockRejectedValue(Object.assign(new Error('draft exists'), {
+      status: 409, body: { code: 'DRAFT_EXISTS', configId: 'd2', error: 'already has a draft' },
+    }));
+    serve(listing({ hasDraft: true, draftConfigId: 'd1' }));
+    await openFinance();
+    choose(JSON.stringify(ADVISOR_MANIFEST));
+    await screen.findByTestId('import-preview');
+    const loads = vi.mocked(svc.listProfilesAndTools).mock.calls.length;
+    fireEvent.click(screen.getByRole('button', { name: 'Import as draft' }));
+    expect(await screen.findByTestId('import-refused')).toHaveTextContent("Nothing was imported: Finance's draft changed after this preview was shown.");
+    await waitFor(() => expect(vi.mocked(svc.listProfilesAndTools).mock.calls.length).toBeGreaterThan(loads));
+    expect(screen.queryByTestId('import-preview')).toBeNull();
+  });
+
+  it('names the unsaved edits the import drops, and drops them once the import lands', async () => {
+    serve(listing({ hasDraft: true, draftConfigId: 'd1' }));
+    renderTab();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Finance' }));
+    fireEvent.click(await screen.findByTestId('assistant-mode-draft'));
+    fireEvent.change(await screen.findByTestId('draft-persona'), { target: { value: 'An edit not saved yet.' } });
+    expect(await screen.findByTestId('assistant-draft-unsaved')).toHaveTextContent('Name and persona');
+    fireEvent.click(screen.getByTestId('assistant-nav-versions'));
+    await screen.findByTestId('import-version');
+    choose(JSON.stringify(ADVISOR_MANIFEST));
+    expect(await screen.findByTestId('import-drops-unsaved')).toHaveTextContent('Unsaved edits to Name and persona are dropped');
+    fireEvent.click(screen.getByRole('button', { name: 'Import as draft' }));
+    await waitFor(() => expect(svc.importProfile).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByTestId('assistant-draft-unsaved')).toBeNull());
+  });
+
+  it('keeps the unsaved edits when the import is refused for a newer draft', async () => {
+    vi.mocked(svc.importProfile).mockRejectedValue(Object.assign(new Error('draft exists'), {
+      status: 409, body: { code: 'DRAFT_EXISTS', configId: 'd2', error: 'already has a draft' },
+    }));
+    serve(listing({ hasDraft: true, draftConfigId: 'd1' }));
+    renderTab();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Finance' }));
+    fireEvent.click(await screen.findByTestId('assistant-mode-draft'));
+    fireEvent.change(await screen.findByTestId('draft-persona'), { target: { value: 'An edit not saved yet.' } });
+    fireEvent.click(screen.getByTestId('assistant-nav-versions'));
+    await screen.findByTestId('import-version');
+    choose(JSON.stringify(ADVISOR_MANIFEST));
+    await screen.findByTestId('import-preview');
+    fireEvent.click(screen.getByRole('button', { name: 'Import as draft' }));
+    await screen.findByTestId('import-refused');
+    expect(screen.getByTestId('assistant-draft-unsaved')).toHaveTextContent('Name and persona');
   });
 
   it('writes nothing on Cancel', async () => {

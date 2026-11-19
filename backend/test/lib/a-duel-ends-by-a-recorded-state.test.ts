@@ -49,6 +49,17 @@ beforeEach(() => {
 /** The commands the module issued, in order, by type. */
 const cmds = (type: string) => mockSend.mock.calls.map((c) => c[0]).filter((c) => c?.__type === type);
 
+describe('the record that a duel was ended', () => {
+  it('stands for the pick window, so an ended duel stays refused for as long as its scorecard could take a pick', async () => {
+    mockSend.mockResolvedValue({});
+    const { markBattleAbandoned, battleRowTtl } = await import('../../lambda/src/lib/battle-state');
+    await markBattleAbandoned(BATTLE_ID, 'user-ended');
+    const [put] = cmds('Put') as Array<{ input: { Item: { botArn: string; ttl: number } } }>;
+    expect(put.input.Item.botArn).toBe('__abandoned__');
+    expect(put.input.Item.ttl).toBeGreaterThan(battleRowTtl() + 29 * 24 * 60 * 60);
+  });
+});
+
 describe('ABANDONED is an end, and never a completion', () => {
   it('does NOT satisfy allBotsTerminal, so round 2 can never fire for an abandoned duel', async () => {
     const { allBotsTerminal } = await import('../../lambda/src/lib/battle-state');
@@ -290,6 +301,16 @@ describe('endBattle does all four writes, or the end is only half done', () => {
       channelArn: CHANNEL, battleId: BATTLE_ID, classification: 'premium', markers: [{ messageId: 'question-msg-1', botArn: BOT_B }], wait: false,
     });
     expect(out.markersCleared).toBe(1);
+  });
+
+  it('asks the router even when no side is waiting, so the work the sides opened is closed', async () => {
+    // A side still generating holds an open task and no marker; the router closes the duel's tasks on this call.
+    const { endBattle } = await loadWithRows([
+      { battleId: BATTLE_ID, botArn: BOT_A, state: 'INVOKED', correlationId: 'c-a' },
+      { battleId: BATTLE_ID, botArn: BOT_B, state: 'COMPLETED', correlationId: 'c-b' },
+    ]);
+    await endBattle({ channelArn: CHANNEL, battleId: BATTLE_ID, reason: 'abandoned:requested', classification: 'premium' });
+    expect(mockClearMarker).toHaveBeenCalledWith(expect.objectContaining({ channelArn: CHANNEL, battleId: BATTLE_ID, markers: [] }));
   });
 
   it('a router ending the duel itself clears the markers in place and invokes no router', async () => {

@@ -26,6 +26,11 @@ export interface InboundMessage {
   targeted?: boolean;
   /** When Amazon Chime SDK recorded the message (ISO 8601), when the lookup read it. */
   createdAt?: string;
+  /**
+   * The message's Metadata as the same listing carries it: what a turn Amazon Lex entered reads its named item and its
+   * attachment from (`lex-entered-message.ts`), with no second read.
+   */
+  metadata?: string;
 }
 
 /**
@@ -140,6 +145,7 @@ export async function findInboundMessage(args: {
           messageId: m.MessageId || '',
           targeted: targetArns.length > 0,
           ...(m.CreatedTimestamp ? { createdAt: new Date(m.CreatedTimestamp).toISOString() } : {}),
+          ...(m.Metadata ? { metadata: m.Metadata } : {}),
         };
       }
     }

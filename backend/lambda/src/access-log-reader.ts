@@ -1,7 +1,11 @@
 /**
- * THE CONSOLE'S ACCESS LOG: who was given access to which conversation, when, and why (ADR-052, FR30).
+ * THE CONSOLE'S ACCESS LOG: who was given access to which conversation, when, and why (ADR-052, FR30),
+ * and every access the credential exchanges refused, each record marked with its outcome.
  *
  *   GET /admin/access-log?days=30&channelId=<id>&actor=<personId>&limit=200
+ *
+ * `limit` applies to each outcome: up to that many grants and that many refusals, merged newest first, so
+ * refusals written at a caller's request rate never push grants out of the view.
  *
  * An AWS_IAM catalog route (`view-access-log`, admins only), so the gateway refuses a role that does
  * not hold it before this runs. The handler refuses on its own as well (tenet D3): only an ADMIN console
@@ -35,13 +39,22 @@ function wholeIn(raw: string | undefined, min: number, max: number, dflt: number
   return Number.isInteger(n) && n >= min && n <= max ? n : null;
 }
 
-/** What the console renders: the record, with the audit line parsed back out. */
+/**
+ * What the console renders: the record, with the audit line parsed back out. Every record states its
+ * outcome, and a refusal its code and status; a record with no outcome was written as a grant. A refusal
+ * of a sign-in that never became a person names no actor.
+ */
 function view(r: AccessRecord) {
   let detail: unknown = null;
   try { detail = JSON.parse(r.detail); } catch { /* left null: the stored line was not JSON */ }
+  const outcome = r.outcome === 'refused' ? 'refused' : 'granted';
   return {
-    id: r.id, event: r.event, at: r.at, actor: r.actorPersonId,
-    conversation: r.conversation ?? null, capabilities: r.capabilities, reason: r.reason ?? null, detail,
+    id: r.id, event: r.event, at: r.at, actor: r.actorPersonId ?? null, outcome,
+    // A reader that is not a person is named by the IAM principal that signed its request.
+    ...(r.actorKind === 'iam' && r.actorPrincipalArn ? { actorKind: 'iam', actorPrincipalArn: r.actorPrincipalArn } : {}),
+    conversation: r.conversation ?? null, capabilities: r.capabilities, reason: r.reason ?? null,
+    ...(outcome === 'refused' ? { code: r.code ?? null, status: r.status ?? null } : {}),
+    detail,
   };
 }
 

@@ -65,12 +65,12 @@ describe('the profile body store is wired end to end', () => {
     const readsProfiles = Object.values(resources).some((r) => {
       if (r.Type !== 'AWS::IAM::Policy' && r.Type !== 'AWS::IAM::Role') return false;
       const statements = JSON.stringify(r.Properties ?? {});
-      return statements.includes('s3:GetObject') && statements.includes('arn:aws:s3:::test-bucket/profiles/*');
+      return statements.includes('s3:GetObject') && statements.includes('arn:aws:s3:::test-profile-bucket/profiles/*');
     });
     expect(readsProfiles).toBe(true);
 
-    // And it must know the bucket. `bodyBucket()` reads PROFILE_BODY_BUCKET ?? CONTEXT_BUCKET; the
-    // processor has had CONTEXT_BUCKET since context sources, so this pins that it still does.
+    // And it must know the bucket. `bodyBucket()` reads PROFILE_BODY_BUCKET, the profile bucket; CONTEXT_BUCKET names
+    // the company bucket, which the processor reads its company context from.
     const processors = Object.values(resources).filter(
       (r) => r.Type === 'AWS::Lambda::Function'
         && JSON.stringify((r.Properties?.Environment ?? {}) as object).includes('PROFILE_NAME'),
@@ -78,7 +78,7 @@ describe('the profile body store is wired end to end', () => {
     expect(processors.length).toBeGreaterThan(0);
     for (const p of processors) {
       const vars = ((p.Properties?.Environment ?? {}) as { Variables?: Record<string, string> }).Variables ?? {};
-      expect(Object.keys(vars)).toContain('CONTEXT_BUCKET');
+      expect(Object.keys(vars)).toEqual(expect.arrayContaining(['CONTEXT_BUCKET', 'PROFILE_BODY_BUCKET']));
     }
   });
 
@@ -110,7 +110,7 @@ describe('the profile body store is wired end to end', () => {
     });
     const handlerReadsProfiles = handlerPolicies.some((r) => {
       const statements = JSON.stringify(r.Properties ?? {});
-      return statements.includes('s3:GetObject') && statements.includes('arn:aws:s3:::test-bucket/profiles/*');
+      return statements.includes('s3:GetObject') && statements.includes('arn:aws:s3:::test-profile-bucket/profiles/*');
     });
     expect(handlerReadsProfiles).toBe(true);
   });

@@ -2,7 +2,7 @@
  * A/B experiment e2e (#39 / cluster E).
  *
  * PRODUCES REAL DATA: creates an active base_model experiment via the admin API,
- * drives a conversation on the targeted tier so the async processor assigns the
+ * drives a conversation on the targeted classification so the async processor assigns the
  * turn to a variant (writes experiment_id/variant_id onto the exchange), then
  * asserts the analytics `experiment_results` query returns a row for it. Cleans
  * up (status -> completed) so re-runs are idempotent.
@@ -464,7 +464,7 @@ async function openAdminExperiments(page: Page): Promise<void> {
     await page.goto(new URL('/?admin=experiments', ADMIN_BASE_URL).toString());
   }
   await page.waitForSelector('.admin-section-rail', { timeout: 15_000 });
-  await expect(page.locator('h3:has-text("A/B Experiments")')).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator('h2:has-text("A/B Experiments")')).toBeVisible({ timeout: 15_000 });
 }
 
 /** The admin id token from the (admin-origin) localStorage — usable as a Bearer for the experiments API. */
@@ -593,6 +593,17 @@ async function setCreateFormTiers(page: Page, tiers: string[]): Promise<void> {
   }
 }
 
+/**
+ * ONE EXPERIMENT'S ROW IN THE LIST, found by its id.
+ *
+ * Not by the id as text: the row is named by the experiment's description when it has one (`experimentName`), so an
+ * experiment created with a description shows no id at all, and the conflict panel's own '"<id>" can't start' line
+ * would match the bare text before the row exists. The name button carries the id as `data-experiment-id`.
+ */
+function experimentRow(page: Page, experimentId: string) {
+  return page.locator(`tr:has([data-experiment-id="${experimentId}"])`).first();
+}
+
 /** The new required objective-statement field (§1.4). Tolerant of the exact selector the build lands on. */
 function objectiveStatementField(page: Page) {
   return page
@@ -632,7 +643,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
 
     try {
       await page.locator('button:has-text("New Experiment")').click();
-      await expect(page.locator('h4:has-text("Create Experiment")')).toBeVisible();
+      await expect(page.locator('h3:has-text("Create Experiment")')).toBeVisible();
       await page.locator('label:has-text("Experiment ID") input').fill(id);
       // Named, not inherited: the form starts on the first declared classification, and what this test
       // checks (the objective) does not depend on which one. Standard selects the form's treatment models.
@@ -657,7 +668,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       await gr.locator('input[type="number"]').first().fill('25');
       await page.locator('.admin-error button:has-text("Dismiss")').click().catch(() => {});
       await page.locator('button:has-text("Create & Activate")').click();
-      await expect(page.locator(`text=${id}`).first()).toBeVisible({ timeout: 15_000 });
+      await expect(experimentRow(page, id)).toBeVisible({ timeout: 15_000 });
 
       // Persistence (INV-2 additive): the record carries the statement + guardrail. (The
       // ObjectiveBanner render over live data is exercised by E6, which drives traffic.)
@@ -699,7 +710,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
 
       // Author a CONFLICTING intent experiment on premium → the create is blocked (type-exclusion, 409).
       await page.locator('button:has-text("New Experiment")').click();
-      await expect(page.locator('h4:has-text("Create Experiment")')).toBeVisible();
+      await expect(page.locator('h3:has-text("Create Experiment")')).toBeVisible();
       await page.locator('label:has-text("Experiment ID") input').fill(newId);
       await setCreateFormTiers(page, ['premium']);
       await objectiveStatementField(page).first().fill('Decide the premium intent model.').catch(() => {});
@@ -725,7 +736,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       // cannot. And the retry is a client-side chain (end -> list scan -> re-derive conflicts ->
       // create), so a single GET after it outran the create: the experiment existed seconds later,
       // created by the very retry the assertion said never ran. Poll, like the blocker check does.
-      await expect(page.locator(`tr:has-text("${newId}")`).first()).toBeVisible({ timeout: 30_000 });
+      await expect(experimentRow(page, newId)).toBeVisible({ timeout: 30_000 });
 
       // Blocker is terminal (completed) with an audit entry; the new experiment is active.
       const blockerRec = await waitForExperimentStatus(api, blockerId, 'completed');
@@ -765,7 +776,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       await openAdminExperiments(page);
 
       await page.locator('button:has-text("New Experiment")').click();
-      await expect(page.locator('h4:has-text("Create Experiment")')).toBeVisible();
+      await expect(page.locator('h3:has-text("Create Experiment")')).toBeVisible();
       await page.locator('label:has-text("Experiment ID") input').fill(newId);
       await setCreateFormTiers(page, ['premium']);
       await objectiveStatementField(page).first().fill('Decide the premium intent model.').catch(() => {});
@@ -788,7 +799,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       // the bare text, so that passed before the client-side retry (pause -> list -> create) had created
       // anything, and the Complete below then answered 404 for an experiment that did not exist yet. The
       // new experiment stayed active, and premium refused the Resume as a second live experiment.
-      await expect(page.locator(`tr:has-text("${newId}")`).first()).toBeVisible({ timeout: 30_000 });
+      await expect(experimentRow(page, newId)).toBeVisible({ timeout: 30_000 });
       expect((await waitForExperimentStatus(api, blockerId, 'paused'))?.status, 'blocker paused').toBe('paused');
       expect((await waitForExperimentStatus(api, newId, 'active', 30_000))?.status, 'the new experiment activated').toBe('active');
 
@@ -802,7 +813,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       // The admin list read is an eventually-consistent scan, so a reload right after the pause can
       // still render the blocker in its pre-pause (active) state. Reload until the paused row — with
       // its Resume button — appears, then resume it.
-      const row = page.locator(`tr:has-text("${blockerId}")`).first();
+      const row = experimentRow(page, blockerId);
       const resumeBtn = () => row.getByRole('button', { name: /Resume/i });
       for (let i = 0; i < 4 && !(await resumeBtn().isVisible({ timeout: 3000 }).catch(() => false)); i++) {
         await page.reload();
@@ -888,7 +899,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       await page.reload();
       await openAdminExperiments(page);
 
-      const row = page.locator(`tr:has-text("${id}")`).first();
+      const row = experimentRow(page, id);
       await expect(row).toBeVisible({ timeout: 15_000 });
       // Completing a test that RAN opens the decision picker (not a silent transition).
       await row.getByRole('button', { name: /Complete|End/i }).click();

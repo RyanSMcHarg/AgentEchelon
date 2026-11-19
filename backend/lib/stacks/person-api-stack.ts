@@ -8,8 +8,7 @@
  *
  * EVERY ROUTE IS AUTHORIZED AT THE EDGE (A3), the credential exchange included: the token is verified
  * against the trusted-issuer registry and resolved through `Identities`, and the answer is a policy naming
- * the routes it may call. A first sign-in reaches the exchange alone, and a one-conversation person
- * `ONE_CHANNEL_ROUTES` alone, and a guest `GUEST_ROUTES` alone, and a host's assertion the exchange alone,
+ * the routes it may call. A first sign-in reaches the exchange alone, and a guest `GUEST_ROUTES` alone, and a host's assertion the exchange alone,
  * once (its `jti` is recorded in `Tokens`). The exchange is never answered from the authorizer cache. The routes with no authorizer are the paused-deployment probe, which names nobody and
  * reads nothing private, and, with a guest issuer, guest start and guest refresh, which take no token and
  * carry their own abuse controls and a route throttle each (L16).

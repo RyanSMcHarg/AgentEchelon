@@ -27,7 +27,7 @@
  *    invitation (M-10). A connector issuing one is **NOT BUILT**, so they are reported as `unresolved` and
  *    nothing is created.
  *
- * ADMISSION IS THE NARROWER OF TWO LIMITS (K4): a resolved person is admitted only when the classification
+ * ADMISSION NEEDS BOTH SETS TO INCLUDE THE CONVERSATION'S CLASSIFICATION (K4): a resolved person is admitted only when the classification
  * their issuers' clearance sources give them, each within its own issuer's classifications, reaches the
  * classification of the conversation the event concerns. A clearance that cannot be read is `undetermined`,
  * never admitted.

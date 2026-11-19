@@ -158,7 +158,9 @@ export async function endBattle(args: {
   const markers = rows
     .filter((row) => row.state === 'WAITING_FOR_USER' && row.waitingMessageId)
     .map((row) => ({ messageId: row.waitingMessageId as string, botArn: row.botArn }));
-  if (markers.length) {
+  // ASKED ON EVERY END, NOT ONLY WHEN A SIDE IS WAITING: the router closes the work the sides opened on this same call
+  // (`clearDuelMarkers` -> `endDuelTasks`), and a side still generating has a task open and no marker.
+  {
     if (args.clearMarkers) {
       // In place, as the router: never throws past here, a marker left standing is cosmetic.
       result.markersCleared = await args.clearMarkers({ channelArn, battleId, markers }).catch((err) => {

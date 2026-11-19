@@ -3,7 +3,7 @@
  * FR30).
  *
  * Through the signed routes the console uses, on the standard classification's declared assistant:
- *  - the sample upload in `backend/demo/golden-set/` enters the set as capability entries marked uploaded, with the email
+ *  - the sample upload in `demo/stratum-company/golden-set/` enters the set as capability entries marked uploaded, with the email
  *    address in it removed by the clean copy's detector on the classification's GoldenRun function; the invalid sample is
  *    refused with each bad line named and nothing stored; the whole upload is retired by its id;
  *  - the gate reports coverage for every intent of the draft's pack, counting what was uploaded; with a minimum declared
@@ -20,6 +20,7 @@
  * `finally`, the way the override test does.
  */
 import { test, expect, declareWait } from './helpers/fixtures';
+import { replacingDraft, draftIdOf } from './helpers/profile-draft';
 import { signIn, idTokenOf } from './helpers/agent-helpers';
 import { signedAnalyticsPost, signedAdminGet } from './helpers/signed-analytics';
 import { getAdminUser, hasTestCredentials, missingUserReason } from './helpers/test-credentials';
@@ -37,7 +38,7 @@ guardConsoleErrors();
 const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || process.env.E2E_BASE_URL || '';
 const profileUrl = (action: string) => adminUrl('assistant-admin', `/admin/profiles/${action}`);
 const analytics = (body: Record<string, unknown>) => `${ADMIN_API_URL}${analyticsPathFor(body)}`;
-const SAMPLES = path.join(__dirname, '../../backend/demo/golden-set');
+const SAMPLES = path.join(__dirname, '../../demo/stratum-company/golden-set');
 
 async function call(url: string, idToken: string, body: Record<string, unknown>): Promise<any> {
   try {
@@ -118,7 +119,7 @@ test.describe.serial('a deployment brings its own golden entries', () => {
     const previous = (await listing())?.activeVersion;
     expect(previous, `${PROFILE} serves a version`).toBeTruthy();
 
-    const draft = await call(profileUrl('version'), idToken, { profileName: PROFILE });
+    const draft = await replacingDraft((b) => call(profileUrl('version'), idToken, b), { profileName: PROFILE });
     expect(draft?.draftConfigId, `a draft: ${JSON.stringify(draft)}`).toBeTruthy();
     const read = await call(profileUrl('golden-gate'), idToken, { profileName: PROFILE });
     const coverage: any[] = read?.gate?.coverage ?? [];
@@ -129,17 +130,17 @@ test.describe.serial('a deployment brings its own golden entries', () => {
     try {
       // A version declaring a minimum, activated. With no regression entry for the assistant, its own activation is not
       // gated by a run; if one is, the spec cannot prove the minimum without an override, so it says so.
-      await call(profileUrl('draft'), idToken, { profileName: PROFILE, patch: { goldenSet: { minRegressionPerIntent: 1 } } });
-      const activated = await call(profileUrl('activate'), idToken, { profileName: PROFILE });
+      const declared = await call(profileUrl('draft'), idToken, { profileName: PROFILE, patch: { goldenSet: { minRegressionPerIntent: 1 } }, configId: draft.draftConfigId });
+      const activated = await call(profileUrl('activate'), idToken, { profileName: PROFILE, configId: draftIdOf(declared) });
       test.skip(!activated?.version, `the assistant's set gates its activation: ${JSON.stringify(activated)}`);
 
       // A draft that lowers the minimum is still measured against the active one's.
-      await call(profileUrl('version'), idToken, { profileName: PROFILE });
-      await call(profileUrl('draft'), idToken, { profileName: PROFILE, patch: { goldenSet: {} } });
+      const lowering = await replacingDraft((b) => call(profileUrl('version'), idToken, b), { profileName: PROFILE });
+      const lowered = await call(profileUrl('draft'), idToken, { profileName: PROFILE, patch: { goldenSet: {} }, configId: draftIdOf(lowering) });
       const gate = await call(profileUrl('golden-gate'), idToken, { profileName: PROFILE });
       expect(gate?.gate?.minRegressionPerIntent).toBe(1);
       expect(gate?.outcome, `the thin set: ${JSON.stringify(gate?.outcome)}`).toMatchObject({ proceed: false, code: 'GOLDEN_SET_THIN', params: { min: 1 } });
-      const refused = await call(profileUrl('activate'), idToken, { profileName: PROFILE });
+      const refused = await call(profileUrl('activate'), idToken, { profileName: PROFILE, configId: draftIdOf(lowered) });
       expect(refused?.code).toBe('GOLDEN_SET_THIN');
     } finally {
       if ((await listing())?.activeVersion !== previous) {

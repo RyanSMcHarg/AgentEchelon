@@ -2,16 +2,24 @@ import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { useTurnState } from '../hooks/useTurnState';
 import { useTranslation, Trans } from 'react-i18next';
 import { useConversations } from '../providers/ConversationProvider.chime';
-import { withPrivateAddressDisplayed, withMentionNamesDisplayed } from '../utils/mentionParser';
+import { memberNameResolver, shownAssistantText } from '@ae/shared/utils/addressTokens.ts';
 import TaskStatusIndicator from './TaskStatusIndicator';
 import QueueStatusIndicator from './QueueStatusIndicator';
 import AttachmentDisplay from './AttachmentDisplay';
 import { ProposalCard } from './ProposalCard';
 import { TaskCard } from './TaskCard';
+import { DashboardCard } from './DashboardCard';
 import ShareConversationModal from './ShareConversationModal';
 import { shareDisabledReason } from './shareAvailability';
 import ArchiveConversationModal from './ArchiveConversationModal';
 import ChannelMembersPanel from './ChannelMembersPanel';
+import { openMeetingWindow } from '../utils/meetingWindow';
+import MeetingInProgress from './meeting/MeetingInProgress';
+import MeetingStartedCard, { startedCardOf } from './meeting/MeetingStartedCard';
+import { isAssistantArn } from '@ae/shared/utils/principalArn.ts';
+import { targetedAudienceOf } from '../utils/targetedAudience';
+import { useConversationMeeting } from '../hooks/useConversationMeeting';
+import { isMeetingEnabled } from '../services/meetingService';
 import { useAwsClient } from '../providers/AwsClientProvider';
 import { chimeService } from '../services/chimeService';
 import { getBattleConfig, type ChannelBattleConfig } from '../services/channelBattleService';
@@ -23,8 +31,7 @@ import { computeBattleTally, type BattleRoundInput, type BattleWinner, type Batt
 import { submitMessageFeedback } from '@ae/shared';
 import { personApiServes } from '@ae/shared';
 import type { FeedbackReason } from '@ae/shared';
-import { shortenModelId } from '../utils/modelLabel';
-import { getModelGreeting } from '../utils/greeting';
+import { emptyConversationGreeting } from '../utils/greeting';
 import type { Message } from '@ae/shared';
 import { orderContinuations } from '../utils/continuationOrder';
 import { taskReferenceOf } from '../utils/taskReference';
@@ -236,13 +243,17 @@ function awaitingReplySinceOf(messages: readonly Message[], currentUserArn: stri
   return undefined;
 }
 
-const ConversationInterface: React.FC = () => {
+/** `inMeetingWindow`: the conversation is the chat column of its own meeting window (`MeetingWindow`). */
+const ConversationInterface: React.FC<{ inMeetingWindow?: boolean }> = ({ inMeetingWindow = false }) => {
   const { t } = useTranslation();
-  const { activeConversation, messages: loadedMessages, isLoadingMessages, isBotTyping, channelMembers, renameConversation, archiveConversation, selectConversation, battleWaitingBots = [], replyingToSides = [], replyToSides } = useConversations();
+  const { activeConversation, messages: loadedMessages, isLoadingMessages, isBotTyping, channelMembers, renameConversation, archiveConversation, selectConversation, battleWaitingBots = [], replyingToSides = [], replyToSides, answeringTaskId, refreshOpenWorkItems } = useConversations();
   // A continuation part is shown with the message it continues, not wherever its creation time put it:
   // a queue notice posted while the answer was generating otherwise lands between the two halves.
   // Ordered once here so every index-based read below sees the same order.
   const messages = useMemo(() => orderContinuations(loadedMessages), [loadedMessages]);
+  // THE CONVERSATION'S MEETING, read once here for the header's control and the in-progress line; inside the meeting
+  // window the meeting is open already, so nothing is read there.
+  const conversationMeeting = useConversationMeeting(inMeetingWindow ? undefined : activeConversation?.conversationArn, loadedMessages);
   const { userArn: currentUserArn } = useAwsClient();
   // The message each waiting duel side waits on, so its answer control is drawn there and nowhere else.
   const liveWaitingMessageIds = useMemo(
@@ -353,13 +364,14 @@ const ConversationInterface: React.FC = () => {
     // no longer pre-gated on a hardcoded premium check against mutable metadata. A non-eligible
     // conversation simply gets `battleEligible: false` back and renders nothing.
     // Battle exists only where the person API serves it (`VITE_PERSON_API_CAPABILITIES` names `battle`).
-    if (!arn || !personApiServes('battle')) { setBattleConfig(null); return; }
+    // A meeting's chat is no battle room: its window offers none of an ordinary room's battle controls.
+    if (!arn || inMeetingWindow || !personApiServes('battle')) { setBattleConfig(null); return; }
     let cancelled = false;
     void getBattleConfig(arn)
       .then((cfg) => { if (!cancelled) setBattleConfig(cfg); })
       .catch(() => { if (!cancelled) setBattleConfig(null); });
     return () => { cancelled = true; };
-  }, [activeConversation?.conversationArn]);
+  }, [activeConversation?.conversationArn, inMeetingWindow]);
 
   // Clicking a starter chip prefills the composer with `/battle <chip>`. The
   // composer (MessageInput) is a sibling component with no shared draft state,
@@ -445,6 +457,9 @@ const ConversationInterface: React.FC = () => {
    */
   const messageById = useMemo(() => messagesById(messages), [messages]);
   const lastIndexByBattleId = useMemo(() => lastMessageIndexByBattleId(messages, messageById), [messages, messageById]);
+
+  // A mention shows the member's current name, looked up by the id its token carries.
+  const resolveMemberName = useMemo(() => memberNameResolver(channelMembers), [channelMembers]);
 
   const humanMemberCount = channelMembers.filter((m) => !m.isBot).length;
 
@@ -535,7 +550,8 @@ const ConversationInterface: React.FC = () => {
   });
   const isMultiUser = humanMemberCount >= 2;
   // Shown only where an assistant is present to answer; a room of people alone has nobody to mention.
-  const showMentionBanner = isMultiUser && channelMembers.some((m) => m.isBot) && !isMentionBannerDismissed;
+  // NOT IN A MEETING'S CHAT: the meeting window is narrow, and its chat is the meeting's side channel.
+  const showMentionBanner = !inMeetingWindow && isMultiUser && channelMembers.some((m) => m.isBot) && !isMentionBannerDismissed;
 
   // Briefing fields ride on the battle config (DESIGN-EXPERIMENTS-BATTLE A.5),
   // snapshotted at enable time. Read them via a local augmentation so this stays
@@ -611,6 +627,19 @@ const ConversationInterface: React.FC = () => {
     // commit that swaps the skeleton back for the messages is a render where the target can appear, even
     // when the `messages` reference did not change again.
   }, [messages, activeConversationId, isLoadingMessages, releaseFollow]);
+
+  // ANSWERING A TASK FROM THE LIST TAKES THE PERSON TO ITS CARD, so they see what they are answering in its context: the
+  // newest card in this conversation for that task, scrolled to and marked once per task chosen. A task whose card is not
+  // in the loaded history leaves the view where it is.
+  const focusedTask = useRef<string | null>(null);
+  useEffect(() => {
+    if (!answeringTaskId) { focusedTask.current = null; return; }
+    if (focusedTask.current === answeringTaskId || isLoadingMessages) return;
+    const card = [...messages].reverse().find((m) => m.taskCard?.id === answeringTaskId);
+    if (!card || !scrollToMessage(card.id)) return;
+    focusedTask.current = answeringTaskId;
+    releaseFollow();
+  }, [answeringTaskId, messages, isLoadingMessages, releaseFollow]);
 
   const formatTimestamp = (date: Date) => {
     return date.toLocaleTimeString('en-US', {
@@ -783,7 +812,9 @@ const ConversationInterface: React.FC = () => {
               )}
             </div>
             <div className="conversation-header-actions">
-              {shareServed && (<>
+              {/* In the meeting window the roster beside the chat lists who is here (`MeetingRoster`), and the
+                  meeting's conversation is entered from its room, so the room's sharing and members panel are left out. */}
+              {shareServed && !inMeetingWindow && (<>
               <button
                 type="button"
                 className={`btn btn-ghost btn-icon conversation-header-btn${shareDisabledReasonText ? ' is-disabled' : ''}`}
@@ -815,9 +846,10 @@ const ConversationInterface: React.FC = () => {
                 </span>
               )}
               </>)}
+              {!inMeetingWindow && (
               <button
                 type="button"
-                className={`btn btn-ghost btn-icon conversation-header-btn${isMembersPanelOpen ? ' is-active' : ''}`}
+                className={`btn btn-ghost btn-icon conversation-header-btn${isMultiUser ? ' has-count' : ''}${isMembersPanelOpen ? ' is-active' : ''}`}
                 onClick={() => setIsMembersPanelOpen((v) => !v)}
                 title={isMembersPanelOpen ? t('membersPanel.toggleClose') : t('membersPanel.toggleOpen')}
                 aria-pressed={isMembersPanelOpen}
@@ -826,13 +858,30 @@ const ConversationInterface: React.FC = () => {
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" width="16" height="16" aria-hidden="true">
                   <path d="M10 9a3 3 0 100-6 3 3 0 000 6zM6 8a2 2 0 11-4 0 2 2 0 014 0zM1.49 15.326a.78.78 0 01-.358-.442 3 3 0 014.308-3.516 6.484 6.484 0 00-1.905 3.959c-.023.222-.014.442.025.654a4.97 4.97 0 01-2.07-.655zM16.44 15.98a4.97 4.97 0 002.07-.654.78.78 0 00.357-.442 3 3 0 00-4.308-3.517 6.484 6.484 0 011.907 3.96 2.32 2.32 0 01-.026.654zM18 8a2 2 0 11-4 0 2 2 0 014 0zM5.304 16.19a.844.844 0 01-.277-.71 5 5 0 019.947 0 .843.843 0 01-.277.71A6.975 6.975 0 0110 18a6.974 6.974 0 01-4.696-1.81z" />
                 </svg>
-                {/* The count rides ON the toggle. It used to be a separate `members-chip` next to it,
+                {/* The count rides ON the toggle, and it is every member the panel lists, people and assistants alike. It used to be a separate `members-chip` next to it,
                     which rendered the SAME people icon a second time - two identical glyphs in the
                     header, one of them not clickable. One control, one icon, one meaning. */}
                 {isMultiUser && (
-                  <span className="conversation-header-btn-count">{humanMemberCount}</span>
+                  <span className="conversation-header-btn-count">{channelMembers.length}</span>
                 )}
               </button>
+              )}
+              {/* THE CONVERSATION'S MEETING, in its own window beside the app (`utils/meetingWindow.ts`). Where the
+                  deployment serves meetings; inside the meeting window the meeting is already open. */}
+              {isMeetingEnabled() && !inMeetingWindow && (
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-icon conversation-header-btn"
+                  data-testid="open-meeting-window"
+                  onClick={() => openMeetingWindow(activeConversation.conversationArn, conversationMeeting.meetingConversationId)}
+                  title={t('meeting.openTitle')}
+                  aria-label={t('meeting.openTitle')}
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" width="16" height="16" aria-hidden="true">
+                    <path d="M2 6a2 2 0 012-2h6a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V6zM14.553 7.106A1 1 0 0014 8v4a1 1 0 00.553.894l2 1A1 1 0 0018 13V7a1 1 0 00-1.447-.894l-2 1z" />
+                  </svg>
+                </button>
+              )}
               {isModerator && (
                 <button
                   type="button"
@@ -857,6 +906,10 @@ const ConversationInterface: React.FC = () => {
               arrive, so it is worth interrupting for. The copy comes from i18n, keyed by the reason
               code, with a generic line for a code this build does not recognise - a newer server must
               degrade to an honest sentence rather than to silence. */}
+          {/* A MEETING RUNNING HERE THAT THE VIEWER IS NOT IN (`MeetingInProgress`); inside the meeting window it is open already. */}
+          {isMeetingEnabled() && !inMeetingWindow && (
+            <MeetingInProgress channelArn={activeConversation.conversationArn} meeting={conversationMeeting} />
+          )}
           {dispatchFailed && (
             <div className="mention-banner" role="alert">
               <div className="mention-banner-icon" aria-hidden="true">
@@ -972,9 +1025,10 @@ const ConversationInterface: React.FC = () => {
           // back to a generic empty string only if we somehow
           // don't have a tier yet.
           <div className="conversation-empty-state">
-            {activeConversation?.modelTier && getModelGreeting(activeConversation.modelTier, t) ? (
+            {/* A meeting's own conversation opens with one line saying what it is (`emptyConversationGreeting`). */}
+            {emptyConversationGreeting(activeConversation, inMeetingWindow, t) ? (
               <div className="conversation-empty-greeting">
-                {(getModelGreeting(activeConversation.modelTier, t) ?? '')
+                {(emptyConversationGreeting(activeConversation, inMeetingWindow, t) ?? '')
                   .split('\n')
                   .map((line, i) => (
                     <p key={i} className={line.startsWith('•') ? 'greeting-bullet' : ''}>
@@ -1094,6 +1148,9 @@ const ConversationInterface: React.FC = () => {
               // and sent its next message into a turn that was still generating, producing the report
               // twice. Absent when the writer stamped no phase.
               data-response-phase={message.responsePhase}
+              // WHAT THE TURN DECLARED THIS MESSAGE TO BE (`turnKind`): with the phase, the one structural way to tell
+              // the reading's room status line (`reading`, interim) from a clarifying question (interim, no reading).
+              data-turn-kind={message.turnKind}
               // WAITING TO BE READ (ADR-033). From the conversation's RECORD, never derived from where
               // this message sits in the transcript: a client that reloaded with partial history or
               // joined late would get that wrong, and the styling would claim something false.
@@ -1102,7 +1159,7 @@ const ConversationInterface: React.FC = () => {
               // stops waiting - there is no per-message signal to wait for, and inventing one would
               // mean claiming an attribution the platform cannot verify.
               data-queued={queuedIds.has(message.id) ? 'true' : undefined}
-              className={`message ${message.isBot ? 'assistant-message' : 'user-message'}${isContinuation || isGroupedWithPrev ? ' continuation' : ''}${message.battle ? ' battle-message' : ''}${queuedIds.has(message.id) ? ' message-queued' : ''}`}
+              className={`message ${message.isBot ? 'assistant-message' : 'user-message'}${isContinuation || isGroupedWithPrev ? ' continuation' : ''}${message.battle ? ' battle-message' : ''}${message.meetingCard || startedCardOf(message) ? ' meeting-card-message' : ''}${queuedIds.has(message.id) ? ' message-queued' : ''}`}
             >
               <div className="message-content">
                 {queuedIds.has(message.id) && (
@@ -1137,29 +1194,6 @@ const ConversationInterface: React.FC = () => {
                   <span className="message-timestamp">
                     {formatTimestamp(message.timestamp)}
                   </span>
-                  {/*
-                    * THE MODEL THE TURN WAS ROUTED TO, and it does not claim to be the author of every
-                    * word.
-                    *
-                    * A bare "Opus" reads as "this reply is Opus". It is the turn's PRIMARY model: a
-                    * turn can fall back to another model mid-flight, run sub-steps on a different one,
-                    * or produce text the platform wrote rather than the model - and the badge said
-                    * "Opus" for all of them. The client cannot tell the difference either, because the
-                    * per-step models go out of band to analytics and only `bedrockModel` reaches here.
-                    *
-                    * So the chip is labeled as routing rather than authorship, and says so on hover.
-                    * Narrowing the claim is the honest fix available at this seam; showing which
-                    * models a turn ACTUALLY used needs the per-step list to reach the client, and that
-                    * is a metadata decision against the 4KB message budget rather than a copy change.
-                    */}
-                  {message.isBot && shortenModelId(message.modelId) && (
-                    <span
-                      className="message-model-badge"
-                      title={t('message.routedToModel', { model: shortenModelId(message.modelId), id: message.modelId })}
-                    >
-                      {t('message.viaModel', { model: shortenModelId(message.modelId) })}
-                    </span>
-                  )}
                   {battleVariantLabel && message.battle?.round && (
                     <span
                       className={`battle-variant-chip battle-variant-chip--round-${message.battle?.round}`}
@@ -1170,6 +1204,21 @@ const ConversationInterface: React.FC = () => {
                   )}
                 </div>
                 )}
+                {message.targetMismatch && (
+                  // THE MESSAGE DID NOT GO WHERE IT SAYS IT WENT (`targetIntegrity.ts`): said on the message, never read past.
+                  <div className="message-target-mismatch" role="alert" data-testid="target-mismatch">
+                    {t(message.targetMismatch === 'address' ? 'message.targetMismatchAddress' : 'message.targetMismatchAssistant')}
+                  </div>
+                )}
+                {(() => {
+                  // A TARGETED MESSAGE SAYS WHO CAN SEE IT: its sender and its recipients, and nobody else in the room.
+                  const audience = targetedAudienceOf(message, currentUserArn, channelMembers);
+                  if (!audience) return null;
+                  const text = audience.side === 'sender'
+                    ? (audience.names.length ? t('message.onlyYouAnd', { names: audience.names.join(', ') }) : t('message.onlyYouAndRecipient'))
+                    : (audience.name ? t('message.onlyYouAnd', { names: audience.name }) : t('message.onlyYouAndSender'));
+                  return <div className="message-targeted-label" data-testid="targeted-label">{text}</div>;
+                })()}
                 {(() => {
                   // A: a battle placeholder (battle marker present, no
                   // battlestats summary yet, no attachment/image) renders
@@ -1194,14 +1243,51 @@ const ConversationInterface: React.FC = () => {
                       </div>
                     );
                   }
-                  // THE ADDRESS IS SHOWN BY NAME, WITH THE ID TAKEN BACK OUT. The composer writes
-                  // `.<Name|id>` so the backend resolves the addressee by id rather than by matching a
-                  // display name; the id is for the server and not for the reader, and until this ran
-                  // a recipient read the literal token, pipe and brackets included.
+                  // A MEETING'S STARTED CARD is drawn as a card from its metadata: Join while this card's meeting runs here,
+                  // else that it ended. A card for an earlier meeting of the room reads as ended.
+                  const card = activeConversation ? startedCardOf(message) : undefined;
+                  if (card && activeConversation) {
+                    const running = conversationMeeting.running
+                      && (!card.conversationId || !conversationMeeting.meetingConversationId || conversationMeeting.meetingConversationId === card.conversationId);
+                    return (
+                      <MeetingStartedCard
+                        content={message.content}
+                        roomArn={activeConversation.conversationArn}
+                        {...(card.conversationId ? { meetingConversationId: card.conversationId } : {})}
+                        running={running}
+                        inMeeting={!!inMeetingWindow}
+                        renderText={(markdown) => <CollapsibleText content={markdown} isBot={message.isBot} resolveName={resolveMemberName} members={channelMembers} />}
+                      />
+                    );
+                  }
+                  // The stored text goes in unchanged: the body draws each `@<Name|id>` and `.<Name|id>`
+                  // as a chip by the member's name, and the id stays for the server. A typed `@Name` of
+                  // any member, person or assistant, is drawn as the same chip.
+                  // An assistant's `@humans` room address routes the message and is not shown.
+                  const shownText = message.isBot && isAssistantArn(message.sender?.arn) ? shownAssistantText(message.content) : message.content;
+                  // A TASK A WORKFLOW ASSIGNED THIS PERSON (ADR-063 decision 2): one card, its message's words above its
+                  // choices, drawn from the targeted message's Metadata, which only they receive. They may answer on it or
+                  // by writing here.
+                  if (message.isBot && message.taskCard && activeConversation?.conversationArn) {
+                    return (
+                      <TaskCard
+                        card={message.taskCard}
+                        channelArn={activeConversation.conversationArn}
+                        onAnswered={refreshOpenWorkItems}
+                        body={<CollapsibleText content={shownText} isBot resolveName={resolveMemberName} members={channelMembers} />}
+                      />
+                    );
+                  }
                   return (
                     <CollapsibleText
-                      content={withMentionNamesDisplayed(withPrivateAddressDisplayed(message.content))}
+                      content={shownText}
                       isBot={message.isBot}
+                      resolveName={resolveMemberName}
+                      members={channelMembers}
+                      // A MEETING'S TRANSCRIPT AND RECORDING ARE ITS HOSTS': its ended card names them, and the links are theirs.
+                      {...(message.meetingCard?.event === 'meeting-ended'
+                        ? { meetingFiles: { hosts: message.meetingCard.hosts ?? [], viewerId: personIdOfArn(currentUserArn) ?? '' } }
+                        : {})}
                     />
                   );
                 })()}
@@ -1257,10 +1343,10 @@ const ConversationInterface: React.FC = () => {
                 {message.isBot && message.proposal && (
                   <ProposalCard proposal={message.proposal} onOpenConversation={(id) => void selectConversation(id)} />
                 )}
-                {/* A TASK A WORKFLOW ASSIGNED THIS PERSON (ADR-063 decision 2): its card, drawn from the targeted message's
-                    Metadata, which only they receive. They may answer on it or by writing here. */}
-                {message.isBot && message.taskCard && activeConversation?.conversationArn && (
-                  <TaskCard card={message.taskCard} channelArn={activeConversation.conversationArn} />
+                {/* THE CONVERSATION'S DASHBOARD (DESIGN-CONVERSATION-DASHBOARDS): opened by each member with their own credentials. */}
+                {message.isBot && message.dashboard && activeConversation?.conversationArn
+                  && activeConversation.conversationArn.endsWith(`/channel/${message.dashboard.conversationId}`) && (
+                  <DashboardCard dashboard={message.dashboard} channelArn={activeConversation.conversationArn} conversationName={activeConversation.title} />
                 )}
                 {/* A generated image (battle generation-out, or any image_generation turn) arrives as
                     an ATTACHMENT and renders below, same as an uploaded one. */}
@@ -1407,6 +1493,7 @@ const ConversationInterface: React.FC = () => {
         onConfirm={handleArchiveConfirm}
       />
       </div>
+      {!inMeetingWindow && (
       <ChannelMembersPanel
         isOpen={isMembersPanelOpen}
         onClose={() => setIsMembersPanelOpen(false)}
@@ -1416,6 +1503,7 @@ const ConversationInterface: React.FC = () => {
         // who just enabled Battle Mode.
         onBattleConfigChange={setBattleConfig}
       />
+      )}
     </div>
   );
 };

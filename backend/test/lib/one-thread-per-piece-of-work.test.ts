@@ -127,7 +127,7 @@ describe('the router declines only a message that is not the awaited input, on t
     'utf8',
   );
   const block = router.slice(
-    router.indexOf('const declineMachines = taskStateMachines();'),
+    router.indexOf('const declineMachines = await taskMachinesOf(activeTask);'),
     router.indexOf("a turn is already owed on this task; declining to start a second"),
   );
 

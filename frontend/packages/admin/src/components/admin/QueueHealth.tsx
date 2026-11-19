@@ -66,7 +66,7 @@ export default function QueueHealth({ dateRange }: Props) {
 
   return (
     <section className="admin-panel">
-      <h3>
+      <h2>
         {t('admin.queueHealth.queueHealth')}
         <InfoTooltip content={
           t('admin.queueHealth.whetherTheOneTurnAt')
@@ -75,7 +75,7 @@ export default function QueueHealth({ dateRange }: Props) {
           + t('admin.queueHealth.hasNeverBeenEmittedWhich')
           + t('admin.queueHealth.zeroIsTheHealthyReading')
         } />
-      </h3>
+      </h2>
 
       {error && (
         <p className="admin-error" role="alert">

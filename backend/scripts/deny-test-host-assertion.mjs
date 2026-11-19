@@ -108,9 +108,10 @@ function hostEntry() {
 }
 
 async function main() {
+  // The issuer first: without one, no key could be pinned, and the setup error names what to declare.
+  const entry = hostEntry();
   const keyPath = process.env.AE_HOST_ASSERTION_KEY;
   if (!keyPath) throw new Error('AE_HOST_ASSERTION_KEY names the test-double private key (see --generate-key)');
-  const entry = hostEntry();
   const { key, spki } = loadKey(keyPath);
   const kid = Object.entries(entry.hostAssertion?.publicKeys || {}).find(([, v]) => v === spki)?.[0];
   if (!kid) throw new Error(`issuer "${entry.id}" pins no key matching ${keyPath}; declare its public half (--generate-key prints it)`);

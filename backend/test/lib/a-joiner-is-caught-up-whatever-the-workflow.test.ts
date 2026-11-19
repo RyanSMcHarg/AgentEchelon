@@ -16,7 +16,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import {
   JOIN_RECAP_STEP_PREFIX,
-  PLATFORM_EVENT_WORKFLOWS,
+  SHIPPED_EVENT_WORKFLOWS,
   continueAfter,
   eventWorkflowErrors,
   isJoinRecapStep,
@@ -39,7 +39,7 @@ const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
 const APP = 'arn:aws:chime:us-east-1:111122223333:app-instance/ai';
 const CHANNEL = `${APP}/channel/ch-1`;
 const JOINER = `${APP}/user/jordan`;
-const RECAP = PLATFORM_EVENT_WORKFLOWS['join-recap'];
+const RECAP = SHIPPED_EVENT_WORKFLOWS['join-recap'];
 
 /** A version's own `person-joined` workflow: a room line, then a private welcome. */
 const OWN: EventWorkflow = {
@@ -99,7 +99,7 @@ describe('the join recap is person-joined\'s default step', () => {
     expect(workflowFor({ mine: OWN }, 'mine')!.states[`${JOIN_RECAP_STEP_PREFIX}done`].agent).toBeDefined();
     expect(workflowFor({}, 'join-recap')).toBe(RECAP);
     // A workflow of another event is read as written.
-    const welcome = clone(PLATFORM_EVENT_WORKFLOWS['opening-and-subject']);
+    const welcome = clone(SHIPPED_EVENT_WORKFLOWS['opening-and-subject']);
     expect(workflowFor({ w: welcome }, 'w')).toBe(welcome);
   });
 
@@ -134,9 +134,9 @@ describe('who may read the room, and what may come first', () => {
   });
 
   it('a step whose draft reaches someone outside the room reads none of it, and nothing reads it at an invitation\'s events', () => {
-    const chase = clone(PLATFORM_EVENT_WORKFLOWS['chase-unredeemed']);
+    const chase = clone(SHIPPED_EVENT_WORKFLOWS['chase-unredeemed']);
     chase.states['draft-nudge'].agent!.reads = 'messages';
-    expect(eventWorkflowErrors('c', chase).join()).toMatch(/reads: a step whose draft reaches a person outside the room/);
+    expect(eventWorkflowErrors('c', chase).join()).toMatch(/reads: a step whose draft reaches a person outside the conversation/);
     const sent: EventWorkflow = {
       on: 'invitation-sent', initial: 'note',
       states: {
@@ -148,7 +148,7 @@ describe('who may read the room, and what may come first', () => {
   });
 
   it('the recap\'s names are the platform\'s', () => {
-    expect(versionEventWorkflowsErrors({ 'join-recap': clone(PLATFORM_EVENT_WORKFLOWS['opening-and-subject']) }).join()).toMatch(/names the platform's person-joined default/);
+    expect(versionEventWorkflowsErrors({ 'join-recap': clone(SHIPPED_EVENT_WORKFLOWS['opening-and-subject']) }).join()).toMatch(/names the platform's person-joined default/);
     const taken = clone(OWN);
     taken.states[`${JOIN_RECAP_STEP_PREFIX}x`] = { disposition: 'success' };
     expect(versionEventWorkflowsErrors({ taken }).join()).toMatch(/is the join recap's/);

@@ -168,6 +168,10 @@ const classificationProps = {
   appInstanceArn: APP,
   attachmentsBucketName: 'test-attachments',
   attachmentsBucketArn: 'arn:aws:s3:::test-attachments',
+  companyBucketName: 'test-company',
+  companyBucketArn: 'arn:aws:s3:::test-company',
+  profileBucketName: 'test-profile',
+  profileBucketArn: 'arn:aws:s3:::test-profile',
   auroraDriftHookup: { rdsProxy: false, liveDrift: true },
 };
 
@@ -178,10 +182,10 @@ const classificationProps = {
 async function synthesized(): Promise<Array<{ stack: string; tpl: Template }>> {
   const out: Array<{ stack: string; tpl: Template }> = [];
   const context = {
-    // A host app's pool with the one-conversation session, which stands up the context membership role.
+    // A host app's pool declaring its context classification, which stands up the context membership role.
     issuers: [
       { id: 'deployment', kind: 'cognito-pool', pool: 'self', clearance: { groups: true, classifications: ['basic', 'standard', 'premium', 'admin'] }, admin: true },
-      { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', clearance: { oneChannel: CONTEXT_CLASSIFICATION, classifications: [CONTEXT_CLASSIFICATION] } },
+      { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', clearance: { fixed: [CONTEXT_CLASSIFICATION], classifications: [CONTEXT_CLASSIFICATION] }, contextClassification: CONTEXT_CLASSIFICATION },
     ],
   };
   const add = (stack: string, build: (app: cdk.App) => cdk.Stack) => {
@@ -203,7 +207,7 @@ async function synthesized(): Promise<Array<{ stack: string; tpl: Template }>> {
   add('ChannelFlow', (app) => new ChannelFlowStack(app, `${STACK_PREFIX}ChannelFlow`, { env, classifications: assistantClassifications(), appInstanceArn: APP } as never));
   add('PostProcessing', (app) => new PostProcessingStack(app, `${STACK_PREFIX}PostProcessing`, {
     env, appInstanceArn: APP, messageStream: testMessageStream(app),
-    attachmentsBucketName: 'test-attachments', attachmentsBucketArn: 'arn:aws:s3:::test-attachments',
+    profileBucketName: 'test-profile', profileBucketArn: 'arn:aws:s3:::test-profile',
   }));
   add('Notifications', (app) => new NotificationStack(app, `${STACK_PREFIX}Notifications`, {
     env, userPoolId: 'us-east-1_x', classifications: assistantClassifications(), appInstanceArn: APP, senderEmail: 'assistant@example.com',
@@ -228,7 +232,7 @@ async function synthesized(): Promise<Array<{ stack: string; tpl: Template }>> {
   out.push({ stack: 'AdminServices/AssistantAdministration', tpl: nestedOnLiteralsTemplate('AssistantAdministration', context) });
   out.push({ stack: 'AdminServices/Analytics', tpl: nestedOnLiteralsTemplate('Analytics', context) });
   add('Archive', (app) => new ArchiveStackAurora(app, `${STACK_PREFIX}Archive`, {
-    env, appInstanceArn: APP, messageStream: testMessageStream(app), userPoolId: 'us-east-1_x', userPoolArn: 'arn:aws:cognito-idp:us-east-1:123456789012:userpool/us-east-1_x',
+    env, appInstanceArn: APP, companyBucketArn: 'arn:aws:s3:::test-company-bucket', messageStream: testMessageStream(app), userPoolId: 'us-east-1_x', userPoolArn: 'arn:aws:cognito-idp:us-east-1:123456789012:userpool/us-east-1_x',
   } as never));
   return out;
 }
@@ -519,10 +523,10 @@ describe('every membership change is conditioned on the conversation\'s classifi
       for (const s of creates) expect([c, s.Condition.StringEquals['aws:RequestTag/classification']]).toEqual([c, [c]]);
     }
     const api = [...byRole].find(([id]) => /^CreateConversationApiRole/.test(id))!;
-    // It holds no Amazon Chime SDK action at all: the edge authorizer names its caller, and the
-    // creators it invokes do the creating. It writes nothing.
+    // Its one Amazon Chime SDK action reads who the caller is for the live clearance recheck: the edge authorizer names its
+    // caller, and the creators it invokes do the creating. It writes nothing.
     const chime = api[1].filter((s) => asList(s.Action).some((a: string) => a.startsWith('chime:')));
-    expect(chime.flatMap((s) => asList<string>(s.Action))).toEqual([]);
+    expect(chime.flatMap((s) => asList<string>(s.Action))).toEqual(['chime:DescribeAppInstanceUser']);
   });
 
   it('no grant can write an existing conversation\'s classification (step 39)', () => {

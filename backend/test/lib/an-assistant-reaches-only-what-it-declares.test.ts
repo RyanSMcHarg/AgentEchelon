@@ -43,6 +43,25 @@ describe('which session policies a definition selects', () => {
     expect(edges).toContain('models-all');
   });
 
+  it('DENY: a catalog of many image models cannot carry a session past the limit, and the text models keep their edge', () => {
+    const images = Array.from({ length: 9 }, (_, i) => `img${i}`);
+    const custom: GrantCatalog = {
+      edges: new Set(['base', 'utility', 'context', 'platform', 'telemetry', 'models-all', 'models-haiku', 'models-cn', ...images.map((k) => `image-${k}`)]),
+      alwaysModelKeys: ['haiku'],
+      defaultImageModelKey: 'img0',
+    };
+    const byIntent = Object.fromEntries(images.map((k, i) => [`intent_${i}`, { primary: 'haiku', image: { primary: k } }]));
+    for (const variant of [undefined, { imageModelKey: 'img8' }]) {
+      const edges = grantEdgesFor({ models: { default: 'haiku', byIntent } }, variant, custom);
+      expect(edges.length).toBeLessThanOrEqual(MAX_SESSION_POLICIES);
+      expect(edges).toEqual(expect.arrayContaining(['base', 'models-cn']));
+      expect(edges.some((e) => e === 'models-all' || e === 'models-haiku')).toBe(true);
+      if (variant) expect(edges).toContain('image-img8');
+    }
+    // No definition read: the seed selects everything, and still fits.
+    expect(grantEdgesFor(null, undefined, custom).length).toBeLessThanOrEqual(MAX_SESSION_POLICIES);
+  });
+
   it('never names an edge the classification does not have', () => {
     const edges = grantEdgesFor({ tools: [], models: { default: 'not-a-model' } }, { modelKeys: ['nope'], imageModelKey: 'nope' }, catalog);
     for (const e of edges) expect(catalog.edges.has(e) || e === 'base').toBe(true);
@@ -77,6 +96,10 @@ describe('no definition can pass IAM\'s session-policy limit on any deployed cat
     appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
     attachmentsBucketName: 'agent-echelon-attachments-test',
     attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
+    companyBucketName: 'agent-echelon-company-test',
+    companyBucketArn: 'arn:aws:s3:::agent-echelon-company-test',
+    profileBucketName: 'agent-echelon-profile-test',
+    profileBucketArn: 'arn:aws:s3:::agent-echelon-profile-test',
   };
 
   it.each(stacks)('%s', (name) => {

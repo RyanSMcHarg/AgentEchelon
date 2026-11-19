@@ -13,7 +13,7 @@ describe('the links an assistant page writes', () => {
     const search = linkSearch({ tab: 'effectiveness', assistant: 'advisor', version: 30 });
     const q = new URLSearchParams(search);
     expect(q.get('admin')).toBe('effectiveness');
-    expect(filtersFromUrl(search)).toMatchObject({ assistant: 'advisor', version: '30' });
+    expect(filtersFromUrl(search)).toMatchObject({ assistant: 'advisor', version: ['30'] });
     expect(intentFromUrl(search)).toBeNull();
   });
 

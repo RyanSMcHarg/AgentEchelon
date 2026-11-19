@@ -115,8 +115,10 @@ function declaredAssistantNames(): string[] {
  *             workflow, the step, the event and its outcome, so it pairs with nothing.
  * `task_step` an idle assistant taking up a task assigned to it (ADR-063 decision 5): one turn nobody's message started,
  *             carrying the task's type and state, so it pairs with nothing.
+ * `meeting_summary` a recorded meeting's summary written onto its ended card (`meeting-summary-turn.ts`): one turn nobody
+ *             asked for, so it pairs with nothing.
  */
-export const TURN_KINDS = ['reading', 'drift', 'welcome', 'notification', 'join_recap', 'receipt', 'queue_ack', 'event_step', 'task_step'] as const;
+export const TURN_KINDS = ['reading', 'drift', 'welcome', 'notification', 'join_recap', 'receipt', 'queue_ack', 'event_step', 'task_step', 'meeting_summary'] as const;
 
 /**
  * HOW A TURN ENTERED, and the only three values that are true of one.
@@ -174,7 +176,7 @@ const VALUE_MAX_LENGTH = 128;
 const DECLARABLE_DELIVERY: readonly string[] = Object.values(DeliveryOption);
 
 /** The whole payload, bounded so a pathological input cannot make the reader work hard. */
-const DECLARATION_MAX_LENGTH = 512;
+const DECLARATION_MAX_LENGTH = 1024;
 
 const VALUE_PATTERN = new RegExp(`^[A-Za-z0-9._-]{1,${VALUE_MAX_LENGTH}}$`);
 
@@ -247,9 +249,23 @@ export interface TurnDeclaration {
    * resolved from the channel tag and never from here.
    */
   assistant?: string;
+  /**
+   * THE MESSAGE WHOSE SUBJECT THIS TURN MOVED TO ANOTHER CONVERSATION: the person's message an accepted drift
+   * offer was about (`kind=drift`). The messages stay where they were, as the record of what happened, and
+   * every reader that builds context for the model leaves the moved exchange out (`lib/moved-subject.ts`), so
+   * the subject is in the conversation it moved to and no longer in this one. Declared by the turn that acted
+   * on the person's yes, never inferred from what anybody wrote.
+   */
+  moves?: string;
+  /**
+   * THE MESSAGE THE INPUT GUARDRAIL REFUSED, declared on the refusal the stopped turn posts. Every reader that builds context
+   * for a model leaves the refused messages and their refusal out (`lib/refused-message.ts`). A turn that folded several
+   * messages refuses them all, each as its own `blocks=` pair.
+   */
+  blocks?: readonly string[];
 }
 
-const KEYS: Array<keyof TurnDeclaration> = ['answers', 'delivery', 'kind', 'phase', 'entry', 'assistant'];
+const KEYS: Array<keyof TurnDeclaration> = ['answers', 'delivery', 'kind', 'phase', 'entry', 'assistant', 'moves', 'blocks'];
 
 /**
  * Can this value survive the round trip? A writer asks BEFORE posting, and the answer is the
@@ -259,6 +275,18 @@ const KEYS: Array<keyof TurnDeclaration> = ['answers', 'delivery', 'kind', 'phas
  * not rejected anywhere downstream, it is simply posted and then silently cannot be read back, so the
  * turn that declared it pairs no better than one that declared nothing.
  */
+/** As many refused message ids as one declaration carries, the first first: a declaration over its bound declares nothing. */
+export function refusalsThatFit(ids: readonly string[]): string[] {
+  let room = DECLARATION_MAX_LENGTH;
+  const fit: string[] = [];
+  for (const id of ids) {
+    room -= `blocks=${id};`.length;
+    if (room < 0) break;
+    fit.push(id);
+  }
+  return fit;
+}
+
 export function isDeclarableValue(value: string): boolean {
   return VALUE_PATTERN.test(value);
 }
@@ -274,8 +302,8 @@ export function turnDeclarationMarker(declaration: TurnDeclaration): string {
   const pairs: string[] = [];
   for (const key of KEYS) {
     const value = declaration[key];
-    if (typeof value === 'string' && value && isDeclarableValue(value)) {
-      pairs.push(`${key}=${value}`);
+    for (const one of Array.isArray(value) ? value : [value]) {
+      if (typeof one === 'string' && one && isDeclarableValue(one)) pairs.push(`${key}=${one}`);
     }
   }
   if (!pairs.length) return '';
@@ -321,7 +349,8 @@ export function turnDeclarationOf(raw: string | null | undefined): TurnDeclarati
     // wrong answer that looks like a right one.
     if (key === 'delivery') {
       if ((DECLARABLE_DELIVERY as readonly string[]).includes(value)) declaration.delivery = value;
-    } else if (key === 'answers' || key === 'phase') declaration[key] = value;
+    } else if (key === 'answers' || key === 'phase' || key === 'moves') declaration[key] = value;
+    else if (key === 'blocks') declaration.blocks = [...(declaration.blocks ?? []), value];
     else if (key === 'kind' && (TURN_KINDS as readonly string[]).includes(value)) {
       declaration.kind = value as TurnKind;
     } else if (key === 'entry' && (TURN_ENTRIES as readonly string[]).includes(value)) {
@@ -366,6 +395,15 @@ export function declaresFinalAnswer(content: string | null | undefined): boolean
   return turnDeclarationOf(content).phase === 'final';
 }
 
+/**
+ * A PLACEHOLDER: the message a turn posts before its answer, marked `<!--corr:` and not declared final. The full reasoning
+ * is at its use in the history a turn reads (`async-processor-core.ts`).
+ */
+export function isPlaceholderMessage(content: string | null | undefined): boolean {
+  if (declaresFinalAnswer(content)) return false;
+  return String(content ?? '').includes('<!--corr:');
+}
+
 /** Remove every declaration from content, so the only one left is the one about to be appended. */
 export function stripTurnDeclarations(content: string): string {
   DECLARATION_MARKER.lastIndex = 0;
@@ -382,4 +420,14 @@ export function withTurnDeclaration(content: string, declaration: TurnDeclaratio
   const marker = turnDeclarationMarker(declaration);
   const cleaned = stripTurnDeclarations(content);
   return marker ? `${cleaned}${marker}` : cleaned;
+}
+
+/**
+ * The declaration on a line of its own, for content that ends in a `NAVIGATE_CHANNEL:<arn>|<label>` link: a link's
+ * label runs to the end of its line in every client that renders it, so the marker never becomes part of the label.
+ */
+export function withTurnDeclarationLine(content: string, declaration: TurnDeclaration): string {
+  const marker = turnDeclarationMarker(declaration);
+  const cleaned = stripTurnDeclarations(content);
+  return marker ? `${cleaned}\n${marker}` : cleaned;
 }

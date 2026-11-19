@@ -3,8 +3,8 @@ title: "ADR-063: A workflow step assigns a task, and an idle assistant takes up 
 status: >-
   Accepted 2026-10-29. Built and deployed to dev, slices T1 to T6, verified by
   `backend/test/lib/a-workflow-step-opens-a-task-for-a-person.test.ts` and the tests "What is built" names. The owner settled
-  decisions A to J (A and G changed from the recommendation, J deferred and NOT BUILT). Each slice's e2e is
-  written, and no run of it on dev is recorded (NOT VERIFIED).
+  decisions A to J (A and G changed from the recommendation, J deferred and NOT BUILT). The T1 to T5 e2e passed on
+  dev, 2026-11-05; the T6 e2e passed on dev, 2026-11-05 ("What proves it").
 date: 2026-10-29
 related:
   - "./024-task-ownership.md"
@@ -12,6 +12,7 @@ related:
   - "./060-a-variable-is-declared-once-and-its-trust-decides-what-it-may-do.md"
   - "./061-a-welcome-is-a-workflow-an-event-starts.md"
   - "./062-a-message-is-a-template-stored-and-versioned-like-a-document.md"
+  - "./067-a-workflow-is-triggered-by-an-event-or-an-intent-and-its-steps-create-tasks.md"
   - "../../overview/TENETS.md"
   - "../../specs/interaction/conversation/DESIGN-TASK-ACCESS-AND-QUEUE-PROCESSING.md"
   - "../../specs/interaction/conversation/SPEC-TASK-STATE-TRANSITIONS.md"
@@ -45,14 +46,19 @@ tracking: |
   checking if there are tasks assigned to them they should pick up (if this isn't already built)". It is not built:
   "What is already built" below says where each half stops, with the file and line.
   Read first, and not re-derived here: the turn queue and its drain (DESIGN-TASK-ACCESS-AND-QUEUE-PROCESSING section 2.6,
-  ADR-033), task ownership (ADR-024), and who a step awaits (SPEC-TASK-STATE-TRANSITIONS section 12).
+  ADR-033), task ownership (ADR-024), and who a step awaits (DESIGN-TASK-STATE-TRANSITIONS section 12).
 ---
 
 # ADR-063: A workflow step assigns a task, and an idle assistant takes up its own
 
 ## Status
 
-**Accepted (2026-10-29). Built and deployed to dev; each slice's e2e is written and NOT VERIFIED, with no run recorded.** The owner settled every open question ("Decisions taken"). Every slice of the build order is built; "What is built" names each with its cited code and the test that verifies it, "What is not built" what remains and why, and each slice's e2e is written; no run of it on dev is recorded.
+Status for workflows and tasks lives in [SPEC-WORKFLOWS-AND-TASKS](../../specs/interaction/conversation/SPEC-WORKFLOWS-AND-TASKS.md) (this record's parts: WT12 to WT15); the status below is kept for the record of when each part landed.
+
+**Accepted (2026-10-29). Built and deployed to dev.** The owner settled every open question ("Decisions taken"). Every slice of the build order is built; "What is built" names each with its cited code and the test that verifies it, "What is not built" what remains and why, and "What proves it" the e2e results on dev.
+
+**Amended by [ADR-066](./066-an-intents-workflow-rides-the-assistants-version.md) (accepted 2026-11-04; built except its console):** an intent's machine is declared on the assistant's version; the platform's machines stay fixed and cannot be overridden; a task resolves its machine from the version it started on.
+
 
 ## Context
 
@@ -64,17 +70,17 @@ Two requests meet here. A workflow step assigns a task to a person, to a partici
 
 | Question | Answer today | Where |
 |---|---|---|
-| Can a workflow step open a task? | **Partly.** An `agent` step's `workflow:` opens a task of one platform machine, `incident_first_look` (`EVENT_TASK_MACHINES`), owned by the step's assistant and visible to the room; the turn runs its first step and the runtime takes that step's one transition once the turn posted | `backend/lambda/src/lib/event-workflow.ts:126`, `openEventTask` in `event-task.ts`, the processor's `eventStep` branch (`backend/lambda/src/assistant-async-processor.ts:1646`) |
-| Can a step name who a task's step waits on? | **No.** A state declares `awaits: { party: 'requester' }`, and `requester` is the only reference that resolves (SPEC-TASK-STATE-TRANSITIONS FR15, NOT delivered) | `backend/lambda/src/lib/task-state-machines.ts:33` |
-| Is the assignee separate from the owner and the assistant? | **Yes.** Three roles: `assistantId` (never moves), `ownerPersonId`, and `assigneeId`/`assigneeType` (moves at every `awaits` boundary), one writer (`setTaskAssignee`) | ADR-024 D8; `backend/lambda/src/lib/task-tracking.ts:204` |
+| Can a workflow step open a task? | **Partly.** An `agent` step's `workflow:` opens a task of one platform machine, `incident_first_look` (`EVENT_TASK_MACHINES`), owned by the step's assistant and visible to the room; the turn runs its first step and the runtime takes that step's one transition once the turn posted | `backend/lambda/src/lib/event-workflow.ts:130`, `openEventTask` in `event-task.ts`, the processor's `eventStep` branch (`backend/lambda/src/assistant-async-processor.ts:976`) |
+| Can a step name who a task's step waits on? | **No.** A state declares `awaits: { party: 'requester' }`, and `requester` is the only reference that resolves (SPEC-TASK-STATE-TRANSITIONS FR15, NOT delivered) | `backend/lambda/src/lib/task-state-machines.ts:40` |
+| Is the assignee separate from the owner and the assistant? | **Yes.** Three roles: `assistantId` (never moves), `ownerPersonId`, and `assigneeId`/`assigneeType` (moves at every `awaits` boundary), one writer (`setTaskAssignee`) | ADR-024 D8; `backend/lambda/src/lib/task-tracking.ts:251` |
 | Does a person see what they owe? | **Yes.** `GET /tasks/mine` reads the caller's assignee partition of the user-tasks mirror; the chat client's open-work list shows it, oldest first, and opens the conversation | `getActiveTasksForUser` in `task-tracking.ts`; `user-tasks-api.ts`; `OpenWorkItems.tsx` |
-| Is a person told when work becomes theirs? | **Partly.** One machine, `action_item` reaching `awaiting_completion`, posts the `task-assigned` template as a room message whose notify directive emails the assignee (kind `conversation`, the default) | `backend/lambda/src/assistant-async-processor.ts:2727`, `postTaskHandoffNotice` (`backend/lambda/src/lib/async-processor-core.ts:6982`) |
-| How does a person complete a step? | **By writing in the conversation.** The router starts a turn, the model names the item (FR14) and calls `advance_task_state` (FR2). The chat client addresses a reply to an item with `Metadata.task.id` (section 12.8). Nothing outside a model turn advances a task (FR17, its submission half NOT delivered) | SPEC-TASK-STATE-TRANSITIONS sections 3, 12.7 and 12.8 |
-| Can a run wait for something and continue? | **For an `agent` step only.** The processor hands the run back, the router claims `after#<step>` once and takes the step's edge; `continueAfter` returns without running for any other step kind | `continuationClaim` and `continueAfter` (`backend/lambda/src/lib/event-workflow.ts:1418`); `handleEventContinuation` (`backend/lambda/src/router-agent-handler.ts:3044`) |
-| Is there a deadline mechanism? | **Yes, for one event.** Each member classification has an EventBridge Scheduler group and a scheduler role that invokes only its own router; a one-shot schedule carries ids only and deletes itself after firing. The firing shape names an invitation and nothing else | `deadlineFiringOf` and `createDeadlineSchedule` (`backend/lambda/src/lib/event-deadlines.ts:82`, `backend/lambda/src/lib/event-deadlines.ts:110`); `handleDeadlineFired` (`backend/lambda/src/router-agent-handler.ts:3486`) |
-| Does an idle assistant take up tasks assigned to it? | **No.** A turn's exit hands the lock to a reading when messages are queued, and otherwise releases it and reads no task (`backend/lambda/src/lib/turn-handover.ts:342`, `backend/lambda/src/lib/turn-handover.ts:149`). The only reads of an assignee's tasks in a conversation are the operator's assignee route and the router's read of the speaker's own chain. A task no turn has touched is "waiting for its first turn" and nothing gives it one (`backend/lambda/src/lib/task-state-machines.ts:514`) | `settleTurnLockAtExit`, `releaseLock` (`turn-lock.ts`) |
-| Does the queue run accepted work one item at a time? | **Specified, not built.** ADR-033 "Then one task at a time, until the queue is clear" says the agreed tasks run in order, each taking the lock, until none is ready. SPEC-TURN-QUEUE has no requirement row for it, and no code reads `queued_request.accepted`: a second accepted request waits for the person's next message | ADR-033; `backend/lambda/src/lib/task-state-machines.ts:1175` |
-| Does anything act on a task nobody advances? | **No** (FR20). The stall counter is a dashboard signal by design, and the due-date sweep `scanActiveDueTasks` has no caller and no grant | SPEC-TASK-STATE-TRANSITIONS section 12.5; DESIGN-TASK-ACCESS-AND-QUEUE-PROCESSING section 3.1 |
+| Is a person told when work becomes theirs? | **Partly.** One machine, `action_item` reaching `awaiting_completion`, posts the `task-assigned` template as a room message whose notify directive emails the assignee (kind `conversation`, the default) | `backend/lambda/src/assistant-async-processor.ts:2883`, `postTaskHandoffNotice` (`backend/lambda/src/lib/async-processor-core.ts:7129`) |
+| How does a person complete a step? | **By writing in the conversation.** The router starts a turn, the model names the item (FR14) and calls `advance_task_state` (FR2). The chat client addresses a reply to an item with `Metadata.task.id` (section 12.8). Nothing outside a model turn advances a task (FR17, its submission half NOT delivered) | DESIGN-TASK-STATE-TRANSITIONS sections 3, 12.7 and 12.8 |
+| Can a run wait for something and continue? | **For an `agent` step only.** The processor hands the run back, the router claims `after#<step>` once and takes the step's edge; `continueAfter` returns without running for any other step kind | `continuationClaim` and `continueAfter` (`backend/lambda/src/lib/event-workflow.ts:1348`, `:1528`); `handleEventContinuation` (`backend/lambda/src/router-agent-handler.ts:3411`) |
+| Is there a deadline mechanism? | **Yes, for one event.** Each member classification has an EventBridge Scheduler group and a scheduler role that invokes only its own router; a one-shot schedule carries ids only and deletes itself after firing. The firing shape names an invitation and nothing else | `deadlineFiringOf` and `createDeadlineSchedule` (`backend/lambda/src/lib/event-deadlines.ts:82`, `backend/lambda/src/lib/event-deadlines.ts:110`); `handleDeadlineFired` (`backend/lambda/src/router-agent-handler.ts:3915`) |
+| Does an idle assistant take up tasks assigned to it? | **No.** A turn's exit hands the lock to a reading when messages are queued, and otherwise releases it and reads no task (`backend/lambda/src/lib/turn-handover.ts:163`, `backend/lambda/src/lib/turn-handover.ts:138`). The only reads of an assignee's tasks in a conversation are the operator's assignee route and the router's read of the speaker's own chain. A task no turn has touched is "waiting for its first turn" and nothing gives it one (`backend/lambda/src/lib/task-state-machines.ts:593`) | `settleTurnLockAtExit`, `releaseLock` (`turn-lock.ts`) |
+| Does the queue run accepted work one item at a time? | **Specified, not built.** ADR-033 "Then one task at a time, until the queue is clear" says the agreed tasks run in order, each taking the lock, until none is ready. SPEC-TURN-QUEUE has no requirement row for it, and no code reads `queued_request.accepted`: a second accepted request waits for the person's next message | ADR-033; `backend/lambda/src/lib/task-state-machines.ts:1377` |
+| Does anything act on a task nobody advances? | **No** (FR20). The stall counter is a dashboard signal by design, and the due-date sweep `scanActiveDueTasks` has no caller and no grant | DESIGN-TASK-STATE-TRANSITIONS section 12.5; DESIGN-TASK-ACCESS-AND-QUEUE-PROCESSING section 3.1 |
 | Who holds the task tables? | **The task service alone**, one per classification, which refuses against its own `SERVICE_CLASSIFICATION` and the conversation's immutable tag. The router, the processor and the user-tasks function invoke it | `backend/lambda/src/task-service.ts`; `backend/test/task-store-boundary.test.ts` |
 | Can a condition read a task? | **No.** The `task:` variable kind is refused at validation as NOT BUILT | `NOT_BUILT_SOURCES` in `variables.ts` |
 
@@ -84,7 +90,7 @@ So the request is two gaps the specifications already name: a step that names th
 
 The turn lock is keyed by conversation and responder (`turn#<channelArn>#<responderId>`, `turn-lock.ts`), so busy is a property of an assistant in one conversation, not of the assistant everywhere: its turns are separate Lambda invocations and run in many conversations at once. **An assistant is idle in a conversation when no turn holds that conversation's lock for it and its queue is empty.** That is the state ADR-033 calls settled, and the drain machine's last stage reaches it (DESIGN-TASK-ACCESS-AND-QUEUE-PROCESSING section 2.6). Idle is therefore never sampled. It is entered at one of two moments, each an event a component already handles:
 
-1. **A turn ends with nothing queued.** `settleTurnLockAtExit` reaches the branch that releases the lock (`turn-handover.ts:342`). This is the moment ADR-033 already uses to re-read the queue rather than a sweep, "because turn completion is an EVENT and the last moment anything holds the conversation".
+1. **A turn ends with nothing queued.** `settleTurnLockAtExit` reaches the branch that releases the lock (`turn-handover.ts:163`). This is the moment ADR-033 already uses to re-read the queue rather than a sweep, "because turn completion is an EVENT and the last moment anything holds the conversation".
 2. **Work becomes an assistant's while it holds no lock there.** The write that makes an assistant a task's assignee (a workflow step opening the task, a person completing their step so the next step is the assistant's, an operator handing work over) is itself the event.
 
 ## Decisions taken
@@ -125,7 +131,7 @@ review:
 - **`for` names the person the task is for.** It becomes the task's requester and its owner (`userArn`, `ownerPersonId`), so every existing machine's `awaits: { party: 'requester' }` resolves to that person with no change. It accepts the references an audience already resolves to one person: `subject`, `joined`, `{ people: event:person }`, `{ people: invitation:inviter }` and `{ participantRole: <name> }` (one holder, Decision B). Absent, the task is for nobody, and its machine must declare no state that awaits the requester.
 - **`by` names the worker: who does the work.** A person (the same references as `for`), a participant role with one holder, or an assistant role (`{ assistantRole: <role> }`). Absent, the worker is the run's own assistant. The worker is resolved once, when the step runs, and recorded on the task as `workerId` and `workerType`; like `assistantId` it never moves.
 - **The machine's `awaits` decides who acts at each state, and nothing else does (ADR-024).** A new awaited party, `worker`, joins `requester`: a state that `awaits: { party: 'worker' }` is held by the worker, a state that awaits the requester by the person the task is for, and a state that awaits nobody by the task's assistant. The assignee is still written only by `setTaskAssignee`, on creation and at each `awaits` boundary (`maybeHandOver`), so the step adds no second writer. A task's assistant (`assistantId`) is the worker when the worker is an assistant, and the run's assistant otherwise, which is the assistant accountable for a person's work.
-- **An assistant worker is found as an `agent` step's `as` finds it**: the run's own assistant where it holds the role, else the room's live assistant of the same classification holding it (`assistantForStep`). Where none is in the room the task is not opened and the step takes `onFailure`.
+- **An assistant worker is found by its role**: the run's own assistant where it holds the role, else the room's live assistant of the same classification holding it (`assistantForStep`). Where more than one in the room holds it, nobody is asked and the step takes `onFailure` with `task:outcome` `failed` (WT118). Where none is in the room the task is not opened and the step takes `onFailure` with `task:outcome` `no-worker`. Under the ownership tenet (SPEC-WORKFLOWS-AND-TASKS WT118) the step is a request: the found assistant's own run of the intent opens the task on its served version.
 - **Which machines.** A machine the version's `workflows` selection offers, a platform reference machine, or one of `EVENT_TASK_MACHINES`. The platform's queue machines (`PLATFORM_TASK_MACHINE_KEYS`) are never opened by a step, because code depends on their states by name. Two reference machines ship for work somebody does: `approval` (`deciding` awaits the worker and declares the choices `approved` and `declined`, both terminal of kind `success`, because the task was decided either way and the run branches on which) and `acknowledgement` (`asked` awaits the worker and declares the choice `acknowledged`).
 - **One task per step of a run.** Its id follows from the run's key and the step (`eventTaskId`), so a redelivered event opens the same task, and the step is claimed once like every other step.
 - **The run waits, and the step records `opened`.** The run stops at a task step as it stops at an `agent` step, and continues only when the task settles (Decision 3).
@@ -246,7 +252,7 @@ Each slice's e2e runs on dev after the deploy at the end of this merge; none is 
 
 ## What is built
 
-Built and deployed to dev, slices T1 to T6. Each slice's e2e is written; no run of it on dev is recorded, so each is NOT VERIFIED.
+Built and deployed to dev, slices T1 to T6. Each slice's e2e result is under "What proves it".
 
 | Slice | What is built | Code | Verified by |
 |---|---|---|---|
@@ -270,8 +276,17 @@ Built and deployed to dev, slices T1 to T6. Each slice's e2e is written; no run 
 - **The worker resolved again at each step** (FR15): it is resolved once, when the step runs.
 - **Pickup where the turn queue is off** beyond a task's first step (decision H1): by decision, with a validation warning.
 - **An assistant assigning or reassigning work at runtime, a task step fanned out over several people** (sub-agent identity is BLOCKED, ADR-061 decision 8, rule 10), **and a `task:` condition anywhere but a task step's own edges.**
-- **The e2e of each slice**, written and not run: they need the deploy at the end of this merge.
-
 ## What proves it
 
-`backend/test/lib/a-workflow-step-opens-a-task-for-a-person.test.ts` (T1, T2: declaration, the worker through the one writer, the run opened once and continued once), `backend/test/lib/a-person-completes-their-task-on-the-card.test.ts` (T2, T3: the task service opens and refuses, and every deny case of the card), `backend/test/lib/a-task-deadline-ends-the-task-and-continues-the-run.test.ts` (T4), `backend/test/lib/an-idle-assistant-takes-up-its-own-work.test.ts` (T5: readiness, order, the exit's hand-off and its race, the per-entry claim, the pickup dispatched as an ordinary task turn with no processor branch of its own), `backend/test/lib/a-pickup-turn-is-an-ordinary-task-turn.test.ts` (T5: a pickup through the real tool loop runs a declared action and delivers a document), `backend/test/lib/a-pickup-reaches-the-processors-own-router.test.ts` (T5: the exit names its pickup to the router the processor reads from its own `ROUTER_ARN_PARAM`, and gives the handed lock back when there is none), `backend/test/a-task-service-reaches-only-its-own-router.test.ts` (synth, deny), `frontend/packages/chat/src/components/TaskCard.test.tsx`, and the e2e specs `tests/e2e/a-workflow-step-opens-a-task-for-a-person.spec.ts`, `tests/e2e/a-task-deadline-ends-the-task-and-continues-the-run.spec.ts` and `tests/e2e/an-idle-assistant-takes-up-its-own-work.spec.ts`, each to be recorded here with its date and result when it passes on dev.
+`backend/test/lib/a-workflow-step-opens-a-task-for-a-person.test.ts` (T1, T2: declaration, the worker through the one writer, the run opened once and continued once), `backend/test/lib/a-person-completes-their-task-on-the-card.test.ts` (T2, T3: the task service opens and refuses, and every deny case of the card), `backend/test/lib/a-task-deadline-ends-the-task-and-continues-the-run.test.ts` (T4), `backend/test/lib/an-idle-assistant-takes-up-its-own-work.test.ts` (T5: readiness, order, the exit's hand-off and its race, the per-entry claim, the pickup dispatched as an ordinary task turn with no processor branch of its own), `backend/test/lib/a-pickup-turn-is-an-ordinary-task-turn.test.ts` (T5: a pickup through the real tool loop runs a declared action and delivers a document), `backend/test/lib/a-pickup-reaches-the-processors-own-router.test.ts` (T5: the exit names its pickup to the router the processor reads from its own `ROUTER_ARN_PARAM`, and gives the handed lock back when there is none), `backend/test/a-task-service-reaches-only-its-own-router.test.ts` (synth, deny), `frontend/packages/chat/src/components/TaskCard.test.tsx`.
+
+On dev, 2026-11-04 and 2026-11-05 (`node scripts/validate.mjs --only=workflow-tasks` from backend/, with `E2E_TURN_QUEUE=1` and `E2E_WORKFLOW_TASK_PICKUP=1` on 2026-11-05):
+
+| Slice | e2e | Result |
+|---|---|---|
+| T1, T2, T3 | `tests/e2e/a-workflow-step-opens-a-task-for-a-person.spec.ts`: refusals name their reason; a version whose welcome runs a task step validates and activates; the welcome opens an approval for the subject, told privately with the card, and owns it; the subject approves on the card, the run takes the approved edge, and a second press is refused | Passed on dev, 2026-11-05 |
+| T4 | `tests/e2e/a-task-deadline-ends-the-task-and-continues-the-run.spec.ts`: a task nobody answers is cancelled at its deadline and the run takes `onDeadline` | Passed on dev, 2026-11-05 |
+| T5 | `tests/e2e/an-idle-assistant-takes-up-its-own-work.spec.ts`: after the person answers, the assistant works the step it holds with no further message | Passed on dev, 2026-11-05; no e2e covers three accepted queued requests worked in turn |
+| T6 | `tests/e2e/a-participant-role-holder-completes-a-task-on-the-card.spec.ts`: an `ops` room's opening runs an approval for and by `{ participantRole: 'lead' }`; the lead alone is told privately with the card and owns the task; the responder's press is refused as not theirs; the lead approves on the card, the run takes the approved edge, and a second press is refused. It needs `ops-premium` declared, since `ops` is the one type giving `lead` one holder | Passed on dev, 2026-11-05 (`node scripts/validate.mjs --only=workflow-tasks`, with `ops-premium` declared); the cross-classification deny is proven by the synth test above |
+
+The T2 e2e asserts the open-work list entry (and T3 its removal) and the card's `notifyKind: task`; that an email is sent under `task` is unproven on dev.

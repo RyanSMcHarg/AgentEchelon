@@ -568,7 +568,7 @@ describe('the person behind a token', () => {
   const accountStateMock = (): jest.Mock =>
     (jest.requireMock('../lambda/src/lib/membership-source') as { __accountStateForTests: { accountState: jest.Mock } }).__accountStateForTests.accountState;
 
-  it.each(['disabled', 'gone'] as const)('refuses an account its issuer reports %s, before anything is minted, recorded or assumed', async (state) => {
+  it.each(['disabled', 'gone'] as const)('refuses an account its issuer reports %s, before anything is minted or assumed, and records only the refusal', async (state) => {
     const { handler } = loadHandler();
     accountStateMock().mockResolvedValue(state);
     const res = await handler(event({ sub: SUB, 'cognito:groups': 'premium' }));
@@ -576,7 +576,9 @@ describe('the person behind a token', () => {
     expect(JSON.parse(res.body).code).toBe('PERSON_NOT_ACTIVE');
     expect(accountStateMock()).toHaveBeenCalledWith(NATIVE_ID, SUB);
     expect(identityRows.size).toBe(0);
-    expect(mockDocSend).not.toHaveBeenCalled();
+    // The one write is the refusal's record (a-refusal-is-recorded-beside-the-grants.test.ts).
+    expect(mockDocSend.mock.calls.map((c) => [c[0].input.TableName, c[0].input.Item?.outcome, c[0].input.Item?.code]))
+      .toEqual([['access-log', 'refused', 'PERSON_NOT_ACTIVE']]);
     expect(mockStsSend).not.toHaveBeenCalled();
     expect(mockChimeSend).not.toHaveBeenCalled();
   });

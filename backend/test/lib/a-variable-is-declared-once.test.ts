@@ -38,8 +38,8 @@ import { REPLY_PREFERENCES } from '../../lib/config/reply-preferences';
 
 const DEPLOYMENT: CatalogDeploymentContext = {
   classification: 'standard',
-  attachmentsBucketArn: 'arn:aws:s3:::attachments',
-  attachmentsBucketName: 'attachments',
+  companyBucketArn: 'arn:aws:s3:::attachments',
+  companyBucketName: 'attachments',
   userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/profiles',
   userProfileTableName: 'profiles',
   region: 'us-east-1',

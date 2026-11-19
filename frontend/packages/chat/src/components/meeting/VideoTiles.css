@@ -1,0 +1,73 @@
+/*
+ * The meeting's video layout (VideoTiles.tsx, SPEC-ASSISTANT-MEETINGS FR61): the stage with its share overlay and self
+ * view, the paged grid, and the camera-off placeholder.
+ * Colors are design-system tokens with their light value as the fallback; tiles sit on black in either theme.
+ */
+
+/* The stage holds the overlays: the speaker over a shared screen, and the viewer's own view. */
+.ae-video-stage { position: relative; }
+
+/* A shared screen is shown whole, never cropped. */
+.ae-video-tile--content .ae-video-el { object-fit: contain; }
+
+/* A video paused by the network policy, or a camera turned off, keeps its element so it plays again in place. */
+.ae-video-el--hidden { visibility: hidden; position: absolute; inset: 0; }
+.ae-video-avatar { position: absolute; inset: 0; }
+.ae-video-initials {
+  display: grid; place-items: center;
+  width: 30%; max-width: 96px; min-width: 32px; aspect-ratio: 1; border-radius: 50%;
+  font-size: clamp(14px, 3vw, 32px); font-weight: 600;
+  color: var(--text-on-accent, #FAFAFA); background: var(--btn-primary-bg, #0F766E);
+}
+.ae-video-tile--strip .ae-video-initials, .ae-video-tile--overlay .ae-video-initials, .ae-video-tile--self .ae-video-initials { font-size: 14px; }
+
+/* THE SPEAKER OVER A SHARED SCREEN, bottom right, 10rem by 7.5rem. */
+.ae-video-overlay {
+  position: absolute; right: 12px; bottom: 12px; width: 10rem; z-index: 2;
+  border: 1px solid var(--divider-strong, #8F8F99); border-radius: 8px; overflow: hidden;
+}
+.ae-video-overlay .ae-video-tile { border-radius: 0; }
+
+/* THE VIEWER'S OWN VIEW, in a corner over the stage, 7.5rem, 3:4 portrait. */
+.ae-video-self {
+  position: absolute; width: 7.5rem; z-index: 3; touch-action: none; cursor: grab;
+  border-radius: 12px; overflow: hidden; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+  transition: width 0.3s ease;
+}
+.ae-video-self .ae-video-tile { aspect-ratio: 3 / 4; border-radius: 0; }
+.ae-video-self--tl { top: 12px; left: 12px; }
+.ae-video-self--tr { top: 12px; right: 12px; }
+.ae-video-self--bl { bottom: 12px; left: 12px; }
+.ae-video-self--br { bottom: 12px; right: 12px; }
+.ae-video-self--expanded { width: 10rem; }
+@media (prefers-reduced-motion: reduce) { .ae-video-self { transition: none; } }
+
+/* Hide on the viewer's own tile; show again where it was. */
+.ae-video-self-hide {
+  position: absolute; top: 6px; right: 6px; z-index: 1;
+  font-size: 11px; padding: 2px 8px; border-radius: 999px; border: none; cursor: pointer;
+  background: rgba(0, 0, 0, 0.6); color: #FFFFFF;
+}
+.ae-video-self-hide:focus-visible { outline: 2px solid var(--focus-ring, #14B8A6); outline-offset: 2px; }
+.ae-video-stage > .ae-video-self-show { position: absolute; top: 12px; right: 12px; z-index: 3; min-height: 32px; padding: 4px 12px; font-size: 13px; }
+
+/* THE GRID: a shared screen above the page of people, then the page controls. */
+.ae-video-grid-wrap { display: flex; flex-direction: column; gap: 10px; height: 100%; min-height: 0; }
+.ae-video-grid-wrap .ae-video-grid { flex: 1 1 0; min-height: 0; }
+.ae-video-grid-content, .ae-video-pager { flex: none; }
+.ae-video-grid-content { display: grid; gap: 10px; }
+.ae-video-pager { display: flex; gap: 8px; align-items: center; justify-content: center; flex-wrap: wrap; }
+.ae-video-pager-text { font-size: 13px; color: var(--text-secondary, #71717A); }
+
+/* A PHONE-WIDTH WINDOW (640px and under): a smaller self view and overlay, and a narrower filmstrip. */
+@media (max-width: 640px), (max-height: 480px) and (orientation: landscape) {
+  .ae-video-self { width: 6rem; }
+  .ae-video-self--expanded { width: 10rem; }
+  .ae-video-overlay { width: 7rem; }
+  .ae-video-tile--strip { width: 120px; }
+}
+/* A finger's reach on the self view's small controls: the press area is 44px while the control keeps its size. */
+@media (max-width: 640px), (max-height: 480px) and (orientation: landscape) {
+  .ae-video-self-hide::after { content: ''; position: absolute; inset: -14px -10px; }
+  .ae-video-stage > .ae-video-self-show { min-height: 44px; }
+}

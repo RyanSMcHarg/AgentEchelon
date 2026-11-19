@@ -74,13 +74,16 @@ const { keptTestAdmin, identityPreconditionProblems } = require('./lib/test-user
 // Demo (Stratum) personas. Their own module because seed-demo runs main() at import, so nothing can
 // read them from here without running the whole seeder - and they are the portable payload a profile
 // export carries to another instance.
-import { BASIC_PERSONA, STANDARD_PERSONA, PREMIUM_PERSONA, OPS_PERSONA } from '../demo/personas.js';
+import { BASIC_PERSONA, STANDARD_PERSONA, PREMIUM_PERSONA } from '../../demo/stratum-company/personas.js';
 // Demo intent packs, same reason and same place as the personas above - and kept measurable, so a
 // pack that outgrows its parameter fails a unit test instead of a deploy's seed step.
-import { stratumIntentPack, opsIntentPack, PREMIUM_REPORT_TEMPLATES } from '../demo/intent-packs.js';
-import { BASIC_ONBOARDING, STANDARD_ONBOARDING } from '../demo/onboarding.js';
-import { BASIC_BOUNDARY, STANDARD_BOUNDARY, PREMIUM_BOUNDARY, OPS_BOUNDARY } from '../demo/boundaries.js';
-import { OPS_WELCOME, ADVISOR_WELCOME } from '../demo/welcomes.js';
+import { stratumIntentPack, PREMIUM_REPORT_TEMPLATES } from '../../demo/stratum-company/intent-packs.js';
+import { BASIC_ONBOARDING, STANDARD_ONBOARDING } from '../../demo/stratum-company/onboarding.js';
+import { BASIC_BOUNDARY, STANDARD_BOUNDARY, PREMIUM_BOUNDARY } from '../../demo/stratum-company/boundaries.js';
+import { ACCOUNT_LEAD_GROUP, ACCOUNT_TEAM, ACCOUNT_TEAM_GROUP, ACCOUNTS_RECORD, withAccountTeamPeople } from '../../demo/stratum-company/account-teams.js';
+import { ADVISOR_WELCOME } from '../../demo/portable-assistants/welcomes.js';
+// The ops assistant's version is imported from its shipped manifest, not seeded here (step 2d).
+import { OPS_ASSISTANT } from '../../demo/portable-assistants/ops-assistant-manifest.js';
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const DRY_RUN = process.argv.includes('--dry-run');
@@ -115,15 +118,18 @@ const TEST_SECRET_NAME = process.env.TEST_SECRET_NAME || 'agent-interface/test-c
 
 interface StackOutputs {
   userPoolId: string;
-  bucketName: string;
+  /** The company bucket: the company corpus under `context/` and the platform's self-knowledge. */
+  companyBucketName: string;
+  /** The profile bucket: profile bodies, intent packs and templates. */
+  profileBucketName: string;
   appInstanceArn: string;
   /** The app client a demo user signs in with, and the exchange that makes them a person. */
   clientId: string;
   exchangeUrl: string;
-  // Aurora mode only: the archive bucket whose `rag/` prefix the DocumentIngestion
+  // Aurora mode only: the company bucket whose `rag/` prefix the DocumentIngestion
   // Lambda watches. Company docs are seeded under `rag/company/{tier}/` here so
   // they are embedded and retrievable (ADR-017). Absent in Athena mode.
-  archiveBucketName?: string;
+  corpusBucketName?: string;
 }
 
 /** A DescribeStacks on a non-existent stack throws a ValidationError whose
@@ -166,23 +172,25 @@ async function getStackOutputs(): Promise<StackOutputs> {
   }
 
   const userPoolId = outputs['UserPoolId'];
-  const bucketName = outputs['AttachmentsBucketName'];
+  const companyBucketName = outputs['CompanyBucketName'];
+  const profileBucketName = outputs['ProfileBucketName'];
   // The Chime stack exports this as `AppInstanceArnOutput`; older
   // builds used `AppInstanceArn`. Accept either so the seed survives
   // an output logical-id rename.
   const appInstanceArn = outputs['AppInstanceArn'] || outputs['AppInstanceArnOutput'];
-  const archiveBucketName = outputs['ArchiveBucketName']; // Aurora mode only
+  // THE RAG CORPUS IS INGESTED IN AURORA MODE ONLY, from the company bucket's `rag/` (the Archive stack says the mode).
+  const corpusBucketName = outputs['AnalyticsMode'] === 'aurora' ? companyBucketName : undefined;
   const clientId = outputs['UserPoolClientId'];
   // The person credential exchange is a route on PersonApi, at its base URL.
   const exchangeUrl = outputs['PersonApiUrl'];
 
-  if (!userPoolId || !bucketName || !appInstanceArn || !clientId || !exchangeUrl) {
-    console.error('Missing required stack outputs:', { userPoolId, bucketName, appInstanceArn, clientId, exchangeUrl });
+  if (!userPoolId || !companyBucketName || !profileBucketName || !appInstanceArn || !clientId || !exchangeUrl) {
+    console.error('Missing required stack outputs:', { userPoolId, companyBucketName, profileBucketName, appInstanceArn, clientId, exchangeUrl });
     console.error('Available outputs:', outputs);
     throw new Error('Deploy the CDK stacks first (e.g. `npm run deploy`).');
   }
 
-  return { userPoolId, bucketName, appInstanceArn, clientId, exchangeUrl, archiveBucketName };
+  return { userPoolId, companyBucketName, profileBucketName, appInstanceArn, clientId, exchangeUrl, corpusBucketName };
 }
 
 async function createDemoUser(
@@ -190,7 +198,9 @@ async function createDemoUser(
   login: { clientId: string; exchangeUrl: string },
   email: string,
   tier: string,
-  displayName: string
+  displayName: string,
+  /** Membership groups beside the tier group: never a clearance group and never `admins`. */
+  extraGroups: string[] = [],
 ): Promise<string> {
   console.log(`  Creating user: ${email} (${tier})`);
 
@@ -256,7 +266,7 @@ async function createDemoUser(
   // Each persona gets its tier group alone: none of them is an administrator. The admin console is
   // driven by a dedicated identity (`testAdmin` from provision-test-users for the e2e, `demoAdmin` from
   // the demo cast for a presenter), and validateIdentity below refuses a persona that holds `admins`.
-  const groups = [tier];
+  const groups = [tier, ...extraGroups];
   for (const group of groups) {
     try {
       await cognitoClient.send(
@@ -530,7 +540,7 @@ async function writeStandardAssistantConfig(): Promise<void> {
 async function writeExampleTemplates(bucketName: string): Promise<void> {
   const deps = { s3: s3Client, ssm: ssmClient, bucket: bucketName, ssmRoot: SSM_ROOT };
   for (const name of PREMIUM_REPORT_TEMPLATES) {
-    const source = fs.readFileSync(path.join(__dirname, '..', 'demo', 'templates', `${name}.md`), 'utf8');
+    const source = fs.readFileSync(path.join(__dirname, '..', '..', 'demo', 'stratum-company', 'templates', `${name}.md`), 'utf8');
     const put = await putTemplate('premium', source, deps);
     const pointer = await readTemplatePointer('premium', put.name, deps);
     if (!pointer) await activateTemplate('premium', put.name, put.contentHash, deps);
@@ -541,7 +551,7 @@ async function writeExampleTemplates(bucketName: string): Promise<void> {
 
 async function writeStratumIntentPacks(bucketName: string): Promise<void> {
   for (const tier of ['basic', 'standard', 'premium'] as const) {
-    // The body to `classification-packs/{tier}/...` in the attachments bucket, then the pointer to the
+    // The body to `classification-packs/{tier}/...` in the profile bucket, then the pointer to the
     // parameter (`writeClassificationPack`), so the pack's size is not the parameter's value limit.
     const wrote = await writeClassificationPack(
       ssmClient, SSM_ROOT, tier, JSON.stringify(stratumIntentPack(tier)), { s3: s3Client, bucket: bucketName }, { ifAbsent: true },
@@ -550,8 +560,8 @@ async function writeStratumIntentPacks(bucketName: string): Promise<void> {
   }
 }
 
-async function uploadContextFiles(bucketName: string): Promise<void> {
-  const contextDir = path.join(__dirname, '..', 'demo', 'context');
+async function uploadContextFiles(bucketName: string, csmPersonByKey: Record<string, string> = {}): Promise<void> {
+  const contextDir = path.join(__dirname, '..', '..', 'demo', 'stratum-company', 'context');
 
   async function uploadDir(dir: string, prefix: string): Promise<number> {
     let count = 0;
@@ -563,8 +573,10 @@ async function uploadContextFiles(bucketName: string): Promise<void> {
       if (entry.isDirectory()) {
         count += await uploadDir(fullPath, `${prefix}${entry.name}/`);
       } else if (entry.name.endsWith('.json')) {
-        const content = fs.readFileSync(fullPath, 'utf-8');
         const key = `${prefix}${entry.name}`;
+        // THE ACCOUNTS RECORD CARRIES EACH CSM'S PERSON ID (`account-teams.ts`), from the people this run signed in.
+        const raw = fs.readFileSync(fullPath, 'utf-8');
+        const content = key === `context/premium/${ACCOUNTS_RECORD}` ? withAccountTeamPeople(raw, csmPersonByKey) : raw;
 
         await s3Client.send(
           new PutObjectCommand({
@@ -590,7 +602,7 @@ async function uploadContextFiles(bucketName: string): Promise<void> {
   // includes standard + basic); stored at context/{classification}/_digest.json, scoped by
   // the SAME IAM prefix boundary as the documents it describes. The `_` prefix
   // keeps it out of company-context document loads.
-  const manifestPath = path.join(__dirname, '..', 'demo', 'context-digest-manifest.json');
+  const manifestPath = path.join(__dirname, '..', '..', 'demo', 'stratum-company', 'context-digest-manifest.json');
   if (fs.existsSync(manifestPath)) {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as {
       documents: Array<{ file: string; tier: 'basic' | 'standard' | 'premium'; title: string; description: string }>;
@@ -622,7 +634,7 @@ async function uploadContextFiles(bucketName: string): Promise<void> {
   // Platform self-knowledge (about AgentEchelon itself) uploads to a SEPARATE
   // prefix so it is never bundled into a company-context load — it is retrieved
   // only via the load_platform_info tool when a user asks about the platform.
-  const platformDir = path.join(__dirname, '..', 'demo', 'platform-knowledge');
+  const platformDir = path.join(__dirname, '..', '..', 'demo', 'stratum-company', 'platform-knowledge');
   if (fs.existsSync(platformDir)) {
     const platformCount = await uploadDir(platformDir, 'platform-knowledge/');
     console.log(`  ✓ ${platformCount} platform-knowledge files uploaded to s3://${bucketName}/platform-knowledge/`);
@@ -634,13 +646,13 @@ async function uploadContextFiles(bucketName: string): Promise<void> {
 /**
  * ADR-017: embed the per-classification company docs for relevance retrieval. Each
  * `demo/context/{classification}/*.json` is uploaded under `rag/company/{classification}/` in the
- * archive bucket; the DocumentIngestion Lambda chunks + embeds it with
+ * company bucket; the DocumentIngestion Lambda chunks + embeds it with
  * `source_type='company'` and the classification stamped from the path, so the router
  * retrieves the relevant company facts per turn (deterministic pre-fetch),
  * classification-scoped by the fail-closed SQL filter. Aurora mode only.
  */
-async function uploadCompanyRag(archiveBucketName: string): Promise<void> {
-  const contextDir = path.join(__dirname, '..', 'demo', 'context');
+async function uploadCompanyRag(corpusBucketName: string): Promise<void> {
+  const contextDir = path.join(__dirname, '..', '..', 'demo', 'stratum-company', 'context');
   let count = 0;
   for (const tierEntry of fs.readdirSync(contextDir, { withFileTypes: true })) {
     if (!tierEntry.isDirectory()) continue;
@@ -650,7 +662,7 @@ async function uploadCompanyRag(archiveBucketName: string): Promise<void> {
       const body = fs.readFileSync(path.join(tierDir, file), 'utf-8');
       await s3Client.send(
         new PutObjectCommand({
-          Bucket: archiveBucketName,
+          Bucket: corpusBucketName,
           Key: `rag/company/${tierEntry.name}/${file}`,
           Body: body,
           ContentType: 'application/json',
@@ -659,7 +671,7 @@ async function uploadCompanyRag(archiveBucketName: string): Promise<void> {
       count++;
     }
   }
-  console.log(`  ✓ ${count} company docs uploaded to s3://${archiveBucketName}/rag/company/ (embedding is async)`);
+  console.log(`  ✓ ${count} company docs uploaded to s3://${corpusBucketName}/rag/company/ (embedding is async)`);
 }
 
 /**
@@ -715,11 +727,12 @@ async function main(): Promise<void> {
 
   // Step 1: Get stack outputs
   console.log('Step 1: Reading CDK stack outputs...');
-  const { userPoolId, bucketName, appInstanceArn, clientId, exchangeUrl, archiveBucketName } = await getStackOutputs();
+  const { userPoolId, companyBucketName, profileBucketName, appInstanceArn, clientId, exchangeUrl, corpusBucketName } = await getStackOutputs();
   console.log(`  ✓ User Pool: ${userPoolId}`);
-  console.log(`  ✓ S3 Bucket: ${bucketName}`);
+  console.log(`  ✓ Company bucket: ${companyBucketName}`);
+  console.log(`  ✓ Profile bucket: ${profileBucketName}`);
   console.log(`  ✓ App Instance: ${appInstanceArn}`);
-  if (archiveBucketName) console.log(`  ✓ Archive Bucket (RAG): ${archiveBucketName}`);
+  if (corpusBucketName) console.log(`  ✓ Corpus Bucket (RAG): ${corpusBucketName}`);
   console.log('');
 
   // Step 2: Create demo users
@@ -746,6 +759,17 @@ async function main(): Promise<void> {
   const unnamed = people.filter((p) => !p.userArn).map((p) => p.email);
   if (unnamed.length) {
     throw new Error(`the credential exchange named no person for ${unnamed.join(', ')}; the e2e acts as the person the exchange names, so fix the exchange and re-run`);
+  }
+  console.log('');
+
+  // Step 2a': THE ACCOUNT TEAMS (`demo/stratum-company/account-teams.ts`): each customer account's CSM as a premium-cleared
+  // person in the account-management group, signed in so the exchange names their person, which the accounts record carries.
+  console.log("Step 2a': Creating the account teams...");
+  const csmPersonByKey: Record<string, string> = {};
+  for (const person of ACCOUNT_TEAM) {
+    const arn = await createDemoUser(userPoolId, { clientId, exchangeUrl }, `${person.local}@${domain}`, 'premium', person.name, [ACCOUNT_TEAM_GROUP, ...(person.lead ? [ACCOUNT_LEAD_GROUP] : [])]);
+    if (arn) csmPersonByKey[person.key] = arn;
+    else console.warn(`  ! ${person.name} has no person yet; their accounts carry no csmPerson until a re-run names one`);
   }
   console.log('');
 
@@ -793,15 +817,15 @@ async function main(): Promise<void> {
   // and a one-page executive summary; every other classification's reports follow the platform's
   // `report` template, which the deploy writes (HOW-TO-ADD-OR-MANAGE-A-PROFILE, "Document templates").
   console.log('Step 2c-iv: Storing the premium report templates...');
-  await writeExampleTemplates(bucketName);
+  await writeExampleTemplates(profileBucketName);
   // The workflow that offers them, on the parameter a classification's machines are read from. The same
   // pack the version carries, so the two cannot disagree about the taxonomy. Write-if-absent, so an
   // operator's `-c assistantIntentPack` is never clobbered.
   const wrotePremiumPack = await writeClassificationPack(
-    ssmClient, SSM_ROOT, 'premium', JSON.stringify(stratumIntentPack('premium')), { s3: s3Client, bucket: bucketName }, { ifAbsent: true },
+    ssmClient, SSM_ROOT, 'premium', JSON.stringify(stratumIntentPack('premium')), { s3: s3Client, bucket: profileBucketName }, { ifAbsent: true },
   );
   console.log(wrotePremiumPack
-    ? `  ✓ premium intent pack (its report workflow's template choice) → s3://${bucketName}/classification-packs/premium/`
+    ? `  ✓ premium intent pack (its report workflow's template choice) → s3://${profileBucketName}/classification-packs/premium/`
     : '  - premium intent pack already set - leaving it');
   console.log('');
 
@@ -815,28 +839,33 @@ async function main(): Promise<void> {
   // rather than the generic default. The parameter is still written (below) as the deployment seam
   // for a deploy that runs no versioned profile - it is the fallback now, not the source of truth.
   console.log('Step 2d: Seeding active profile definitions to SSM...');
-  // The attachments bucket doubles as the profile BODY store, so each persona is written to
+  // The profile bucket is the profile BODY store, so each persona is written to
   // `profiles/{name}/{configId}/persona` and the parameter carries a pointer. Resolved from the stack
   // outputs rather than an env var: this runs as an operator script, not in a Lambda, so there is no
-  // PROFILE_BODY_BUCKET/CONTEXT_BUCKET in its environment to fall back to.
+  // PROFILE_BODY_BUCKET in its environment.
   // The intent pack is folded in the same way, and it matters more here than the persona does: the
   // `assistant-intent-pack` parameter above is write-if-absent and its CDK writer only exists under
   // `-c assistantIntentPack`, so on a deployment that passes neither, editing `stratumIntentPack()` in
   // code can never reach SSM. On the version it can, and it converges within the profile cache TTL.
+  // THE OPS ROOMS' WORKFLOWS FOLLOW THE OPS ROLE. An `ops` room names the ops assistant, so a primary declaring workflows
+  // for it while no ops role is deployed lists rooms the deployment cannot open. Seeded only where the role's assignment
+  // exists; `npm run ops-workflows -- add` puts the primary's on once `npm run add-assistant-role` has deployed it.
+  const opsRoleDeclared = await ssmClient.send(new GetParameterCommand({ Name: `${SSM_ROOT}/assistant-assignments/premium/ops/assistants/ops-premium` }))
+    .then(() => true, (err: any) => { if (err?.name === 'ParameterNotFound') return false; throw err; });
+  if (!opsRoleDeclared) console.log("  - no ops role on this deployment: the ops rooms' workflows are left off (npm run ops-workflows -- add, once it is)");
+  // THE OPS ASSISTANT IS NOT SEEDED HERE. Its first version is imported from its shipped manifest when it is created
+  // (`demo/portable-assistants/ops-assistant-manifest.ts`, SPEC-PORTABLE-PROFILES FR14), so its definition reaches a deployment through
+  // the profile API's import, and a rerun of this seed never overwrites what that import, or a team since, activated.
+  console.log(`  - ${OPS_ASSISTANT} is not seeded here: its first version is imported from its shipped manifest (validate.mjs runs npm run ops-assistant -- import --if-deployed after this, and npm run add-assistant-role -- ops-premium runs it too)`
+    + (opsRoleDeclared ? ' (rerun it with npm run ops-assistant -- import)' : ''));
   for (const r of await seedAllProfileDefinitions(ssmClient, SSM_ROOT, {
     concierge: BASIC_PERSONA,
     analyst: STANDARD_PERSONA,
     advisor: PREMIUM_PERSONA,
-    // THE `ops` ROLE'S ASSISTANT, keyed by profile name like every other entry here - which is the only
-    // way it CAN be keyed: it is a second assistant inside `premium`, so there is no classification to
-    // hang it on. Without these two entries it had an identity, a Lex bot and an assignment record, and answered in
-    // premium's built-in tier voice with premium's taxonomy (see demo/personas.ts OPS_PERSONA).
-    'ops-premium': OPS_PERSONA,
-  }, { bucket: bucketName }, {
+  }, { bucket: profileBucketName }, {
     concierge: stratumIntentPack('basic'),
     analyst: stratumIntentPack('standard'),
     advisor: stratumIntentPack('premium'),
-    'ops-premium': opsIntentPack(),
   }, {
     // The assistant's opening differs by what the assistant can reach - see demo/onboarding.ts. Seeded
     // onto the version for the same reason the pack is: the per-deployment parameter is one config for
@@ -851,36 +880,29 @@ async function main(): Promise<void> {
     concierge: BASIC_BOUNDARY,
     analyst: STANDARD_BOUNDARY,
     advisor: PREMIUM_BOUNDARY,
-    // The ops role's assistant, which was missing from this map and from the onboarding one above while
-    // it had a persona and a pack - so it could say what it recognizes and not what it cannot reach.
-    'ops-premium': OPS_BOUNDARY,
   }, {
     // WELCOME WORKFLOWS (W1), and only for the assistants that need their own.
     //
     // The three primaries' ordinary openings are their classification's parameter, seeded above; a copy here
-    // would be two sources for one sentence. 'ops-premium' is the case this map exists for: the premium
-    // parameter is the ADVISOR's copy, so before this the ops assistant opened by introducing itself as
-    // the Stratum leadership assistant and offering to compile ARR reports, one second after the primary
-    // had said the same words. show-ops-rollout.mjs reports the cause in its own output.
-    // The premium PRIMARY gets welcomes for the ops rooms ONLY - none for an ordinary room, so its
-    // normal opening stays the classification parameter that was written for it.
-    advisor: ADVISOR_WELCOME,
-    'ops-premium': OPS_WELCOME,
-  })) {
+    // would be two sources for one sentence. The premium PRIMARY gets welcomes for the ops rooms ONLY - none for an
+    // ordinary room, so its normal opening stays the classification parameter that was written for it. The ops
+    // assistant's own welcomes ride its manifest.
+    ...(opsRoleDeclared ? { advisor: ADVISOR_WELCOME } : {}),
+  }, [OPS_ASSISTANT])) {
     console.log(`  ✓ ${r.profileName} definition v${r.version} labeled active`);
   }
   console.log('');
 
   // Step 3: Upload context files
   console.log('Step 3: Uploading context files to S3...');
-  await uploadContextFiles(bucketName);
+  await uploadContextFiles(companyBucketName, csmPersonByKey);
   // ADR-017: also embed company docs for retrieval. Upload them under
-  // rag/company/{tier}/ in the archive bucket; the DocumentIngestion Lambda
+  // rag/company/{tier}/ in the company bucket; the DocumentIngestion Lambda
   // chunks + embeds them (tier stamped from the path) so the router retrieves
-  // the relevant company facts per turn. Aurora mode only (no archive bucket
+  // the relevant company facts per turn. Aurora mode only (no ingestion
   // otherwise); the load_company_context tool remains the fallback.
-  if (archiveBucketName) {
-    await uploadCompanyRag(archiveBucketName);
+  if (corpusBucketName) {
+    await uploadCompanyRag(corpusBucketName);
     // The PLATFORM corpus (the repo's own docs, for "how does AgentEchelon work?") is deliberately
     // NOT uploaded here: it is generated from the docs tree, which a deployed instance does not have,
     // so it is its own deploy-time step. Say so at the point the operator is already looking at RAG,
@@ -912,9 +934,9 @@ async function main(): Promise<void> {
   }
   console.log('');
   console.log('  Context files uploaded to:');
-  console.log(`    s3://${bucketName}/context/basic/`);
-  console.log(`    s3://${bucketName}/context/standard/`);
-  console.log(`    s3://${bucketName}/context/premium/`);
+  console.log(`    s3://${companyBucketName}/context/basic/`);
+  console.log(`    s3://${companyBucketName}/context/standard/`);
+  console.log(`    s3://${companyBucketName}/context/premium/`);
   console.log('');
 }
 
@@ -926,7 +948,7 @@ function printDryRun(): void {
   console.log(`  reads outputs   ${prefix}Identity, ${prefix}Conversations, ${prefix}Messaging and ${prefix}Archive`);
   console.log('  users           basic@, standard@, premium@ the demo domain (each in its tier group only, none in admins), each signed in through the credential exchange');
   console.log(`  writes secret   ${TEST_SECRET_NAME}: basicUser, standardUser, premiumUser with each userArn, merged; testAdmin kept from provision-test-users`);
-  console.log(`  writes SSM      welcome orientation, onboarding intake, the standard persona (if absent), each profile's active definition`);
+  console.log(`  writes SSM      welcome orientation, onboarding intake, the standard persona (if absent), each profile's active definition except ${OPS_ASSISTANT}'s, which npm run add-assistant-role -- ops-premium imports`);
   console.log('  uploads         classification context files, and the company RAG corpus in Aurora mode');
 }
 

@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import DataTable from './DataTable';
 import { fetchAccessLog, type AccessLogRecord } from '../../services/accessLogService';
-import { accessKind, accessExpiry, accessAssistant } from './accessLogRow';
+import { accessActor, accessKind, accessExpiry, accessAssistant, accessOutcome, accessScope, reasonRequired, refusalOf, servedOnConsoleSession } from './accessLogRow';
+import { usePersonNames } from './usePersonNames';
 import { useConsoleAccess } from '../../capabilities';
 import { useTeamName } from './TeamSelector';
 
@@ -14,6 +15,9 @@ function shortId(arn: string | null): string {
 }
 
 const DAY_CHOICES = [1, 7, 30, 90, 400] as const;
+/** The outcome badges' class lists, built rather than written as one literal, as the other tabs build theirs. */
+const GRANTED_BADGE = ['badge', 'badge-success'].join(' ');
+const REFUSED_BADGE = ['badge', 'badge-error'].join(' ');
 
 /**
  * WHAT THIS SIGN-IN REACHES (SPEC-ADMIN-CONSOLE FR0e), in the two forms the exchange enforces: what the
@@ -48,12 +52,12 @@ const YourAccess: React.FC = () => {
           : t('admin.accessLog.yourAccess.role', { role: t(`admin.access.role.${access.role}`) })}
       </p>
       <div>
-        <h5>{t('admin.accessLog.yourAccess.held', { count: held.length })}</h5>
+        <h4>{t('admin.accessLog.yourAccess.held', { count: held.length })}</h4>
         {list(held, 'access-log-held')}
       </div>
       {vended.length > 0 && (
         <div>
-          <h5>{t('admin.accessLog.yourAccess.onRequest', { count: vended.length, minutes: Math.round(onRequest.ttlSeconds / 60) })}</h5>
+          <h4>{t('admin.accessLog.yourAccess.onRequest', { count: vended.length, minutes: Math.round(onRequest.ttlSeconds / 60) })}</h4>
           {list(vended, 'access-log-on-request')}
         </div>
       )}
@@ -63,8 +67,10 @@ const YourAccess: React.FC = () => {
 
 /**
  * THE ACCESS LOG (ADR-052, SPEC-ADMIN-CONSOLE 3.3, FR30): who was given access to which conversation,
- * when, and the reason they stated. The exchange writes a record for every credential it vends, before
- * the credential is returned, and opening this tab is recorded the same way.
+ * when, and the reason they stated, and every access the credential exchanges refused. The exchange writes
+ * a record for every credential it vends, before the credential is returned, and one for every request it
+ * refuses; opening this tab is recorded the same way. Each row states its outcome, and a refused row the
+ * refusal's code.
  */
 const AccessLogTab: React.FC = () => {
   const { t } = useTranslation();
@@ -74,6 +80,8 @@ const AccessLogTab: React.FC = () => {
   const [actor, setActor] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // The log names a person by their id; their name is shown beside it where this role may be told it.
+  const names = usePersonNames('AccessLogTab');
 
   const load = useCallback(async (filter: { days: number; channelId: string; actor: string }) => {
     setIsLoading(true);
@@ -98,7 +106,7 @@ const AccessLogTab: React.FC = () => {
   return (
     <div className="admin-tab">
       <div className="admin-tab-header">
-        <h3>{t('admin.accessLog.title')}</h3>
+        <h2>{t('admin.accessLog.title')}</h2>
       </div>
       <p className="admin-tab-description" style={{ maxWidth: 640 }}>{t('admin.accessLog.description')}</p>
 
@@ -137,7 +145,40 @@ const AccessLogTab: React.FC = () => {
           emptyMessage={t('admin.accessLog.empty')}
           columns={[
             { key: 'at', label: t('admin.accessLog.when'), render: (v) => new Date(String(v)).toLocaleString() },
-            { key: 'actor', label: t('admin.accessLog.person'), render: (v) => <span className="font-mono">{String(v)}</span> },
+            {
+              // GRANTED OR REFUSED, and for a refusal what the exchange answered: its code, or its status.
+              key: 'outcome', label: t('admin.accessLog.outcome.label'),
+              render: (_v, row) => {
+                const r = row as unknown as AccessLogRecord;
+                if (accessOutcome(r) === 'granted') return <span className={GRANTED_BADGE}>{t('admin.accessLog.outcome.granted')}</span>;
+                const refusal = refusalOf(r);
+                return (
+                  <span data-testid="access-log-refused">
+                    <span className={REFUSED_BADGE}>{t('admin.accessLog.outcome.refused')}</span>
+                    {refusal && ' '}
+                    {refusal && ('code' in refusal
+                      ? <code>{refusal.code}</code>
+                      : t('admin.accessLog.outcome.status', { status: refusal.status }))}
+                  </span>
+                );
+              },
+            },
+            {
+              key: 'actor', label: t('admin.accessLog.person'),
+              render: (_v, row) => {
+                // A READER THAT IS NOT A PERSON is the IAM principal that signed the request, shown by its role's name.
+                const who = accessActor(row as unknown as AccessLogRecord);
+                if (!who) return t('admin.accessLog.noPerson');
+                if (who.kind === 'iam') {
+                  return <span data-testid="access-log-iam-actor" title={who.arn}>{t('admin.accessLog.iamActor', { name: who.name })}</span>;
+                }
+                const id = who.id;
+                const name = names.get(id);
+                return name
+                  ? <span data-testid="access-log-person">{name} <span className="admin-field-hint"><span className="font-mono">{id}</span></span></span>
+                  : <span className="font-mono">{id}</span>;
+              },
+            },
             {
               // WHAT KIND OF ACCESS, in words: a temporary moderation credential, a temporary read, a team
               // member's read through their assistant, a de-identified read (`accessLogRow.ts`).
@@ -156,17 +197,44 @@ const AccessLogTab: React.FC = () => {
               render: (v) => <span className="font-mono" title={String(v ?? '')}>{shortId((v as string | null) ?? null)}</span>,
             },
             {
+              // WHAT THE ACCESS WAS NARROWED TO beyond the conversation: a sign-in's role, the assistant a team
+              // read through, the classifications a content read reached, and the query it ran.
+              key: 'scope', label: t('admin.accessLog.scope.label'), sortable: false,
+              render: (_v, row) => {
+                const s = accessScope(row as unknown as AccessLogRecord);
+                const parts = [
+                  s.role ? t('admin.accessLog.scope.role', { role: s.role }) : null,
+                  s.assistant ? t('admin.accessLog.scope.assistant', { assistant: s.assistant }) : null,
+                  s.classifications ? t('admin.accessLog.scope.classifications', { classifications: s.classifications }) : null,
+                  s.query ? t('admin.accessLog.scope.query', { query: s.query }) : null,
+                ].filter(Boolean);
+                return parts.join(' · ');
+              },
+            },
+            {
               key: 'capabilities', label: t('admin.accessLog.capabilities'), sortable: false,
               render: (v) => (Array.isArray(v) ? v.map((c) => t(`admin.accessLog.allows.${String(c)}`, { defaultValue: String(c) })).join(', ') : ''),
             },
             {
               key: 'expires', label: t('admin.accessLog.expires'), sortable: false,
               render: (_v, row) => {
-                const until = accessExpiry(row as unknown as AccessLogRecord);
-                return until ? until.toLocaleString() : t('admin.accessLog.notTimed');
+                const r = row as unknown as AccessLogRecord;
+                if (accessOutcome(r) === 'refused') return t('admin.accessLog.notGranted');
+                const until = accessExpiry(r);
+                if (until) return until.toLocaleString();
+                return t(servedOnConsoleSession(r) ? 'admin.accessLog.onConsoleSession' : 'admin.accessLog.notTimed');
               },
             },
-            { key: 'reason', label: t('admin.accessLog.reason'), sortable: false, render: (v) => (v ? String(v) : t('admin.accessLog.noReason')) },
+            {
+              key: 'reason', label: t('admin.accessLog.reason'), sortable: false,
+              // The no-reason label is only for an access that asks for none; a reason-gated record without one says so.
+              render: (v, row) => {
+                if (v) return String(v);
+                const r = row as unknown as AccessLogRecord;
+                if (accessOutcome(r) === 'refused') return t('admin.accessLog.noReasonGiven');
+                return t(reasonRequired(r) ? 'admin.accessLog.reasonNotRecorded' : 'admin.accessLog.noReason');
+              },
+            },
           ]}
         />
       )}

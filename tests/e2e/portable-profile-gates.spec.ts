@@ -34,6 +34,7 @@ import { signedAnalyticsPost } from './helpers/signed-analytics';
 import { getAdminUser, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 import { ADMIN_API_URL, adminUrl, profileActionUrl } from './helpers/api-urls';
+import { replacingDraft, draftIdOf } from './helpers/profile-draft';
 
 const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || process.env.E2E_BASE_URL || 'http://localhost:5174';
 test.use({ baseURL: ADMIN_BASE_URL });
@@ -87,7 +88,7 @@ test.describe.serial('portable profile write-path gates', () => {
     test.setTimeout(120_000);
     await page.goto('/?admin=profiles');
 
-    await expect(page.locator('h3:has-text("Assistants")')).toBeVisible({ timeout: 20000 });
+    await expect(page.locator('h2:has-text("Assistants")')).toBeVisible({ timeout: 20000 });
     await expect(page.locator('.admin-tab-loading')).toHaveCount(0, { timeout: 20000 });
 
     // The Assistants list is the tab's one table: every assistant, however it was created.
@@ -105,8 +106,8 @@ test.describe.serial('portable profile write-path gates', () => {
     test.setTimeout(180_000);
 
     const bogus = 'x-e2e-key-that-is-not-published';
-    await api(idToken, '/version', { profileName: PROFILE });
-    await api(idToken, '/draft', { profileName: PROFILE, patch: { contextSources: [bogus] } });
+    const started = await replacingDraft((b) => api(idToken, '/version', b), { profileName: PROFILE });
+    const edited = await api(idToken, '/draft', { profileName: PROFILE, patch: { contextSources: [bogus] }, configId: draftIdOf(started) });
 
     const validated = await api(idToken, '/validate', { profileName: PROFILE });
     const seen = JSON.stringify(validated);
@@ -119,7 +120,7 @@ test.describe.serial('portable profile write-path gates', () => {
     expect(validated.valid, 'the draft must not be reported valid').toBe(false);
 
     // Activation must refuse too: a caller can skip validate entirely, so it is the real gate.
-    const activated = await api(idToken, '/activate', { profileName: PROFILE });
+    const activated = await api(idToken, '/activate', { profileName: PROFILE, configId: draftIdOf(edited) });
     expect(
       JSON.stringify(activated),
       'activate accepted a version naming an unpublished context key',
@@ -129,14 +130,14 @@ test.describe.serial('portable profile write-path gates', () => {
   test('a persona LARGER than the definition parameter is accepted, because the body is not in it', async () => {
     test.setTimeout(180_000);
 
-    await api(idToken, '/version', { profileName: PROFILE });
+    const started = await replacingDraft((b) => api(idToken, '/version', b), { profileName: PROFILE });
     // Comfortably over the 4096-character limit the definition parameter has, comfortably inside the
     // 20000-character persona cap. This exact edit used to be REJECTED, and this test used to assert
     // the rejection: the persona rode inside the parameter, so the parameter's limit was the persona's
     // limit. It is not any more - the body is stored in S3 and the definition carries a pointer
     // (SPEC-PORTABLE-PROFILES, "Where it lives"), which is the whole point of the indirection.
     const persona = `E2E oversize persona. ${'x'.repeat(6000)}`;
-    const edited = await api(idToken, '/draft', { profileName: PROFILE, patch: { persona } });
+    const edited = await api(idToken, '/draft', { profileName: PROFILE, patch: { persona }, configId: draftIdOf(started) });
 
     expect(
       JSON.stringify(edited),
@@ -162,10 +163,11 @@ test.describe.serial('portable profile write-path gates', () => {
     // remove the limit. MAX_PERSONA_LENGTH (20000) still bounds what a version may carry, so an
     // import or edit cannot smuggle an unbounded prompt into a turn. Asserted on the EDIT because
     // that is where the operator's change is, and a bare 500 here would name neither field nor size.
-    await api(idToken, '/version', { profileName: PROFILE });
+    const started = await replacingDraft((b) => api(idToken, '/version', b), { profileName: PROFILE });
     const edited = await api(idToken, '/draft', {
       profileName: PROFILE,
       patch: { persona: `E2E past the cap. ${'x'.repeat(21000)}` },
+      configId: draftIdOf(started),
     });
 
     expect(
@@ -188,7 +190,7 @@ test.describe.serial('portable profile write-path gates', () => {
     // the call. A rollback that swallowed its own errors is how a test persona was once left live on
     // this deployment. Nothing here ever activated, so the active version is untouched either way.
     if (!idToken) return;
-    await api(idToken, '/version', { profileName: PROFILE });
+    await replacingDraft((b) => api(idToken, '/version', b), { profileName: PROFILE });
     const check = await api(idToken, '/validate', { profileName: PROFILE });
     expect(
       check.valid,

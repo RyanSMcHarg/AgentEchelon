@@ -97,7 +97,8 @@ describe('an answer is not half-delivered and then called stopped', () => {
     expect(stopIdx).toBeGreaterThan(-1);
     expect(stopIdx).toBeLessThan(deliverIdx);
     expect(src).toContain('suppressContinuations?: boolean,');
-    expect(src).toMatch(/if \(!suppressContinuations\) \{\s*try \{[\s\S]{0,200}await sendContinuations\(/);
+    // A stopped turn has no continuations to post: `handleLongResponse` returns none for the caller to send.
+    expect(src).toMatch(/const postContinuations = suppressContinuations \? undefined : async \(\): Promise<void> => \{\s*try \{[\s\S]{0,200}await sendContinuations\(/);
   });
 });
 

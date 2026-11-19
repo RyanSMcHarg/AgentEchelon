@@ -14,17 +14,20 @@
  *     name }`: return the assistant's template of that name, one it rewords or one of its own, to the version active
  *     before.
  *
- * WHAT IS WRITTEN IS BOUNDED THREE WAYS. The key is built here from the assistant the route names, never from
+ * WHAT IS WRITTEN IS BOUNDED FOUR WAYS. The key is built here from the assistant the route names, never from
  * the body, so a write lands only in `templates/<classification>/_assistants/<assistant>/`. This function's
  * role may write that family in every classification and nothing else under `templates/` (the classification's
- * and the shipped families are refused at IAM). And a team member's session reaches only the assistants their
- * team owns (`teamSessionPolicy`), which `requireOwnedAssistant` reads again here. A source is stored only when
+ * and the shipped families are refused at IAM). A team member's session reaches only the assistants their
+ * team owns (`teamSessionPolicy`), which `requireOwnedAssistant` reads again here. And a team route writes on its
+ * team writer session (`team-scoped-writer.ts`), whose grants name the path's assistant's family alone, so IAM
+ * refuses a write into another assistant's family whatever this handler decided. A source is stored only when
  * it names a template the platform ships, parses, and fits that template's call site (`storedTemplateMisfit`),
  * so a saved rewording can never ask a call site for a value it does not supply.
  */
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { callerActor, callerCanManageProfiles, parseJsonBody, respond as authRespond } from './lib/auth.js';
-import { requireOwnedAssistant, isRefusal } from './lib/assistant-scope.js';
+import { requireOwnedAssistant, isRefusal, scopedAssistant, refuseTeamSessionOnAdminRoute } from './lib/assistant-scope.js';
+import { onTeamRoute, TeamWriterRefused } from './lib/team-scoped-writer.js';
 import { listAssistantIdentities, type AssistantIdentity } from './lib/assistant-ownership.js';
 import { chimeIdentityClient } from './lib/chime/clients.js';
 import { loadProfileRegistry } from '../../lib/profile-registry';
@@ -165,6 +168,9 @@ export async function handleTemplates(event: APIGatewayProxyEvent, deps: Templat
   const actor = await callerActor(event);
   if (!actor) return respond(401, { error: 'Unauthorized' });
   if (!callerCanManageProfiles(event)) return respond(403, { error: 'manage-profiles capability required' });
+  // A TEAM SESSION WRITES ONLY ON ITS TEAM ROUTE, never on the administrator's, where the body names the assistant.
+  const offRoute = refuseTeamSessionOnAdminRoute(event, origin);
+  if (offRoute) return offRoute;
 
   // THE TEAM ROUTE NAMES ITS ASSISTANT, and the caller's team must own it. A body naming another is refused.
   const scope = await (deps.scope ?? requireOwnedAssistant)(event, origin);
@@ -221,6 +227,10 @@ export async function handleTemplates(event: APIGatewayProxyEvent, deps: Templat
     return respond(404, { error: 'Not found' });
   } catch (err) {
     if (err instanceof TemplateReferenceError) return respond(409, { error: err.message.replace(/^\[TemplateStore\] /, '') });
+    if (err instanceof TeamWriterRefused) {
+      console.error('[manage-message-templates] the team writer session could not be opened', { assistant, reason: err.reason });
+      return respond(503, { error: 'The team\'s write session could not be opened; nothing was written', code: 'TEAM_WRITER_UNAVAILABLE' });
+    }
     console.error('[manage-message-templates] failed', { assistant, err: (err as Error)?.name, message: (err as Error)?.message });
     return respond(500, { error: 'The templates could not be read or written' });
   }
@@ -229,5 +239,7 @@ export async function handleTemplates(event: APIGatewayProxyEvent, deps: Templat
 export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
   // The deployment's set, read at runtime from the rows its stacks publish: the ownership check reads it.
   await loadProfileRegistry();
-  return handleTemplates(event);
+  // A TEAM ROUTE WRITES AS ITS PATH'S ASSISTANT: the store's writes go out on the team writer session, whose grants
+  // name that assistant's family alone, behind the ownership check `handleTemplates` makes.
+  return onTeamRoute(scopedAssistant(event), () => handleTemplates(event));
 };

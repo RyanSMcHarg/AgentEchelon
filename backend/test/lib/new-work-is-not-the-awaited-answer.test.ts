@@ -101,7 +101,35 @@ describe('the router applies the rule to both waiting lookups', () => {
 
   it('one helper asks the rule for both waiting lookups, and reads the duel only when the rule sets a task aside', () => {
     expect(router.match(/opensOtherWorkThan\(\{/g)?.length).toBe(1);
-    expect(router).toMatch(/inADuel: false,\s*\}\) && !\(await inADuel\(\)\);/);
+    expect(router).toMatch(/inADuel: false,\s*\}\);\s*return other && !\(await inADuel\(\)\);/);
+  });
+
+  it("the classifier's decision on a task it was offered comes first; the rule decides only where it was not offered", () => {
+    expect(router).toContain('const placed = placementSetsAside(classification, task, { opens: turnOpensOtherWorkKey(), keptHere: turnKeptHereAs() });');
+    expect(router).toMatch(/const other = placed !== undefined\s*\? placed\s*: opensOtherWorkThan\(\{/);
+  });
+
+  it("a placement elsewhere that names the waiting task's own work continues that task, so no second one of its kind opens", () => {
+    const { placementSetsAside } = require('../../lambda/src/router-agent-handler');
+    const A = { taskId: 'task-a', taskType: 'report_generation' };
+    expect(placementSetsAside({ waitingWorkDecided: ['task-a'] }, A, { opens: 'report_generation', keptHere: 'report_generation' })).toBe(false);
+    expect(placementSetsAside({ waitingWorkDecided: ['task-a'] }, A, { opens: 'data_extraction', keptHere: 'data_extraction' })).toBe(true);
+    expect(placementSetsAside({}, A, { keptHere: 'report_generation' })).toBeUndefined();
+  });
+
+  it("a message the classifier placed in one of two waiting tasks of a kind is that one's, never the newer one's", () => {
+    const { placementSetsAside } = require('../../lambda/src/router-agent-handler');
+    const newer = { taskId: 'task-a', taskType: 'report_generation' };
+    const older = { taskId: 'task-b', taskType: 'report_generation' };
+    const decision = { waitingWorkDecided: ['task-a', 'task-b'], continuesTask: { taskId: 'task-b', taskType: 'report_generation' } };
+    const turn = { opens: 'report_generation', keptHere: 'report_generation' };
+    expect(placementSetsAside(decision, newer, turn)).toBe(true);
+    expect(placementSetsAside(decision, older, turn)).toBe(false);
+  });
+
+  it('a turn that continues an offered task is recorded as continuing it, whether the classifier named its place or its label', () => {
+    expect(router).toContain("return routed ? { routedAs: routed === 'own_intent' && continued ? 'continues_task' as const : routed } : {};");
+    expect(router).toContain('const continued = !isNewTaskForBattle && activeTask && classification.waitingWorkDecided?.includes(activeTask.taskId);');
   });
 
   it('every caller reads the same rule, roommate keys included', () => {

@@ -91,7 +91,7 @@ describe('(a) a failed ingest fails the invocation, so the asynchronous invoke r
       const { testMessageStream } = await import('../helpers/synth');
       retry = DOCUMENT_INGESTION_RETRY;
       const app = new cdk.App();
-      const stack = new ArchiveStackAurora(app, 'TestIngestRetry', {
+      const stack = new ArchiveStackAurora(app, 'TestIngestRetry', { companyBucketArn: 'arn:aws:s3:::test-company-bucket',
         env: { account: '123456789012', region: 'us-east-1' },
         appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
         messageStream: testMessageStream(app),

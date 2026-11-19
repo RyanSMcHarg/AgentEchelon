@@ -54,6 +54,8 @@ function statementsOf(app: Synthesized): Array<{ stack: string; id: string; role
   return out;
 }
 const actionsOf = (s: Statement): string[] => list(s.Action).map(String);
+/** A membership CHANGE. `DescribeChannelMembership` is a read: the caller's own membership, looked up as them. */
+const MEMBERSHIP_CHANGE = /(Create|Delete)ChannelMembership$/;
 
 describe('a member-side role never reaches an outside conversation', () => {
   let app: Synthesized;
@@ -78,14 +80,14 @@ describe('a member-side role never reaches an outside conversation', () => {
   ])('%s is denied its membership changes on an outside conversation and on one with no audience', (_name, stack, role) => {
     const statements = onRole(stack, role);
     const allowedOnChannels = statements.filter(({ s }) => s.Effect === 'Allow' && list(s.Resource).some((r) => String(r).endsWith('/channel/*') || JSON.stringify(r).includes('/channel/*'))
-      && actionsOf(s).some((a) => /ChannelMembership$/.test(a)));
+      && actionsOf(s).some((a) => MEMBERSHIP_CHANGE.test(a)));
     expect(allowedOnChannels.length).toBeGreaterThan(0);
     const outside = statements.filter(({ s }) => s.Effect === 'Deny' && s.Condition?.StringEquals?.[AUDIENCE] === 'outside');
     const absent = statements.filter(({ s }) => s.Effect === 'Deny' && s.Condition?.Null?.[AUDIENCE] === 'true');
     // Every membership change the role holds on a channel is covered by both denials.
     const denied = (ds: typeof outside) => new Set(ds.flatMap(({ s }) => actionsOf(s)));
     for (const { s } of allowedOnChannels) {
-      for (const a of actionsOf(s).filter((x) => /ChannelMembership$/.test(x))) {
+      for (const a of actionsOf(s).filter((x) => MEMBERSHIP_CHANGE.test(x))) {
         expect(denied(outside).has(a)).toBe(true);
         expect(denied(absent).has(a)).toBe(true);
       }

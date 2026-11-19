@@ -105,15 +105,18 @@ jest.mock('../../lambda/src/lib/conversation-primary', () => {
     } catch { /* the suite mocks no tags */ }
     return process.env.CLASSIFICATION || 'premium';
   };
+  const tagMemo = new Map<string, any>();
   return {
     __esModule: true,
     PRIMARY_TAG,
     PRIMARY_ROLE: 'primary',
     RoomHasNoPrimary,
     __resetRoomPrimaryCache: () => undefined,
-    // A real memo, so a suite that queues one tag read per request sees one.
+    // A real memo, one per module registry like the container's, shared by every reader it hands out: a suite
+    // that queues one tag read per conversation sees one, whichever reader asked.
+    tagMemoHolds: (arn: string) => tagMemo.has(arn),
     memoizedTagReader: (client: { send: (c: any) => Promise<any> }) => {
-      const memo = new Map<string, any>();
+      const memo = tagMemo;
       return {
         send: async (cmd: any) => {
           const arn = cmd?.input?.ResourceARN || '';

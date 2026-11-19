@@ -36,7 +36,14 @@ const firehose = new FirehoseClient({});
 const ssm = new SSMClient({});
 
 let dataPlaneResolved = false;
-/** Resolve the Aurora data plane's ARN from its SSM parameter, once; absent in Athena mode. */
+/**
+ * Resolve the Aurora data plane's ARN from its SSM parameter, once per container. THE ONE RESOLVER: every writer and
+ * reader that chooses between the projection and the archive alone calls this.
+ *
+ * Only an ANSWER is remembered. A parameter that does not exist is Athena mode, and that is the answer. A read that
+ * failed (throttled, denied, the service unreachable) is not an answer: it throws and is not remembered, so the caller's
+ * retry reads it again and a container is never left choosing the wrong store for its lifetime.
+ */
 export async function ensureDataPlaneArn(): Promise<void> {
   if (dataPlaneResolved || process.env.AURORA_DATA_PLANE_ARN) { dataPlaneResolved = true; return; }
   const paramName = process.env.AURORA_DATA_PLANE_ARN_PARAM;
@@ -44,7 +51,9 @@ export async function ensureDataPlaneArn(): Promise<void> {
   try {
     const r = await ssm.send(new GetParameterCommand({ Name: paramName }));
     if (r.Parameter?.Value) process.env.AURORA_DATA_PLANE_ARN = r.Parameter.Value;
-  } catch { /* absent (Athena mode) -> Firehose */ }
+  } catch (err) {
+    if ((err as { name?: string })?.name !== 'ParameterNotFound') throw err;
+  }
   dataPlaneResolved = true;
 }
 
@@ -54,13 +63,20 @@ async function deliverToFirehose(
   if (records.length === 0) return { delivered: 0, dropped: 0 };
   const stream = process.env.CLIENT_EVENTS_DELIVERY_STREAM || '';
   if (!stream) throw new Error('CLIENT_EVENTS_DELIVERY_STREAM not configured');
+  // The wrapper carries the partition key, so the Firehose MetadataExtraction processor routes it to its prefix
+  // (event_type=... for events, performance).
+  return putArchiveLines(stream, records.map(({ partitionKey, payload }) => ({ partitionKey, ...payload })));
+}
 
-  // Each record becomes one S3 line. The wrapper carries the partition key, so the Firehose
-  // MetadataExtraction processor routes it to its prefix (event_type=... for events, performance).
+/**
+ * Put objects to an archive delivery stream, one S3 line each. A line over {@link MAX_RECORD_BYTES} is dropped and
+ * counted, and so is a record the stream refused. Every archive family's writer delivers through here.
+ */
+export async function putArchiveLines(stream: string, lines: object[]): Promise<{ delivered: number; dropped: number }> {
   let dropped = 0;
   const safe: _Record[] = [];
-  for (const { partitionKey, payload } of records) {
-    const data = new TextEncoder().encode(JSON.stringify({ partitionKey, ...payload }) + '\n');
+  for (const line of lines) {
+    const data = new TextEncoder().encode(JSON.stringify(line) + '\n');
     if (data.byteLength > MAX_RECORD_BYTES) dropped++;
     else safe.push({ Data: data });
   }

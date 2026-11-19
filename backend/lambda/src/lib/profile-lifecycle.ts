@@ -18,16 +18,18 @@ import {
   GetParameterCommand,
   GetParameterHistoryCommand,
   PutParameterCommand,
-  LabelParameterVersionCommand,
   DeleteParameterCommand,
 } from '@aws-sdk/client-ssm';
 import { ssmJsonValue } from './ssm-json-value.js';
 import type { BackendModelDefinition, BackendModelKey, RouteKey } from '../../../lib/config/model-strategy.js';
 import { defaultProfileRegistry } from '../../../lib/profile-registry';
 import { SSM_STANDARD_TIER_MAX } from './seed-profile-definitions.js';
-import { offloadBodies, hydrateBodies, bodyBucket, withLayout } from './profile-bodies.js';
+import { offloadBodies, hydrateBodies, bodyBucket, withConsoleBodies } from './profile-bodies.js';
+import { keptWelcomeErrors } from './kept-welcome.js';
+import { roleTasksOf, versionIntentWorkflowsErrors, withIntentWorkflowsDeclared } from './intent-workflow.js';
+import { inCurrentForm } from './retired-fields.js';
 import { layoutFor, workflowLayoutErrors, type WorkflowLayout } from './workflow-layout.js';
-import { parseIntentPack, resolvePackParameterValue, intentKeysOf, taskStateMachines, canOpenWork, needsOf, UNIVERSAL_INTENT_KEYS, WORK_MANAGEMENT_INTENT_KEYS } from './intent-pack.js';
+import { DEFAULT_INTENT_PACK, parseIntentPack, resolveStoredPack, resolvePackParameterValue, intentKeysOf, taskStateMachines, canOpenWork, needsOf, UNIVERSAL_INTENT_KEYS, WORK_MANAGEMENT_INTENT_KEYS, MAX_INTENT_PACK_BYTES } from './intent-pack.js';
 import { RETIRED_ROUTE_KEYS, retiredRouteKeyError, TRIVIAL_ROUTE_KEYS } from './model-resolver.js';
 import { modelFits } from '../../../lib/config/model-availability.js';
 import { modelKindOf } from '../../../lib/config/model-catalog.js';
@@ -35,14 +37,18 @@ import { IMAGE_GEN_MODELS, type ImageGenModelKey } from './image-gen-models.js';
 import { IMAGE_ROUTE_KEY, isImageModelKey, isImageRoute, routeKindError, routeKindErrorDetail } from './image-route.js';
 import { stepRouteErrors, type IntentRoute, type RouteError } from './step-models.js';
 import { displayNameErrors } from './display-name.js';
+import { isCompanyContextSource, readableByRole } from './context-source-reach.js';
+import { resolveGuardrailSelection } from './guardrail-selection.js';
 import { messagesShapeErrors, patchShapeErrors, retiredCopyErrors, retiredWelcomeErrors } from './profile-copy-fields.js';
 import { legacyWelcomePlan } from './legacy-welcome-migration.js';
-import { eventWorkflowRoleWarnings, templatesNamedBy, versionEventWorkflowsErrors, type EventWorkflow } from './event-workflow.js';
+import { eventWorkflowRoleWarnings, eventWorkflowSubjectWarnings, templatesNamedBy, versionEventWorkflowsErrors, versionProcessesErrors, type EventWorkflow } from './event-workflow.js';
+import { processEditionOf } from './process-start.js';
 import { workerAssistantRole } from './task-step.js';
-import { confirmBriefErrors, type TaskStateMachine } from './task-state-machines.js';
-import { buildSourceTable, catalogEntryForVariables, intakeFactKeys, sourceKindOf, sourceLookup, versionLookup, versionVariablesErrors, versionVariablesShapeErrors, whenErrors, whenReadsCatalog, withUnreadCatalog, type VariableCatalogEntry } from './variables.js';
+import { confirmBriefErrors, isPlatformMachineKey, machineCatalogConditionErrors, machineConditions, PLATFORM_MACHINE_KEYS, type TaskStateMachine } from './task-state-machines.js';
+import { withVersionMachines, versionDeclaredMachines } from './version-machines.js';
+import { buildSourceTable, catalogEntryForVariables, intakeFactKeys, routerHeldVariables, sourceKindOf, sourceLookup, versionLookup, versionVariablesErrors, versionVariablesShapeErrors, whenErrors, whenReadsCatalog, withUnreadCatalog, type VariableCatalogEntry } from './variables.js';
 import { parseIntakeConfig, type IntakeConfig } from './onboarding-intake.js';
-import { projectAdvertisement, writeAdvertisement } from './assistant-advertisement.js';
+import { projectAdvertisement, readAdvertisement, writeAdvertisement, type AssistantAdvertisement } from './assistant-advertisement.js';
 import { lookupProfileVersion } from './profile-version-lookup.js';
 import { GOLDEN_SET_CAPACITY } from './golden-upload.js';
 import { withStartingChoices, type StartingChoices } from './starting-point.js';
@@ -85,6 +91,22 @@ export interface ProfileVersionSummary {
   promotedFrom?: ProfileDefinition['promotedFrom'];
   /** Present on a version an administrator activated past the golden gate, with the refusal and the reason. */
   activatedPastGate?: ProfileDefinition['activatedPastGate'];
+  /**
+   * Present on a version stored before the welcome became a workflow (W1): it carries the retired `welcome`, so
+   * `activateExistingVersion` refuses it and the console offers the migration instead of a rollback.
+   */
+  retiredWelcome?: true;
+}
+
+/**
+ * WHERE A DRAFT WAS STARTED FROM, recorded on the draft's envelope when it is made (never hashed): the active version a
+ * New version cloned, or the assistant and version an import or a copy carried. Provenance only; what serves is the
+ * `active` label's to say.
+ */
+export interface DraftProvenance {
+  basedOnVersion?: number;
+  createdFrom?: { instanceId?: string; profileName?: string; version?: number };
+  contentHash?: string;
 }
 
 export interface ProfileListing {
@@ -93,6 +115,10 @@ export interface ProfileListing {
   versions: ProfileVersionSummary[];
   hasDraft: boolean;
   draftConfigId?: string;
+  /** The active version the draft was cloned from by New version, when the draft records one. */
+  draftBasedOnVersion?: number;
+  /** The assistant and version an imported or copied draft came from, when the draft records them. */
+  draftCreatedFrom?: { profileName?: string; version?: number };
   /** The active version's own `displayName`, when it names one (it stays inline, never offloaded). */
   activeDisplayName?: string;
   /**
@@ -103,6 +129,17 @@ export interface ProfileListing {
   activeEventWorkflows?: Array<{ name: string; on: string; types?: string[] }>;
   /** Whether the active version declares an onboarding intake, which is how an assistant with no welcome of its own greets. */
   activeOnboarding?: boolean;
+  /**
+   * THE TASKS THE ACTIVE VERSION GIVES TO AN ASSISTANT ROLE (ADR-067 WT78): each task step, in an event workflow or an
+   * intent's, whose worker is `{ assistantRole }`, by its workflow, step, role and the intent it names. Names only, so the
+   * role's assistant lists the tasks it is given without reading another assistant's definition.
+   */
+  activeRoleTasks?: Array<{ workflow: string; step: string; role: string; machine: string }>;
+  /**
+   * THE ACTIVE VERSION'S PROCESSES (SPEC-PROCESSES P9, P10): each one's label, its declared metrics and the edition they are
+   * computed for, read from the definition the listing already holds (`processes` is inline, never a body).
+   */
+  activeProcesses?: Record<string, { label: string; description?: string; edition: string; workflows?: string[]; metrics?: import('./event-workflow.js').ProcessMetric[] }>;
 }
 
 /**
@@ -169,15 +206,25 @@ export function classificationServedBy(profileName: string): string {
  * never from a request, so a name is only known with the classification its own record names.
  */
 const runtimeAssistants = new Map<string, string>();
+/** The role each runtime assistant's record names, for the checks that read what its role can reach. */
+const runtimeRoles = new Map<string, string>();
 
 /** Know a runtime assistant read from the directory, so its versions and catalogs resolve. */
-export function rememberRuntimeAssistant(name: string, classification: string): void {
+export function rememberRuntimeAssistant(name: string, classification: string, role?: string): void {
   runtimeAssistants.set(name, classification);
+  if (role) runtimeRoles.set(name, role);
+  else runtimeRoles.delete(name);
+}
+
+/** The role a profile acts in: the deployment's declaration, or the role its directory record names. */
+export function roleServedBy(profileName: string): string | undefined {
+  return defaultProfileRegistry.roleOfAssistant(profileName)?.role ?? runtimeRoles.get(profileName);
 }
 
 /** Forget a name the directory no longer reports as an active runtime assistant. */
 export function forgetRuntimeAssistant(name: string): void {
   runtimeAssistants.delete(name);
+  runtimeRoles.delete(name);
 }
 
 /** Whether a name is a runtime assistant this container knows, and not a compiled one. */
@@ -203,7 +250,7 @@ export function allProfileNames(): string[] {
 }
 
 /** The provenance envelope of a stored definition (`derivedFrom`, `promotedFrom`, `activatedPastGate`), or nothing. */
-function provenanceOf(rawValue: string | undefined): Pick<ProfileVersionSummary, 'derivedFrom' | 'promotedFrom' | 'activatedPastGate'> {
+function provenanceOf(rawValue: string | undefined): Pick<ProfileVersionSummary, 'derivedFrom' | 'promotedFrom' | 'activatedPastGate' | 'retiredWelcome'> {
   if (!rawValue) return {};
   try {
     const def = JSON.parse(rawValue) as ProfileDefinition;
@@ -211,6 +258,29 @@ function provenanceOf(rawValue: string | undefined): Pick<ProfileVersionSummary,
       ...(def.derivedFrom ? { derivedFrom: def.derivedFrom } : {}),
       ...(def.promotedFrom ? { promotedFrom: def.promotedFrom } : {}),
       ...(def.activatedPastGate ? { activatedPastGate: def.activatedPastGate } : {}),
+      // The same test `activateExistingVersion` refuses by, so the console offers a rollback only where it lands.
+      ...(retiredWelcomeErrors(def.welcome).length ? { retiredWelcome: true as const } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
+/** Where a stored draft says it was started from, as the listing reports it. Pure. */
+export function draftStartedFrom(rawValue: string | undefined): Pick<ProfileListing, 'draftBasedOnVersion' | 'draftCreatedFrom'> {
+  if (!rawValue) return {};
+  try {
+    const p = (JSON.parse(rawValue) as { provenance?: DraftProvenance }).provenance;
+    if (!p || typeof p !== 'object') return {};
+    const from = p.createdFrom;
+    return {
+      ...(typeof p.basedOnVersion === 'number' ? { draftBasedOnVersion: p.basedOnVersion } : {}),
+      ...(from && (typeof from.profileName === 'string' || typeof from.version === 'number') ? {
+        draftCreatedFrom: {
+          ...(typeof from.profileName === 'string' ? { profileName: from.profileName } : {}),
+          ...(typeof from.version === 'number' ? { version: from.version } : {}),
+        },
+      } : {}),
     };
   } catch {
     return {};
@@ -232,7 +302,7 @@ export async function listProfile(ssm: SSMClient, ssmRoot: string, profileName: 
   const versions: ProfileVersionSummary[] = [];
   let activeVersion: number | null = null;
   let activeDisplayName: string | undefined;
-  let activeWorkflows: Pick<ProfileListing, 'activeEventWorkflows' | 'activeOnboarding'> = {};
+  let activeWorkflows: Pick<ProfileListing, 'activeEventWorkflows' | 'activeOnboarding' | 'activeRoleTasks'> = {};
   let nextToken: string | undefined;
   do {
     let page;
@@ -263,29 +333,46 @@ export async function listProfile(ssm: SSMClient, ssmRoot: string, profileName: 
 
   let hasDraft = false;
   let draftConfigId: string | undefined;
+  let startedFrom: ReturnType<typeof draftStartedFrom> = {};
   try {
     const d = await ssm.send(new GetParameterCommand({ Name: draftParamName(ssmRoot, profileName) }));
     if (d.Parameter?.Value) {
       hasDraft = true;
       draftConfigId = configIdOf(d.Parameter.Value);
+      startedFrom = draftStartedFrom(d.Parameter.Value);
     }
   } catch {
     /* no draft */
   }
 
   versions.sort((a, b) => b.version - a.version);
-  return { profileName, activeVersion, versions, hasDraft, draftConfigId, ...(activeDisplayName ? { activeDisplayName } : {}), ...activeWorkflows };
+  return {
+    profileName, activeVersion, versions, hasDraft, draftConfigId, ...startedFrom,
+    ...(activeDisplayName ? { activeDisplayName } : {}), ...activeWorkflows,
+  };
 }
 
 /** A stored definition's event workflows as the listing names them, and whether it declares an onboarding intake. */
-function eventWorkflowsListedOf(rawValue: string | undefined): Pick<ProfileListing, 'activeEventWorkflows' | 'activeOnboarding'> {
+export function eventWorkflowsListedOf(rawValue: string | undefined): Pick<ProfileListing, 'activeEventWorkflows' | 'activeOnboarding' | 'activeRoleTasks' | 'activeProcesses'> {
   if (!rawValue) return {};
   try {
     const def = JSON.parse(rawValue) as ProfileDefinition;
-    const workflows = Object.entries(def.eventWorkflows ?? {})
-      .filter(([, wf]) => typeof wf?.on === 'string')
-      .map(([name, wf]) => ({ name, on: wf.on, ...(Array.isArray(wf.types) && wf.types.length ? { types: [...wf.types] } : {}) }));
-    return { activeEventWorkflows: workflows, activeOnboarding: !!def.onboarding };
+    // THE EVENT WORKFLOWS from the definition where they are inline, and from the names it keeps where they are a body of the
+    // store (`eventWorkflowsListed`), so the listing reads no body.
+    const workflows = def.eventWorkflows
+      ? Object.entries(def.eventWorkflows)
+        .filter(([, wf]) => typeof wf?.on === 'string')
+        .map(([name, wf]) => ({ name, on: wf.on, ...(Array.isArray(wf.types) && wf.types.length ? { types: [...wf.types] } : {}) }))
+      : (def.eventWorkflowsListed ?? []);
+    // THE INTENT WORKFLOWS' ROLE TASKS are read from the workflows where they are inline, and from the summary the definition
+    // keeps where they are a body of the store (`intentRoleTasks`), so the listing reads no body.
+    const intentWorkflows = (def as { intentWorkflows?: Record<string, never> }).intentWorkflows;
+    const roleTasks: NonNullable<ProfileListing['activeRoleTasks']> = [
+      ...(def.eventWorkflows ? roleTasksOf(def.eventWorkflows as never) : (def.eventRoleTasks ?? [])),
+      ...(intentWorkflows ? roleTasksOf(intentWorkflows) : (def.intentRoleTasks ?? [])),
+    ];
+    const processes = Object.entries(def.processes ?? {}).map(([name, p]) => [name, { label: p.label, ...(p.description ? { description: p.description } : {}), edition: processEditionOf(p), workflows: [...(p.workflows ?? [])] as string[], ...(p.metrics?.length ? { metrics: p.metrics } : {}) }] as [string, NonNullable<ProfileListing["activeProcesses"]>[string]]);
+    return { activeEventWorkflows: workflows, activeOnboarding: !!def.onboarding, ...(roleTasks.length ? { activeRoleTasks: roleTasks } : {}), ...(processes.length ? { activeProcesses: Object.fromEntries(processes) } : {}) };
   } catch {
     return {};
   }
@@ -316,7 +403,7 @@ export async function getDraft(ssm: SSMClient, ssmRoot: string, profileName: str
   // work in progress would disappear without an error.
   // THE CANVAS LAYOUT IS READ BACK TOO (ADR-061 decision 7): getDraft is the admin plane's read, and the layout rides the draft
   // through every edit and into activation. An unreadable layout reads as none (`readLayout`).
-  return withLayout(await hydrateBodies(JSON.parse(raw) as ProfileDefinition));
+  return withConsoleBodies(await hydrateBodies(JSON.parse(raw) as ProfileDefinition));
 }
 
 /**
@@ -428,7 +515,15 @@ async function activeVersionNumber(ssm: SSMClient, ssmRoot: string, profileName:
  *  (nothing to edit). Backfilling here means a NEW version persists the full base/classifier/per-intent
  *  bundle, so activating it heals the stored definition. */
 async function activeOrSeedBodyComplete(ssm: SSMClient, ssmRoot: string, profileName: string): Promise<ProfileDefinitionBody> {
-  const body = ensureModelsBundle(await activeOrSeedBody(ssm, ssmRoot, profileName));
+  // A NEW VERSION IS WRITTEN IN THE CURRENT FORM (ADR-067 stage 4): a stored version's retired fields are rewritten for it,
+  // and the stored version itself is left as it is.
+  const started = ensureModelsBundle(await activeOrSeedBody(ssm, ssmRoot, profileName));
+  const needsPack = Array.isArray((started as { workflows?: unknown }).workflows) && !(started.intentPack as { intents?: unknown[] } | undefined)?.intents;
+  const current = inCurrentForm(started, needsPack ? { pack: await classificationPackOf(ssm, ssmRoot, profileName) } : {});
+  if (current.rewritten.length) {
+    console.log('[profile-lifecycle] a new version rewrites the retired fields of the one it starts from', { profileName, rewritten: current.rewritten });
+  }
+  const body = current.body;
   // A BODY CLONED INTO A NEW VERSION KEEPS ONLY THE MODELS ITS CLASSIFICATION ALLOWS. The write path
   // refuses any other selection (`validateBody`), and a version stored before it did - an image model
   // backfilled into every classification, a route copied from the platform strategy - would otherwise
@@ -470,27 +565,42 @@ async function putDefinition(
   return { stored, version: put.Version ?? 1 };
 }
 
-/** The active version's canvas layout, or undefined when it has none or none could be read. */
-async function activeLayout(ssm: SSMClient, ssmRoot: string, profileName: string): Promise<WorkflowLayout | undefined> {
+/** The active version's console bodies, its canvas layout and its kept welcome; each undefined when it has none or none could be read. */
+async function activeConsoleBodies(ssm: SSMClient, ssmRoot: string, profileName: string): Promise<Pick<ProfileDefinition, 'layout' | 'keptWelcomeWorkflow'>> {
   try {
     const resp = await ssm.send(new GetParameterCommand({ Name: `${definitionParamName(ssmRoot, profileName)}:${ACTIVE_LABEL}` }));
-    if (!resp.Parameter?.Value) return undefined;
-    return (await withLayout(JSON.parse(resp.Parameter.Value) as ProfileDefinition)).layout;
+    if (!resp.Parameter?.Value) return {};
+    const def = await withConsoleBodies(JSON.parse(resp.Parameter.Value) as ProfileDefinition);
+    return { layout: def.layout, keptWelcomeWorkflow: def.keptWelcomeWorkflow };
   } catch {
-    return undefined;
+    return {};
   }
 }
 
 /** Clone the active version into a fresh draft (§4 create-version). Returns the draft definition. */
 export async function createDraft(ssm: SSMClient, ssmRoot: string, profileName: string, actor: string): Promise<ProfileDefinition> {
   if (!isKnownProfile(profileName)) throw new Error(`unknown profile '${profileName}'`);
-  const body = await activeOrSeedBodyComplete(ssm, ssmRoot, profileName);
+  const cloned = await activeOrSeedBodyComplete(ssm, ssmRoot, profileName);
+  // A NEW VERSION SAYS WHAT IT RUNS (ADR-066 decision 1): a clone whose pack declares no machines is given its multi-step
+  // intents' machines as they run today. A classification set that cannot be read, or a deployment with no body store to
+  // hold the pack they grow (`startsWithMachines`), leaves the draft running that set.
+  const classificationMachines = startsWithMachines(cloned)
+    ? await deploymentTaskMachines(ssm, ssmRoot, profileName) : undefined;
+  // EVERY MULTI-STEP INTENT'S WORKFLOW IS DECLARED in the new version.
+  const body = await withDeclaredWorkflows(classificationMachines && 'machines' in classificationMachines
+    ? withStartingMachines(cloned, classificationMachines.machines) : cloned, ssm, ssmRoot, profileName);
   // A NEW VERSION STARTS WHERE THE ACTIVE ONE'S STEPS ARE DRAWN (ADR-061 decision 7), so a rollback followed by a new version
   // edits the layout the rolled-to version was saved with.
-  const layout = layoutFor(await activeLayout(ssm, ssmRoot, profileName), body.eventWorkflows);
-  const def = { ...buildDefinition(profileName, body), ...(layout ? { layout } : {}) };
+  const active = await activeConsoleBodies(ssm, ssmRoot, profileName);
+  const layout = layoutFor(active.layout, body.eventWorkflows, body.intentPack?.machines ?? null, body.intentWorkflows ?? null);
+  // A KEPT WELCOME CARRIES INTO THE NEW DRAFT (ADR-067 G40), so a switch back to Workflow in it restores the same steps.
+  const kept = active.keptWelcomeWorkflow;
+  // THE DRAFT RECORDS THE VERSION IT CLONED, so it is named by where it started, whatever is active by the time it is read.
+  const basedOnVersion = await activeVersionNumber(ssm, ssmRoot, profileName);
+  const provenance: DraftProvenance | undefined = basedOnVersion !== null ? { basedOnVersion } : undefined;
+  const def = { ...buildDefinition(profileName, body), ...(layout ? { layout } : {}), ...(kept ? { keptWelcomeWorkflow: kept } : {}), ...(provenance ? { provenance } : {}) };
   await putDefinition(ssm, draftParamName(ssmRoot, profileName), def);
-  audit('create-version', actor, profileName, { configId: def.configId });
+  audit('create-version', actor, profileName, { configId: def.configId, ...(provenance ? { basedOnVersion } : {}) });
   return def;
 }
 
@@ -540,16 +650,23 @@ export async function seedFirstDraft(
     await optional(`${ssmRoot}/assistant/${classification}/assistant-intent-pack`), classification,
   );
   const persona = (await optional(`${ssmRoot}/assistant/${classification}/assistant-system-prompt`))?.replace(/\r\n/g, '\n').trim();
-  const body: ProfileDefinitionBody = withStartingChoices({
+  const seeded: ProfileDefinitionBody = {
     ...(await activeOrSeedBodyComplete(ssm, ssmRoot, profileName)),
-    // THE CLASSIFICATION'S TASK GRAPHS STAY ON THE CLASSIFICATION: its pack parameter may declare `machines`, and a
-    // version that carries them is refused at activation, so a first draft copied whole could never be activated.
-    ...(packRaw ? { intentPack: packWithoutMachines(JSON.parse(packRaw)) as ProfileDefinitionBody['intentPack'] } : {}),
+    // THE CLASSIFICATION'S `machines` BLOCK IS NOT COPIED WHOLE: it may name a platform key, which a version is refused.
+    // The draft is given the machines its own multi-step intents run instead (`withStartingMachines`, ADR-066 decision 1).
+    // A CLASSIFICATION WITH NO PACK PARAMETER SERVES THE PLATFORM DEFAULT (`getIntentPack`), so that is the pack its
+    // first draft carries: a runtime assistant's version must carry its own (ADR-048, ADR-054), and seeding none
+    // left a draft that activation refused.
+    intentPack: packWithoutMachines(packRaw ? JSON.parse(packRaw) : { intents: DEFAULT_INTENT_PACK.intents }) as ProfileDefinitionBody['intentPack'],
     ...(persona ? { persona } : {}),
-  }, opts.choices ?? {});
+  };
+  const body: ProfileDefinitionBody = await withDeclaredWorkflows(withStartingChoices(
+    startsWithMachines(seeded) ? withStartingMachines(seeded, taskStateMachines(parseIntentPack(packRaw))) : seeded,
+    opts.choices ?? {},
+  ), ssm, ssmRoot, profileName);
   const def = buildDefinition(profileName, body);
   await putDefinition(ssm, draftParamName(ssmRoot, profileName), def);
-  audit('seed-first-draft', actor, profileName, { configId: def.configId, classification, intentPack: !!packRaw, persona: !!persona });
+  audit('seed-first-draft', actor, profileName, { configId: def.configId, classification, intentPack: packRaw ? 'classification' : 'platform-default', persona: !!persona });
   return {
     seeded: true,
     configId: def.configId,
@@ -589,7 +706,7 @@ export async function copyFirstDraft(
     const carried = legacyWelcomePlan(retiredWelcome, sourceBody.eventWorkflows).eventWorkflows;
     if (Object.keys(carried).length) sourceBody.eventWorkflows = carried;
   }
-  const body = withStartingChoices(ensureModelsBundle(sourceBody as typeof source.body), choices);
+  const body = await withDeclaredWorkflows(withStartingChoices(ensureModelsBundle(sourceBody as typeof source.body), choices), ssm, ssmRoot, profileName);
   const def = { ...buildDefinition(profileName, body), provenance: { createdFrom: { profileName: from, version: source.version } } };
   await putDefinition(ssm, draftParamName(ssmRoot, profileName), def);
   audit('copy-first-draft', actor, profileName, { configId: def.configId, from, fromVersion: source.version });
@@ -614,13 +731,25 @@ export async function editDraft(
   ssm: SSMClient,
   ssmRoot: string,
   profileName: string,
-  patchWithLayout: Partial<ProfileDefinitionBody> & { layout?: WorkflowLayout | null },
+  patchWithLayout: Partial<ProfileDefinitionBody> & { layout?: WorkflowLayout | null; keptWelcomeWorkflow?: EventWorkflow | null },
   actor: string,
+  /**
+   * The draft this edit was based on, as the request names it (`configId`; undefined when it names none). Present, the
+   * edit is held to it (`draftBasisError`): a draft saved since is refused, never merged over. The management API always
+   * passes it.
+   */
+  basedOn?: { configId: string | undefined },
+  /**
+   * The classification's published guardrails. Present, a patched `guardrailId` is resolved the way import resolves
+   * it (`resolveGuardrailSelection`): a catalog key is stored as the id it names, and a selection naming none is refused.
+   */
+  readGuardrailCatalog?: (profileName: string) => Promise<Array<{ key: string; guardrailId: string }>>,
 ): Promise<ProfileDefinition> {
   // THE CANVAS LAYOUT RIDES THE PATCH AND IS NO PART OF THE BODY (ADR-061 decision 7): checked for its shape alone, kept when
   // the patch does not name it, cleared by `null`, and never hashed or validated against what the workflows do.
-  const { layout: patchedLayout, ...patch } = patchWithLayout;
-  const layoutErrors = workflowLayoutErrors(patchedLayout);
+  // A KEPT WELCOME RIDES THE PATCH THE SAME WAY (ADR-067 G40): checked for its shape, kept when unnamed, cleared by `null`.
+  const { layout: patchedLayout, keptWelcomeWorkflow: patchedKept, ...patch } = patchWithLayout;
+  const layoutErrors = [...workflowLayoutErrors(patchedLayout), ...keptWelcomeErrors(patchedKept)];
   if (layoutErrors.length) throw new ProfileValidationError(layoutErrors);
   // WHAT ONLY A DEPLOY CHANGES IS REFUSED BY NAME, not dropped. Where an assistant runs (its classification
   // and role) and what that reaches are IAM, built at deploy from the deployment's profiles; ownership is the
@@ -640,24 +769,52 @@ export async function editDraft(
   const patchMachines = hasTaskStep((patch as { eventWorkflows?: unknown }).eventWorkflows)
     ? await deploymentTaskMachines(ssm, ssmRoot, profileName) : undefined;
   if (patchMachines && 'error' in patchMachines) throw new ProfileValidationError([patchMachines.error]);
-  const shapeErrors = patchShapeErrors(patch, patchMachines ? { machines: patchMachines.machines } : {});
+  const storedDraft = await getDraft(ssm, ssmRoot, profileName);
+  // The base a first edit clones, read once: the variables below are checked through it, and the draft is built on it.
+  const baseBody = storedDraft ? undefined : await activeOrSeedBody(ssm, ssmRoot, profileName);
+  const patchedVariables = 'variables' in (patch as Record<string, unknown>)
+    ? ((patch as { variables?: ProfileDefinitionBody['variables'] | null }).variables ?? undefined)
+    : storedDraft ? bodyFrom(storedDraft).variables : baseBody!.variables;
+  const shapeErrors = patchShapeErrors(patch, { ...(patchMachines ? { machines: patchMachines.machines } : {}), lookup: routerHeldVariables(patchedVariables ?? undefined).lookup });
   if (shapeErrors.length) throw new ProfileValidationError(shapeErrors);
-  const existing = (await getDraft(ssm, ssmRoot, profileName)) ?? buildDefinition(profileName, await activeOrSeedBody(ssm, ssmRoot, profileName));
-  // A VERSION MAY NOT DEFINE A TASK WORKFLOW, AND THE REFUSAL HAS TO HAPPEN ON THE PATCH.
+  if (basedOn) {
+    const refusal = draftBasisError(profileName, storedDraft?.configId ?? null, basedOn.configId);
+    if (refusal) throw refusal;
+  }
+  // THE STORED GUARDRAIL IS THE ID APPLYGUARDRAIL IS CALLED WITH, so a key sent here is stored as its id, and a
+  // selection the catalog cannot resolve, or a catalog that cannot be read, is refused before anything is written.
+  const patchedGuardrail = (patch as { guardrailId?: unknown }).guardrailId;
+  if (typeof patchedGuardrail === 'string' && patchedGuardrail && readGuardrailCatalog) {
+    let available: Array<{ key: string; guardrailId: string }>;
+    try {
+      available = await readGuardrailCatalog(profileName);
+    } catch (err) {
+      throw new ProfileValidationError([
+        `the guardrail catalog for '${profileName}' could not be read (${(err as Error).message}); `
+        + 'refusing to save a guardrail selection that cannot be verified',
+      ]);
+    }
+    const resolved = resolveGuardrailSelection(patchedGuardrail, available);
+    if (!('guardrailId' in resolved)) {
+      throw new ProfileValidationError([`guardrailId '${patchedGuardrail}' matches no guardrail published for '${profileName}'; one of: ${resolved.offered}`]);
+    }
+    (patch as { guardrailId?: string }).guardrailId = resolved.guardrailId;
+  }
+  const existing = storedDraft ?? buildDefinition(profileName, baseBody!);
+  // A VERSION'S MACHINES ARE DECLARED IN ITS INTENT PACK (ADR-066 decision 1), as its event workflows are declared in
+  // `eventWorkflows` (ADR-061 decision 1). Both are validated with the version below (`validateDefinitionBody`, which
+  // refuses a platform key by name), so a draft edit, a validation, an activation and an import apply one rule.
   //
-  // EVENT WORKFLOWS ARE THE EXCEPTION, BY DECISION (ADR-061 decision 1, as built): `eventWorkflows` is the
-  // assistant's own greeting and follow-up, so a version declares it and it is validated with the version
-  // (`welcomeWorkflowErrors`). Task machines stay global and select-only.
-  //
-  // `bodyFrom` below is a whitelist and drops `machines`, so by the time the body validator runs
-  // there is nothing left to object to - the edit would be accepted and the block silently
-  // discarded. An operator who sent one meant something by it, so they are told where task graphs
-  // live instead of watching a field refuse to stick.
+  // THE LEGACY TOP-LEVEL `machines` IS REFUSED ON THE PATCH: `bodyFrom` below is a whitelist and drops it, so the edit
+  // would be accepted and the block silently discarded. The refusal names the field that is read, and a platform key
+  // in it by name.
   const patchedMachines = (patch as { machines?: Record<string, unknown> }).machines;
   if (patchedMachines !== undefined && Object.keys(patchedMachines ?? {}).length > 0) {
+    const platform = Object.keys(patchedMachines ?? {}).filter(isPlatformMachineKey);
     throw new ProfileValidationError([
-      'machines are global workflows and are not part of a version. They are defined by the platform '
-      + "and by a classification's intent pack; a version SELECTS from them with `workflows`.",
+      "a version declares its intents' machines in its intent pack, as intentPack.machines keyed by intent; the "
+      + 'top-level machines field is not part of a version',
+      ...platform.map((k) => `machines['${k}'] is a platform machine, which a version may not declare or override (${PLATFORM_MACHINE_KEYS.join(', ')})`),
     ]);
   }
   // Only runtime-editable keys from the patch are honored; unknown/boundary keys are ignored (§7).
@@ -682,16 +839,28 @@ export async function editDraft(
   // a null that then hashes into `configId` and persists. The base model has no "clear" today (the
   // console never sends one), but the typed client advertises `null` for every body key, so the
   // reachable-but-wrong path is closed here rather than left to the caller to avoid.
+  //
+  // A PATCHED `models` WITH NO `default` IS THE CLASSIFICATION DEFAULT. The patch's `models` replaces the draft's whole,
+  // so its base model is gone, and the served base model is `models.default`, else `modelKey`, else the classification's
+  // (`resolveFromDefinition`). `modelKey` then takes the `'default'` sentinel, so the turn serves the classification
+  // default rather than the base model the draft named before.
   if (patch.modelKey != null) {
     mergedBody.models = { ...(mergedBody.models ?? {}), default: patch.modelKey };
   } else if (patch.models?.default != null) {
     mergedBody.modelKey = patch.models.default;
+  } else if (patch.models != null && bodyFrom(existing).models?.default != null) {
+    // Only a base model the draft held and the patch leaves out is cleared: a draft whose base model is `modelKey`
+    // alone keeps it through a patch that names none (a routing rules save sends `models` without one).
+    mergedBody.modelKey = DEFAULT_MODEL;
   }
   const errs = validateDefinitionBody(mergedBody, new Set(Object.keys(bodyFrom(existing).models?.byIntent ?? {})));
   if (errs.length) throw new ProfileValidationError(errs);
   // A STEP'S POINT FOLLOWS IT, and a removed step's point is dropped (`layoutFor`).
-  const layout = layoutFor(patchedLayout === null ? undefined : patchedLayout ?? existing.layout, mergedBody.eventWorkflows);
-  const def = { ...buildDefinition(profileName, mergedBody), ...(layout ? { layout } : {}) };
+  const layout = layoutFor(patchedLayout === null ? undefined : patchedLayout ?? existing.layout, mergedBody.eventWorkflows, mergedBody.intentPack?.machines ?? null, mergedBody.intentWorkflows ?? null);
+  // WHERE THE DRAFT WAS STARTED FROM rides every edit of it: envelope, never hashed (`DraftProvenance`).
+  const provenance = (storedDraft as { provenance?: DraftProvenance } | null)?.provenance;
+  const kept = patchedKept === null ? undefined : patchedKept ?? existing.keptWelcomeWorkflow;
+  const def = { ...buildDefinition(profileName, mergedBody), ...(layout ? { layout } : {}), ...(kept ? { keptWelcomeWorkflow: kept } : {}), ...(provenance ? { provenance } : {}) };
   // The edit re-hashes, so it produces a NEW configId and therefore a new body key. That is correct and
   // is why nothing here deletes: the previous version's body must survive for a rollback to it to mean
   // anything. Content-addressing makes the write idempotent - re-saving an unchanged draft rewrites
@@ -820,11 +989,11 @@ export function validateBody(
   // that saves perfectly well. The pointer that replaces it costs about 90 characters, which this does
   // not add back - a deliberate slack, since the load-bearing check is the one `putDefinition` runs on
   // the exact bytes it is about to send, and that one reports just as precisely.
-  // Both bodies move to S3 when a store is configured, so neither counts against the parameter. Leaving
-  // `intentPack` in this measurement would reject a taxonomy that stores perfectly well - and would do it
-  // precisely on the deployments that migrated, which is backwards.
+  // Every body moves to S3 when a store is configured, so none counts against the parameter. Leaving one in this measurement
+  // would reject a version that stores perfectly well, and precisely on the deployments that use a store: an Advisor version
+  // with the demo's ops workflows measures 4796 characters inline, and stored keeps only a pointer and the names the listing reads.
   const tooBig = storageBoundaryError(
-    bodyBucket() ? { ...body, persona: undefined, intentPack: undefined } : body,
+    bodyBucket() ? { ...body, persona: undefined, intentPack: undefined, intentWorkflows: undefined, eventWorkflows: undefined } : body,
   );
   if (tooBig) errs.push(tooBig);
   return errs;
@@ -896,6 +1065,37 @@ async function contextSelectionErrors(
   return body.contextSources
     .filter((key) => !keys.has(key))
     .map((key) => `contextSources key '${key}' is not published for '${profileName}'; one of: ${offered}`);
+}
+
+/**
+ * THE SELECTED SOURCES THE ASSISTANT'S ROLE CANNOT READ, said beside Validate's result and never refused: a stored
+ * version selecting one must still activate. Read with the rule the turn applies (`readableByRole` over
+ * `contextPrefixesForRole`), so a source named here is exactly one each turn skips as `not-readable-by-role`. A role
+ * this check cannot resolve is said too, so an unchecked selection never reads as a checked one.
+ */
+export async function contextReachWarnings(
+  body: Partial<ProfileDefinitionBody>,
+  profileName: string,
+  readCatalog?: (profileName: string) => Promise<Array<{ key: string; type?: string; prefix?: string }>>,
+): Promise<string[]> {
+  if (!body.contextSources?.length || !readCatalog) return [];
+  // An unreadable catalog is refused by `contextSelectionErrors`; nothing further to say here.
+  let available: Array<{ key: string; type?: string; prefix?: string }>;
+  try { available = await readCatalog(profileName); } catch { return []; }
+  const byKey = new Map(available.map((s) => [s.key, s]));
+  const company = body.contextSources.filter((k) => { const e = byKey.get(k); return !!e && isCompanyContextSource(e); });
+  if (!company.length) return [];
+  const classification = servedClassification(profileName);
+  const role = roleServedBy(profileName);
+  let prefixes: string[] | undefined;
+  try { prefixes = classification && role ? defaultProfileRegistry.contextPrefixesForRole(classification, role) : undefined; } catch { prefixes = undefined; }
+  if (!prefixes) {
+    return [`contextSources ${company.map((k) => `'${k}'`).join(', ')} read company context, and the role of '${profileName}' could not be resolved, so whether it can read them is not checked`];
+  }
+  const reads = prefixes.join(', ') || 'no company context';
+  return company
+    .filter((k) => !readableByRole(byKey.get(k) as { type?: string; prefix?: string }, prefixes as string[]))
+    .map((k) => `contextSources key '${k}' reads ${byKey.get(k)?.prefix}, which the ${role} role of '${profileName}' does not read (it reads ${reads}); every turn skips it, counted as the not-readable-by-role skip under AgentEchelon/ContextSources`);
 }
 
 /**
@@ -975,6 +1175,46 @@ export async function deploymentTaskMachines(
 }
 
 /**
+ * THE MACHINES A VERSION RUNS (ADR-066 decision 1), as the runtime resolves them (`machinesForVersion`): the version's own
+ * over its classification's set, with the platform's machines from the platform set. A version that declares none runs
+ * its classification's set. Read only by the checks that need the graphs; a read failure is the caller's to name.
+ */
+export async function versionTaskMachines(
+  body: Partial<ProfileDefinitionBody>, ssm: SSMClient, ssmRoot: string, profileName: string,
+): Promise<{ machines: Record<string, TaskStateMachine> } | { error: string }> {
+  const read = await deploymentTaskMachines(ssm, ssmRoot, profileName);
+  return 'error' in read ? read : { machines: withVersionMachines(read.machines, body.intentPack) };
+}
+
+/**
+ * Whether a new draft is given its starting machines: it carries a pack that declares none, and the deployment has a
+ * body store, where the pack they grow is kept. A pack stored inline shares the definition's 4096-character parameter,
+ * which a copied machine would overflow, so without a store the draft runs its classification's set, as it always has.
+ */
+export function startsWithMachines(body: Pick<ProfileDefinitionBody, 'intentPack'>): boolean {
+  return !!body.intentPack && body.intentPack.machines === undefined && !!bodyBucket();
+}
+
+/**
+ * A DRAFT SAYS WHAT IT RUNS (ADR-066 decision 1): a draft whose pack declares no machines is given, as its starting point,
+ * the machine each of its multi-step intents runs today (`base`, the classification's and platform's set), platform keys
+ * left out. A pack that already declares machines keeps exactly what it declares. A version stored before this keeps
+ * running its classification's set until a draft is made from it.
+ */
+export function withStartingMachines(body: ProfileDefinitionBody, base: Readonly<Record<string, TaskStateMachine>>): ProfileDefinitionBody {
+  const pack = body.intentPack;
+  if (!pack || pack.machines !== undefined) return body;
+  const keys = resolveStoredPack(pack).intents
+    .filter((i) => i.delivery === 'TASK_MULTI_STEP' && !isPlatformMachineKey(i.key) && base[i.key])
+    .map((i) => i.key);
+  if (!keys.length) return body;
+  const withMachines = { ...pack, machines: Object.fromEntries(keys.map((k) => [k, base[k]])) };
+  // A COPY THE PACK'S LIMIT WOULD REFUSE IS NOT MADE: the draft would fail every edit on a size its author never chose.
+  if (Buffer.byteLength(JSON.stringify(withMachines), 'utf8') > MAX_INTENT_PACK_BYTES) return body;
+  return { ...body, intentPack: withMachines };
+}
+
+/**
  * THE STEP OVERRIDES OF A VERSION'S ROUTES, checked against the machines the runtime runs (ADR-064 decision D): each names
  * a state of its intent's workflow and a model of the kind the step produces. The machines are read only where a route
  * overrides a step. Returned structured, so the console anchors each to the card and step it names.
@@ -982,7 +1222,7 @@ export async function deploymentTaskMachines(
 export async function stepModelErrorDetails(body: Partial<ProfileDefinitionBody>, ssm: SSMClient, ssmRoot: string, profileName: string): Promise<RouteError[]> {
   const routes = Object.entries(body.models?.byIntent ?? {}).filter(([, r]) => r && typeof r === 'object' && (r as IntentRoute).steps);
   if (!routes.length) return [];
-  const read = await deploymentTaskMachines(ssm, ssmRoot, profileName);
+  const read = await versionTaskMachines(body, ssm, ssmRoot, profileName);
   if ('error' in read) return [{ code: 'machines_unreadable', path: 'models.byIntent', message: read.error.replace('eventWorkflows assigns a task', 'a route overrides a step') }];
   return routes.flatMap(([intent, route]) => stepRouteErrors(intent, route as IntentRoute, read.machines[intent]));
 }
@@ -999,12 +1239,15 @@ export async function requiredToolErrors(body: Partial<ProfileDefinitionBody>, s
 /** The same refusals, structured: each anchored to the workflow step that requires the tool (`workflows['<m>'].steps['<s>'].requiresTool`). */
 export async function requiredToolErrorDetails(body: Partial<ProfileDefinitionBody>, ssm: SSMClient, ssmRoot: string, profileName: string): Promise<RouteError[]> {
   if (!Array.isArray(body.tools)) return [];
-  const read = await deploymentTaskMachines(ssm, ssmRoot, profileName);
+  const read = await versionTaskMachines(body, ssm, ssmRoot, profileName);
   if ('error' in read) return [];
   const allowed = new Set(body.tools);
   const selected = Array.isArray(body.workflows) ? body.workflows : Object.keys(read.machines);
+  // A machine the version declares is checked with the version, step by step (`versionMachineErrors`).
+  const declared = versionDeclaredMachines(body.intentPack) ?? {};
   const errs: RouteError[] = [];
   for (const name of selected) {
+    if (declared[name]) continue;
     for (const [state, def] of Object.entries(read.machines[name]?.states ?? {})) {
       for (const t of def.requiresTool ?? []) {
         if (allowed.has(t)) continue;
@@ -1044,9 +1287,48 @@ export function routeErrorDetails(models: ProfileDefinitionBody['models'] | unde
 
 /** Each event-workflow check that needs the runtime's machines, read only where a step assigns a task. */
 async function workflowErrorsWithMachines(body: ProfileDefinitionBody, ssm: SSMClient, ssmRoot: string, profileName: string): Promise<string[]> {
-  if (!hasTaskStep(body.eventWorkflows)) return welcomeWorkflowErrors(body);
+  const intentErrs = await intentWorkflowErrorsWithPack(body, ssm, ssmRoot, profileName);
+  if (!hasTaskStep(body.eventWorkflows)) return [...welcomeWorkflowErrors(body), ...intentErrs];
   const read = await deploymentTaskMachines(ssm, ssmRoot, profileName);
-  return 'error' in read ? [read.error] : welcomeWorkflowErrors(body, read.machines);
+  return 'error' in read ? [read.error, ...intentErrs] : [...welcomeWorkflowErrors(body, read.machines), ...intentErrs];
+}
+
+/**
+ * A VERSION'S INTENT WORKFLOWS (ADR-067 decision 1), checked against the pack it serves (its own, else its
+ * classification's) and the machines it runs: each key a multi-step intent of that pack, each workflow held to the event
+ * workflow rules on the intent trigger and to an intent's own (`intentWorkflowErrors`). Read only where the version
+ * declares one, so a version that declares none reads nothing more.
+ */
+async function intentWorkflowErrorsWithPack(body: ProfileDefinitionBody, ssm: SSMClient, ssmRoot: string, profileName: string): Promise<string[]> {
+  const { multiStepIntents, intents } = await versionIntentsOf(body, ssm, ssmRoot, profileName);
+  if (body.intentWorkflows === undefined && !multiStepIntents.length) return [];
+  const read = await versionTaskMachines(body, ssm, ssmRoot, profileName);
+  if ('error' in read) return [read.error.replace('eventWorkflows assigns a task', 'intentWorkflows opens a task')];
+  // A DEPLOYMENT WITH NO BODY STORE writes no workflow out (withDeclaredWorkflows), so it is not asked for one.
+  return versionIntentWorkflowsErrors(body.intentWorkflows, { multiStepIntents, intents, machines: read.machines, requireDeclared: !!bodyBucket() });
+}
+
+/** The intents a version answers, and the multi-step ones: its own pack's, else the deployment's for its classification. */
+export async function versionIntentsOf(body: Partial<ProfileDefinitionBody>, ssm: SSMClient, ssmRoot: string, profileName: string): Promise<{ multiStepIntents: string[]; intents: string[] }> {
+  const pack = body.intentPack ? resolveStoredPack(body.intentPack) : parseIntentPack(await deploymentPackRaw(ssm, ssmRoot, profileName));
+  return {
+    multiStepIntents: pack.intents.filter((i) => i.delivery === 'TASK_MULTI_STEP').map((i) => i.key),
+    intents: pack.intents.map((i) => i.key),
+  };
+}
+
+/**
+ * A NEW DRAFT DECLARES EVERY MULTI-STEP INTENT'S WORKFLOW: its own, and the standard one written out for
+ * each intent that declares none, so the version shows and owns every workflow it runs (`withIntentWorkflowsDeclared`).
+ */
+export async function withDeclaredWorkflows(body: ProfileDefinitionBody, ssm: SSMClient, ssmRoot: string, profileName: string): Promise<ProfileDefinitionBody> {
+  // ONLY WHERE A BODY STORE HOLDS THEM, as a draft's starting machines are (startsWithMachines): inline, every intent's
+  // workflow would make the parameter's cap the limit on the taxonomy, so a deployment with no store keeps running each
+  // undeclared intent's standard workflow, as every version stored before did.
+  if (!bodyBucket()) return body;
+  const { multiStepIntents } = await versionIntentsOf(body, ssm, ssmRoot, profileName).catch(() => ({ multiStepIntents: [] as string[], intents: [] as string[] }));
+  const intentWorkflows = withIntentWorkflowsDeclared(body.intentWorkflows, multiStepIntents);
+  return intentWorkflows ? { ...body, intentWorkflows } : body;
 }
 
 /**
@@ -1056,7 +1338,7 @@ async function workflowErrorsWithMachines(body: ProfileDefinitionBody, ssm: SSMC
  */
 export async function versionConfirmBriefErrors(body: Partial<ProfileDefinitionBody>, ssm: SSMClient, ssmRoot: string, profileName: string): Promise<string[]> {
   if (body.confirmBrief === undefined) return [];
-  const read = await deploymentTaskMachines(ssm, ssmRoot, profileName);
+  const read = await versionTaskMachines(body, ssm, ssmRoot, profileName);
   if ('error' in read) return [read.error.replace('eventWorkflows assigns a task', 'confirmBrief names a workflow')];
   return confirmBriefErrors(body.confirmBrief, read.machines);
 }
@@ -1067,8 +1349,18 @@ export async function workflowSelectionErrors(
   ssmRoot: string,
   profileName: string,
 ): Promise<string[]> {
-  const selected = body.workflows;
-  if (!selected?.length) return [];
+  const errs: string[] = [];
+  // RETIRED (ADR-067 stage 4): an intent opens work when it is multi-step, which its workflow makes it. A new draft and an
+  // import carry a stored selection as single-turn intents (`inCurrentForm`, retired-fields.ts), so only a draft edited to
+  // carry it again, or an import with no pack to carry it in, meets this.
+  if ((body as { workflows?: unknown }).workflows !== undefined) {
+    errs.push('workflows is retired: an intent opens work when it is multi-step, so make each intent that should not open a task single-turn in intentPack.intents (delivery) and leave workflows out');
+  }
+  // AN INTENT THAT IS MULTI-STEP HAS A WORKFLOW: a multi-step intent of the version's own pack with no
+  // workflow it could open is refused, and is made single-turn or given one.
+  const own = ((body.intentPack as { intents?: Array<{ key?: string; delivery?: string }> } | undefined)?.intents ?? [])
+    .filter((i) => i?.delivery === 'TASK_MULTI_STEP' && typeof i.key === 'string');
+  if (!own.length) return errs;
   let raw: string | undefined;
   try {
     const classification = classificationServedBy(profileName);
@@ -1079,13 +1371,25 @@ export async function workflowSelectionErrors(
   } catch {
     // No pack ⇒ the platform graphs are the whole available set, which is a real answer.
   }
-  const available = new Set(Object.keys(taskStateMachines(parseIntentPack(raw))));
-  const unknown = selected.filter((w) => !available.has(w));
-  return unknown.map((w) => (
-    `workflows['${w}'] names no workflow this deployment has, so the assistant could never open it; `
-    + `available: ${[...available].sort().join(', ') || '(none)'}. Task graphs are global - a `
-    + 'classification adds its own on its intent pack, and a version selects from what exists.'
-  ));
+  const available = new Set(Object.keys(withVersionMachines(taskStateMachines(parseIntentPack(raw)), body.intentPack)));
+  for (const i of own) {
+    if (!available.has(i.key!)) {
+      errs.push(`intentPack.intents ${i.key} is multi-step and has no workflow: give it one (intentPack.machines.${i.key}) or make it single-turn`);
+    }
+  }
+  return errs;
+}
+
+/** The classification's intent pack, parsed, for a version that has none of its own; undefined where it cannot be read. */
+async function classificationPackOf(ssm: SSMClient, ssmRoot: string, profileName: string): Promise<{ intents?: unknown[] } | undefined> {
+  try {
+    const classification = classificationServedBy(profileName);
+    const got = await ssm.send(new GetParameterCommand({ Name: `${ssmRoot}/assistant/${classification}/assistant-intent-pack` }));
+    const raw = await resolvePackParameterValue(got.Parameter?.Value, classification);
+    return raw ? packWithoutMachines(JSON.parse(raw)) as { intents?: unknown[] } : { intents: DEFAULT_INTENT_PACK.intents };
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -1259,7 +1563,7 @@ export async function messageTemplateErrors(
     for (const name of messageEntryNames(entry)) {
       try {
         const loaded = await loadTemplate(classification, { name }, deps, { owner: { family: 'assistant', assistant: profileName }, kind: shipped.kind ?? 'message' });
-        const misfit = storedTemplateMisfit(loaded.template, shipped);
+        const misfit = storedTemplateMisfit(loaded.template, shipped, { lookup });
         if (misfit) errors.push(`messages.${message} names "${name}", which does not fit it: ${misfit}`);
       } catch (err) {
         errors.push(`messages.${message} names "${name}", which is not an active template of this assistant: ${(err as Error).message.replace(/^\[TemplateStore\] /, '')}`);
@@ -1296,13 +1600,47 @@ export function stepRoleWarnings(body: ProfileDefinitionBody, declaredRoles: rea
     for (const [step, def] of Object.entries(wf?.states ?? {})) {
       const role = def?.agent?.as?.role;
       if (role && !declaredRoles.includes(role)) {
-        out.push(`eventWorkflows.${name}, whose step ${step} is taken by the ${role} assistant, which this deployment does not declare for the classification; until one is in the room the step reads nothing and says its absent message`);
+        out.push(`eventWorkflows.${name}, whose step ${step} is taken by the ${role} assistant, which this deployment does not declare for the classification; until one is in the conversation the step reads nothing and says its absent message`);
       }
       // A TASK WORKED BY AN ASSISTANT ROLE (ADR-063 decision 1), held to the same rule as `as`: said, never refused.
       const worker = workerAssistantRole(def?.task?.by);
       if (worker && !declaredRoles.includes(worker)) {
-        out.push(`eventWorkflows.${name}, whose step ${step} assigns its task to the ${worker} assistant, which this deployment does not declare for the classification; until one is in the room the task is not opened and the step takes its failure edge`);
+        out.push(`eventWorkflows.${name}, whose step ${step} assigns its task to the ${worker} assistant, which this deployment does not declare for the classification; until one is in the conversation the task is not opened and the step takes its failure edge`);
       }
+    }
+  }
+  return out;
+}
+
+/**
+ * A TASK GIVEN TO AN ASSISTANT ROLE NAMES A REQUEST THAT ASSISTANT OFFERS (ADR-067 G11, WT78). The task runs the machine
+ * of the intent it names on the role assistant's own version, which the run reads only through that assistant's
+ * advertisement (tenet D3). A task step, in an event workflow or an intent's, naming an intent the role's assistant does
+ * not advertise as multi-step is said beside the result, never refused: the role's assistant can publish it later, and
+ * until it does the step takes its failure edge. A role the classification does not declare is `stepRoleWarnings`'s.
+ */
+export async function roleTaskWarnings(
+  body: ProfileDefinitionBody,
+  roleAssistant: (role: string) => string | undefined,
+  read: (assistant: string) => Promise<AssistantAdvertisement | null> = readAdvertisement,
+): Promise<string[]> {
+  const steps: Array<{ at: string; step: string; role: string; machine: string }> = [];
+  const collect = (at: string, wf: { states?: Record<string, EventWorkflow['states'][string]> } | undefined) => {
+    for (const [step, def] of Object.entries(wf?.states ?? {})) {
+      const role = workerAssistantRole(def?.task?.by);
+      if (role && def?.task?.machine) steps.push({ at, step, role, machine: def.task.machine });
+    }
+  };
+  for (const [name, wf] of workflowsRunBy(body)) collect(`eventWorkflows.${name}`, wf);
+  for (const [intent, wf] of Object.entries((body.intentWorkflows ?? {}) as Record<string, { states?: Record<string, EventWorkflow['states'][string]> }>)) collect(`intentWorkflows.${intent}`, wf);
+  const ads = new Map<string, AssistantAdvertisement | null>();
+  const out: string[] = [];
+  for (const { at, step, role, machine } of steps) {
+    const assistant = roleAssistant(role);
+    if (!assistant) continue;
+    if (!ads.has(assistant)) ads.set(assistant, await read(assistant).catch(() => null));
+    if (!ads.get(assistant)?.intents.some((i) => i.key === machine)) {
+      out.push(`${at}, whose step ${step} asks the ${role} assistant for ${machine}, which that assistant does not advertise; until it does, the step takes its failure edge`);
     }
   }
   return out;
@@ -1320,7 +1658,7 @@ export function pickupWarnings(body: ProfileDefinitionBody, turnQueueOn = proces
     for (const [step, def] of Object.entries(wf?.states ?? {})) {
       if (!def?.task) continue;
       const toAssistant = def.task.by === undefined || workerAssistantRole(def.task.by) !== undefined;
-      if (toAssistant) out.push(`eventWorkflows.${name}, whose step ${step} assigns its task to an assistant: the turn queue is off in this deployment, so the assistant runs the task's first step and every later step waits for a message in the room`);
+      if (toAssistant) out.push(`eventWorkflows.${name}, whose step ${step} assigns its task to an assistant: the turn queue is off in this deployment, so the assistant runs the task's first step and every later step waits for a message in the conversation`);
     }
   }
   return out;
@@ -1336,7 +1674,12 @@ export function welcomeWorkflowErrors(body: ProfileDefinitionBody, machines?: Re
   const own = body.eventWorkflows ?? {};
   // A TASK STEP OPENS A MACHINE THE RUNTIME RUNS (ADR-063 decision 1): the classification's pack merged over the
   // platform's (`deploymentTaskMachines`), the set the router and the task service resolve. Absent, the platform's.
-  const errors: string[] = [...versionEventWorkflowsErrors(body.eventWorkflows, machines ? { machines } : {})];
+  // CHECKED THROUGH THE VERSION'S VARIABLES, the lookup the router evaluates a step's condition with (`routerHeldVariables`).
+  const errors: string[] = [
+    ...versionEventWorkflowsErrors(body.eventWorkflows, { lookup: routerHeldVariables(body.variables).lookup, ...(machines ? { machines } : {}) }),
+    // THE PROCESSES THE VERSION DECLARES (SPEC-PROCESSES P1), checked against its workflows.
+    ...versionProcessesErrors(body.processes, body.eventWorkflows, body.intentWorkflows),
+  ];
   const tools = new Set(body.tools ?? []);
   if (body.tools) {
     for (const [name, wf] of Object.entries(own)) {
@@ -1371,7 +1714,11 @@ export async function eventWorkflowTemplateErrors(
   deps?: import('./template-store.js').TemplateStoreDeps,
 ): Promise<string[]> {
   const own = body.eventWorkflows ?? {};
-  if (!Object.keys(own).length) return [];
+  const machines = (body.intentPack as { machines?: Record<string, TaskStateMachine> } | undefined)?.machines ?? {};
+  const notices = Object.entries(machines).flatMap(([machine, m]) => Object.entries(m?.states ?? {})
+    .filter(([, def]) => def?.notice?.template)
+    .map(([state, def]) => ({ at: `intentPack.machines.${machine}.states.${state}.notice`, name: def.notice!.template })));
+  if (!Object.keys(own).length && !notices.length) return [];
   const classification = servedClassification(profileName);
   if (!classification) return [`eventWorkflows cannot be checked: '${profileName}' serves no classification this deployment declares`];
   const [{ loadNamedTemplate }, { shippedMessageTemplates }] = await Promise.all([
@@ -1387,6 +1734,12 @@ export async function eventWorkflowTemplateErrors(
       if (!(await loadNamedTemplate({ classification, assistant: profileName, name: t.name }, t.kind, deps))) {
         errors.push(`eventWorkflows.${name}.states.${t.at} names "${t.name}", which is not a ${t.kind} template the platform ships, this assistant holds, or its classification holds`);
       }
+    }
+  }
+  for (const n of notices) {
+    if (shipped.get(n.name)?.template.kind === 'message') continue;
+    if (!(await loadNamedTemplate({ classification, assistant: profileName, name: n.name }, 'message', deps))) {
+      errors.push(`${n.at} names "${n.name}", which is not a message template the platform ships, this assistant holds, or its classification holds`);
     }
   }
   return errors;
@@ -1475,7 +1828,12 @@ export async function versionConditionErrors(
   const messageWhens = messages.flatMap(([message, entry]) => (Array.isArray(entry)
     ? entry.flatMap((c: { when?: unknown }, i: number) => (c && c.when !== undefined && whenReadsCatalog(c.when, messageLookup) ? [{ message, i, when: c.when }] : []))
     : []));
-  if (!routeWhens.length && !messageWhens.length) return [];
+  // A VERSION'S OWN MACHINES (ADR-066 decision 6) decide on the same sources, against the same catalog, as a classification's
+  // pack's do at its synth (`machineCatalogConditionErrors`).
+  const declared = versionDeclaredMachines(body.intentPack);
+  const machinesReadCatalog = !!declared
+    && Object.values(declared).some((m) => machineConditions(m).some((w) => whenReadsCatalog(w, routeLookup)));
+  if (!routeWhens.length && !messageWhens.length && !machinesReadCatalog) return [];
   if (!readCatalog) return ['a condition names a ctx: source, and no context source catalog was given to check it against'];
   let catalog: ReturnType<typeof catalogEntryForVariables>[];
   try {
@@ -1490,10 +1848,27 @@ export async function versionConditionErrors(
       .map((e) => `models.routing[${i}].when: ${e}`)),
     ...messageWhens.flatMap(({ message, i, when }) => whenErrors(when, versionLookup(table, body.variables), { selects: audienceOf(message), catalog: 'only' })
       .map((e) => `messages.${message}[${i}].when: ${e}`)),
+    ...(machinesReadCatalog ? machineCatalogConditionErrors(declared!, sourceLookup(table)).map((e) => `intentPack.machines: ${e}`) : []),
   ];
 }
 
-/** Validate the current draft (returns errors; empty ⇒ activatable). */
+/**
+ * A RUNTIME ASSISTANT CARRIES ITS OWN INTENT PACK (ADR-048, ADR-054). It has no deploy-time pack of its own, and
+ * inheriting its classification's would hand it another assistant's use cases. Validate and Activate both read this.
+ */
+export function runtimeIntentPackErrors(profileName: string, body: Pick<ProfileDefinitionBody, 'intentPack'>): string[] {
+  return isRuntimeAssistant(profileName) && !body.intentPack
+    ? ["a runtime assistant's version must carry its own intentPack; it does not inherit its classification's"]
+    : [];
+}
+
+/**
+ * Validate the current draft: every check Activate runs on the draft itself (returns errors; empty means Activate refuses
+ * nothing in the draft). The golden set's gate is Activate's alone, read from the draft's run (ADR-065).
+ *
+ * `nameTaken` is the route's check that another assistant in the classification already shows the draft's name, the one
+ * Activate runs (`manage-profiles`): it answers the refusal's text, or null when the name is free.
+ */
 export async function validateDraft(
   ssm: SSMClient,
   ssmRoot: string,
@@ -1501,10 +1876,12 @@ export async function validateDraft(
   catalog: Record<BackendModelKey, BackendModelDefinition>,
   readContextCatalog?: (profileName: string) => Promise<Array<{ key: string }>>,
   readGuardrailCatalog?: (profileName: string) => Promise<Array<{ key: string; guardrailId: string }>>,
+  nameTaken?: (displayName: string) => Promise<string | null>,
 ): Promise<{ errors: string[]; configId?: string; warnings?: string[]; errorDetails?: RouteError[] }> {
   const draft = await getDraft(ssm, ssmRoot, profileName);
   if (!draft) return { errors: ['no draft to validate'] };
   const body = bodyFrom(draft);
+  const taken = nameTaken && body.displayName ? await nameTaken(body.displayName) : null;
   // The routes the ACTIVE version already serves: inherited, so not this edit's doing.
   const inherited = await activeRouteKeys(ssm, ssmRoot, profileName);
   // THE REFUSALS THE CONSOLE ANCHORS TO A CARD OR STEP, read once and returned beside the flat list (ADR-064 decision 5).
@@ -1512,6 +1889,8 @@ export async function validateDraft(
   const toolDetails = await requiredToolErrorDetails(body, ssm, ssmRoot, profileName);
   const errorDetails = [...routeErrorDetails(body.models), ...stepDetails, ...toolDetails];
   const errors = [
+    ...(taken ? [taken] : []),
+    ...runtimeIntentPackErrors(profileName, body),
     ...validateBody(body, catalog, inherited, servedClassification(profileName)),
     ...retiredCopyErrors(body.copy),
     ...retiredWelcomeErrors(body.welcome),
@@ -1535,9 +1914,15 @@ export async function validateDraft(
   const classification = servedClassification(profileName);
   const warnings = [
     ...Object.entries(body.eventWorkflows ?? {}).flatMap(([name, wf]) => eventWorkflowRoleWarnings(name, wf as EventWorkflow, body.variables)),
+    // A STEP NAMING THE SUBJECT OFF assistant-joined reaches nobody there: said, never refused, so a stored version still validates.
+    ...Object.entries(body.eventWorkflows ?? {}).flatMap(([name, wf]) => eventWorkflowSubjectWarnings(name, wf as EventWorkflow)),
     // A STEP ANOTHER ASSISTANT TAKES, by a role this classification does not declare: said, never refused.
     ...(classification ? stepRoleWarnings(body, defaultProfileRegistry.rolesFor(classification)) : []),
     ...pickupWarnings(body),
+    // A TASK GIVEN TO A ROLE, NAMING A REQUEST ITS ASSISTANT DOES NOT OFFER (WT78): said, never refused.
+    ...(classification ? await roleTaskWarnings(body, (role) => defaultProfileRegistry.roleAssistantName(classification, role)) : []),
+    // A SOURCE THE ASSISTANT'S ROLE CANNOT READ: said, never refused, so a stored version selecting one still activates.
+    ...(await contextReachWarnings(body, profileName, readContextCatalog)),
   ];
   return { errors, configId: draft.configId, ...(warnings.length ? { warnings } : {}), ...(errorDetails.length ? { errorDetails } : {}) };
 }
@@ -1596,6 +1981,83 @@ async function consumeDraft(ssm: SSMClient, ssmRoot: string, profileName: string
     if ((err as { name?: string })?.name === 'ParameterNotFound') return;
     console.error(JSON.stringify({ event: 'profile-draft-not-consumed', profileName, configId: promotedConfigId, error: (err as Error)?.message }));
   }
+}
+
+/**
+ * A DRAFT WRITE REFUSED BECAUSE THE DRAFT IS NOT THE ONE THE CALLER SAW (SPEC-PORTABLE-PROFILES FR18, FR19). Every write
+ * that would replace or promote a draft names the configId it was based on, so an edit, an import or an activation never
+ * lands over, or promotes, a draft saved by someone else since. The route answers it as `409` with `code` and the
+ * configId of the draft there now (null when there is none).
+ *
+ * - `CONFIG_ID_REQUIRED`: a draft exists and the request named none.
+ * - `DRAFT_CHANGED`: the request named a draft that is no longer the stored one (saved again, activated or discarded).
+ * - `DRAFT_EXISTS`: a new version or an import would replace a draft the request did not name.
+ */
+export class DraftConflictError extends Error {
+  constructor(
+    public readonly code: 'CONFIG_ID_REQUIRED' | 'DRAFT_CHANGED' | 'DRAFT_EXISTS',
+    public readonly configId: string | null,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'DraftConflictError';
+  }
+}
+
+/**
+ * The stored draft's configId, read from its envelope (no body is hydrated), or null when there is no draft. A read that
+ * fails for any other reason throws: an unreadable draft is never reported as an absent one.
+ */
+export async function storedDraftConfigId(ssm: SSMClient, ssmRoot: string, profileName: string): Promise<string | null> {
+  let raw: string | undefined;
+  try {
+    raw = (await ssm.send(new GetParameterCommand({ Name: draftParamName(ssmRoot, profileName) }))).Parameter?.Value;
+  } catch (err) {
+    if ((err as { name?: string })?.name === 'ParameterNotFound') return null;
+    throw err;
+  }
+  if (!raw) return null;
+  return (JSON.parse(raw) as { configId?: string }).configId ?? '';
+}
+
+/** A configId as a request carries it: a non-empty trimmed string, else undefined. */
+export function requestConfigId(v: unknown): string | undefined {
+  return typeof v === 'string' && v.trim() ? v.trim() : undefined;
+}
+
+/**
+ * REFUSES A NEW DRAFT OVER ONE THE CALLER DID NOT NAME (New version, import). With no draft stored, anything goes; with one,
+ * the request must name its configId as the draft it replaces, or `DRAFT_EXISTS` is thrown carrying the stored configId.
+ */
+export async function assertDraftReplaceable(
+  ssm: SSMClient,
+  ssmRoot: string,
+  profileName: string,
+  replaceConfigId: string | undefined,
+): Promise<void> {
+  const stored = await storedDraftConfigId(ssm, ssmRoot, profileName);
+  if (stored === null || stored === replaceConfigId) return;
+  throw new DraftConflictError('DRAFT_EXISTS', stored,
+    `'${profileName}' already has a draft (${stored}); name it as the draft to replace, or open it instead`);
+}
+
+/**
+ * HOLDS A WRITE TO THE DRAFT THE CALLER SAW (an edit, an activation). `stored` is the draft's configId now (null: none),
+ * `basedOn` the one the request names. A draft that exists must be named, and named exactly; a request naming a draft
+ * when none is stored is refused too, because that draft was activated or discarded since.
+ */
+export function draftBasisError(profileName: string, stored: string | null, basedOn: string | undefined): DraftConflictError | null {
+  if (stored === null) {
+    return basedOn === undefined ? null
+      : new DraftConflictError('DRAFT_CHANGED', null, `the draft of '${profileName}' this request was based on (${basedOn}) was activated or discarded since`);
+  }
+  if (basedOn === undefined) {
+    return new DraftConflictError('CONFIG_ID_REQUIRED', stored, `'${profileName}' has a draft (${stored}); the request names the configId of the draft it was based on`);
+  }
+  if (basedOn !== stored) {
+    return new DraftConflictError('DRAFT_CHANGED', stored, `the draft of '${profileName}' was saved again since it was read (now ${stored}); reload it and apply the change again`);
+  }
+  return null;
 }
 
 /** What `discardDraft` did: the draft it removed, no draft at all, or a newer draft it kept. */
@@ -1663,19 +2125,18 @@ export async function activateDraft(
   activatedPastGate?: ProfileDefinition['activatedPastGate'],
 ): Promise<{ version: number; configId: string; displayName?: string }> {
   const draft = await getDraft(ssm, ssmRoot, profileName);
-  if (!draft) throw new Error('no draft to activate');
+  if (!draft) {
+    if (expectedConfigId !== undefined) throw draftBasisError(profileName, null, expectedConfigId)!;
+    throw new Error('no draft to activate');
+  }
   if (expectedConfigId !== undefined && draft.configId !== expectedConfigId) {
-    throw new ProfileValidationError([`the draft changed while it was being activated (now ${draft.configId}); activate again`]);
+    throw draftBasisError(profileName, draft.configId, expectedConfigId)!;
   }
   const body = bodyFrom(draft);
   // The routes the ACTIVE version already serves: inherited, so not this edit's doing.
   const inherited = await activeRouteKeys(ssm, ssmRoot, profileName);
   const errs = [
-    // A RUNTIME ASSISTANT CARRIES ITS OWN INTENT PACK (ADR-048, ADR-054). It has no deploy-time pack of
-    // its own, and inheriting its classification's would hand it another assistant's use cases.
-    ...(isRuntimeAssistant(profileName) && !body.intentPack
-      ? ["a runtime assistant's version must carry its own intentPack; it does not inherit its classification's"]
-      : []),
+    ...runtimeIntentPackErrors(profileName, body),
     ...validateBody(body, catalog, inherited, servedClassification(profileName)),
     ...retiredCopyErrors(body.copy),
     ...retiredWelcomeErrors(body.welcome),
@@ -1697,8 +2158,9 @@ export async function activateDraft(
   ];
   if (errs.length) throw new ProfileValidationError(errs);
   // THE ACTIVATED VERSION KEEPS THE DRAFT'S LAYOUT (ADR-061 decision 7): the same configId, so the same layout key.
-  const layout = layoutFor(draft.layout, body.eventWorkflows);
-  const def = { ...buildDefinition(profileName, body), ...(layout ? { layout } : {}), ...(activatedPastGate ? { activatedPastGate } : {}) };
+  const layout = layoutFor(draft.layout, body.eventWorkflows, body.intentPack?.machines ?? null, body.intentWorkflows ?? null);
+  // A KEPT WELCOME IS KEPT BY ACTIVATION too, so the next draft started from this version restores it (ADR-067 G40).
+  const def = { ...buildDefinition(profileName, body), ...(layout ? { layout } : {}), ...(draft.keptWelcomeWorkflow ? { keptWelcomeWorkflow: draft.keptWelcomeWorkflow } : {}), ...(activatedPastGate ? { activatedPastGate } : {}) };
   const name = definitionParamName(ssmRoot, profileName);
   // `putDefinition` re-measures the value it is about to send, for the same reason editDraft relies on
   // it: validateBody above sees only the body, and this is the last gate before the write - activation
@@ -1779,7 +2241,7 @@ export async function activateExistingVersion(
     ]);
   }
 
-  await ssm.send(new LabelParameterVersionCommand({ Name: name, ParameterVersion: version, Labels: [ACTIVE_LABEL] }));
+  await labelJustWrittenVersion(ssm, name, version, ACTIVE_LABEL);
   // A ROLLBACK CHANGES WHAT THIS ASSISTANT ADVERTISES, so the projection follows the label rather than
   // the last forward activation. Projected from the version being rolled TO, read out of the body this
   // function already fetched to check it.
@@ -2140,14 +2602,20 @@ export async function previewDraftWorkflow(
   if (!name || wf === undefined) throw new ProfileValidationError([`no workflow named '${name}' to preview`]);
   const outcomes = req.outcomes;
   const outcomeErrors = outcomes === undefined ? [] : typeof outcomes !== 'object' || outcomes === null || Array.isArray(outcomes)
-    ? ['outcomes maps a step name to success, failure or deadline']
-    : Object.entries(outcomes as Record<string, unknown>).filter(([, v]) => !(PREVIEW_ENDINGS as readonly unknown[]).includes(v)).map(([k]) => `outcomes.${k} is success, failure or deadline`);
+    ? ['outcomes maps a step name to success, failure, deadline or absent']
+    : Object.entries(outcomes as Record<string, unknown>).flatMap(([k, v]) => {
+      if (!(PREVIEW_ENDINGS as readonly unknown[]).includes(v)) return [`outcomes.${k} is success, failure, deadline or absent`];
+      const step = (wf as { states?: Record<string, { task?: { by?: unknown } } | undefined> } | null)?.states?.[k];
+      // ABSENT is a step whose taker is not here: a task step that names who does the work. An agent step is the run's own
+      // assistant's turn (WT118), so it is never absent.
+      return v === 'absent' && step?.task?.by === undefined ? [`outcomes.${k} is absent only on a task step that names by: the one whose taker may not be here`] : [];
+    });
   const machines = hasTaskStep({ [name]: wf }) ? await deploymentTaskMachines(ssm, ssmRoot, profileName) : undefined;
   if (machines && 'error' in machines) throw new ProfileValidationError([machines.error]);
   const errors = [
     ...previewValuesErrors(req.values),
     ...outcomeErrors,
-    ...versionEventWorkflowsErrors({ [name]: wf }, machines ? { machines: machines.machines } : {}),
+    ...versionEventWorkflowsErrors({ [name]: wf }, { lookup: routerHeldVariables(body?.variables).lookup, ...(machines ? { machines: machines.machines } : {}) }),
   ];
   if (errors.length) throw new ProfileValidationError(errors);
   return previewWorkflowRun(name, wf as EventWorkflow, {

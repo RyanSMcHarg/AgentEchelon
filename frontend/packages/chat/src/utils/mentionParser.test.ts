@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { parseMentions, mentionValidationMessage, privatePrefixToken, withPrivateAddressDisplayed, withMentionNamesDisplayed, mentionTokenFor } from './mentionParser';
+import { parseMentions, mentionValidationMessage, privatePrefixToken, mentionTokenFor } from './mentionParser';
+import { readableAddressText } from '@ae/shared/utils/addressTokens.ts';
 import type { ChannelMember } from '@ae/shared';
 
 const me: ChannelMember = { userArn: 'arn:user:me', name: 'Me', isBot: false };
@@ -80,10 +81,22 @@ describe('parseMentions', () => {
 // item."). The parser
 // enforces single-target-or-@all by returning an error rather than
 // silently dropping the extras and shipping a half-targeted message.
+describe('parseMentions — @humans', () => {
+  it('addresses the people in the room and no assistant, with no Target', () => {
+    const r = parseMentions('@humans the plan changed', members, me.userArn);
+    expect(r).toEqual({ isAtAll: false, isAtHumans: true, mentionedArns: [] });
+  });
+
+  it('is refused beside a named member, as @all is', () => {
+    expect(parseMentions('@humans @Alice look', members, me.userArn).error).toBe('all_with_member');
+  });
+});
+
 describe('parseMentions — Target=1 enforcement', () => {
-  it('flags multiple distinct human mentions as multiple_humans', () => {
+  it('accepts several human mentions, with no Target', () => {
     const r = parseMentions('@Bob and @Alice take a look', members, me.userArn);
-    expect(r.error).toBe('multiple_humans');
+    expect(r.error).toBeUndefined();
+    expect(r.mentionedArns).toEqual([bob.userArn, alice.userArn]);
     expect(r.targetArn).toBeUndefined();
     expect(r.mentionBotArn).toBeUndefined();
     // Still surface every match so the UI can highlight what to remove.
@@ -126,7 +139,7 @@ describe('parseMentions — Target=1 enforcement', () => {
 
 describe('mentionValidationMessage', () => {
   it('returns a distinct human-readable message for each error code', () => {
-    const a = mentionValidationMessage('multiple_humans');
+    const a = mentionValidationMessage('private_with_mention');
     const b = mentionValidationMessage('multiple_bots');
     const c = mentionValidationMessage('all_with_member');
     expect(a.length).toBeGreaterThan(0);
@@ -214,9 +227,7 @@ describe('the private prefix', () => {
     const samuel: ChannelMember = { userArn: 'arn:user:samuel', name: 'Samuel', isBot: false };
     const sam: ChannelMember = { userArn: 'arn:user:sam', name: 'Sam', isBot: false };
     const r = parseMentions('@Samuel and @Sam please review', [me, bot, samuel, sam], me.userArn);
-    // Two humans is a refusal, which is the CORRECT outcome - and it can only be reached once both
-    // are actually found.
-    expect(r.error).toBe('multiple_humans');
+    expect(r.error).toBeUndefined();
     expect(r.mentionedArns).toContain(sam.userArn);
     expect(r.mentionedArns).toContain(samuel.userArn);
   });
@@ -282,49 +293,47 @@ describe('the private prefix', () => {
  *
  * The composer writes `.<Name|id>` so the backend resolves the addressee by id rather than by matching
  * a display name - that is what makes a private address land on the member the picker actually
- * selected. Nothing undid it at display, so a recipient read the literal token: the id, the pipe and
- * the angle brackets included. `privatePrefixToken`'s own comment asserted the opposite ("the SPA
- * renders the token and the id never reaches them") while no code did it.
+ * selected. A reader sees the name only (`readableAddressText`), never the id, the pipe or the angle
+ * brackets.
  */
 describe('what a person reads when a message was privately addressed', () => {
   it('shows the name and takes the id back out', () => {
-    expect(withPrivateAddressDisplayed('.<Alice|alice-sub-123> can you check this'))
+    expect(readableAddressText('.<Alice|alice-sub-123> can you check this'))
       .toBe('.Alice can you check this');
   });
 
-  it('keeps the delimited form when the name needs it', () => {
-    // The bare token ends at the first space, so a two-word name has to stay bracketed or it would
-    // read as a different, shorter name.
-    expect(withPrivateAddressDisplayed('.<Ryan McHarg|ryan-sub> hello'))
-      .toBe('.<Ryan McHarg> hello');
+  it('shows a two-word name whole, with no brackets', () => {
+    // The brackets delimit the name for the server; a reader sees the name itself.
+    expect(readableAddressText('.<Ryan McHarg|ryan-sub> hello'))
+      .toBe('.Ryan McHarg hello');
   });
 
   it('shows the address rather than removing it, because who it went to is information', () => {
     // A message addressed to one person reads differently from one addressed to the room. Stripping
     // the address entirely would make a private note look like an open one.
-    const shown = withPrivateAddressDisplayed('.<Alice|alice-sub-123> hi');
+    const shown = readableAddressText('.<Alice|alice-sub-123> hi');
     expect(shown).toContain('Alice');
     expect(shown.startsWith('.')).toBe(true);
   });
 
   it('never leaves the id, the pipe or the brackets in what is rendered', () => {
-    const shown = withPrivateAddressDisplayed('.<Alice|alice-sub-123> hi');
+    const shown = readableAddressText('.<Alice|alice-sub-123> hi');
     expect(shown).not.toContain('alice-sub-123');
     expect(shown).not.toContain('|');
     expect(shown).not.toContain('<');
   });
 
   it('preserves a leading /md, because the rendering command is not part of the address', () => {
-    expect(withPrivateAddressDisplayed('/md .<Alice|alice-sub> **hi**'))
+    expect(readableAddressText('/md .<Alice|alice-sub> **hi**'))
       .toBe('/md .Alice **hi**');
   });
 
   it('leaves a bare address and an ordinary message untouched', () => {
     // A bare `.Alice` never carried an id, and a message with no address has nothing to rewrite - so
     // this is safe to apply to every message.
-    expect(withPrivateAddressDisplayed('.Alice hello')).toBe('.Alice hello');
-    expect(withPrivateAddressDisplayed('just a normal message')).toBe('just a normal message');
-    expect(withPrivateAddressDisplayed('')).toBe('');
+    expect(readableAddressText('.Alice hello')).toBe('.Alice hello');
+    expect(readableAddressText('just a normal message')).toBe('just a normal message');
+    expect(readableAddressText('')).toBe('');
   });
 });
 
@@ -384,8 +393,8 @@ describe('an @mention that carries an id', () => {
   });
 
   it('shows the reader a name and never the id', () => {
-    const shown = withMentionNamesDisplayed('@<Alice|alice-2> and @<Ryan McHarg|ryan> hi');
-    expect(shown).toBe('@Alice and @<Ryan McHarg> hi');
+    const shown = readableAddressText('@<Alice|alice-2> and @<Ryan McHarg|ryan> hi');
+    expect(shown).toBe('@Alice and @Ryan McHarg hi');
     expect(shown).not.toContain('alice-2');
     expect(shown).not.toContain('|');
   });

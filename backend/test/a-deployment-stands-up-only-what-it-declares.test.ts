@@ -17,7 +17,7 @@
 import * as path from 'path';
 import { synthesizeApp, type SynthesizedApp } from '../lib/docs/api-contract';
 import {
-  CAPABILITIES, capabilityDefinition, capabilityErrors, parseCapabilities, resolveCapabilities,
+  CAPABILITIES, capabilityDefinition, capabilityErrors, parseCapabilities, resolveCapabilities, type CapabilityDefinition,
 } from '../lib/config/capabilities';
 import { DESTRUCTIVE_IF_ABSENT, RETIRED_CONTEXT_KEYS, retiredContextKeyErrors } from '../lib/config/deploy-context';
 import { assistantClassifications, DEFAULT_PROFILES_CONFIG, deployedAssistantClassifications, resolveDeploymentProfiles } from '../lib/config/profiles';
@@ -89,6 +89,23 @@ describe('the capability registry', () => {
       expect(capabilityErrors([def.name, ...def.requires])).toEqual([`"${def.name}" cannot be declared: ${def.notBuilt}`]);
       expect(def.notBuilt).toMatch(/NOT BUILT|not in this code base/);
     }
+    // Every shipped capability is built, so the refusal is held on a registry with one that is not.
+    const notBuilt: CapabilityDefinition = {
+      name: 'not-built-fixture',
+      summary: 'a capability whose stacks are not in this code base',
+      requires: ['chat'],
+      stacks: ['NotBuiltFixture'],
+      attaches: [],
+      stage: 'surface',
+      notBuilt: 'NOT BUILT: its stacks are not in this code base',
+    };
+    const registry = [...CAPABILITIES, notBuilt];
+    expect(capabilityErrors(['not-built-fixture', 'chat'], registry)).toEqual(['"not-built-fixture" cannot be declared: NOT BUILT: its stacks are not in this code base']);
+    expect(capabilityErrors(['not-built-fixture'], registry)).toEqual([
+      '"not-built-fixture" cannot be declared: NOT BUILT: its stacks are not in this code base',
+      '"not-built-fixture" requires "chat", which is not declared',
+    ]);
+    expect(capabilityErrors(['chat'], registry)).toEqual([]);
     expect(() => resolveCapabilities(['battle', 'experiments', 'chat'])).not.toThrow();
   });
 
@@ -99,11 +116,12 @@ describe('the capability registry', () => {
     for (const def of CAPABILITIES) for (const r of def.requires) expect(capabilityDefinition(r)).toBeDefined();
   });
 
-  it('holds meetings as one entry, requiring chat, refused until its stack lands', () => {
+  it('holds meetings as one entry, requiring chat, built by its own stack', () => {
     const meetings = capabilityDefinition('meetings')!;
     expect(meetings.requires).toEqual(['chat']);
     expect(meetings.stacks).toEqual(['Meetings']);
-    expect(meetings.notBuilt).toBeDefined();
+    expect(meetings.build).toBeDefined();
+    expect(meetings.notBuilt).toBeUndefined();
   });
 
   it('retires the four switches the list replaces, and treats an absent list as destructive', () => {
@@ -176,10 +194,9 @@ describe('each built capability adds its own stacks and nothing else (athena)', 
 });
 
 describe('synth refuses what it cannot build, naming each reason', () => {
-  it('an unknown name, a capability that is not built, and a missing prerequisite', () => {
-    const text = synthFailure({ capabilities: ['bogus', 'meetings', 'battle'] });
+  it('an unknown name and a missing prerequisite', () => {
+    const text = synthFailure({ capabilities: ['bogus', 'battle'] });
     expect(text).toContain('"bogus" is not a capability');
-    expect(text).toContain(`"meetings" cannot be declared: ${capabilityDefinition('meetings')!.notBuilt}`);
     expect(text).toContain('"battle" requires "experiments", which is not declared');
   }, SYNTH_TIMEOUT_MS);
 

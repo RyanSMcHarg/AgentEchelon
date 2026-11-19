@@ -92,7 +92,7 @@ Stated because a migration that does not address them ships reassignment broken.
 
 ### Why this blocks the battle work
 
-DESIGN-BATTLE §2a settles that battle state is not task state, so the battle row carries no `taskId`. The two resume paths that read that field to find a duelling side's task chain are `planBattleResume` and `resumeBotFromWaiting`, both in `lib/battle-state.ts` (`:722` and `:432` respectively; the latter is called from `channel-flow-processor.ts:898`). Removing the field leaves them with no lookup - unless one exists that answers **"the active task owned by this actor in this channel"**, which is the same question for a duelling assistant and for a person holding a work item. One index then serves both, and the battle row needs nothing.
+DESIGN-BATTLE §2a settles that battle state is not task state, so the battle row carries no `taskId`. The two resume paths that read that field to find a duelling side's task chain were `planBattleResume` and `resumeBotFromWaiting`, both in `lib/battle-state.ts`, called from the channel flow. Removing the field leaves them with no lookup - unless one exists that answers **"the active task owned by this actor in this channel"**, which is the same question for a duelling assistant and for a person holding a work item. One index then serves both, and the battle row needs nothing.
 
 `planBattleResume` is retired by the continuation handoff: the flow no longer plans a delivery option, so nothing calls it, and `flow-does-not-run-the-turn.test.ts` pins the symbol out of the flow.
 
@@ -164,7 +164,7 @@ The minimum. Ownership becomes readable but the lookup does not change.
 
 ## D3. Where ownership history is recorded (maintainer decision, 2026-08-09: DECIDED, H1)
 
-**Ownership changes are entries in the task log, which already has a home:** `Task.stateHistory` (`task-tracking.ts:118`), the append-only log of SPEC-TASK-STATE-TRANSITIONS §6, appended at `:940` and projected into Aurora per turn. No second log (H2) and not nothing (H3).
+**Ownership changes are entries in the task log, which already has a home:** `Task.stateHistory` (`task-tracking.ts:118`), the append-only log of DESIGN-TASK-STATE-TRANSITIONS §6, appended at `:940` and projected into Aurora per turn. No second log (H2) and not nothing (H3).
 
 **What that requires of the entry shape, because an ownership change is not a graph edge.** A `StateTransition` is `{from, to, at, by, reason?, messageId?}` where `from` and `to` are declared machine states. Two additions:
 
@@ -306,15 +306,15 @@ Recorded so the distance is measured rather than assumed. After D1, D2 and D4 th
 
 ## The migration
 
-**Status: ALL EIGHT STEPS BUILT AND DEPLOYED.** `channelArn-updatedAt-index` is live on the agent-tasks table (`IndexStatus: ACTIVE`), read back off the deployment rather than inferred from a successful stack update. The ownership rules are pinned by `task-ownership.test.ts`, `battle-task.test.ts` and `a-battle-turn-resolves-its-task-by-the-answering-assistant.test.ts`, the last of which exists because swapping the battle task lookup from the bot owner to the human passed every other test in the repo. The four-shard backend suite has not been run to completion on the settled tree.
+**Status: ALL EIGHT STEPS BUILT AND DEPLOYED.** `channelArn-updatedAt-index` is live on the agent-tasks table (`IndexStatus: ACTIVE`), read back off the deployment rather than inferred from a successful stack update. The ownership rules are pinned by `task-ownership.test.ts`, `battle-task.test.ts` and `a-battle-turn-resolves-its-task-by-the-answering-assistant.test.ts`, the last of which exists because swapping the battle task lookup from the bot owner to the human passed every other test in the repo (all three under `backend/test/lib/`; the index is declared in `backend/lib/stacks/conversations-stack.ts:170`).
 
 In order, and the first two are prerequisites rather than steps:
 
 1. **One writer.** A single `setTaskAssignee` used by `createTask`, `createBattleTask` and reassignment, which is where the one-owner invariant is enforced and where `assigneeId` and `assigneeType` are only ever written together (D1). `assignedBotArn` and `assigneePersonId` become derived reads during the transition and are then deleted.
 2. **Backfill.** Existing rows get `assigneeType: 'user'` and keep their id untouched, since it is already the app-instance principal's unique id. Battle tasks get `assigneeType: 'assistant'` with `assigneeId` taken from `assignedBotArn`'s **last ARN segment**, not the ARN, and are written into the mirror for the first time.
 3. **Fix the split partition** (finding 1) and **the ttl-less upsert** (finding 2) as part of the move, not after it. Under one owner they cannot recur, because there is one id to key on.
-4. **Repoint the battle lookup.** `planBattleResume` takes the owner lookup; `taskId` leaves the battle state row; `resumeBotFromWaiting` stops reading it.
-5. **Reassignment ships as a forward-looking affordance, unwired (maintainer, 2026-08-09).** It is not needed yet and is expected soon, so `reassignTask` replaces `updateTaskAssignee` and waits for a caller rather than being deleted and rebuilt. **This is not finding 3 repeating**, and the difference is worth stating because the two look identical from outside: finding 3 was uncalled by accident, undocumented and untested, so nobody could tell whether reassignment worked or had simply never run. This one is uncalled on purpose, says so at the definition, and is covered by tests. When a caller arrives it also decides whether the hand-off announces itself.
+4. **Repoint the battle lookup.** The handler finds a resumed duel side's chain with the owner lookup `getActiveTaskForOwner` (`router-agent-handler.ts:7096`); `taskId` leaves the battle state row (`battle-state.ts:545`); `resumeBotFromWaiting` (`battle-state.ts:802`, called from `router-agent-handler.ts:1956`) reads no task. `planBattleResume` is removed.
+5. **Reassignment is one function, `reassignTask` (maintainer, 2026-08-09).** It replaces `updateTaskAssignee` (`backend/lambda/src/lib/task-tracking.ts:2692`). It has callers: the hand-over at each `awaits` boundary (`maybeHandOver`, `task-tracking.ts:3096`) and the return of an unmoved task to the person it awaits (`task-tracking.ts:3418-3429`). `Verified by:` `backend/test/lib/task-hand-over.test.ts` ("hands the task to the USER when the machine enters a state that awaits them") and `backend/test/lib/an-unmoved-task-goes-back-to-the-person.test.ts`. This closes finding 3, where reassignment existed with no caller and no test, so nobody could tell whether it worked.
 6. **Split the resume subject from the read subject (D4).** Today `getActiveTask` is called with the **sender's** sub (`router-agent-handler.ts:1338`), so one lookup serves both "what can I see" and "what do I resume". Under D4 they separate: the conversation index answers what is open here, and ownership answers what this turn advances. A task assigned to someone else stops being resumed when its creator speaks, and stays visible to them throughout. **That is a behavior change, and it is the point rather than a side effect** - a member seeing work they do not own is the requirement.
 7. **Add the conversation index** (`PK channelArn`, D4), and repoint the visibility reads onto it. It is a separate index from the owner one and neither substitutes for the other. Sorted by `updatedAt`, which is a judgement rather than a measurement: recency answers "what is open here" in one ordered query, where a `status` sort key needs one query per active status and still does not order them.
 8. **Bound what the row stores of the message (D5)**, split `Task.messageId` into `correlationId` and an optional `userMessageId`, and have the bypass paths store the id they already hold. Existing rows keep whatever they hold: the prompt builder reads the excerpt or falls back to the old field.
@@ -390,7 +390,7 @@ D1 gave a task an owner and an assigned assistant. Two roles were one too few, a
 
 **The human the work belongs to had no field.** `userArn` carried the requester and was doing the job: private-task disclosure is gated on it. But a requester is a fact about how a task started, not a position somebody holds, so it can never be handed on. Work that is delegated has no way to say so.
 
-So a task names three roles, changing at three different rates (SPEC-TASK-STATE-TRANSITIONS §2):
+So a task names three roles, changing at three different rates (DESIGN-TASK-STATE-TRANSITIONS §2):
 
 | Role | Field | Changes |
 | --- | --- | --- |

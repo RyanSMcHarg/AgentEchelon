@@ -170,6 +170,34 @@ export const CAPABILITIES: readonly CapabilityDefinition[] = [
     },
   },
   {
+    name: 'dashboard-pages',
+    summary: 'A conversation dashboard as a page opened outside the chat app, on a short-lived link signed for members (publish_dashboard_page)',
+    requires: [],
+    stacks: ['DashboardPages'],
+    attaches: [
+      { stack: 'Conversations', change: 'CloudFront may read a conversation\'s dashboard page, and only pages, from the attachments bucket (`dashboardPagesReadStatement`)' },
+      { stack: 'Assistants-*', change: 'DASHBOARD_PAGES in the processor\'s environment, so the page tool is offered' },
+      { stack: 'PersonApi', change: 'the /dashboard-link route' },
+    ],
+    stage: 'surface',
+    build: (ctx) => {
+      const { DashboardPagesStack } = require('../stacks/dashboard-pages-stack') as typeof import('../stacks/dashboard-pages-stack');
+      const { core } = ctx;
+      const stack = new DashboardPagesStack(ctx.app, `${ctx.prefix}DashboardPages`, {
+        env: ctx.env,
+        appInstanceArn: core.messaging.appInstanceArn,
+        selfPoolId: core.identity.selfPoolId,
+        attachmentsBucketName: core.conversations.attachmentsBucket.bucketName,
+        attachmentsBucketRegionalDomainName: core.conversations.attachmentsBucket.bucketRegionalDomainName,
+        appUrl: ctx.settings.appUrl,
+        description: 'Conversation dashboard pages: their distribution, signing key and the members-only link route',
+      });
+      stack.addDependency(core.conversations);
+      stack.addDependency(core.identity);
+      return [stack];
+    },
+  },
+  {
     name: 'chat',
     summary: 'The chat web app hosting (S3 and CloudFront)',
     requires: [],
@@ -215,6 +243,7 @@ export const CAPABILITIES: readonly CapabilityDefinition[] = [
       const battle = ctx.stacks.get('Battle');
       const services = new AdminServicesStack(ctx.app, `${ctx.prefix}AdminServices`, {
         env: ctx.env,
+        emailConfigured: ctx.declared.has('notifications'),
         appInstanceArn: core.messaging.appInstanceArn,
         appInstanceAdminArn: core.messaging.appInstanceAdminArn,
         userPool: core.identity.userPool,
@@ -227,11 +256,14 @@ export const CAPABILITIES: readonly CapabilityDefinition[] = [
         offboardingFunction: core.identity.offboardingFunction,
         subjectProvisioner: core.identity.subjectProvisioners.admin,
         attachmentsBucketArn: core.conversations.attachmentsBucket.bucketArn,
+        companyBucketName: core.conversations.companyBucket.bucketName,
+        profileBucketArn: core.conversations.profileBucket.bucketArn,
         feedbackTable: { tableName: core.conversations.feedbackTable.tableName, tableArn: core.conversations.feedbackTable.tableArn },
         archiveBucketArn: core.archive.archiveBucketArn,
         aurora: core.aurora,
         experimentsTable: experiments?.experimentsTable,
         battle: Boolean(battle),
+        meetings: ctx.declared.has('meetings'),
         adminGroupName: ctx.settings.adminGroupName,
         description: 'AgentEchelon admin backend: every admin handler, the admin credential exchange and the admin notification channel',
       });
@@ -252,6 +284,7 @@ export const CAPABILITIES: readonly CapabilityDefinition[] = [
         env: ctx.env,
         routes: services.routes,
         consoleRoles: services.consoleRoles,
+        adminPlaneRole: services.adminPlaneRole,
         appInstanceArn: core.messaging.appInstanceArn,
         selfPoolId: core.identity.selfPoolId,
         selfClientIds: core.identity.selfClientIds,
@@ -286,7 +319,7 @@ export const CAPABILITIES: readonly CapabilityDefinition[] = [
       { stack: 'Conversations', change: 'TRANSACTIONAL_MAIL_FUNCTION in the environment of the invitation and guest-upgrade functions; the invoke grant on their roles is this stack\'s' },
       { stack: 'PersonApi', change: 'the share route, and the email preference page' },
       { stack: 'Assistants-*', change: 'the read of its stacks\' alarms, its own policy on the acting role of a classification with an observability role (`capabilityAlarmNamePrefixes`)' },
-      { stack: 'Identity', change: 'the email reply poster role on the one-conversation role, when replyDomain is set' },
+      { stack: 'Identity', change: 'the email reply poster role on the restricted role, when replyDomain is set' },
     ],
     stage: 'surface',
     build: (ctx) => {
@@ -306,7 +339,7 @@ export const CAPABILITIES: readonly CapabilityDefinition[] = [
         tokens: core.conversations.tokensTable,
         mailSenders: [core.conversations.invitationsFunction, core.conversations.guestUpgradeFunction].filter((fn): fn is NonNullable<typeof fn> => Boolean(fn)),
         replyPoster: core.identity.replyPoster,
-        templateBucket: { bucketName: core.conversations.attachmentsBucket.bucketName, bucketArn: core.conversations.attachmentsBucket.bucketArn },
+        templateBucket: { bucketName: core.conversations.profileBucket.bucketName, bucketArn: core.conversations.profileBucket.bucketArn },
         description: 'Email: conversation sharing, the proactive briefing and the email bridge on the message stream',
       });
       stack.addDependency(core.messaging);
@@ -389,12 +422,50 @@ export const CAPABILITIES: readonly CapabilityDefinition[] = [
   },
   {
     name: 'meetings',
-    summary: 'Meetings as conversation state',
+    summary: 'Meetings: a conversation\'s Amazon Chime SDK meeting, started by a member or a workflow step, its ring, its join link and its roster events',
     requires: ['chat'],
     stacks: ['Meetings'],
-    attaches: [],
+    attaches: [
+      { stack: 'Conversations', change: 'the attachments bucket\'s policy statements that let the Amazon Chime SDK media pipelines service write a meeting\'s capture and recording under `recordings/` (`meetingRecordingsSinkStatements`)' },
+      { stack: 'Conversations', change: 'the attachments bucket\'s object events to the default bus, and its transcript and recording expiry (`DeleteOldTranscripts`, `DeleteOldRecordings`)' },
+      { stack: 'Conversations', change: 'the presigner\'s read of the transcript and recording families and its moderator read, the proposals function\'s moderator read, and the conversation management function\'s read of a meeting conversation\'s record (`ReadAMeetingConversationsRecord`)' },
+      { stack: 'Assistants-*', change: 'CONVERSATION_MANAGEMENT_FUNCTION, MEETING_RING_SECONDS, MEETING_MAX_MINUTES and MEETING_MEDIA_RECORDING in the router\'s environment, and the invoke of the conversation management function on the router\'s role, so an ended meeting\'s conversation is archived' },
+      { stack: 'Assistants-*', change: 'TRANSCRIPT_BUCKET in the processor\'s environment and the acting role\'s read and prefix-conditioned listing of its own classification\'s transcript family (`AssistantTranscriptRead`), so a summary turn reads the meeting\'s transcript' },
+      { stack: 'Assistants-*', change: 'the processor\'s read of an invitee\'s AppInstanceUser name (`ProcessorMeetingInviteeNames`); a turn\'s meeting place is read by its own router (`handleMeetingPlaceRead`), so the acting role holds no context-table read' },
+      { stack: 'Assistants-*', change: 'the typed creator\'s read of a conversation\'s membership (`TypedCreatorReadsRoomMembership`), so a meeting\'s conversation adds only the members of the conversation it was started from' },
+      { stack: 'PersonApi', change: 'the /meetings, /meetings/join, /meetings/status, /meetings/end, /meetings/events, /meetings/mine, /meetings/transcription, /meetings/transcript, /meetings/speaking, /meetings/remove and /meetings/unmute-request routes' },
+      { stack: 'Assistants-*', change: 'MEETING_RUN_FUNCTION in the router\'s environment, naming its own classification\'s run entry (`CAPABILITY_RESOURCES.meetingRun(classification)`), and the invoke of that entry alone on the router\'s role (`AgentHandlerStartsMeetings`), so a workflow\'s `start_meeting` step runs and no router reaches another classification\'s run entry' },
+      { stack: 'Assistants-*', change: 'MEETING_SUMMARY_FUNCTION in the router\'s environment, naming its own classification\'s summary entry (`CAPABILITY_RESOURCES.meetingSummary(classification)`), and the invoke of that entry alone on the router\'s role, so a meeting\'s ended card is rewritten with its figures' },
+      { stack: 'Assistants-*', change: 'the rule that hands the router its conversations\' meeting starts and ends (`meeting-started`, `meeting-ended`), and `chime:GetMeeting` on the router\'s role, so an end is believed only once Amazon Chime SDK no longer holds the meeting' },
+      { stack: 'Assistants-*', change: 'the `meeting` conversation type\'s creator (`TypedConversationFromEvent`), its role and the router\'s invoke of it, so a meeting is held in its own conversation' },
+      { stack: 'Archive', change: 'exports of the conversation archive bucket and its key, which the meeting events stream files into under `meeting_events/`' },
+      { stack: 'AdminServices', change: 'the meeting figures handler of the console, reading the meeting events, the record of each meeting and `chime:GetMeeting` for whether it runs now, and ending one for everyone through the run entry of the meeting\'s recorded classification (MEETING_RUN_FUNCTION_PATTERN, with the invoke of every classification\'s run entry, since an admin spans every classification) with an access-log record, and reading a meeting\'s transcript from the conversation store\'s transcript family with an access-log record, when admin is declared' },
+      { stack: 'AdminApi', change: 'the /admin/meetings routes, POST /admin/meetings/{meetingId}/end and GET /admin/meetings/{meetingId}/transcript, when admin is declared' },
+      { stack: 'Assistants-*', change: 'the read of its stacks\' alarms, its own policy on the acting role of a classification with an observability role (`capabilityAlarmNamePrefixes`)' },
+    ],
     stage: 'surface',
-    notBuilt: 'the Meetings stack is not in this code base yet: it lands with the meetings work as its own stack file and this entry, so meetings cannot be declared yet',
+    build: (ctx) => {
+      const { MeetingsStack } = require('../stacks/meetings-stack') as typeof import('../stacks/meetings-stack');
+      const { core } = ctx;
+      const stack = new MeetingsStack(ctx.app, `${ctx.prefix}Meetings`, {
+        env: ctx.env,
+        appInstanceArn: core.messaging.appInstanceArn,
+        selfPoolId: core.identity.selfPoolId,
+        appUrl: ctx.settings.appUrl,
+        classifications: ctx.classifications,
+        archive: {
+          bucketName: core.archive.conversationArchiveBucketName,
+          bucketArn: core.archive.conversationArchiveBucketArn,
+          keyArn: core.archive.archiveKeyArn,
+        },
+        description: 'AgentEchelon meetings: a conversation\'s Amazon Chime SDK meeting, its routes, its run entry and its roster events',
+      });
+      stack.addDependency(core.messaging);
+      stack.addDependency(core.archive); // the system of record its events are filed in, and the Glue database
+      stack.addDependency(core.identity); // the trusted-issuer registry its routes read the caller through
+      stack.addDependency(core.conversations); // the channel-context table, from the shared contract
+      return [stack];
+    },
   },
 ];
 
@@ -427,14 +498,17 @@ export interface DeclaredCapabilities {
   has(name: string): boolean;
 }
 
-/** Every reason a declared list cannot be synthesized, one line each. Empty when it can. */
-export function capabilityErrors(names: readonly string[]): string[] {
+/**
+ * Every reason a declared list cannot be synthesized, one line each. Empty when it can. `registry` is the
+ * capability registry the list is read against, `CAPABILITIES` unless a test passes its own.
+ */
+export function capabilityErrors(names: readonly string[], registry: readonly CapabilityDefinition[] = CAPABILITIES): string[] {
   const errors: string[] = [];
   const declared = new Set(names);
   for (const name of declared) {
-    const def = capabilityDefinition(name);
+    const def = registry.find((c) => c.name === name);
     if (!def) {
-      errors.push(`"${name}" is not a capability; the registry (lib/config/capabilities.ts) declares ${CAPABILITIES.map((c) => c.name).join(', ')}`);
+      errors.push(`"${name}" is not a capability; the registry (lib/config/capabilities.ts) declares ${registry.map((c) => c.name).join(', ')}`);
       continue;
     }
     if (def.notBuilt) errors.push(`"${name}" cannot be declared: ${def.notBuilt}`);

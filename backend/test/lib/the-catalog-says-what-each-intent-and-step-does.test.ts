@@ -10,6 +10,7 @@
 import { PutParameterCommand } from '@aws-sdk/client-ssm';
 import { classificationCatalog, machineSteps } from '../../lambda/src/lib/classification-catalog';
 import { DEFAULT_TASK_STATE_MACHINES } from '../../lambda/src/lib/task-state-machines';
+import { DEFAULT_INTENT_PACK } from '../../lambda/src/lib/intent-pack';
 import { getModelCatalog } from '../../lib/config/model-strategy';
 import { fakeSsmStore } from '../helpers/fake-ssm-store';
 
@@ -23,7 +24,7 @@ const PACK = {
       key: 'report_generation', description: 'User wants a written report.', summary: 'A report, delivered as a document',
       keywords: ['report'], delivery: 'TASK_MULTI_STEP', instructions: 'Confirm the subject first.',
     },
-    { key: 'financial_metric', description: 'One number.', keywords: ['arr'], delivery: 'PLACEHOLDER_UPDATE' },
+    { key: 'financial_metric', description: 'One number.', keywords: ['arr'], delivery: 'PLACEHOLDER_UPDATE', tools: ['get_company_context'] },
     // Multi-step, with no machine of its own name: the page says multi-step and names no machine.
     { key: 'orphan_task', description: 'No machine.', keywords: ['orphan'], delivery: 'TASK_MULTI_STEP' },
   ],
@@ -43,17 +44,21 @@ describe('each intent of the pack, with what it is for', () => {
         key: 'report_generation', description: 'User wants a written report.', summary: 'A report, delivered as a document',
         instructions: 'Confirm the subject first.', multiStep: true, machine: 'report_generation', needs: 'document',
       },
-      { key: 'financial_metric', description: 'One number.', multiStep: false },
+      // The tools a turn of the intent is offered: the version's allowlist narrowed to these.
+      { key: 'financial_metric', description: 'One number.', multiStep: false, tools: ['get_company_context'] },
       { key: 'orphan_task', description: 'No machine.', multiStep: true },
     ]);
     // The keys alone stay where a reader of them already looks.
     expect(c.packIntents).toEqual(['report_generation', 'financial_metric', 'orphan_task']);
+    expect(c.packSource).toBe('classification');
   });
 
-  it('serves no intents for a classification with no pack of its own, as it serves no pack keys', async () => {
+  it('serves the platform default pack for a classification with no pack of its own, as the runtime does', async () => {
     const c = await classificationCatalog(fakeSsmStore().client, lambda, ROOT, 'standard', keys);
-    expect(c.intents).toBeUndefined();
-    expect(c.packIntents).toBeUndefined();
+    expect(c.packIntents).toEqual(DEFAULT_INTENT_PACK.intents.map((i) => i.key));
+    expect(c.intents?.map((i) => i.key)).toEqual(DEFAULT_INTENT_PACK.intents.map((i) => i.key));
+    expect(c.intents?.find((i) => i.key === 'report_generation')).toMatchObject({ multiStep: true, machine: 'report_generation', needs: 'document' });
+    expect(c.packSource).toBe('platform');
   });
 });
 

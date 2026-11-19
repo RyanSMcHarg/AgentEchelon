@@ -72,6 +72,8 @@ interface FileChoice {
   summary: ManifestSummary;
   intents: string[];
   hasWelcome: boolean;
+  /** The file carries the retired `welcome` (W1), which the create refuses: the welcome is an assistant-joined workflow. */
+  retiredWelcome: boolean;
   hasPersona: boolean;
   modelKey?: string;
   classifierModelKey?: string;
@@ -89,9 +91,10 @@ function fileChoiceOf(fileName: string, raw: string): FileChoice | null {
     fileName,
     ...read,
     intents: (pack?.intents ?? []).map((i) => str(i?.key)).filter((k): k is string => !!k),
-    // Its own welcome is an assistant-joined workflow (W1); a manifest exported before W1 carries a retired `welcome`.
-    hasWelcome: Object.values((body.eventWorkflows ?? {}) as Record<string, { on?: unknown }>).some((wf) => wf?.on === 'assistant-joined')
-      || body.welcome !== undefined || body.copy !== undefined,
+    // Its own welcome is an assistant-joined workflow (W1). A manifest exported before W1 carries a retired `welcome`
+    // instead, which the import the create runs refuses, so it is said here rather than promised as the file's own.
+    hasWelcome: Object.values((body.eventWorkflows ?? {}) as Record<string, { on?: unknown }>).some((wf) => wf?.on === 'assistant-joined'),
+    retiredWelcome: body.welcome !== undefined && body.welcome !== null,
     hasPersona: !!str(body.persona),
     modelKey: str(models.default) ?? str(body.modelKey),
     classifierModelKey: str(models.classifier),
@@ -154,7 +157,7 @@ const CreateAssistantFlow: React.FC<CreateAssistantFlowProps> = ({ targets, owne
   const id = form.assistantId.trim();
   const validAssistant = !!form.classification && roles.includes(form.role)
     && ID_PATTERN.test(id) && !id.includes('--') && !!form.displayName.trim() && (isAdmin || !!form.ownerTeam);
-  const validStart = form.start === 'defaults' || (form.start === 'manifest' && !!file) || (form.start === 'copy' && !!source);
+  const validStart = form.start === 'defaults' || (form.start === 'manifest' && !!file && !file.retiredWelcome) || (form.start === 'copy' && !!source);
   const validModels = validStart && !!form.modelKey && limitValid;
   /** Intents decided by keyword rules, which take no classifier model. */
   const keywordRules = form.classifierMode === 'keyword';
@@ -257,7 +260,10 @@ const CreateAssistantFlow: React.FC<CreateAssistantFlowProps> = ({ targets, owne
           <dd><code data-testid="create-start-source">{t('admin.create.start.fileFrom', { assistant: file.summary.profileName, version: file.summary.version ?? '' }).trim()}</code></dd>
           <dt>{t('admin.create.start.intents')}</dt>
           <dd data-testid="create-start-intents">{file.intents.length ? file.intents.join(', ') : t('admin.create.start.intentsNone')}</dd>
-          <dt>{t('admin.create.start.welcome')}</dt><dd>{t(file.hasWelcome ? 'admin.create.start.welcomeOwn' : 'admin.create.start.welcomePlatform')}</dd>
+          <dt>{t('admin.create.start.welcome')}</dt>
+          <dd>{file.retiredWelcome
+            ? <span className="admin-error" role="alert" data-testid="create-start-retired-welcome">{t('admin.create.start.welcomeRetired')}</span>
+            : t(file.hasWelcome ? 'admin.create.start.welcomeOwn' : 'admin.create.start.welcomePlatform')}</dd>
           <dt>{t('admin.create.start.persona')}</dt><dd>{t(file.hasPersona ? 'admin.create.start.personaOwn' : 'admin.create.start.personaClassification')}</dd>
         </>
       )}
@@ -273,7 +279,7 @@ const CreateAssistantFlow: React.FC<CreateAssistantFlowProps> = ({ targets, owne
   /** THE LIVE PREVIEW: what has been chosen so far, which is what the create sends. */
   const preview = (
     <aside className="admin-wizard-preview" aria-labelledby="create-preview-title" data-testid="create-preview">
-      <h5 id="create-preview-title">{t('admin.create.preview')}</h5>
+      <h4 id="create-preview-title">{t('admin.create.preview')}</h4>
       <dl className="admin-config-list" data-testid="create-review">
         <dt>{L.classification}</dt><dd>{form.classification || '-'}</dd>
         <dt>{L.role}</dt><dd>{form.role || '-'}</dd>
@@ -298,7 +304,7 @@ const CreateAssistantFlow: React.FC<CreateAssistantFlowProps> = ({ targets, owne
   return (
     <section className="admin-config-group" aria-labelledby="create-assistant-title" data-testid="create-assistant">
       <div className="admin-edit-card-head">
-        <h4 id="create-assistant-title">{t('admin.create.title')}</h4>
+        <h3 id="create-assistant-title">{t('admin.create.title')}</h3>
         <HelpToggle label={t('admin.create.helpLabel')} testId="create-help"><p>{t('admin.create.intro')}</p></HelpToggle>
       </div>
       <WizardSteps steps={steps} current={index} headingTestId="create-step-heading" />
@@ -416,17 +422,18 @@ const CreateAssistantFlow: React.FC<CreateAssistantFlowProps> = ({ targets, owne
                     <StackedField label={t('admin.create.start.copyFrom')} help={t('admin.create.start.copyHelp', { classification: form.classification })}>
                       {({ id: fid, describedBy }) => (
                         <select id={fid} aria-describedby={describedBy} className="select" value={form.copyFrom} onChange={(e) => set({ copyFrom: e.target.value })}>
-                          <option value="">{t('admin.create.start.chooseCopy')}</option>
+                          <option value="" className="select-placeholder" disabled hidden>{t('admin.create.start.chooseCopy')}</option>
                           {sources.map((s) => <option key={s.profileName} value={s.profileName}>{s.label}</option>)}
                         </select>
                       )}
                     </StackedField>
                   ))}
 
-                {validStart && (
+                {/* A file the create refuses is still summarized, so the refusal is said beside what the file holds. */}
+                {(validStart || (form.start === 'manifest' && !!file)) && (
                   <section aria-labelledby="create-start-contents-title">
                     <div className="admin-edit-card-head">
-                      <h5 id="create-start-contents-title">{t('admin.create.start.contents')}</h5>
+                      <h4 id="create-start-contents-title">{t('admin.create.start.contents')}</h4>
                       <HelpToggle label={t('admin.create.start.contentsHelp')} testId="create-start-help">
                         <p>{t('admin.create.start.editLater')}</p>
                         <GuideLinks guides={[guideSection(t('admin.create.start.guide'), 'portability')]} />

@@ -53,7 +53,7 @@ const AccountMenu: React.FC<Props> = ({ name, onOpenSettings, onSignOut }) => {
           <button ref={firstItemRef} type="button" role="menuitem" className="account-menu-item" onClick={pick(onOpenSettings)}>
             {t('accountMenu.settings')}
           </button>
-          <button type="button" role="menuitem" className="account-menu-item" onClick={pick(onSignOut)}>
+          <button type="button" role="menuitem" className="account-menu-item" data-testid="account-menu-sign-out" onClick={pick(onSignOut)}>
             {t('header.signOut')}
           </button>
         </div>

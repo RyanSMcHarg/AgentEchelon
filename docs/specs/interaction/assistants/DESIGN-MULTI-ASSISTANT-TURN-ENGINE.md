@@ -17,19 +17,19 @@ Three entry points let assistants speak together, and none of them composes. The
 ```mermaid
 flowchart TB
   MSG["A message in a conversation"] --> FLOW["Channel flow decides<br/>who responds"]
-  FLOW -->|"@all, Lex bypass"| ALL["Broadcast: every bot member<br/>answers once, no turns"]
+  FLOW -->|"@all, Lex bypass"| ALL["Broadcast: every assistant member<br/>answers once, no turns"]
   FLOW -->|"/battle, Lex bypass"| BAT["Duel: exactly 2 sides,<br/>2 rounds, scored"]
   FLOW -->|"an addressed mention"| ONE["One assistant, one turn"]
   ALL --> H["Classification handler"]
   BAT --> H
   ONE --> H
   H --> W["Worker: the ordinary<br/>Converse tool loop"]
-  BAT -.->|"round 2 only"| ORCH["Battle orchestrator:<br/>its own dispatch,<br/>straight to the worker"]
-  ORCH --> W
+  BAT -.->|"round 2 only"| ORCH["Battle orchestrator:<br/>its own dispatch"]
+  ORCH -->|"aeRebuttal: a rebuttal-only<br/>router entry, no classifier"| H
   DEL["A delegate tool:<br/>a parent spawning workers"] -.->|"the hierarchical topology,<br/>owned elsewhere"| H
 ```
 
-The shape of the problem is in the dotted edges. Everything reaches one worker, and nothing models the three as configurations of one thing, so battle is the platform's only peer turn-taker and it is fixed at two participants and two rounds.
+Everything reaches one worker, but nothing models the three as configurations of one thing, so battle is the only peer turn-taker and it is fixed at two participants and two rounds.
 
 **The goal:** one engine that runs N named assistant participants through a policy-driven sequence of turns, where battle, co-reply, round-robin discussion and facilitated meetings are configurations over it rather than separate features.
 
@@ -41,13 +41,13 @@ These constraints are authoritative and shape every phase below.
 - **Battle runs the platform's normal request engine.** Each side answers through the same flow as any other message: real intent classification, real profile model resolution, real tools. A side is resolved by the same experiment-variant resolution the normal engine already applies to an in-experiment request; battle runs **all** the experiment's variants instead of hash-assigning one. The `/battle` prefix adds exactly three things: every variant responds, a rebuttal round runs, and a scorecard is rendered.
 - **The rebuttal is the point, and assistants are coached for it.** After the parallel first responses each side reacts to what the other produced. A side carries a light awareness note on its first turn and explicit guidance on the rebuttal turn; round-one content and length stay normal.
 - **The parallel race comes first.** Round one is simultaneous. Richer assistant-to-assistant coordination is a later enhancement (section 9).
-- **Battle mode is scoped to the experiment's lifetime.** It is a property of the experiment (`experiment.battleEnabled`) rather than a per-conversation toggle re-enabled each time. **This is a proposed change:** enablement today layers a per-channel moderator toggle (`ChannelBattleConfig`) on the experiment's flag.
+- **Battle mode is scoped to the experiment's lifetime.** It is a property of the experiment (`experiment.battleEnabled`) rather than a per-conversation toggle. **NOT BUILT:** enablement layers a per-channel moderator toggle (`ChannelBattleConfig`, `channel-battle.ts`) on the experiment's flag.
 - **The scorecard is inline and terminal**, appearing at the end of each duel rather than staying visible.
 - **Results are recorded as they are today** unless the refactor forces a change.
 
 ## 3. Consequence: image generation must become a normal capability
 
-Image generation is a first-class profile capability and intent, and that is the enabling change rather than an add-on. `image_generation` is an intent in the pack, and an image model is a route in `models.byIntent` whose primary is an image model, with a fallback like every other intent; any intent routed that way generates an image, whatever it is called. A version's legacy `models.image` reads as the `image_generation` route's primary. `resolveTurnImageRoute` decides the route for a turn. It follows the rule every model selection follows ([MODEL_STRATEGY](../../../guides/developer/MODEL_STRATEGY.md#one-rule-for-every-model)): an image model serves only an image route or an intent that needs an image, and only one the classification's catalog list allows.
+Image generation is a profile capability and intent (built; section 12 phase 2). `image_generation` is an intent in the pack (`intent-pack-taxonomy.ts`), and an image model is a route in `models.byIntent` whose primary is an image model, with a fallback like every other intent; any intent routed that way generates an image, whatever it is called. A version that sets the retired `models.image` field is refused at validation (`active-profile.ts`, ADR-064 decision 2). `resolveTurnImageRoute` (`async-processor-core.ts`) decides the route for a turn. It follows the rule every model selection follows ([MODEL_STRATEGY](../../../guides/developer/MODEL_STRATEGY.md#one-rule-for-every-model)): an image model serves only an image route or an intent that needs an image, and only one the classification's catalog list allows.
 
 ```mermaid
 flowchart TB
@@ -119,17 +119,18 @@ sequenceDiagram
     W-->>O: each side reaches a terminal state
     Note over O: the last writer claims the<br/>orchestrator sentinel exactly once
     O->>O: resolve each side's variant ONCE,<br/>stamp it into the round-2 context
-    O->>W: dispatch the rebuttal STRAIGHT to the worker,<br/>with the rival's round-1 reply
+    O->>H: aeRebuttal: the router checks the side against<br/>the duel record, posts the placeholder as the side
+    H->>W: dispatch with the side re-resolved from the experiment's pins<br/>(payload versions dropped), with the rival's round-1 reply
     W-->>P: the rebuttals, then the scorecard
 ```
 
-**The two rounds differ in one way that matters, and it is the remaining work.** Round 1 hands each side to the handler exactly as `@all` does, so the handler classifies, resolves the variant, selects the delivery option and dispatches. Round 2 goes straight to the worker, so the orchestrator supplies what the handler would have: it resolves both variants once and stamps them into the round-2 context, it inherits round 1's recorded intent rather than deriving one, and it carries a fixed non-task delivery option. Each of those is a deliberate consequence of the direct dispatch rather than a divergent second implementation - the intent is omitted when round 1 recorded none rather than falling back, and the fixed delivery is what keeps a rebuttal from becoming a third, ungated door into opening work ([ADR-047](../../../design/decisions/047-a-turn-resolves-its-task-machines-once.md)). Dispatching the rebuttal through the same handler entry, with the rival's prior turn injected as the thing to respond to, is what removes the need for any of them.
+**The two rounds differ in one way, and it is the remaining work.** Round 1 hands each side to the handler exactly as `@all` does, so the handler classifies, resolves the variant, selects the delivery option and dispatches. Round 2 enters the classification router through its rebuttal-only entry (`dispatchRebuttalRound` in `router-agent-handler.ts`), which refuses any payload that is not round 2 with `trigger: 'rebuttal'` and `deliveryOption: 'PLACEHOLDER_UPDATE'`, checks the side and the conversation against the classification and the duel's record, posts the placeholder as the side, and dispatches the processor. It runs no classifier. It re-resolves each side's version, variant and names from the experiment's own pins (`resolveDuelSides`) and drops any the payload carries, so a forged payload can neither be served nor widen the session; the orchestrator supplies the rest (`battle-orchestrator.ts`): round 1's recorded intent (omitted when round 1 recorded none), and a fixed non-task delivery, which keeps a rebuttal from becoming an ungated door into opening work ([ADR-047](../../../design/decisions/047-a-turn-resolves-its-task-machines-once.md)). Dispatching the rebuttal through the ordinary handler entry, with the rival's prior turn injected as the thing to respond to, removes the need for any of them.
 
-**This is the class of bug the redesign was triggered by.** The pre-handoff fan-out resolved the image-model pair and display names while the worker independently re-resolved the battle variant, so a resolution that succeeded on one side and fell through on the other - the fan-out Lambda missing the experiments-table grant, for instance - silently degraded to a text turn with no signal. An image duel therefore ran as a text duel and nothing errored. When there is one resolution path, there is nothing to diverge.
+**One resolution path is the target.** Two resolvers of the same variant can disagree, for example when one Lambda lacks the experiments-table grant, and an image duel then runs silently as a text duel. Round 2 still resolves twice, in the orchestrator and again in the router, and the router's resolution is the one served.
 
 ## 7. Modality follows the profile, never the battle path
 
-Because a turn is a normal request, its modality is whatever the assistant's profile and the classified intent produce. An assistant whose profile grants image generation produces an image when the intent calls for one, in a duel or not; an assistant without it does not. There is no battle-specific image branch and no separate image-model registry to forget, which is what section 3's precedence chain buys.
+A turn's modality is whatever the assistant's profile and the classified intent produce, in a duel or not. There is no battle-specific image branch and no separate image-model registry (section 3).
 
 ## 8. Scheduler: generalize the barrier and the sentinel
 
@@ -163,7 +164,7 @@ flowchart TB
 
 Every state move is a conditional write, and the sentinel row is what makes the advance exactly-once under an at-least-once delivery. Battle is two phases, co-reply is one, discussion is M, and a meeting is policy-driven.
 
-**The wait model is the open mechanical question.** The barrier is write-then-read today: whoever writes the last terminal state discovers it and drives the advance. At larger N that is N reads of the whole participant set per phase, and whether the scheduler should instead be woken by a callback is unresolved.
+**OPEN: the wait model.** The barrier is write-then-read: whoever writes the last terminal state discovers it and drives the advance. At larger N that is N reads of the whole participant set per phase, and whether the scheduler should instead be woken by a callback is unresolved.
 
 ## 9. Data model: generalize what is built
 
@@ -175,7 +176,7 @@ Every state move is a conditional write, and the sentinel row is what makes the 
 | `rivalBotArn`, singular | "the transcript slice this turn sees", a list | Two becomes N |
 | `variants[0]` control, `variants[1]` treatment | `participants[]` with roles | Position stops carrying meaning |
 | `totalRounds: 2`, a literal type | a policy-driven phase index | The phase count leaves the type system |
-| the fewer-than-two-bots fallback to the router | the general N case | Co-reply is the N-participant preset; battle asserts exactly two as a preset precondition |
+| the fewer-than-two-assistants fallback to the router | the general N case | Co-reply is the N-participant preset; battle asserts exactly two as a preset precondition |
 
 **The participant pool is the one row that does not generalize from battle, because what it would have generalized from is gone.** An alt belongs to one classification, is tagged with it, and the turn-path identity check filters on it ([DESIGN-BATTLE](../quality/DESIGN-BATTLE.md)). A borrowable pool of persona-less acting identities re-opens exactly the question that closed - which room a leased identity may act in - so it has to answer that per lease rather than inherit an answer. Which kind of principal a leased participant is remains open (section 11).
 
@@ -200,7 +201,7 @@ The engine never silently falls back to a degraded format. A duel that quietly a
 
 | Question | Why it is open |
 |---|---|
-| What kind of principal a participant identity is | The pool of alt bots this design once leased from is gone: an alt is an ordinary assistant holding a role for its classification, with its own profile and version history. The same question is [DESIGN-MULTI-AGENT-ORCHESTRATION](./DESIGN-MULTI-AGENT-ORCHESTRATION.md) Decision 2, where it is recorded as open and blocking, and the candidates are a bounded set of worker identities that is not the alt structure, or no identity of its own at all |
+| What kind of principal a participant identity is | There is no pool of alt identities to lease from: an alt is an ordinary assistant holding a role for its classification, with its own profile and version history. The same question is [DESIGN-MULTI-AGENT-ORCHESTRATION](./DESIGN-MULTI-AGENT-ORCHESTRATION.md) Decision 2, where it is recorded as open and blocking, and the candidates are a bounded set of worker identities that is not the alt structure, or no identity of its own at all |
 | Vended versus leased | A credential-exchange-vended identity and a leased pool identity are two stories for the same participant. The engine needs one, or a rule for when each applies, and the rule cannot be written before the question above is answered |
 | Pool sizing and contention | Whatever the scarce resource turns out to be, battle, discussion and any future delegation compete for it. There is no number to size it at until the mechanism names what is scarce |
 | Peer versus hierarchical | This engine models peer turn-taking, which is the built topology. The hierarchical delegate-and-collate topology is expressible as a turn policy and is out of scope for the first build |
@@ -218,8 +219,8 @@ flowchart LR
   P1 -.->|"parallel, and a prerequisite<br/>for image duels"| P2
 ```
 
-1. **Route battle through the normal engine.** Round 1 hands each side to the handler as an ordinary request. What remains is the round-2 orchestrator: dispatching the rebuttal through the same handler entry, with the rival's prior turn injected as the thing to respond to, rather than straight to the worker with the intent, delivery option and variants supplied around it.
-2. **Image generation as a normal capability.** Section 3's precedence chain is the enabling change, and a prerequisite for image duels under the new model rather than a follow-on.
+1. **Route battle through the normal engine.** Round 1 is built: each side reaches the handler as an ordinary request. **OPEN:** round 2 enters through the router's rebuttal-only entry with the intent, delivery option and variants supplied by the orchestrator (section 6), rather than through the ordinary handler entry with the rival's prior turn injected.
+2. **Image generation as a normal capability.** Built (section 3); the prerequisite for image duels.
 3. **Extract the scheduler.** Reimplement the round handoff as the generic phase advancer over `SessionState`. Behavior-preserving.
 4. **First new presets.** Co-reply, folding `@all` in, and round-robin discussion. The first reply-together and take-turns formats beyond battle, and the substrate for later coordination.
 5. **Generalize identity and the turn policy.** Grow the participant set past two and add the turn-policy interface, which is what the meeting preset needs.
@@ -241,7 +242,7 @@ flowchart TB
   W2 --> OWN["Owning loop safety<br/>the platform otherwise provides"]
 ```
 
-Amazon Chime SDK does not deliver a message authored by an `AppInstanceBot` to another `AppInstanceBot`'s Lex, so one assistant cannot trigger another by addressing it. The identical message from a user principal does trigger. This is undocumented - `TargetedMessages: ALL` reads as though any targeted message would be processed - and it is loop prevention rather than an oversight. The evidence and the two ways around it are in [ADR-023](../../../design/decisions/023-battle-round-coordination.md). Any turn policy that assumes assistants can pass control to each other in-channel has to choose one of them first, and the proxy route means owning the loop safety the platform otherwise provides.
+Amazon Chime SDK does not deliver a message authored by an `AppInstanceBot` to another `AppInstanceBot`'s Lex, so one assistant cannot trigger another by addressing it. The identical message from a user principal does trigger. AWS does not document this (`TargetedMessages: ALL` reads as though any targeted message would be processed); it is loop prevention. The evidence and the two ways around it are in [ADR-023](../../../design/decisions/023-battle-round-coordination.md). Any turn policy that assumes assistants can pass control to each other in-channel has to choose one of them first, and the proxy route means owning the loop safety the platform otherwise provides.
 
 ## Related Documents
 

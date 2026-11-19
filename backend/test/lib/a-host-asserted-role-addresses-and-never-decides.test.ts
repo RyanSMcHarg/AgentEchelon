@@ -100,6 +100,6 @@ describe('host:role is member trust', () => {
     expect(router).toMatch(/const roles = Object\.keys\(host\)\.length \? withHostHoldings\(stored, host, conversationType\) : stored;/);
     expect(router).toMatch(/\.\.\.\(roles !== stored \? \{ deciding: stored \} : \{\}\),/);
     expect(router).toMatch(/const held = ctx\.decidingRoles \?\? ctx\.roles;/);
-    expect(router).toMatch(/const hostRole = args\.to\.length === 1 && Object\.values\(written\.fields \?\? \{\}\)\.includes\('host:role'\)/);
+    expect(router).toMatch(/const hostRole = args\.to\.length === 1 && Object\.values\(args\.written\.fields \?\? \{\}\)\.includes\('host:role'\)/);
   });
 });

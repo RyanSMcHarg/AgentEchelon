@@ -13,8 +13,6 @@
  *   5. The token type the registry does not declare (the pool's ACCESS token, where `id` is declared): 401.
  *   6. A first-time token (a disposable pool account that has never been through the exchange): refused
  *      (403) on every route but the exchange, and admitted there.
- *   7. A one-conversation issuer's token (the host pool, when the test secret names it): refused (403) on
- *      every route but `ONE_CHANNEL_ROUTES`.
  *
  * The control: the same genuine token is admitted (not 401 or 403, and not a 5xx) on the routes it reaches. A route that
  * refuses every token, the control included, would pass every refusal above while proving nothing, so a
@@ -30,10 +28,8 @@
  *   AWS_PROFILE=<profile> AE_INSTANCE_NAME=<instance> node backend/scripts/deny-test-edge-authorizer.mjs
  *
  * Needs: the backend built (`npm run build`), and the test secret (`TEST_SECRET_NAME`, default
- * `agent-interface/test-credentials`) holding `cognitoClientId` and `basicUser { email, password }`;
- * for row 7, `federatedClientId` and `federatedUser { email, password }` of a one-conversation host pool.
- * Without the host-pool fixture row 7 is skipped with the reason printed; `REQUIRE_FEDERATED=1` fails
- * instead. The disposable account of row 6 is created here and deleted at the end.
+ * `agent-interface/test-credentials`) holding `cognitoClientId` and `basicUser { email, password }`.
+ * The disposable account one refusal row needs is created here and deleted at the end.
  *
  * Exit 0 = every refusal held; 1 = a gap; 2 = a setup error.
  */
@@ -53,7 +49,6 @@ import {
 
 const require = createRequire(import.meta.url);
 const { resolveStackPrefix } = require('./lib/stack-lookup.cjs');
-const { ONE_CHANNEL_ROUTES } = require('../lib/constructs/trusted-issuers.js');
 const { EXCHANGE_ROUTE } = require('../lib/constructs/edge-authorizer.js');
 
 const REGION = process.env.AWS_REGION || 'us-east-1';
@@ -200,23 +195,6 @@ async function main() {
       else pass(`6. a first-time token is admitted at the exchange (${atExchange})`);
     } finally {
       await idp.send(new AdminDeleteUserCommand({ UserPoolId: poolId, Username: username })).catch(() => undefined);
-    }
-  }
-
-  // 7. A ONE-CONVERSATION ISSUER: its own routes only.
-  console.log('\na one-conversation issuer');
-  if (!secret.federatedClientId || !secret.federatedUser) skip('7. the test secret names no federatedClientId and federatedUser');
-  else {
-    const host = await tokens(new CognitoIdentityProviderClient({ region: secret.federatedRegion || REGION }),
-      secret.federatedClientId, secret.federatedUser.email, secret.federatedUser.password);
-    // The exchange first, so the person exists and the refusals below are the edge's, not a first sign-in's.
-    await call(base, EXCHANGE_ROUTE, host.id);
-    await expectRefusedEverywhere('7. a one-conversation token, outside its routes', base,
-      routes.filter((r) => !ONE_CHANNEL_ROUTES.includes(r)), host.id, [403]);
-    for (const route of ONE_CHANNEL_ROUTES) {
-      const status = await call(base, route, host.id);
-      if (!handlerAnswered(status)) fail(`7. a one-conversation token is not admitted on its own route ${route} (${status})`);
-      else pass(`7. a one-conversation token is admitted on ${route} (${status})`);
     }
   }
 

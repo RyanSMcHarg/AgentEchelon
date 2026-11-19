@@ -60,7 +60,7 @@ export type { ImageGenModelKey };
  *                 on Bedrock). Body `{ prompt, mode, aspect_ratio,
  *                 output_format, seed }`; response `{ images:[...],
  *                 seeds:[...], finish_reasons:[...] }`.
- *   `openai`    — OpenAI Images API (gpt-image-1, formerly DALL-E 3).
+ *   `openai`    — OpenAI Images API (gpt-image-2).
  *                 Body `{ model, prompt, n, size, response_format:
  *                 'b64_json' }`; response `{ data: [{ b64_json:'...' }] }`.
  *   `fal`       — FAL.ai inference API (FLUX 1.1 Pro and similar
@@ -108,7 +108,7 @@ export interface ImageGenModelDef {
    * The id the provider's API expects. Named `bedrockModelId` for
    * back-compat with the original Bedrock-only registry; for
    * `hosting: 'external-http'` entries this is the model id sent in
-   * the HTTP request body (e.g. `gpt-image-1` for OpenAI,
+   * the HTTP request body (e.g. `gpt-image-2` for OpenAI,
    * `fal-ai/flux-pro/v1.1` for FAL).
    */
   bedrockModelId: string;
@@ -197,14 +197,14 @@ const IMAGE_GEN_MODEL_ENTRIES: Record<ImageGenModelKey, Omit<ImageGenModelDef, '
     maxImages: 1,
     maxDimension: 1024,
   },
-  // OpenAI gpt-image-1 (formerly DALL-E 3). Best-in-breed for prompt
-  // adherence and typography. External-HTTP — deployer sets
+  // OpenAI gpt-image-2, OpenAI's current image model. Best-in-breed for prompt
+  // adherence and typography. External-HTTP: the deployer sets
   // OPENAI_API_KEY on the Lambda to enable. AWS hosting is optional
   // per the OSS posture; this is a deployer choice, not a default.
-  openai_gpt_image_1: {
-    key: 'openai_gpt_image_1',
-    displayName: 'OpenAI gpt-image-1',
-    bedrockModelId: 'gpt-image-1',
+  openai_gpt_image_2: {
+    key: 'openai_gpt_image_2',
+    displayName: 'OpenAI gpt-image-2',
+    bedrockModelId: 'gpt-image-2',
     provider: 'openai',
     hosting: 'external-http',
     lifecycle: 'active',
@@ -275,9 +275,10 @@ export const IMAGE_GEN_RATE_USD_PER_IMAGE: Record<ImageGenModelKey, number> = {
   nova_canvas: 0.04,
   stability_image_core: 0.04,
   stability_image_ultra: 0.08,
-  // OpenAI gpt-image-1: $0.040 per standard 1024×1024 image at writing.
-  // Deployer reviews against current openai.com/pricing.
-  openai_gpt_image_1: 0.04,
+  // OpenAI gpt-image-2: an ESTIMATE of $0.040 per 1024×1024 image. OpenAI prices gpt-image-2 by tokens and
+  // quality (one 1024×1024 image at the default `low` quality uses about 196 output image tokens). Deployer
+  // reviews against current openai.com/pricing.
+  openai_gpt_image_2: 0.04,
   // FAL FLUX 1.1 Pro: ~$0.04 per image at FAL's pay-as-you-go rate.
   // Subscription / commit plans are cheaper.
   fal_flux_pro_1_1: 0.04,
@@ -401,12 +402,10 @@ export function shapeImageGenRequest(
         ...(opts.seed != null && { seed: opts.seed }),
       };
     case 'openai':
-      // OpenAI Images API. gpt-image-1 ALWAYS returns inline base64
-      // (`data[].b64_json`) and REJECTS the `response_format` param that
-      // DALL-E 3 used ("Unknown parameter: 'response_format'"), so we must
-      // NOT send it. The base64 result feeds the persistence path
-      // identically to the Bedrock providers. (`seed` is likewise not a
-      // gpt-image-1 param; omit it.)
+      // OpenAI Images API. The gpt-image models return inline base64 (`data[].b64_json`, confirmed for gpt-image-2
+      // with exactly this body) and REJECT the `response_format` param that DALL-E 3 takes ("Unknown
+      // parameter: 'response_format'"), so it is not sent. The base64 result feeds the
+      // persistence path identically to the Bedrock providers. (`seed` is not a gpt-image parameter; omitted.)
       return {
         model: def.bedrockModelId,
         prompt: text,

@@ -32,6 +32,7 @@ import * as lambdaDestinations from 'aws-cdk-lib/aws-lambda-destinations';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as snsSubscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
+import { transcriptPrefix } from '../../lambda/src/lib/meeting-transcript';
 import * as scheduler from 'aws-cdk-lib/aws-scheduler';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as cr from 'aws-cdk-lib/custom-resources';
@@ -75,12 +76,12 @@ import { eventOpenersAt, openerWatchesAlarms } from '../config/event-openers';
 import { issuersOf } from '../constructs/trusted-issuers';
 import { ExchangeRole, vendedClassifications } from '../constructs/exchange-role';
 import { clearanceGroups } from '../constructs/clearance-groups';
-import { ConversationCreator, typedCreatorName } from '../constructs/conversation-creator';
+import { ConversationCreator, eventTriggerRelayName, eventTriggerRulePrefix, typedCreatorName, eventWatchRulePrefix, twelveCharIds } from '../constructs/conversation-creator';
 import { ClassificationArchiveFunctions } from '../constructs/classification-archive-functions';
 import { userProfileServiceArn } from '../config/issuers';
 import { assertTypeGroupsRequireTheirClassifications } from '../conversation-type-grants';
 import { assertParticipantRolesAreDeclared, roleGroups } from '../config/participant-roles';
-import { PLATFORM_EVENT_WORKFLOWS, eventWorkflowRoleWarnings } from '../../lambda/src/lib/event-workflow';
+import { SHIPPED_EVENT_WORKFLOWS, eventWorkflowRoleWarnings } from '../../lambda/src/lib/event-workflow';
 import { attachBattle, attachExperiments } from './classification-capabilities';
 import { publishRegistryRow } from '../constructs/registry-row';
 import { DeclaredAssistantsSeed, type DeclaredAssistant } from '../constructs/declared-assistants-seed';
@@ -95,6 +96,7 @@ import {
   modelArnsForClassification,
   resolveSharedSSM,
   alertEmitterWiring,
+  readOwnAssistantsTagsStatement,
   abuseControlsWiring,
   turnQueueWiring,
   battleResourcesOf,
@@ -124,9 +126,15 @@ import {
   SHARED_SSM,
   tagAudience,
   messageTemplateReadStatements,
+  deployOwnedAssistantKey,
+  ANALYTICS_PREFIX,
+  CAPABILITY_RESOURCES,
+  INSTANCE_NAME,
 } from './agent-classification-common';
+import { MEETING_LIFECYCLE_DETAIL_TYPE, MEETING_LIFECYCLE_SOURCE } from '../../lambda/src/lib/meeting-lifecycle';
 import { invitationIndexReadStatement, invitationRecordReadStatement, leadingKeysFor } from '../constructs/token-store';
 import { DEADLINE_METRIC_NAMESPACE, DEADLINE_SCHEDULE_FAILED_METRIC } from '../../lambda/src/lib/event-workflow';
+import { GUARDRAIL_NAMESPACE, GUARDRAIL_UNAVAILABLE_METRIC } from '../../lambda/src/lib/guardrail-unavailable';
 import { alarmNamesPathOf } from '../constructs/alarm-names';
 
 /** The topology the shared body reads: the registry's, plus the classification it serves. */
@@ -151,9 +159,15 @@ export interface AssistantsStackProps extends cdk.StackProps {
   classification: string;
   /** Shared Chime AppInstance ARN (from AgentEchelonMessaging). */
   appInstanceArn: string;
-  /** Shared attachments bucket holding context/{classification}/*.json (from AgentEchelonConversations). */
+  /** The attachments bucket (Conversations): members' uploads, deliverables, generated images and golden-set hand-overs. */
   attachmentsBucketName: string;
   attachmentsBucketArn: string;
+  /** The company bucket (Conversations): the company corpus under `context/` and the platform's self-knowledge. */
+  companyBucketName: string;
+  companyBucketArn: string;
+  /** The profile bucket (Conversations): profile bodies, intent packs and templates. */
+  profileBucketName: string;
+  profileBucketArn: string;
   /**
    * Image-generation guardrails in the regions the MODELS live in, region -> {id, version}.
    *
@@ -313,6 +327,8 @@ export class AssistantsStack extends cdk.Stack {
     if (props.credentialExchangeRoleArn && vendedClassifications(issuersOf(this)).includes(classification)) {
       new ExchangeRole(this, 'ExchangeRole', {
         appInstanceArn: props.appInstanceArn, token: classification, exchangeRoleArn: props.credentialExchangeRoleArn,
+        // A MEMBER READS ITS CONVERSATION'S DASHBOARD with this role (DESIGN-CONVERSATION-DASHBOARDS section 4).
+        ...(props.attachmentsBucketArn ? { dashboardsBucketArn: props.attachmentsBucketArn } : {}),
       });
     }
     if (selfPoolId) clearanceGroups(this, classification, selfPoolId);
@@ -321,7 +337,7 @@ export class AssistantsStack extends cdk.Stack {
     new ConversationCreator(this, 'ConversationCreator', {
       classification, appInstanceArn: props.appInstanceArn,
       channelContextTableName: shared.channelContextName, channelContextTableArn: shared.channelContextArn,
-      templateBucketName: props.attachmentsBucketName, templateBucketArn: props.attachmentsBucketArn,
+      templateBucketName: props.profileBucketName, templateBucketArn: props.profileBucketArn,
     });
     // THE SERVICE ADMIN, COMPOSED RATHER THAN RESOLVED FROM SSM AT DEPLOY TIME.
     //
@@ -388,7 +404,7 @@ export class AssistantsStack extends cdk.Stack {
     // a profile author can discover what a profile's guardrailId may be set to (4.6b). Not read by the
     // runtime (the processor gets guardrailId from the profile definition); it is the selection catalog.
     new ssm.StringParameter(this, 'GuardrailsCatalogParam', {
-      parameterName: `${SSM_ROOT}/assistant/${classification}/guardrails`,
+      parameterName: deployOwnedAssistantKey(classification, 'guardrails'),
       stringValue: JSON.stringify([
         { key: 'default', name: `${RES_PREFIX}-${classification}-guardrail`, guardrailId: guardrail.guardrailId, guardrailVersion: guardrail.guardrailVersion },
         ...alternateGuardrails.map((a) => ({ key: a.key, name: a.name, guardrailId: a.gr.guardrailId, guardrailVersion: a.gr.guardrailVersion })),
@@ -446,7 +462,7 @@ export class AssistantsStack extends cdk.Stack {
       vendRole,
       roles: this.deployedRoles(classification),
       sessionChannelActions: [...ASSISTANT_TURN_CHANNEL_ACTIONS, 'chime:UpdateChannel'],
-      contextBucketArn: props.attachmentsBucketArn,
+      buckets: { attachmentsBucketArn: props.attachmentsBucketArn, companyBucketArn: props.companyBucketArn, profileBucketArn: props.profileBucketArn },
       // Every classification's turns say message templates (ADR-062 decision 2).
       readsTemplates: true,
       capabilities: props.capabilities,
@@ -559,7 +575,7 @@ export class AssistantsStack extends cdk.Stack {
         statements: [
           new iam.PolicyStatement({
             actions: ['s3:ListBucket'],
-            resources: [props.attachmentsBucketArn],
+            resources: [props.companyBucketArn],
             // SCOPED TO THE CLASSIFICATION'S GRANTS: platform documentation is internal
             // material, and the external classification is granted a public overview only.
             conditions: { StringLike: { 's3:prefix': platformGrantedPrefixes.map((p) => `${p}*`) } },
@@ -567,25 +583,25 @@ export class AssistantsStack extends cdk.Stack {
           new iam.PolicyStatement({
             actions: ['s3:GetObject'],
             resources: [
-              ...platformGrantedPrefixes.map((p) => `${props.attachmentsBucketArn}/${p}*`),
+              ...platformGrantedPrefixes.map((p) => `${props.companyBucketArn}/${p}*`),
               // The active version's PERSONA (SPEC-PORTABLE-PROFILES, "Bodies are S3"): the definition
               // in SSM holds a pointer under `profiles/*` and the processor follows it every time it
               // resolves its profile. READ-ONLY, and deliberately not classification-scoped the way the
               // context prefixes are: a profile can only ever be handed its OWN version's key, which is
-              // content-addressed, and the assistant fails closed to the compiled seed if the read
-              // fails. Write stays exclusive to manage-profiles (§7).
-              `${props.attachmentsBucketArn}/profiles/*`,
+              // content-addressed, and a version whose body cannot be read is never served (the last
+              // version read answers, else the turn degrades). Write stays exclusive to manage-profiles (§7).
+              `${props.profileBucketArn}/profiles/*`,
               // THE CLASSIFICATION'S OWN INTENT PACK BODY, which its `assistant-intent-pack` parameter
               // points at. Scoped to this classification's prefix and no other: the processor of one
               // classification has no read on another's pack (`a-classification-reads-only-its-own-pack`).
-              ...(topo.intentPackParam ? [`${props.attachmentsBucketArn}/${classificationPackPrefix(classification)}*`] : []),
+              ...(topo.intentPackParam ? [`${props.profileBucketArn}/${classificationPackPrefix(classification)}*`] : []),
             ],
           }),
           // THE CLASSIFICATION'S OWN TEMPLATES (SPEC-DOCUMENT-TEMPLATES FR2, ADR-062 decision 2), through the one helper every
           // role that words a message for the classification holds: read-only bodies under `templates/<classification>/`
           // and no other's, the pointers that say which version is active, and the list of which templates each family
           // holds. Every classification's turns say messages, so the read is unconditional; no turn role writes one.
-          ...messageTemplateReadStatements(this, props.attachmentsBucketArn, classification),
+          ...messageTemplateReadStatements(this, props.profileBucketArn, classification),
         ],
       }),
     };
@@ -691,8 +707,8 @@ export class AssistantsStack extends cdk.Stack {
     // exists, because a wildcard would satisfy "a grant exists" while destroying least privilege.
     const contextSources = loadContextSourceCatalog({
       classification,
-      attachmentsBucketArn: props.attachmentsBucketArn,
-      attachmentsBucketName: props.attachmentsBucketName,
+      companyBucketArn: props.companyBucketArn,
+      companyBucketName: props.companyBucketName,
       userProfileTableArn: shared.userProfileArn,
       userProfileTableName: shared.userProfileName,
       region: this.region,
@@ -739,11 +755,11 @@ export class AssistantsStack extends cdk.Stack {
     actingRole.addToPolicy(new iam.PolicyStatement({
       actions: ['ssm:GetParameter'],
       resources: [
-        `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/${classification}/context-sources`,
+        `arn:aws:ssm:${this.region}:${this.account}:parameter${deployOwnedAssistantKey(classification, 'contextSources')}`,
       ],
     }));
     new ssm.StringParameter(this, 'ContextSourcesCatalogParam', {
-      parameterName: `${SSM_ROOT}/assistant/${classification}/context-sources`,
+      parameterName: deployOwnedAssistantKey(classification, 'contextSources'),
       // Published WITHOUT the arn, WITH the locator and prefix. The arn is the grant resource and is
       // the only field carrying an account and region, so stripping it keeps account identifiers out
       // of a parameter any principal with ssm:GetParameter on it can read. The locator and prefix
@@ -841,6 +857,30 @@ export class AssistantsStack extends cdk.Stack {
       // Recovery goes to the same place. An alert that never says "fixed" trains people to ignore it.
       alarm.addOkAction(new cloudwatchActions.SnsAction(alarmTopic));
 
+      // A GUARDRAIL THAT CANNOT BE APPLIED WITHHOLDS EVERY TURN IT GUARDS, so one occurrence is worth a
+      // look: an occurrence count, not a rate. Same notifier, so it reaches the admin channel the same way.
+      const guardrailAlarm = new cloudwatch.Alarm(this, 'GuardrailUnavailableAlarm', {
+        alarmName: `${this.stackName}-guardrail-unavailable`,
+        alarmDescription:
+          `The ${classification} guardrail could not be applied, so turns were withheld rather than sent `
+          + 'unchecked. People are being told to try again. Check the processor log for "guardrail could '
+          + 'not be applied": AccessDeniedException or ResourceNotFoundException means the grant or the '
+          + 'guardrail is miswired; ThrottlingException or a 5xx means Bedrock is refusing or down.',
+        metric: new cloudwatch.Metric({
+          namespace: GUARDRAIL_NAMESPACE,
+          metricName: GUARDRAIL_UNAVAILABLE_METRIC,
+          dimensionsMap: byClassification,
+          statistic: 'Sum',
+          period: cdk.Duration.minutes(5),
+        }),
+        threshold: 0,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      });
+      guardrailAlarm.addAlarmAction(new cloudwatchActions.SnsAction(alarmTopic));
+      guardrailAlarm.addOkAction(new cloudwatchActions.SnsAction(alarmTopic));
+
       // The dashboard the alert links to. Source keys are known at SYNTH time, so the per-source
       // widget names this deployment's actual catalog rather than making an operator guess.
       const sourceKeys = [...contextSources.entries.map((e) => e.key), '(catalog)'];
@@ -891,8 +931,8 @@ export class AssistantsStack extends cdk.Stack {
           ],
           [
             new cloudwatch.GraphWidget({
-              title: 'Skipped - sustained not-in-catalog is a profile naming a removed key; no-record is a person with no record yet',
-              left: (['not-in-catalog', 'unavailable', 'no-record'] as const).map((outcome) =>
+              title: 'Skipped - sustained not-in-catalog is a profile naming a removed key; not-readable-by-role is company context the role does not read; no-record is a person with no record yet',
+              left: (['not-in-catalog', 'unavailable', 'not-readable-by-role', 'no-record'] as const).map((outcome) =>
                 new cloudwatch.Metric({
                   namespace: CONTEXT_SOURCE_METRIC_NAMESPACE,
                   metricName: 'ContextSourceSkipped',
@@ -925,7 +965,7 @@ export class AssistantsStack extends cdk.Stack {
     const useParamWriter =
       this.node.tryGetContext('assistantParamWriter') === 'true' ||
       this.node.tryGetContext('assistantParamWriter') === true;
-    const systemPromptParamName = `${SSM_ROOT}/assistant/${classification}/assistant-system-prompt`;
+    const systemPromptParamName = deployOwnedAssistantKey(classification, 'systemPrompt');
     const systemPromptParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${systemPromptParamName}`;
     if (topo.systemPromptParam) {
       // CONFIG GUARD: an empty persona silently falls back to the generic default (off-brand). Warn
@@ -985,7 +1025,7 @@ export class AssistantsStack extends cdk.Stack {
       // THE DEPLOYMENT PACK THE ROUTER CLASSIFIES AGAINST, so a version with no pack of its own is
       // answered by the same one (SPEC-CONFIGURABLE-INTENT-PACK FR17). Read on the assistant's session;
       // the grant is on the acting role below.
-      ...(topo.intentPackParam ? { ASSISTANT_INTENT_PACK_PARAM: `${SSM_ROOT}/assistant/${classification}/assistant-intent-pack` } : {}),
+      ...(topo.intentPackParam ? { ASSISTANT_INTENT_PACK_PARAM: deployOwnedAssistantKey(classification, 'intentPack') } : {}),
       /**
        * THE ASSISTANT'S CLASSIFICATION, as an access fact rather than a profile lookup.
        *
@@ -1052,7 +1092,10 @@ export class AssistantsStack extends cdk.Stack {
       MODEL_ID: profileModel.bedrockModelId,
       MODEL_NAME: profileModel.displayName,
       AWS_ACCOUNT_ID: this.account,
-      CONTEXT_BUCKET: props.attachmentsBucketName,
+      // The company corpus and the platform's self-knowledge; the version's bodies and the templates it says.
+      CONTEXT_BUCKET: props.companyBucketName,
+      PROFILE_BODY_BUCKET: props.profileBucketName,
+      TEMPLATE_BUCKET: props.profileBucketName,
       GUARDRAIL_ID: guardrail.guardrailId,
       GUARDRAIL_VERSION: guardrail.guardrailVersion,
       TASKS_TABLE: shared.agentTasksName,
@@ -1076,6 +1119,28 @@ export class AssistantsStack extends cdk.Stack {
     if (attachmentsReadable) {
       processorEnv.ATTACHMENTS_BUCKET = props.attachmentsBucketName;
     }
+    // A ROOM'S MEETING TRANSCRIPTS AS GROUNDING (SPEC-ASSISTANT-MEETINGS FR28, DESIGN-WORKFLOWS-AND-TASKS section 6): where
+    // the deployment declares meetings, a turn reads the transcript of a `thread` child it may read, in this classification's
+    // transcript family only, and lists that family to find the newest; and a recorded meeting's summary turn reads that
+    // meeting's transcript segments there (FR66). Its own policy, so a deployment without meetings has none of it.
+    if (props.capabilities?.includes('meetings') && props.attachmentsBucketArn) {
+      processorEnv.TRANSCRIPT_BUCKET = props.attachmentsBucketName;
+      new iam.ManagedPolicy(this, 'AssistantTranscriptRead', {
+        roles: [actingRole],
+        statements: [
+          new iam.PolicyStatement({ sid: 'ReadItsOwnTranscripts', actions: ['s3:GetObject'], resources: [`${props.attachmentsBucketArn}/${transcriptPrefix(classification)}*`] }),
+          new iam.PolicyStatement({
+            sid: 'ListItsOwnTranscripts', actions: ['s3:ListBucket'], resources: [props.attachmentsBucketArn],
+            conditions: { StringLike: { 's3:prefix': [`${transcriptPrefix(classification)}*`] } },
+          }),
+        ],
+      });
+    }
+    // WHERE A CONVERSATION'S DASHBOARD IS WRITTEN (DESIGN-CONVERSATION-DASHBOARDS section 3). A name only: the write is the
+    // acting session's `dashboard` edge, held by a role a dashboard tool is offered to, so every other turn is refused.
+    processorEnv.DASHBOARD_BUCKET = props.attachmentsBucketName;
+    // THE PAGE TOOL ONLY WHERE ITS DISTRIBUTION STANDS (the `dashboard-pages` capability); the in-app dashboard needs none.
+    if (props.capabilities?.includes('dashboard-pages')) processorEnv.DASHBOARD_PAGES = 'true';
     if (topo.systemPromptParam) {
       // Always reference the param by NAME (it may exist from a preserved prior deploy even if THIS
       // deploy didn't set it); the processor falls back to its default when the param is absent.
@@ -1298,14 +1363,14 @@ export class AssistantsStack extends cdk.Stack {
     const processorArnParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${processorArnKey(classification)}`;
 
     // ── Per-deployment intent taxonomy (intentPackParam profiles) + onboarding-intake (all) ──
-    const intentPackParamName = `${SSM_ROOT}/assistant/${classification}/assistant-intent-pack`;
+    const intentPackParamName = deployOwnedAssistantKey(classification, 'intentPack');
     const intentPackParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${intentPackParamName}`;
-    const onboardingIntakeParamName = `${SSM_ROOT}/assistant/${classification}/onboarding-intake`;
+    const onboardingIntakeParamName = deployOwnedAssistantKey(classification, 'onboardingIntake');
     const onboardingIntakeParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${onboardingIntakeParamName}`;
     // Welcome orientation (all profiles): optional per-assistant SSM param the deployment writes
     // (company/access/examples) to give a first-time user context. Absent ⇒ generic welcome. The
     // handler reads it on the WelcomeIntent path; the demo seed writes it (see seed-demo.ts).
-    const welcomeParamName = `${SSM_ROOT}/assistant/${classification}/welcome-orientation`;
+    const welcomeParamName = deployOwnedAssistantKey(classification, 'welcomeOrientation');
     const welcomeParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${welcomeParamName}`;
     if (topo.intentPackParam) {
       const intentPackJson = (this.node.tryGetContext('assistantIntentPack') as string) || '';
@@ -1341,13 +1406,13 @@ export class AssistantsStack extends cdk.Stack {
           onUpdate: {
             service: 'S3',
             action: 'putObject',
-            parameters: { Bucket: props.attachmentsBucketName, Key: packKey, Body: intentPackJson, ContentType: 'application/json' },
+            parameters: { Bucket: props.profileBucketName, Key: packKey, Body: intentPackJson, ContentType: 'application/json' },
             physicalResourceId: cr.PhysicalResourceId.of(packKey),
           },
           policy: cr.AwsCustomResourcePolicy.fromStatements([
             new iam.PolicyStatement({
               actions: ['s3:PutObject'],
-              resources: [`${props.attachmentsBucketArn}/${classificationPackPrefix(classification)}*`],
+              resources: [`${props.profileBucketArn}/${classificationPackPrefix(classification)}*`],
             }),
           ]),
           installLatestAwsSdk: false,
@@ -1389,8 +1454,8 @@ export class AssistantsStack extends cdk.Stack {
         classification,
         declared: declaredTemplates,
         ssmRoot: SSM_ROOT,
-        bucketName: props.attachmentsBucketName,
-        bucketArn: props.attachmentsBucketArn,
+        bucketName: props.profileBucketName,
+        bucketArn: props.profileBucketArn,
         region: this.region,
         account: this.account,
       });
@@ -1412,8 +1477,10 @@ export class AssistantsStack extends cdk.Stack {
           defaultGuardrailId: guardrail.guardrailId,
           defaultGuardrailVersion: guardrail.guardrailVersion,
           guardrailArns: [guardrail.guardrailArn, ...alternateGuardrails.map((a) => a.gr.guardrailArn)],
-          bodyBucketName: props.attachmentsBucketName,
-          bodyBucketArn: props.attachmentsBucketArn,
+          bodyBucketName: props.profileBucketName,
+          bodyBucketArn: props.profileBucketArn,
+          uploadBucketName: props.profileBucketName,
+          uploadBucketArn: props.profileBucketArn,
         },
       })
       : undefined;
@@ -1797,7 +1864,9 @@ export class AssistantsStack extends cdk.Stack {
       // (`initiation` absent or 'user') that no proposal opens has no business with a manually invokable creator.
       .filter(([key, cfg]) => ((!!cfg.initiation && cfg.initiation !== 'user')
         || Object.values(cfg.participants?.participantRoles ?? {}).some((r) => r.from.some((src) => 'creator' in src)))
-        && classificationAllowedForType(key, classification))
+        && classificationAllowedForType(key, classification)
+        // A TYPE A MEETING IS HELD IN EXISTS ONLY WITH THE `meetings` CAPABILITY: absent, it has no creator and no grant.
+        && (!cfg.meeting || !!props.capabilities?.includes('meetings')))
       .map(([key]) => key);
     if (eventInitiatedTypes.length > 0) {
       // ITS OWN ROLE, PINNED TO ONE CLASSIFICATION, which is what makes a manually invokable creator
@@ -1827,6 +1896,31 @@ export class AssistantsStack extends cdk.Stack {
         actions: ['chime:ListTagsForResource'],
         resources: [`${props.appInstanceArn}/channel/*`],
       }));
+
+      // A PERSON ENTERS A MEETING'S CONVERSATION ONLY AS A MEMBER OF ITS ROOM (`meetings`): the creator reads that membership
+      // itself before it adds anyone, the second layer behind the meeting function's own check (tenet D3). A read of this
+      // classification's conversations, bearing the service admin by its exact ARN. A managed policy of its own, so declaring
+      // `meetings` adds a resource and changes nothing the creator's role already held, and sits outside its inline budget.
+      if (props.capabilities?.includes('meetings')) {
+        new iam.ManagedPolicy(this, 'TypedCreatorReadsRoomMembershipManaged', {
+          roles: [eventCreateRole],
+          statements: [
+            // The parent conversation's people and moderators are read too: everyone in the parent conversation is a member of its meeting's conversation
+            // from the moment it opens, and a meeting a workflow starts is hosted by the parent conversation's moderators.
+            new iam.PolicyStatement({
+              sid: 'EventCreateReadRoomMembership',
+              actions: ['chime:DescribeChannelMembership', 'chime:ListChannelMemberships', 'chime:ListChannelModerators'],
+              resources: [`${props.appInstanceArn}/channel/*`],
+              conditions: { StringEquals: { 'aws:ResourceTag/classification': classification } },
+            }),
+            new iam.PolicyStatement({
+              sid: 'EventCreateReadRoomMembershipAsServiceAdmin',
+              actions: ['chime:DescribeChannelMembership', 'chime:ListChannelMemberships', 'chime:ListChannelModerators'],
+              resources: [serviceAdminArn],
+            }),
+          ],
+        });
+      }
 
       // WHICH ASSISTANT ANSWERS TO WHICH HANDLE. The conversation type names its assistants by handle,
       // and the assignment records are the authority on which assistant holds which role. Scoped to
@@ -1883,7 +1977,7 @@ export class AssistantsStack extends cdk.Stack {
           USER_POOL_ID: selfPoolId,
           // Where the classification's message templates are, for the room's name: the bucket, and the root their
           // pointers are under, which the read grant below names (`messageTemplateReadStatements`).
-          TEMPLATE_BUCKET: props.attachmentsBucketName,
+          TEMPLATE_BUCKET: props.profileBucketName,
           SSM_ROOT,
         },
         bundling: { minify: false, forceDockerBundling: false },
@@ -1913,7 +2007,19 @@ export class AssistantsStack extends cdk.Stack {
         ],
       });
       eventCreateRole.addToPrincipalPolicy(serviceAdminParamRead);
-      handlerRole.addToPrincipalPolicy(serviceAdminParamRead);
+      // THE ROUTER'S PART IN THIS CREATOR, in a policy of its own: the bearer read, and the invoke a workflow step's `open`
+      // makes (WT120), by the creator's fixed name. A capability that brings a type of its own (`meetings`) adds this
+      // policy where the classification had no creator, and changes nothing the router's role already held.
+      new iam.Policy(this, 'AgentHandlerOpensTypedConversations', {
+        roles: [handlerRole],
+        statements: [
+          serviceAdminParamRead,
+          new iam.PolicyStatement({
+            actions: ['lambda:InvokeFunction'],
+            resources: [cdk.Stack.of(this).formatArn({ service: 'lambda', resource: 'function', resourceName: typedCreatorName(classification), arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME })],
+          }),
+        ],
+      });
 
       // The same NARROW pair every other writer on this table holds: owned-field patches on a row this
       // function is creating. No PutItem, no Delete, no Scan.
@@ -1923,17 +2029,21 @@ export class AssistantsStack extends cdk.Stack {
       }));
       // THE ROOM IS NAMED FROM THE conversation-name TEMPLATE its assistant words (`conversation-name.ts`), so the
       // creator reads this classification's message templates, as the router does.
-      for (const stmt of messageTemplateReadStatements(this, props.attachmentsBucketArn, classification)) eventCreateRole.addToPrincipalPolicy(stmt);
+      for (const stmt of messageTemplateReadStatements(this, props.profileBucketArn, classification)) eventCreateRole.addToPrincipalPolicy(stmt);
 
       // THE DECLARED EVENTS THAT OPEN A TYPE AT THIS CLASSIFICATION (`openedBy`, lib/config/event-openers.ts):
       // one EventBridge rule each, targeting this function with a dead-letter queue, bounded retries and an
       // alarm, and the router invoke its welcomes need (lib/constructs/event-opened-conversations.ts). A
       // direct invoke still works, for the platform's own standing room and for an operator.
       wireEventOpenedConversations(this, { classification, creator: typedConversationFromEvent, creatorRole: eventCreateRole });
-      new cdk.CfnOutput(this, 'TypedConversationFromEventFunctionName', {
+      // THE OPERATOR'S HANDLE ON THE EVENT PATH, for the types an event opens. A meeting's conversation is opened by the
+      // meeting function, never invoked by hand, so it is not listed and a classification whose only typed conversation is
+      // a meeting's has no output to change when `meetings` is declared.
+      const eventOpenedTypes = eventInitiatedTypes.filter((key) => !CONVERSATION_TYPES[key]?.meeting);
+      if (eventOpenedTypes.length > 0) new cdk.CfnOutput(this, 'TypedConversationFromEventFunctionName', {
         value: typedConversationFromEvent.functionName,
         description:
-          `Opens a typed conversation (${eventInitiatedTypes.join(', ')}) for an event, posting nothing `
+          `Opens a typed conversation (${eventOpenedTypes.join(', ')}) for an event, posting nothing `
           + 'into the conversation it concerned. Invoke: aws lambda invoke --function-name <this> --payload \'{"detail":'
           + '{"conversationType":"ops","concernedChannelArn":"...","forUserArn":"...","topicLabel":"..."}}\' out.json',
       });
@@ -1957,13 +2067,14 @@ export class AssistantsStack extends cdk.Stack {
     assertTypeGroupsRequireTheirClassifications(defaultProfileRegistry);
     // A PLATFORM WORKFLOW WITH NO `types` that names a participant role runs everywhere, and addresses nobody where a type
     // does not declare the role: synthesis records each such reference as a warning (ADR-061 decision 1).
-    for (const [name, wf] of Object.entries(PLATFORM_EVENT_WORKFLOWS)) {
+    for (const [name, wf] of Object.entries(SHIPPED_EVENT_WORKFLOWS)) {
       for (const warning of eventWorkflowRoleWarnings(name, wf)) cdk.Annotations.of(this).addWarning(warning);
     }
     // A type's participant roles name only sources a path fills and conferrals a reader binds (DESIGN-CONVERSATION-TYPES 6.1).
     assertParticipantRolesAreDeclared({
       membershipGroups: defaultProfileRegistry.membershipGroups(),
       outside: defaultProfileRegistry.outsideClassificationValues(),
+      classifications: [...defaultProfileRegistry.memberClassificationValues(), ...defaultProfileRegistry.outsideClassificationValues()],
     });
     // The groups a participant role is sourced from are reconciled too: the reconcile keeps their holdings (section 6.1).
     const roleSourceGroups = roleGroups(classification);
@@ -2099,9 +2210,9 @@ export class AssistantsStack extends cdk.Stack {
       new iam.PolicyStatement({
         actions: ['s3:GetObject'],
         resources: [
-          `${props.attachmentsBucketArn}/profiles/*`,
+          `${props.profileBucketArn}/profiles/*`,
           // The classification's own intent-pack body, behind its parameter's pointer. This prefix only.
-          ...(topo.intentPackParam ? [`${props.attachmentsBucketArn}/${classificationPackPrefix(classification)}*`] : []),
+          ...(topo.intentPackParam ? [`${props.profileBucketArn}/${classificationPackPrefix(classification)}*`] : []),
         ],
       }),
     );
@@ -2113,7 +2224,7 @@ export class AssistantsStack extends cdk.Stack {
     // size cap. No role of a turn writes a template.
     new iam.ManagedPolicy(this, 'RouterMessageTemplatesRead', {
       roles: [handlerRole],
-      statements: messageTemplateReadStatements(this, props.attachmentsBucketArn, classification),
+      statements: messageTemplateReadStatements(this, props.profileBucketArn, classification),
     });
 
     const handlerEnv: Record<string, string> = {
@@ -2124,8 +2235,11 @@ export class AssistantsStack extends cdk.Stack {
       // the one declared role; when a classification declares more, each gets its own handler and
       // this reads that handler's role.
       ASSISTANT_ROLE: ASSISTANT_ROLES[0],
-      PROFILE_BODY_BUCKET: props.attachmentsBucketName,
-      ...(drift?.env ?? {}),
+      PROFILE_BODY_BUCKET: props.profileBucketName,
+      // A FUNCTION THE ROUTER ONLY INVOKES IS NAMED BY ITS FUNCTION NAME, which `lambda:Invoke` takes as well as its ARN,
+      // so the router's environment fits Lambda's 4 KB (`a-function-environment-fits-lambdas-limit.test.ts`). Each
+      // grant still names the function by its ARN.
+      ...(drift && archiveFunctions ? { ...drift.env, AURORA_DATA_PLANE_ARN: archiveFunctions.turnDataPlane.functionName } : {}),
       ...(drift ? { CHANNEL_FLOW_ARN_PARAM: CHANNEL_FLOW_ARN_SSM_KEY } : {}),
       SSM_ROOT,
       ONBOARDING_INTAKE_PARAM: onboardingIntakeParamName,
@@ -2135,7 +2249,7 @@ export class AssistantsStack extends cdk.Stack {
       // creating identity as the other two paths: the service admin, so the channel flow is attached
       // before any assistant is a member and the welcome goes through it.
       CREATOR_BEARER_ARN_PARAM: INSTANCE_SSM.appInstanceAdminArn,
-      [classificationEnvName(classification, 'ASYNC_PROCESSOR_ARN')]: asyncProcessor.functionArn,
+      [classificationEnvName(classification, 'ASYNC_PROCESSOR_ARN')]: asyncProcessor.functionName,
       APP_INSTANCE_ARN: props.appInstanceArn,
       AWS_ACCOUNT_ID: this.account,
       USER_POOL_ID: selfPoolId,
@@ -2195,6 +2309,111 @@ export class AssistantsStack extends cdk.Stack {
       bundling: { minify: false, forceDockerBundling: false },
     });
     asyncProcessor.grantInvoke(agentHandler);
+    // THE RUN'S OWNER TEAM, read from its assistant's own tag, on this classification's assistants only (O16).
+    handlerRole.addToPrincipalPolicy(readOwnAssistantsTagsStatement(props.appInstanceArn, classification));
+    // A RUN MESSAGE'S PROCESS RIDES ITS OUT-OF-BAND RECORD (SPEC-PROCESSES P8): the router writes that one table, write-only, as
+    // the processor does for its turns, so nothing is added to the message's Amazon Chime SDK Metadata.
+    wireMessageAnalytics({
+      addEnvironment: (k: string, v: string) => agentHandler.addEnvironment(k, v),
+      addToRolePolicy: (st: iam.PolicyStatement) => handlerRole.addToPrincipalPolicy(st),
+    }, props.messageAnalytics);
+
+    // A WORKFLOW'S `start_meeting` STEP (the `meetings` capability): the router names its own classification's run entry by
+    // its fixed name and may invoke it, and nothing else of the Meetings stack. Each classification has its own run and summary
+    // entry, so IAM refuses a router another classification's (tenet D12). That stack deploys after this one, so the name is known here
+    // without a reference to it.
+    if (props.capabilities?.includes('meetings')) {
+      // The conversation management function, published by the Conversations stack, which deploys before this one.
+      const conversationManagementFunctionArn = ssm.StringParameter.valueForStringParameter(this, `${SSM_ROOT}/admin/conversation-management-function-arn`);
+      agentHandler.addEnvironment('MEETING_RUN_FUNCTION', CAPABILITY_RESOURCES.meetingRun(classification));
+      // AN ENDED MEETING'S CONVERSATION IS ARCHIVED (`archiveEndedMeeting`) by the function every archive goes through.
+      // Named by its function name, read out of the published ARN at deploy; the grant below names the ARN.
+      agentHandler.addEnvironment('CONVERSATION_MANAGEMENT_FUNCTION', cdk.Arn.split(conversationManagementFunctionArn, cdk.ArnFormat.COLON_RESOURCE_NAME).resourceName ?? conversationManagementFunctionArn);
+      // A MEETING'S SUMMARY, read through its own entry once the meeting's summary schedule fires, to rewrite the ended card.
+      agentHandler.addEnvironment('MEETING_SUMMARY_FUNCTION', CAPABILITY_RESOURCES.meetingSummary(classification));
+      // The deployment's ring length (`meetingRingSeconds`); a step's own `ringSeconds` comes first, and absent both it is 10.
+      const ring = String(this.node.tryGetContext('meetingRingSeconds') ?? '').trim();
+      if (ring) agentHandler.addEnvironment('MEETING_RING_SECONDS', ring);
+      // The longest a meeting runs (`meetingMaxMinutes`, 10 to 1440); absent, 90 minutes (`meeting-watch.ts`).
+      const maxMinutes = String(this.node.tryGetContext('meetingMaxMinutes') ?? '').trim();
+      if (maxMinutes) agentHandler.addEnvironment('MEETING_MAX_MINUTES', maxMinutes);
+      // Whether recording keeps a meeting's audio and video (`meetingMediaRecording`), so the recording notice says so.
+      if (String(this.node.tryGetContext('meetingMediaRecording') ?? '').trim() === 'true') agentHandler.addEnvironment('MEETING_MEDIA_RECORDING', 'true');
+      // A CONVERSATION'S MEETING STARTED OR ENDED (`meeting-started`, `meeting-ended`): this instance's lifecycle events for
+      // this classification, handed to the router with the conversation, the meeting and the event, nothing else. The rule
+      // reaches the router by its own ARN alone. Anyone who may put events on the default bus can publish this shape, so the
+      // event decides nothing: the router checks each against the conversation's own record and an end against Amazon Chime
+      // SDK itself before anything runs (`handleMeetingLifecycle`).
+      new events.Rule(this, 'MeetingLifecycle', {
+        description: `Hands ${classification}'s router each start and end of its conversations' meetings`,
+        eventPattern: {
+          source: [MEETING_LIFECYCLE_SOURCE],
+          detailType: [MEETING_LIFECYCLE_DETAIL_TYPE],
+          detail: { instance: [INSTANCE_NAME], classification: [classification], event: [{ 'anything-but': ['person-attended'] }] },
+        },
+        targets: [new eventTargets.LambdaFunction(agentHandler, {
+          event: events.RuleTargetInput.fromObject({
+            aeMeeting: {
+              channelArn: events.EventField.fromPath('$.detail.channelArn'),
+              meetingId: events.EventField.fromPath('$.detail.meetingId'),
+              event: events.EventField.fromPath('$.detail.event'),
+              at: events.EventField.fromPath('$.detail.at'),
+            },
+          }),
+          retryAttempts: 4,
+          maxEventAge: cdk.Duration.hours(1),
+        })],
+      });
+      // A PERSON TOOK THE MEETING (`person-attended`, published by the meetings function as it creates their attendee): the
+      // router sends them a ring-off addressed to them alone, so their other tabs and devices stop ringing. Its own rule, so
+      // the person it names is handed on; the router checks the meeting's record before it sends anything.
+      new events.Rule(this, 'MeetingAttended', {
+        description: `Hands ${classification}'s router each person who took one of its conversations' meetings`,
+        eventPattern: {
+          source: [MEETING_LIFECYCLE_SOURCE],
+          detailType: [MEETING_LIFECYCLE_DETAIL_TYPE],
+          detail: { instance: [INSTANCE_NAME], classification: [classification], event: ['person-attended'] },
+        },
+        targets: [new eventTargets.LambdaFunction(agentHandler, {
+          event: events.RuleTargetInput.fromObject({
+            aeMeeting: {
+              channelArn: events.EventField.fromPath('$.detail.channelArn'),
+              meetingId: events.EventField.fromPath('$.detail.meetingId'),
+              event: events.EventField.fromPath('$.detail.event'),
+              at: events.EventField.fromPath('$.detail.at'),
+              personId: events.EventField.fromPath('$.detail.personId'),
+            },
+          }),
+          retryAttempts: 2,
+          // A ring lasts at most a minute, so a ring-off later than that stops nothing.
+          maxEventAge: cdk.Duration.minutes(2),
+        })],
+      });
+      new iam.ManagedPolicy(this, 'AgentHandlerStartsMeetings', {
+        roles: [handlerRole],
+        statements: [new iam.PolicyStatement({
+          sid: 'StartThisConversationsMeeting',
+          actions: ['lambda:InvokeFunction'],
+          resources: [`arn:${this.partition}:lambda:${this.region}:${this.account}:function:${CAPABILITY_RESOURCES.meetingRun(classification)}`],
+        }), new iam.PolicyStatement({
+          sid: 'ReadThisConversationsMeetingSummary',
+          actions: ['lambda:InvokeFunction'],
+          resources: [`arn:${this.partition}:lambda:${this.region}:${this.account}:function:${CAPABILITY_RESOURCES.meetingSummary(classification)}`],
+        }), new iam.PolicyStatement({
+          // AN END IS BELIEVED FROM THE SERVICE, NEVER FROM THE HANDOFF: the router asks Amazon Chime SDK whether the meeting
+          // still runs (`meetingRunsNow`). A read, on meetings only.
+          sid: 'ConfirmAMeetingEnded',
+          actions: ['chime:GetMeeting'],
+          resources: [`arn:${this.partition}:chime:${this.region}:${this.account}:meeting/*`],
+        }), new iam.PolicyStatement({
+          // AN ENDED MEETING'S CONVERSATION IS ARCHIVED through the one archive sequence, the conversation management
+          // function's, which checks the conversation's own record again (`archiveEndedMeetingConversation`).
+          sid: 'ArchiveAnEndedMeetingsConversation',
+          actions: ['lambda:InvokeFunction'],
+          resources: [conversationManagementFunctionArn],
+        })],
+      });
+    }
 
     // ── DEADLINES (ADR-061 decision 1): THIS CLASSIFICATION'S SCHEDULE GROUP AND SCHEDULER ROLE ──────────────
     //
@@ -2294,7 +2513,7 @@ export class AssistantsStack extends cdk.Stack {
     if (eventOpenersAt(CONVERSATION_TYPES, classification).some((o) => openerWatchesAlarms(o.opener))) {
       const prefixes = incidentWatchAlarmPrefixes();
       const watchRule = new events.Rule(this, 'IncidentWatchAlarmChanges', {
-        description: `Hands ${classification}'s router each state change of this deployment's alarms, for the rooms that watch them`,
+        description: `Hands ${classification}'s router each state change of this deployment's alarms, for the conversations that watch them`,
         eventPattern: incidentWatchPattern(prefixes),
       });
       watchRule.addTarget(new eventTargets.LambdaFunction(agentHandler, {
@@ -2330,6 +2549,24 @@ export class AssistantsStack extends cdk.Stack {
         conditions: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': leadingKeysFor(['proposal']) } },
       })],
     });
+    // A TURN THAT PROPOSES PEOPLE FOR THE RUNNING MEETING (`propose_meeting_invites`, SPEC-ASSISTANT-MEETINGS FR42) asks its
+    // own router whether the conversation's meeting runs and who hosts it (`handleMeetingPlaceRead`, on the router's role,
+    // which answers only for a conversation of this classification). The acting role holds no read of the context table, so
+    // a turn's session cannot read another classification's meeting (tenets D1, D12).
+    // A meetings grant exists only where the `meetings` capability is declared (absent means off).
+    if (props.capabilities?.includes('meetings')) {
+      // EACH PERSON A PROPOSAL ADDS IS NAMED BY THEIR OWN ACCOUNT (`meeting-invite-offer.ts`): the name their AppInstanceUser
+      // holds, read on the processor's own execution role by an identity client no session wraps. A read of any person of
+      // the app instance, so it is never on the acting role or in an edge a session is vended with (tenet D1).
+      new iam.ManagedPolicy(this, 'ProcessorMeetingInviteeNames', {
+        roles: [asyncProcessor.role!],
+        statements: [new iam.PolicyStatement({
+          sid: 'NameAnInviteeByTheirAccount',
+          actions: ['chime:DescribeAppInstanceUser'],
+          resources: [`${props.appInstanceArn}/user/*`],
+        })],
+      });
+    }
 
     if (profileServiceArn) {
       agentHandler.addToRolePolicy(new iam.PolicyStatement({ actions: ['lambda:InvokeFunction'], resources: [profileServiceArn] }));
@@ -2398,6 +2635,56 @@ export class AssistantsStack extends cdk.Stack {
     // The parameter NAME is a literal string and refers to nothing, so unlike the ARN it closes no
     // cycle. Same mechanism as the processor's triage dispatch below.
     agentHandler.addEnvironment('ROUTER_ARN_PARAM', routerArnKey(classification));
+    // A RULE THE CONSOLE ATTACHES MAY START A WORKFLOW HERE (WT121): only rules under this classification's trigger prefix, on the default bus.
+    // An EventBridge rule is a service principal, so it reaches the router through this relay, whose resource policy admits those
+    // rules. The router's resource policy stays limited to its service callers (Amazon Lex, the incident-watch rule and, with
+    // `meetings`, the meeting lifecycle rule, each rule by its own ARN); every other caller, this relay among them, holds an
+    // identity grant naming the router.
+    const eventTriggerRelay = new lambdaNodeJs.NodejsFunction(this, 'EventTriggerRelay', {
+      functionName: eventTriggerRelayName(classification),
+      entry: path.join(__dirname, '../../lambda/src/event-trigger-relay.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: cdk.Duration.seconds(10),
+      memorySize: 128,
+      environment: { ROUTER_ARN: agentHandler.functionArn },
+      bundling: { minify: true, forceDockerBundling: false },
+      // AT MOST THIS MANY EVENTS IN FLIGHT (WT122): a storm waits in the relay's queue rather than fanning out, and the router refuses
+      // an event older than the policy's maxEventAgeSeconds when it arrives. Dev's value is small on purpose; a production deployment
+      // raises it with `-c eventTriggerRelayConcurrency=N`. The relay never retries: the rule already did.
+      retryAttempts: 0,
+      reservedConcurrentExecutions: Number(this.node.tryGetContext('eventTriggerRelayConcurrency') ?? 2),
+    });
+    agentHandler.grantInvoke(eventTriggerRelay);
+    agentHandler.addEnvironment('EVENT_POLICY_PARAM', `${SSM_ROOT}/event-triggers/policy`);
+    agentHandler.addToRolePolicy(new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [cdk.Arn.format({ service: 'ssm', resource: 'parameter', resourceName: `${SSM_ROOT}/event-triggers/policy`.replace(/^\//, '') }, this)] }));
+    // A RELAY THAT THROTTLES is a storm the concurrency is holding back, which an operator should hear about.
+    new cloudwatch.Alarm(this, 'EventTriggerRelayThrottled', {
+      alarmName: `${this.stackName}-event-trigger-relay-throttled`,
+      alarmDescription: 'Events matched a trigger rule faster than the relay may pass them on; the excess waits, and the router refuses any older than the event policy allows. See SPEC-WORKFLOWS-AND-TASKS WT122.',
+      metric: eventTriggerRelay.metricThrottles({ period: cdk.Duration.minutes(5), statistic: 'Sum' }),
+      threshold: 0, comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD, evaluationPeriods: 1, treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    eventTriggerRelay.addPermission('EventTriggerRules', {
+      principal: new iam.ServicePrincipal('events.amazonaws.com'),
+      sourceArn: `arn:aws:events:${this.region}:${this.account}:rule/${eventTriggerRulePrefix(classification)}*`,
+    });
+    // THE WATCHED CONVERSATION'S RULES (DESIGN-EVENT-TARGETS section 4) reach the same relay, and the router reads each one's
+    // binding from its tags: only this classification's watch rules, twelve characters after the prefix, and nothing else.
+    eventTriggerRelay.addPermission('EventWatchRules', {
+      principal: new iam.ServicePrincipal('events.amazonaws.com'),
+      sourceArn: `arn:aws:events:${this.region}:${this.account}:rule/${eventWatchRulePrefix(classification)}*`,
+    });
+    agentHandler.addEnvironment('WATCH_RULE_ARN_PREFIX', `arn:aws:events:${this.region}:${this.account}:rule/${eventWatchRulePrefix(classification)}`);
+    agentHandler.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadOwnWatchRuleBindings', actions: ['events:ListTagsForResource'],
+      resources: [`arn:aws:events:${this.region}:${this.account}:rule/${twelveCharIds(eventWatchRulePrefix(classification))}`],
+    }));
+    // A WORKFLOW STEP OPENS A CHILD CONVERSATION (WT120) through this classification's own creator, by its fixed name, and no other.
+    // The invoke itself is granted with the creator (`AgentHandlerOpensTypedConversations`).
+    if (eventInitiatedTypes.length > 0) {
+      agentHandler.addEnvironment('TYPED_CREATOR_NAME', typedCreatorName(classification));
+    }
     abuse.grant(handlerRole);
     turnQueue.grant(handlerRole);
     // `sourceAccount` is the confused-deputy condition, and it is load-bearing rather than hygiene.
@@ -2534,7 +2821,7 @@ export class AssistantsStack extends cdk.Stack {
         //
         // Set only where a pack exists, exactly as the handler's is: an absent pointer is the
         // documented "run the defaults" path, not a degraded one.
-        ...(topo.intentPackParam ? { ASSISTANT_INTENT_PACK_PARAM: intentPackParamName, PROFILE_BODY_BUCKET: props.attachmentsBucketName } : {}),
+        ...(topo.intentPackParam ? { ASSISTANT_INTENT_PACK_PARAM: intentPackParamName, PROFILE_BODY_BUCKET: props.profileBucketName } : {}),
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
@@ -2551,7 +2838,7 @@ export class AssistantsStack extends cdk.Stack {
       // The body the parameter points at, on this classification's pack prefix only.
       taskService.addToRolePolicy(new iam.PolicyStatement({
         actions: ['s3:GetObject'],
-        resources: [`${props.attachmentsBucketArn}/${classificationPackPrefix(classification)}*`],
+        resources: [`${props.profileBucketArn}/${classificationPackPrefix(classification)}*`],
       }));
       // The processor reads the same pack on the assistant's session (FR17).
       actingRole.addToPrincipalPolicy(new iam.PolicyStatement({
@@ -2571,12 +2858,25 @@ export class AssistantsStack extends cdk.Stack {
     for (const stmt of taskServiceNames.statements) taskService.addToRolePolicy(stmt);
     for (const [k, v] of Object.entries({ ...taskServiceNames.env, SSM_ROOT })) taskService.addEnvironment(k, v);
 
+    // ── A SETTLEMENT NO TURN RECORDS IS ONE ARCHIVE FACT (ADR-067 decision 6, WT61) ───────────────────────────────────
+    //
+    // A card press and a deadline settle a task with no message, so the service puts one platform record per settlement
+    // into the stream the archive already reads; the Firehose copies it into the S3 archive and the archival consumer
+    // projects it. PutRecord only, on that one stream, named as the messaging stack names it; no read, and no person's
+    // credential holds it (deny-tested in `a-settlement-is-one-archive-fact.test.ts`).
+    const factStreamName = `chime-messaging-${ANALYTICS_PREFIX}`;
+    taskService.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['kinesis:PutRecord'],
+      resources: [`arn:${cdk.Aws.PARTITION}:kinesis:${this.region}:${this.account}:stream/${factStreamName}`],
+    }));
+    taskService.addEnvironment('FACT_STREAM_NAME', factStreamName);
+
     // Both halves of a turn ask it. `grantInvoke` is safe here where it was not for the router: the
     // service references neither function, so there is no edge back and no cycle to close.
     taskService.grantInvoke(actingRole);
     taskService.grantInvoke(handlerRole);
     asyncProcessor.addEnvironment('TASK_SERVICE_ARN', taskService.functionArn);
-    agentHandler.addEnvironment('TASK_SERVICE_ARN', taskService.functionArn);
+    agentHandler.addEnvironment('TASK_SERVICE_ARN', taskService.functionName);
 
     new lambda.CfnPermission(this, 'AgentHandlerLexInvoke', {
       action: 'lambda:InvokeFunction',
@@ -2595,7 +2895,7 @@ export class AssistantsStack extends cdk.Stack {
     turnRouting.grant(handlerRole, 'dynamodb:PutItem');
     agentHandler.addEnvironment('TURN_ROUTING_TABLE', turnRouting.tableName);
     assistantVend.grantInvoke(handlerRole);
-    agentHandler.addEnvironment('ASSISTANT_VEND_ARN', assistantVend.functionArn);
+    agentHandler.addEnvironment('ASSISTANT_VEND_ARN', assistantVend.functionName);
     // For the routing services in other stacks (the channel flow, the battle orchestrator).
     new ssm.StringParameter(this, 'AssistantVendArnParam', {
       parameterName: vendArnKey(classification),

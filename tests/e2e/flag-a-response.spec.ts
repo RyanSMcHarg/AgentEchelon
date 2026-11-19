@@ -100,7 +100,7 @@ test.describe('Oversight — a moderator can flag a response (live)', () => {
       await expect(page.locator('.admin-tab').first()).toBeVisible({ timeout: 20000 });
       await page.getByRole('button', { name: 'View' }).nth(i).click();
       // The transcript table renders before the flag controls resolve.
-      await expect(page.locator('.admin-section h4', { hasText: 'Recent Messages' })).toBeVisible({ timeout: 20000 });
+      await expect(page.locator('.admin-section h3', { hasText: 'Recent Messages' })).toBeVisible({ timeout: 20000 });
       // AND THE READ HAS SETTLED. The heading renders as soon as the detail opens, while the messages
       // are still being read (behind the access-reason prompt), so counting here counted an empty
       // table: all twelve conversations read "No messages loaded" with the header still on

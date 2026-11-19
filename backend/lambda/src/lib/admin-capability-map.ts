@@ -62,8 +62,45 @@ export type AnalyticsCapabilityKey =
  *
  * Moving a queryType to a finer capability only tightens access (the deployer note above), so this
  * cannot break a role that was correctly scoped.
+ *
+ * EVERY READ THAT RETURNS WHAT WAS SAID IS HERE, whatever panel it feeds:
+ *   - `conversation_summaries`: the conversation list's summaries and, for one channel, its transcript
+ *     (content, sender name and sender ARN);
+ *   - `evaluation_exchanges`, `flagged_responses`, `ground_truth` and `label_queue`: the person's
+ *     message and the assistant's answer beside each score, flag or label;
+ *   - `user_ratings`: the rated answer and the note the person wrote.
+ * The writes that ride `flagged_responses` and `ground_truth` keep their own capabilities
+ * (`WRITE_ACTIONS` below); only the reads are content.
+ *
+ * Each of these reads is served with a stated reason and an audit line, and its rows are narrowed to
+ * the caller's classification scope (`analytics-aurora/analytics-query.ts`). A team reads
+ * `flagged_responses`, `ground_truth` and `label_queue` on its assistant's route, bound to that
+ * assistant and its clearance in SQL and read with a stated reason (`ASSISTANT_BOUND_QUALITY`).
  */
-const VIEW_EVENTS_QUERIES = ['channel_events', 'cross_conversation_context'];
+const VIEW_EVENTS_QUERIES = [
+  'channel_events',
+  'cross_conversation_context',
+  'conversation_summaries',
+  'evaluation_exchanges',
+  'flagged_responses',
+  'ground_truth',
+  'label_queue',
+  'user_ratings',
+];
+
+/** The capability that holds conversation content. */
+export const CONTENT_CAPABILITY: AnalyticsCapabilityKey = 'view-events';
+
+/**
+ * The native GET routes that return conversation content (paths under the analytics API root). The
+ * catalog grants them under `view-events`, beside the content queryTypes above, and the handler serves
+ * them with a stated reason, an audit line and the caller's classification scope.
+ */
+export const CONTENT_GET_PATHS: readonly string[] = [
+  'analytics/conversations',
+  'analytics/context',
+  'analytics/evaluation/exchanges',
+];
 
 /** Identity / signup+signin funnels (A13, PII) — denied to AI dev + Manager. */
 const VIEW_USER_ACTIVITY_QUERIES = [
@@ -173,4 +210,14 @@ export function capabilityForPath(path: string): AnalyticsCapabilityKey {
  */
 export function queryTypeAllowedOnPath(queryType: string, path: string, action?: string): boolean {
   return capabilityForQueryType(queryType, action) === capabilityForPath(path);
+}
+
+/** Whether a `queryType` (with its write `action`, if any) returns conversation content. */
+export function isContentQuery(queryType: string, action?: string): boolean {
+  return capabilityForQueryType(queryType, action) === CONTENT_CAPABILITY;
+}
+
+/** Whether a GET path is one of the content routes (`CONTENT_GET_PATHS`), matched on its ending. */
+export function isContentGetPath(path: string): boolean {
+  return CONTENT_GET_PATHS.some((p) => path === `/${p}` || path.endsWith(`/${p}`));
 }

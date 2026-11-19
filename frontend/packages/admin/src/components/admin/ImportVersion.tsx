@@ -8,13 +8,16 @@
  *
  * NOTHING IS WRITTEN UNTIL THE PREVIEW IS CONFIRMED. Choosing a file reads it in the browser and shows
  * where it came from and what will happen (a draft of this assistant, replacing a draft that exists);
- * Cancel drops it. A file that is not a manifest is refused here, before any request. What the server
+ * Cancel drops it. An import replaces the whole draft, so the preview names each area holding an unsaved edit, which the
+ * import drops (saved afterwards, it would write over the imported draft). The import names the draft the preview warned about (`replaceConfigId`), so a draft saved
+ * since is kept: the server refuses `DRAFT_EXISTS`, the refusal says so, and the view reloads to that draft. A file that is not a manifest is refused here, before any request. What the server
  * refuses (a deploy-time key, an alt's profile, an assistant outside the session's reach, a model the
  * classification lacks) is shown with each of its reasons.
  */
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { importProfile, type ProfileManifest } from '../../services/profileService';
+import { draftConflictOf } from '../../services/draftConflict';
 import { GuideLinks, guideSection } from './AdminHelp';
 
 /** What the preview says about a manifest's source. Every field but the name is optional. */
@@ -68,14 +71,18 @@ interface ImportVersionProps {
   assistantLabel: string;
   /** Whether a draft exists, which the import replaces. */
   hasDraft: boolean;
+  /** The configId of that draft, as the view loaded it: the one draft this import may replace. */
+  draftConfigId?: string;
   disabled?: boolean;
   /** Set beside the import control in the same row (Export). */
   beside?: React.ReactNode;
-  /** Called after the server landed the draft, to reload what the view shows. */
-  onImported: () => void | Promise<void>;
+  /** The areas holding an unsaved edit, by name: the import drops them with the draft it replaces. */
+  unsaved?: readonly string[];
+  /** Called to reload what the view shows: `landed` once the server landed the draft, false when it kept a newer one. */
+  onImported: (landed: boolean) => void | Promise<void>;
 }
 
-const ImportVersion: React.FC<ImportVersionProps> = ({ assistant, assistantLabel, hasDraft, disabled, beside, onImported }) => {
+const ImportVersion: React.FC<ImportVersionProps> = ({ assistant, assistantLabel, hasDraft, draftConfigId, disabled, beside, unsaved = [], onImported }) => {
   const { t } = useTranslation();
   const [preview, setPreview] = useState<{ manifest: ProfileManifest; summary: ManifestSummary; fileName: string } | null>(null);
   const [refusal, setRefusal] = useState<{ message: string; reasons: string[] } | null>(null);
@@ -104,11 +111,17 @@ const ImportVersion: React.FC<ImportVersionProps> = ({ assistant, assistantLabel
     setRefusal(null);
     try {
       // THE TARGET IS ALWAYS THIS ASSISTANT, whatever the manifest names.
-      await importProfile(preview.manifest, assistant);
+      await importProfile(preview.manifest, assistant, hasDraft ? draftConfigId : undefined);
       setPreview(null);
       setNotice(t('admin.profiles.importVersion.imported', { assistant: assistantLabel }));
-      await onImported();
+      await onImported(true);
     } catch (err) {
+      if (draftConflictOf(err)) {
+        setPreview(null);
+        setRefusal({ message: t('admin.profiles.importVersion.draftChanged', { assistant: assistantLabel }), reasons: [] });
+        await onImported(false);
+        return;
+      }
       const body = (err as { body?: { errors?: unknown } }).body;
       const reasons = Array.isArray(body?.errors) ? body!.errors.filter((e): e is string => typeof e === 'string') : [];
       setRefusal({ message: t('admin.profiles.importVersion.refused', { reason: (err as Error).message }), reasons });
@@ -141,7 +154,7 @@ const ImportVersion: React.FC<ImportVersionProps> = ({ assistant, assistantLabel
 
       {preview && s && (
         <section className="admin-import-preview" aria-labelledby="import-preview-title" data-testid="import-preview">
-          <h5 id="import-preview-title">{t('admin.profiles.importVersion.previewTitle')}</h5>
+          <h4 id="import-preview-title">{t('admin.profiles.importVersion.previewTitle')}</h4>
           <dl className="admin-config-list">
             <dt>{t('admin.profiles.importVersion.file')}</dt>
             <dd>{preview.fileName}</dd>
@@ -157,6 +170,11 @@ const ImportVersion: React.FC<ImportVersionProps> = ({ assistant, assistantLabel
           {hasDraft && (
             <p className="alert-warning" role="note" data-testid="import-replaces-draft">
               {t('admin.profiles.importVersion.replacesDraft', { assistant: assistantLabel })}
+            </p>
+          )}
+          {unsaved.length > 0 && (
+            <p className="alert-warning" role="note" data-testid="import-drops-unsaved">
+              {t('admin.profiles.importVersion.dropsUnsaved', { areas: unsaved.join(', ') })}
             </p>
           )}
           <GuideLinks guides={[guideSection(t('admin.profiles.importVersion.guide'), 'portability')]} />

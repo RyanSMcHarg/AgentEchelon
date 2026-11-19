@@ -308,14 +308,17 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
       // orchestrator speaks as no assistant, so no shared principal holds a speak session or a turn's.
       try {
         // HANDED TO THE ROUTER, which validates the side, posts its placeholder, records the round and
-        // dispatches the processor with this payload unchanged (`aeRebuttal` in router-agent-handler.ts).
+        // dispatches the processor (`aeRebuttal` in router-agent-handler.ts). The router drops the side's
+        // version, variant, attribution and names from this payload and re-resolves them from the
+        // experiment's own pins (`resolveDuelSides`), so the side serves what the experiment pins.
         // Synchronous, so a refused round is logged here rather than lost.
         const dispatch = await lambdaClient.send(
           new InvokeCommand({
             FunctionName: roundRouterArn,
             InvocationType: InvocationType.RequestResponse,
             Payload: Buffer.from(JSON.stringify({ aeRebuttal: {
-              // This side's variant, so the vend narrows the round's session to what the side serves.
+              // This side's variant as the orchestrator read it. The router discards it and rebuilds the grant from
+              // the experiment's pins, so the vend narrows the round's session to what the pins say the side serves.
               routedVariant: variantGrantOf({ modelKey: selfVariant?.modelKey, imageModelKey: selfVariant?.imageGenModelKey, profile: selfVariant?.variantProfile }),
               channelArn,
               correlationId,

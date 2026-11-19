@@ -181,8 +181,16 @@ try {
   process.exit(1);
 }
 
+// `--grep=<title>` runs only the tests whose title matches, and `--trace=off` records no trace, for a run that
+// needs a verdict rather than a trace to read: recording every test is what has run this machine out of memory.
+const grepArg = args.find((a) => a.startsWith('--grep='))?.slice('--grep='.length);
+const traceArg = args.find((a) => a.startsWith('--trace='))?.slice('--trace='.length);
+const PW_EXTRA = [
+  ...(grepArg ? [`--grep=${JSON.stringify(grepArg)}`] : []),
+  ...(traceArg ? [`--trace=${traceArg}`] : []),
+].join(' ');
 const PW = (specs, extraEnv = {}) =>
-  `npx playwright test ${specs} --config=playwright.config.ts`;
+  `npx playwright test ${specs} --config=playwright.config.ts${PW_EXTRA ? ` ${PW_EXTRA}` : ''}`;
 
 // Phase → { label, cmd, cwd, env }. Ordered; admin is LAST by design.
 const PHASES = [
@@ -206,18 +214,21 @@ const PHASES = [
   // group-sourced conversations and the admin conversations in sync. Checked rather than assumed.
   { id: 'audit-trail', label: 'A CloudTrail trail is logging management events (audit + group sync)', cwd: BACKEND,
     cmd: 'node scripts/check-audit-trail.mjs' },
-  { id: 'seed', label: 'Seed demo (users + classification context + identity)', cwd: BACKEND,
-    cmd: 'npx ts-node scripts/seed-demo.ts' },
+  // THE OPS ASSISTANT'S FIRST VERSION IS ITS MANIFEST'S, imported through the profile API rather than seeded, so a fresh
+  // deployment with the ops role declared gets it here too, not only from `add-assistant-role`. Without the role it writes nothing.
+  { id: 'seed', label: 'Seed demo (users + classification context + identity), then import the ops assistant where its role is deployed', cwd: BACKEND,
+    cmd: 'npx ts-node scripts/seed-demo.ts && npm run -s ops-assistant -- import --if-deployed' },
   // `deployed-build.spec.ts` runs FIRST in this phase and takes ~2s. It answers "is the deployed chat
   // app the one these specs were written against?", which is the question every browser assertion
   // below silently assumes. It existed but NO phase named it - the same gap the profiles phase
   // records - so the guard built to catch a stale deployment had never run in a sweep. A stale bundle
   // makes a correct spec fail for a reason that has nothing to do with the code under test, and that
   // is worth two seconds at the front rather than a hand-diff of the served JavaScript.
-  { id: 'user', label: 'User e2e: deployed-build guard, classification-context boundary, per-classification conversations, mentions, drift, identity, fulfillment retry, turn state without the Lex session', cwd: TESTS,
-    cmd: PW('e2e/deployed-build.spec.ts e2e/classification-context.spec.ts e2e/agent-intents.spec.ts e2e/credential-exchange.spec.ts e2e/mentions.spec.ts e2e/drift-detection.spec.ts '
+  { id: 'user', label: 'User e2e: deployed-build guard, classification-context boundary, per-classification conversations, mentions, drift, identity, fulfillment retry, turn state without the Lex session, a created conversation stays open, a removed member and a non-member refused', cwd: TESTS,
+    cmd: PW('e2e/deployed-build.spec.ts e2e/classification-context.spec.ts e2e/agent-intents.spec.ts e2e/credential-exchange.spec.ts e2e/mentions.spec.ts e2e/a-message-that-disagrees-with-its-target-is-an-error.spec.ts e2e/drift-detection.spec.ts e2e/a-moved-subject-follows-its-audience.spec.ts '
       + 'e2e/a-replayed-turn-claims-once.spec.ts e2e/dispatch-routing.spec.ts e2e/turn-state-without-lex.spec.ts '
-      + 'e2e/a-person-opened-conversation-goes-through-the-canonical-creator.spec.ts') },
+      + 'e2e/a-person-opened-conversation-goes-through-the-canonical-creator.spec.ts e2e/a-created-conversation-stays-open.spec.ts '
+      + 'e2e/a-removed-member-is-refused.spec.ts e2e/a-non-member-is-refused-a-file.spec.ts') },
   // BATTLE_IMAGE_E2E is set HERE because nothing else sets it: the image battle (generation-out) skipped
   // itself on every sweep, which under E2E_REQUIRE_ALL fails the phase and otherwise reads as covered.
   // It needs the image-generation keys, which DATA READINESS above reports.
@@ -304,7 +315,8 @@ const PHASES = [
       + 'e2e/an-assistants-infrastructure-links-name-live-resources.spec.ts '
       + 'e2e/an-assistants-page-shows-its-templates-intents-and-workflows.spec.ts '
       + 'e2e/a-declared-assistant-is-the-registrys-own-name.spec.ts '
-      + 'e2e/admin-workflow-builder.spec.ts'),
+      + 'e2e/admin-workflow-builder.spec.ts e2e/the-workflows-list-is-grouped-by-trigger.spec.ts '
+      + 'e2e/an-intents-task-step-edited-in-the-console-runs.spec.ts'),
     env: { PROFILE_CONFIG_E2E: '1' }, optional: true },
   // A draft answers the golden set before it is activated (ADR-065): a labeled answer nominated as a regression entry,
   // Activate refused until the draft is run, the run's record deciding the gate, and an edit needing a new run; and a
@@ -337,14 +349,15 @@ const PHASES = [
     cmd: PW('e2e/a-person-who-joins-is-welcomed-once-in-their-language.spec.ts e2e/an-opened-room-welcomes-its-lead-once-by-role.spec.ts '
       + 'e2e/an-invitation-runs-its-workflow-until-it-is-revoked.spec.ts e2e/a-welcome-workflow-offers-the-intake-as-a-step.spec.ts '
       + 'e2e/a-proposal-is-applied-once-by-its-addressee.spec.ts e2e/a-welcome-is-said-in-the-assistants-voice.spec.ts '
-      + 'e2e/an-agent-step-addressed-to-a-role-reaches-only-its-holders.spec.ts'),
+      + 'e2e/an-agent-step-addressed-to-a-role-reaches-only-its-holders.spec.ts e2e/a-welcome-prompt-step-follows-the-opening.spec.ts'),
     env: { WELCOME_WORKFLOWS_E2E: '1' }, optional: true },
-  // A workflow's task step (ADR-063): a person's task told and settled on its card, a task ended by its deadline, and an
-  // idle assistant taking up its own work. Each changes a deployed assistant's active version for its run, so the phase
-  // runs only when named; the pickup spec also skips itself where the turn queue is off (E2E_TURN_QUEUE).
+  // A workflow's task step (ADR-063): a person's task told and settled on its card, a task ended by its deadline, an
+  // idle assistant taking up its own work, and a participant role's holder completing a task on its card. Each changes a
+  // deployed assistant's active version for its run, so the phase runs only when named; the pickup spec also skips itself
+  // where the turn queue is off (E2E_TURN_QUEUE), and the role spec where the deployment declares no ops assistant.
   { id: 'workflow-tasks', label: 'Workflow-task e2e: a step assigns a task, a card or a deadline settles it, and an idle assistant takes up its own', cwd: TESTS,
     cmd: PW('e2e/a-workflow-step-opens-a-task-for-a-person.spec.ts e2e/a-task-deadline-ends-the-task-and-continues-the-run.spec.ts '
-      + 'e2e/an-idle-assistant-takes-up-its-own-work.spec.ts'),
+      + 'e2e/an-idle-assistant-takes-up-its-own-work.spec.ts e2e/a-participant-role-holder-completes-a-task-on-the-card.spec.ts'),
     env: { E2E_WORKFLOW_TASKS: '1', E2E_WORKFLOW_TASK_DEADLINE: '1', E2E_WORKFLOW_TASK_PICKUP: '1' }, optional: true },
   // A turn takes its model from its intent and, where the step overrides it or delivers, from the step (ADR-064): routes
   // keyed by the intent, per-step models and their rows, text and image in one intent, a required tool, the console and
@@ -430,17 +443,32 @@ const PHASES = [
     cmd: 'node scripts/show-ops-rollout.mjs', optional: true },
 
   { id: 'ops-role', label: 'Ops-role e2e: a second assistant reaches its own classification and nothing else', cwd: TESTS,
-    cmd: PW('e2e/an-ops-role-reaches-only-its-own-classification.spec.ts e2e/an-assistant-boundary-refuses-cloudwatch.spec.ts e2e/a-typed-conversation-creator-creates-at-one-classification.spec.ts e2e/an-assistant-passes-a-question-to-its-ops-roommate.spec.ts'),
-    optional: true },
+    // The ops assistant's version is created by importing its shipped manifest (npm run add-assistant-role -- ops-premium), and
+    // the import spec proves that path on the deployment: import, validate, activate, and an export equal to the manifest.
+    cmd: PW('e2e/the-ops-assistant-is-created-by-importing-its-manifest.spec.ts e2e/an-ops-role-reaches-only-its-own-classification.spec.ts e2e/an-assistant-boundary-refuses-cloudwatch.spec.ts e2e/a-typed-conversation-creator-creates-at-one-classification.spec.ts e2e/an-assistant-passes-a-question-to-its-ops-roommate.spec.ts'),
+    env: { OPS_IMPORT_E2E: '1' }, optional: true },
 
   // THE INCIDENT WATCH AND THE ROOM'S FIRST LOOK (ADR-061): an ops event naming an alarm opens an `ops` room that watches
   // it, the first look opens an `incident_first_look` task, a state change on the watched alarm runs the room's incident
   // watch, and one on an alarm no room watches posts nothing. It owns two alarms and both rooms, and activates a version
   // of the premium primary for its duration and rolls it back, so it runs only when named. E2E_INSTANCE_NAME resolves the
   // instance the ops event names.
+  // An AWS event opens an incident from the team's room: it attaches a trigger and changes the premium primary's active version for its
+  // duration, returning both, so it runs only when named.
+  { id: 'incident-triage', label: 'Incident triage e2e: an alarm attached in the console opens an incident conversation from the team\'s room, owned by the on-call', cwd: TESTS,
+    cmd: PW('e2e/an-aws-event-opens-an-incident-from-the-team-room.spec.ts e2e/an-event-reaches-the-conversation-that-watches-its-key.spec.ts'),
+    env: { INCIDENT_TRIAGE_E2E: '1' }, optional: true },
   { id: 'incident-watch', label: 'Incident-watch e2e: an ops room watches its alarm, takes a first look, and answers its alarm changing state', cwd: TESTS,
     cmd: PW('e2e/an-alarm-a-room-watches-starts-its-workflow.spec.ts'),
     env: { INCIDENT_WATCH_E2E: '1', E2E_INSTANCE_NAME: INSTANCE_NAME }, optional: true },
+  // INCIDENT RESPONSE AS A PROCESS (SPEC-PROCESSES P1 to P11): the ops team declares the process on its version, one incident
+  // carries one process id from triage to the post-incident review, and the Processes view groups its runs. It drives its
+  // own incident on the incident triage trigger and changes the ops assistant's active version, so it runs only when named. A
+  // person's request for an account brief is a process of its own too (Advisor's `account-briefs`, a request-started workflow),
+  // which changes Advisor's active version and returns it.
+  { id: 'processes', label: 'Process e2e: incident response is one process from triage to review, a request starts its own, a join goes on once both parts are in, read in the Processes view', cwd: TESTS,
+    cmd: PW('e2e/a-process-is-declared-on-its-teams-version.spec.ts e2e/an-incident-is-one-process-from-triage-to-review.spec.ts e2e/a-request-starts-its-own-process.spec.ts e2e/a-join-goes-on-once-both-parts-are-in.spec.ts e2e/process-analytics-groups-runs-by-process-id.spec.ts'),
+    env: { PROCESS_E2E: '1', E2E_INSTANCE_NAME: INSTANCE_NAME }, optional: true },
 
   { id: 'context-sources', label: 'Context-source e2e: sources resolve, and the staleness alarm fires', cwd: TESTS,
     cmd: PW('e2e/context-sources.spec.ts e2e/context-source-alarm.spec.ts'), optional: true },
@@ -511,8 +539,21 @@ const PHASES = [
   { id: 'notifications', label: 'Notification e2e: the bridge delivers outside the app, and an admin alert is sent as the admin assistant, in its own words, to members', cwd: TESTS,
     // `preferences` reads the same test inbox: a mail a person can stop carries its one-click unsubscribe. The operator
     // notice spec saves the admin assistant a `cloudwatch-alarm` template and drives an alarm through the one notifier.
-    cmd: PW('e2e/notification-bridge.spec.ts e2e/preferences.spec.ts e2e/an-operator-notice-is-worded-by-the-admin-agent.spec.ts'),
+    // A share finds only a verified account, and its welcome names the conversation; read from the room and the inbox.
+    cmd: PW('e2e/notification-bridge.spec.ts e2e/preferences.spec.ts e2e/an-operator-notice-is-worded-by-the-admin-agent.spec.ts '
+      + 'e2e/a-share-reaches-only-a-verified-account.spec.ts'),
     env: { ADMIN_ALERT_E2E: '1', E2E_INSTANCE_NAME: INSTANCE_NAME }, optional: true },
+
+  // WHO A MESSAGE ADDRESSES, AND WHAT A LATER TURN READS: `@humans` and `@all` as tokens of their own in a room of two
+  // people, and a message the input guardrail refused staying out of every later turn's context.
+  { id: 'addresses-and-refusals', label: 'Addresses e2e: @humans and @all are tokens of their own, and a refused message stays out of later turns', cwd: TESTS,
+    cmd: PW('e2e/a-room-address-is-a-token-of-its-own.spec.ts e2e/a-refused-message-stays-out-of-later-turns.spec.ts'), optional: true },
+
+  // A MEETING (SPEC-ASSISTANT-MEETINGS FR35 to FR39), where the deployment declares the `meetings` capability: a workflow
+  // step starts it, rings the room and asks for the join link's email (it changes the advisor's active version for the run,
+  // so it carries E2E_WORKFLOW_TASKS), and a person's start rings the other person, who joins in the meeting window.
+  { id: 'meetings', label: 'Meetings e2e: a workflow step starts a meeting and rings the room, and the other person joins in the meeting window', cwd: TESTS,
+    cmd: PW('e2e/a-workflow-starts-a-meeting-and-rings-the-room.spec.ts'), env: { E2E_WORKFLOW_TASKS: '1' }, optional: true },
 
   // THE DEMO'S PEOPLE RECEIVE WHAT THE DEMO SAYS THEY DO. The demo cast (`provision-test-users --cast ops-demo`,
   // secret agent-interface/demo-credentials) is on the test inbox's domain, so the mail a share sends one cast
@@ -636,7 +677,7 @@ const PHASES = [
   { id: 'attribution', label: 'Attribution e2e: a merged turn is labelled, a reply never is', cwd: TESTS,
     cmd: PW('e2e/speaker-attribution.spec.ts'), env: { ATTRIBUTION_E2E: '1' }, optional: true },
 
-  { id: 'admin-surfaces', label: 'Admin e2e (surfaces): navigation, flows, attachment access, render integrity', cwd: TESTS,
+  { id: 'admin-surfaces', label: 'Admin e2e (surfaces): navigation, flows, attachment access, render integrity, user approval', cwd: TESTS,
     // The dashboard phase asserts DATA; these assert the console around it - the parts an operator
     // touches to reach that data.
     cmd: PW('e2e/admin-nav.spec.ts e2e/admin-flow.spec.ts e2e/admin-attachments.spec.ts '
@@ -646,7 +687,14 @@ const PHASES = [
       // NO phase is a spec that never runs - which is what it was. It asserts the three D8 task
       // routes through the signed path, including that the assignee read and the owner read do not
       // serve each other's set, and that each vend is pinned to the one principal it named.
-      + 'e2e/admin-task-routes.spec.ts'),
+      + 'e2e/admin-task-routes.spec.ts '
+      // Approve, reject, disable and re-enable on Manage Users, each read back from the pool and the
+      // credential exchange. It writes two throwaway accounts to the pool and removes them after, so it
+      // runs behind `USER_MANAGEMENT_E2E`, which this phase sets.
+      + 'e2e/an-admin-approves-rejects-and-disables-a-person.spec.ts '
+      // The Messages section creates, edits, saves and rolls back a template under a name of its own, which no
+      // message uses until a version picks it.
+      + 'e2e/admin-messages-section-saves-and-rolls-back-a-template.spec.ts'),
     // AND THE INSTANCE NAME, WITHOUT WHICH THAT SPEC SILENTLY OPTS OUT (2026-09-10).
     //
     // `resolveTaskTable` reads the shared SSM contract at `/<instance>/shared/tables/...`, and with no
@@ -658,7 +706,7 @@ const PHASES = [
     // It matters beyond the four tests: this spec is the live check that the D8 task routes keep the
     // assignee and owner reads apart and pin each vend to its principal, so neither could be settled
     // while it quietly opted out.
-    env: { E2E_INSTANCE_NAME: INSTANCE_NAME },
+    env: { E2E_INSTANCE_NAME: INSTANCE_NAME, USER_MANAGEMENT_E2E: '1' },
     optional: true },
 
   // THE BOUNDARY AND CONSOLE SPECS NO PHASE NAMED, and so never ran: a conversation read carries no name,
@@ -690,6 +738,13 @@ const PHASES = [
   { id: 'identity-providers', label: 'Identity providers e2e: a provider\'s groups give the access the guide describes; a foreign person and their offboarding', cwd: TESTS,
     cmd: PW('e2e/a-providers-groups-give-the-access-the-guide-describes.spec.ts e2e/h1-person.spec.ts e2e/h1-offboard.spec.ts'),
     env: { E2E_INSTANCE_NAME: INSTANCE_NAME }, optional: true },
+
+  // REVOCATION WINDOWS (DESIGN-REVOCATION-WINDOWS section 4): a downgraded, removed and disabled person, each on the
+  // credential they already hold, refused within the window the design states. Changes a test user's clearance and
+  // account for its run and restores both, so the phase runs only when named.
+  { id: 'revocation-windows', label: 'Revocation e2e: a downgraded, removed or disabled person is refused within the stated window', cwd: TESTS,
+    cmd: PW('e2e/a-removed-or-downgraded-person-is-refused-within-the-window.spec.ts'),
+    env: { REVOCATION_WINDOWS_E2E: '1' }, optional: true },
 
   // THE GUEST AND INVITATION PATHS, each gated as its spec says: a guest deployment (the widget on the sample
   // host page, the funnel's two paths), invitations, and a person's export.

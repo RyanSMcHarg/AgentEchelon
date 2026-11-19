@@ -22,6 +22,7 @@
  * caller is entitled to see, by definition of ownership (ADR-024).
  */
 
+import { machinesOfTask } from './lib/version-machines.js';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import {
@@ -39,9 +40,10 @@ import { taskStateMachines, parseIntentPack, DEFAULT_INTENT_PACK, resolvePackPar
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
 import { userArnFor } from './lib/person-arn.js';
 import { callerPersonId } from './lib/auth.js';
+import { callerReachesConversation, isNotAMemberError, listReach, refusalAnswer, type CheckUse, type ConversationAccess } from './lib/conversation-access.js';
+import { capabilityRefusal, typeAllows } from './lib/type-capability.js';
 import { responder, originsFrom, DEV_ORIGIN } from './lib/http-response.js';
 import { chimeMessagingClient } from './lib/chime/clients.js';
-import { readChannelTags } from './lib/channel-classification.js';
 import { loadProfileRegistry } from '../../lib/profile-registry';
 
 const ALLOWED_ORIGINS = originsFrom(process.env.ALLOWED_ORIGIN, DEV_ORIGIN);
@@ -365,6 +367,23 @@ async function taskServiceArnFor(classification: string): Promise<string> {
   }
 }
 
+/**
+ * THE CALLER'S OWN BOUNDARY IN FRONT OF A TASK ROUTE: a current member of the conversation, proven with their
+ * own AppInstanceUser as bearer, and cleared for its classification (`lib/conversation-access.ts`). Anything that
+ * cannot be answered is a refusal.
+ */
+function callerReaches(event: APIGatewayProxyEvent, channelArn: string, liveTags = false, use: CheckUse = 'check'): Promise<ConversationAccess> {
+  return callerReachesConversation(event, channelArn, { appInstanceArn: APP_INSTANCE_ARN, client: chime, liveTags, use });
+}
+
+/** A reach check that could not be answered: the list cannot be shown as complete, so it is not shown. */
+class ReachUnavailable extends Error {
+  constructor(readonly access: Extract<ConversationAccess, { ok: false }>) {
+    super('a conversation the caller owns work in could not be checked');
+    this.name = 'ReachUnavailable';
+  }
+}
+
 async function openWorkItem(event: APIGatewayProxyEvent, origin?: string): Promise<APIGatewayProxyResult> {
   const personId = await callerPersonId(event);
   if (!personId) return respond(401, { error: 'Unauthorized: this sign-in names no person' }, origin);
@@ -403,30 +422,33 @@ async function openWorkItem(event: APIGatewayProxyEvent, origin?: string): Promi
 
   const callerArn = userArnFor(APP_INSTANCE_ARN, personId);
 
-  // 1. MEMBERSHIP, as the caller. The same call yields the expiration the TTL limit comes from.
+  // 1. A CURRENT MEMBER CLEARED FOR THE CONVERSATION (`lib/conversation-access.ts`), its tags read live
+  //    in this request: the classification it is cleared for (resolved), and `archived`, which changes. An
+  //    untagged conversation, or tags that cannot be read, is refused there, never read as open.
+  const access = await callerReaches(event, channelArn, true);
+  if (!access.ok) {
+    const refused = refusalAnswer(access);
+    return respond(refused.statusCode, refused.body, origin);
+  }
+  // A TYPE THAT TURNS TASKS OFF IS REFUSED HERE (`lib/type-capability.ts`): a customer's room declares them off.
+  const allowed = await typeAllows(channelArn, 'tasks');
+  if (!allowed.ok) return respond(allowed.statusCode, capabilityRefusal(allowed), origin);
+  // 2. The expiration the TTL limit comes from, read as the caller. The caller is a proven member, so a
+  //    failure here is the service's, and retryable.
   let expirationDays: number | undefined;
   try {
     const described = await chime.send(new DescribeChannelCommand({
       ChannelArn: channelArn, ChimeBearer: callerArn,
     }));
     expirationDays = described.Channel?.ExpirationSettings?.ExpirationDays;
-  } catch {
-    return respond(403, { error: 'Not a member of this conversation', code: 'NOT_A_MEMBER' }, origin);
-  }
-
-  // 2 and 3. The authoritative tags. A failure to READ them is a refusal rather than a pass: an item
-  //    opened in an archived or unserved conversation can never be worked, so "could not tell" must
-  //    not mean "go ahead".
-  let gate: ChannelGate;
-  try {
-    const tags = await readChannelTags(chime, channelArn);
-    gate = {
-      classification: tags.classification || '',
-      archived: String(tags.archived) === 'true',
-      expirationDays,
-    };
   } catch (err) {
-    console.error('[user-tasks-api] could not read the conversation tags; refusing rather than guessing', {
+    // The Amazon Chime SDK refusing the caller now is an answer about membership, decided as the check decides
+    // it; anything else is an outage.
+    if (isNotAMemberError(err)) {
+      const refused = refusalAnswer({ ok: false, status: 403, code: 'NOT_A_MEMBER', memberProven: false });
+      return respond(refused.statusCode, refused.body, origin);
+    }
+    console.error('[user-tasks-api] could not read the conversation; refusing rather than guessing', {
       channelArn, message: (err as Error)?.message,
     });
     return respond(503, {
@@ -435,18 +457,15 @@ async function openWorkItem(event: APIGatewayProxyEvent, origin?: string): Promi
     }, origin);
   }
 
+  const gate: ChannelGate = {
+    classification: access.classification,
+    archived: String(access.tags?.archived) === 'true',
+    expirationDays,
+  };
   if (gate.archived) {
     return respond(409, {
       error: 'This conversation is archived and is read-only',
       code: 'CONVERSATION_ARCHIVED',
-    }, origin);
-  }
-  if (!gate.classification) {
-    // An untagged conversation is refused by the task service anyway, so an item opened here would be
-    // invisible to every turn that followed. Fail closed and loudly.
-    return respond(409, {
-      error: 'This conversation carries no classification and cannot hold work items',
-      code: 'CONVERSATION_UNCLASSIFIED',
     }, origin);
   }
 
@@ -525,10 +544,10 @@ const CARD_REFUSALS: Record<string, { status: number; error: string }> = {
  * POST /tasks/advance: A PERSON TAKES A CHOICE ON THEIR TASK'S CARD (ADR-063 decision 2, the FR17 submission advance).
  *
  * The caller is the person the request's authorizer resolved (tenet D14), never a field of the body. They must be a
- * member, checked as them; the conversation must be tagged with a classification and not archived; then the
+ * member cleared for the conversation, checked as them (`lib/conversation-access.ts`); the conversation must be tagged with a classification and not archived; then the
  * conversation's own task service decides the rest against the row it reads now: the caller is the task's current
- * assignee, the task is still in the state the card showed, and the choice is one that state declares. No new grant:
- * this function already reads tags, checks membership as the caller and invokes a task service by name.
+ * assignee, the task is still in the state the card showed, and the choice is one that state declares. This function
+ * reads the tags, checks membership and clearance as the caller and invokes a task service by name.
  */
 async function advanceOnCard(event: APIGatewayProxyEvent, origin?: string): Promise<APIGatewayProxyResult> {
   const personId = await callerPersonId(event);
@@ -548,25 +567,22 @@ async function advanceOnCard(event: APIGatewayProxyEvent, origin?: string): Prom
   if (!channelArn.startsWith(`${APP_INSTANCE_ARN}/channel/`) || !taskId || !state || !choice) {
     return respond(400, { error: 'channelArn, taskId, state and choice are required', code: 'MALFORMED_BODY' }, origin);
   }
-  const callerArn = userArnFor(APP_INSTANCE_ARN, personId);
-  try {
-    await chime.send(new DescribeChannelCommand({ ChannelArn: channelArn, ChimeBearer: callerArn }));
-  } catch {
-    return respond(403, { error: 'Not a member of this conversation', code: 'NOT_A_MEMBER' }, origin);
+  // Tags read live in this request: the classification the caller is cleared for, and `archived`.
+  const access = await callerReaches(event, channelArn, true);
+  if (!access.ok) {
+    const refused = refusalAnswer(access);
+    return respond(refused.statusCode, refused.body, origin);
   }
-  let classification = '';
-  try {
-    const tags = await readChannelTags(chime, channelArn);
-    if (String(tags.archived) === 'true') return respond(409, { error: 'This conversation is archived and is read-only', code: 'CONVERSATION_ARCHIVED' }, origin);
-    classification = tags.classification || '';
-  } catch {
-    return respond(503, { error: 'Could not confirm this conversation is open', code: 'CHANNEL_STATE_UNREADABLE' }, origin);
-  }
-  const serviceArn = classification ? await taskServiceArnFor(classification) : '';
+  const { classification } = access;
+  if (String(access.tags?.archived) === 'true') return respond(409, { error: 'This conversation is archived and is read-only', code: 'CONVERSATION_ARCHIVED' }, origin);
+  const serviceArn = await taskServiceArnFor(classification);
   if (!serviceArn) return respond(503, { error: 'No task service is published for this conversation', code: 'TASK_SERVICE_UNAVAILABLE' }, origin);
   try {
+    // A FORM'S ANSWERS (WT50) ride the press, bounded here and held to the form's fields by the task service.
+    const answers = body?.answers && typeof body.answers === 'object' && !Array.isArray(body.answers) && JSON.stringify(body.answers).length <= 20_000
+      ? body.answers as Record<string, unknown> : undefined;
     const out = await invokeTaskServiceOp<{ ok: boolean; to?: string; error?: string }>(lambdaClient, serviceArn, 'advanceAsAssignee', {
-      taskId, channelArn, callerPersonId: personId, state, choice,
+      taskId, channelArn, callerPersonId: personId, state, choice, ...(answers ? { answers } : {}),
     });
     if (out?.ok) return respond(200, { taskId, state: out.to }, origin);
     const refusal = CARD_REFUSALS[out?.error ?? 'REFUSED'] ?? CARD_REFUSALS.REFUSED;
@@ -610,19 +626,46 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
   if (!personId) {
     return respond(401, { error: 'Unauthorized: this sign-in names no person' }, origin);
   }
+  if (!APP_INSTANCE_ARN) {
+    return respond(500, { error: 'APP_INSTANCE_ARN is not configured', code: 'SERVER_MISCONFIG' }, origin);
+  }
 
   try {
-    const rows = await getActiveTasksForUser(personId, { limit: MAX_ITEMS });
+    // ONLY WHERE THE CALLER STILL REACHES. An item is listed only from a conversation the caller is still a
+    // member of and cleared for, each distinct conversation asked once; one they left, were removed from, or
+    // whose classification their clearance no longer reaches is dropped, never named. The filter runs on each
+    // page as it is read, before the limit, so dropped items never leave the list short while more remain.
+    // A check that cannot be answered fails the request rather than dropping the item. Membership comes from
+    // ONE read of the caller's own memberships for the whole request (`listReach`), not a lookup per
+    // conversation, so the list costs the same Amazon Chime SDK budget however many conversations hold the
+    // caller's work; clearance is checked per conversation as every route checks it, and the check is
+    // recorded as a list filter (`use: 'list'`), not refused access.
+    const reach = new Map<string, ConversationAccess>();
+    const reader = listReach(event, { appInstanceArn: APP_INSTANCE_ARN, client: chime });
+    const admit = async (page: UserTask[]): Promise<UserTask[]> => {
+      const unchecked = [...new Set(page.map((task) => task.channelArn))].filter((arn) => !reach.has(arn));
+      for (const [arn, access] of await reader.reaches(unchecked)) reach.set(arn, access);
+      const outage = unchecked.map((arn) => reach.get(arn)!)
+        .find((a): a is Extract<ConversationAccess, { ok: false }> => !a.ok && a.code === 'UNAVAILABLE');
+      if (outage) throw new ReachUnavailable(outage);
+      return page.filter((task) => reach.get(task.channelArn)?.ok === true);
+    };
+    const rows = await getActiveTasksForUser(personId, { limit: MAX_ITEMS, admit });
     // OWNED, not merely mentioned. `getActiveTasksForUser` queries the mirror partition keyed on the
     // owner, which since ADR-024 is written by one writer under one field - so a task an assistant
     // still owns cannot appear here, and one handed to this user cannot fail to.
     const declared = await machinesByAssistant();
+    // A TASK THAT CARRIES ITS OWN MACHINE (ADR-067 stage 2) is read on it: a state only its version declares says what it needs.
     const items = rows.map((task) => toOpenWorkItem(
       task,
-      (task.assistantId && declared.get(task.assistantId)) || DEFAULT_MACHINES,
+      machinesOfTask(task, (task.assistantId && declared.get(task.assistantId)) || DEFAULT_MACHINES),
     ));
     return respond(200, { items, count: items.length }, origin);
   } catch (error) {
+    if (error instanceof ReachUnavailable) {
+      const refused = refusalAnswer(error.access);
+      return respond(refused.statusCode, refused.body, origin);
+    }
     console.error('[user-tasks-api] read failed:', error);
     // A queue that cannot be read must not look like a queue that is empty: an empty list would tell
     // the user they owe nothing, which is a worse lie than an error.

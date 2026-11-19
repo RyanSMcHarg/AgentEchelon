@@ -4,7 +4,10 @@ import { useConversations } from '../providers/ConversationProvider.chime';
 import type { Conversation } from '@ae/shared';
 import { classificationBadgeStyle, classificationName } from '@ae/shared/config/classifications.ts';
 import './ConversationList.css';
+import { OngoingMeetingsList } from './meeting/OngoingMeetings';
+import { useOngoingMeetings } from '../hooks/useOngoingMeetings';
 import { conversationTitleFor } from '../utils/conversationTitle';
+import { conversationListing, meetingRoomsFrom } from '../utils/conversationListing';
 
 interface ConversationListProps {
   onNewConversation: () => void;
@@ -17,8 +20,14 @@ const ConversationList: React.FC<ConversationListProps> = ({ onNewConversation }
 
   // Archived conversations are retained (read-only access) but hidden from the
   // active list by default; the "Show archived" toggle reveals them (ADR-017).
-  const active = conversations.filter((c) => !c.archived);
-  const archived = conversations.filter((c) => c.archived);
+  // A meeting's own conversation is listed with its room, not beside it (`conversationListing`).
+  // The meetings, read once for the sidebar: the running ones listed above it, and the server's word on which room each
+  // meeting conversation belongs to, running or ended.
+  const { meetings, rooms } = useOngoingMeetings();
+  const meetingRooms = meetingRoomsFrom(rooms, meetings);
+  const { listed, meetingsOf } = conversationListing(conversations, activeConversation?.id, meetingRooms);
+  const active = listed.filter((c) => !c.archived);
+  const archived = listed.filter((c) => c.archived);
 
   const handleSelectConversation = (conversation: Conversation) => {
     selectConversation(conversation.id);
@@ -43,7 +52,9 @@ const ConversationList: React.FC<ConversationListProps> = ({ onNewConversation }
 
   const renderItem = (conversation: Conversation) => {
     const isActive = activeConversation?.id === conversation.id;
-    const unread = !isActive && !conversation.archived && isConversationUnread(conversation);
+    // What is new in the room's running meetings shows on the room; an archived meeting conversation carries nothing.
+    const meetings = (meetingsOf.get(conversation.id) ?? []).filter((m) => !m.archived);
+    const unread = !isActive && !conversation.archived && [conversation, ...meetings].some((c) => isConversationUnread(c));
     return (
       <button
         type="button"
@@ -56,6 +67,7 @@ const ConversationList: React.FC<ConversationListProps> = ({ onNewConversation }
         ].filter(Boolean).join(' ')}
         onClick={() => handleSelectConversation(conversation)}
         aria-current={isActive ? 'page' : undefined}
+        data-conversation-id={conversation.id}
       >
         <div className="conversation-item-body">
           <div className="conversation-title">
@@ -91,6 +103,8 @@ const ConversationList: React.FC<ConversationListProps> = ({ onNewConversation }
 
   return (
     <div className="conversation-list">
+      {/* Meetings running now in the person's conversations, above every conversation. */}
+      <OngoingMeetingsList meetings={meetings} />
       <div className="conversation-list-header">
         <h2>{t('conversationList.heading')}</h2>
         <button className="new-conversation-btn" onClick={onNewConversation}>

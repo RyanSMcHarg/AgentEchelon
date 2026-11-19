@@ -132,7 +132,7 @@ test.describe('Admin console — operator flows (live)', () => {
     }
 
     // L0 -> L1: report_generation is the deterministic task-bearing intent the tasks e2e produces.
-    const intentLink = page.locator('.data-table-row--clickable .admin-link-btn', { hasText: 'report_generation' }).first();
+    const intentLink = page.locator('.data-table-row--clickable .btn-link', { hasText: 'report_generation' }).first();
     await expect(intentLink).toBeVisible({ timeout: 10000 });
     await intentLink.click();
     await expect(page.locator('.admin-breadcrumb')).toBeVisible({ timeout: 10000 });
@@ -142,14 +142,14 @@ test.describe('Admin console — operator flows (live)', () => {
     await expect(tasksDrill).toBeVisible({ timeout: 10000 });
     await tasksDrill.click();
     await expect(page.locator('.admin-breadcrumb')).toContainText(/Tasks/i, { timeout: 15000 });
-    const taskLink = page.locator('.data-table-row--clickable .admin-link-btn').first();
+    const taskLink = page.locator('.data-table-row--clickable .btn-link').first();
     await expect(taskLink).toBeVisible({ timeout: 20000 });
 
     // L2 -> L3: the turn timeline + (when scored) the multi-turn flow score fold in here. The flow score
     // depends on the evaluate phase, so accept it OR the deepened breadcrumb as proof we reached L3.
     await taskLink.click();
     await expect(
-      page.getByText(/Flow score/i).or(page.locator('.admin-breadcrumb .admin-link-btn').nth(2)),
+      page.getByText(/Flow score/i).or(page.locator('.admin-breadcrumb .btn-link').nth(2)),
     ).toBeVisible({ timeout: 25000 });
   });
 
@@ -159,7 +159,7 @@ test.describe('Admin console — operator flows (live)', () => {
 
     // Latency is the Performance view's latency drill; the old link still lands on it.
     await page.goto('/?admin=latency');
-    await expect(page.locator('h3:has-text("Response Latency")')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('h2:has-text("Response Latency")')).toBeVisible({ timeout: 15000 });
     await page.locator('.admin-metrics-row').first().waitFor({ timeout: 20000 });
 
     // TTFF is the PRIMARY perceived-latency metric (the placeholder appearing); P95 is the tail.

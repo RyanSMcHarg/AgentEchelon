@@ -3,7 +3,7 @@ import * as ses from 'aws-cdk-lib/aws-ses';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNodeJs from 'aws-cdk-lib/aws-lambda-nodejs';
-import { grantDirectoryRead, grantEmailFanOut, type EmailConsentAccess } from '../constructs/directory-access';
+import { grantDirectoryRead, grantEmailFanOut, grantLiveClearance, type EmailConsentAccess } from '../constructs/directory-access';
 import { grantTokenKinds } from '../constructs/token-store';
 import { grantIssuerRegistry } from '../constructs/trusted-issuers';
 import type * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
@@ -60,7 +60,7 @@ export interface NotificationStackProps extends cdk.StackProps {
   senderEmail: string;
   /** Frontend URL for conversation deep links */
   appUrl?: string;
-  /** The attachments bucket, which holds the message templates an email is worded from (ADR-062). */
+  /** The profile bucket, which holds the message templates an email is worded from (ADR-062). */
   templateBucket?: { bucketName: string; bucketArn: string };
   /**
    * Set true when `senderEmail` is ALREADY a verified SES identity (or is
@@ -74,7 +74,7 @@ export interface NotificationStackProps extends cdk.StackProps {
   /** The token store (A8), for each mail's unsubscribe and reply tokens. */
   tokens: dynamodb.ITable;
   /**
-   * The email reply poster (M-8): its role and the one-conversation role it posts on, from Identity. Present
+   * The email reply poster (M-8): its role and the `restricted` role it posts on, from Identity. Present
    * exactly when `replyDomain` is set.
    */
   replyPoster?: { roleArn: string; restrictedRoleArn: string };
@@ -242,6 +242,9 @@ export class NotificationStack extends cdk.Stack implements RouteSource {
       userPoolId: props.userPoolId,
       poolReads: ['cognito-idp:ListUsers', 'cognito-idp:AdminListGroupsForUser', 'cognito-idp:AdminGetUser'],
     });
+    // The live clearance recheck of the shared conversation check (DESIGN-REVOCATION-WINDOWS R4): the sharer's
+    // current groups decide, so a downgraded person adds nobody at a classification they no longer hold.
+    grantLiveClearance(shareConversationFunction, { appInstanceArn: props.appInstanceArn, userPoolId: props.userPoolId });
     shareConversationRole.addToPolicy(new iam.PolicyStatement({
       sid: 'ShareReadEnforcedMembershipSource',
       actions: ['dynamodb:GetItem'],
@@ -481,18 +484,21 @@ export class NotificationStack extends cdk.Stack implements RouteSource {
         actions: ['kinesis:GetRecords', 'kinesis:GetShardIterator', 'kinesis:DescribeStream', 'kinesis:DescribeStreamSummary', 'kinesis:ListShards'],
         resources: [props.messageStream.streamArn],
       }));
-      // READ ONLY: whether the conversation is the admin conversation (its immutable `aeChannelKind` tag)
-      // and who its members are, bearing whoever posted the message. Nothing here reads message content:
-      // the fan-out works from the stream record it was handed.
+      // READ ONLY: the conversation's immutable tags (its `classification`, which every recipient's clearance
+      // must reach, and `aeChannelKind`, whether it is the admin conversation) and who its members are,
+      // bearing whoever posted the message. Nothing here reads message content: the fan-out works from the
+      // stream record it was handed.
       bridgeFn.addToRolePolicy(new iam.PolicyStatement({
         actions: ['chime:ListTagsForResource', 'chime:ListChannelMemberships'],
         resources: [`${props.appInstanceArn}/*`],
       }));
+      // Each recipient's clearance is read from their groups (`Directory.clearanceOf`), beside their contact.
       grantEmailFanOut(bridgeFn, {
         appInstanceArn: props.appInstanceArn,
         userPoolId: props.userPoolId,
         additionalPoolIds: props.notifyAdditionalUserPoolIds,
         senderEmail: props.senderEmail,
+        poolReads: ['cognito-idp:AdminListGroupsForUser'],
         consent: consentFor(true),
       });
       // LATEST: a notification for a message sent before the consumer existed reaches nobody who is
@@ -744,13 +750,19 @@ export class NotificationStack extends cdk.Stack implements RouteSource {
         actions: ['s3:GetObject', 's3:DeleteObject'],
         resources: [inbound.arnForObjects(`${INBOUND_REPLY_PREFIX}*`)],
       }));
-      // The From check: the address the person's issuer holds for them now.
+      // The From check, the address the person's issuer holds for them now, and the clearance check, the
+      // person's groups now (`Directory.clearanceOf`).
       grantDirectoryRead(posterFn, {
         appInstanceArn: props.appInstanceArn,
         userPoolId: props.userPoolId,
         additionalPoolIds: props.notifyAdditionalUserPoolIds,
-        poolReads: ['cognito-idp:AdminGetUser'],
+        poolReads: ['cognito-idp:AdminGetUser', 'cognito-idp:AdminListGroupsForUser'],
       });
+      // READ ONLY: the conversation's immutable `classification` tag, which the replier's clearance must reach.
+      posterRole.addToPrincipalPolicy(new iam.PolicyStatement({
+        actions: ['chime:ListTagsForResource'],
+        resources: [`${props.appInstanceArn}/channel/*`],
+      }));
       const storeInBucket: ses.IReceiptRuleAction = {
         bind: () => ({ s3Action: { bucketName: inbound.bucketName, objectKeyPrefix: INBOUND_REPLY_PREFIX } }),
       };

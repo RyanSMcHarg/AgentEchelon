@@ -50,7 +50,7 @@ describe('the conversation timeline', () => {
   const rowsText = () => screen.getAllByRole('row').map((r) => r.textContent ?? '');
 
   it('interleaves membership changes with the messages, in time order, keeping a removed message in place', async () => {
-    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
+    render(<ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
     await screen.findByText('I cannot take card numbers');
     const order = rowsText().filter((t) => /Membership: joined|Redacted by a moderator|I cannot take card numbers/.test(t))
       .map((t) => (t.includes('Membership') ? 'join' : t.includes('Redacted') ? 'removed question' : 'answer'));
@@ -58,7 +58,7 @@ describe('the conversation timeline', () => {
   });
 
   it('narrows to what is there now on request', async () => {
-    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
+    render(<ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
     await screen.findByText('I cannot take card numbers');
     fireEvent.click(screen.getByLabelText('Current state'));
     expect(screen.queryByText(/Redacted by a moderator/)).toBeNull();
@@ -77,7 +77,7 @@ describe('the conversation timeline', () => {
       { action: 'subject_resolved', memberArn: '', subjectOutcome: 'declined', timestamp: '2026-07-18T10:03:15Z', isBot: false },
       { action: 'subject_dropped', memberArn: '', subject: 'Order lookup', timestamp: '2026-07-18T10:03:20Z', isBot: false },
     ]);
-    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
+    render(<ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
     await screen.findByText('I cannot take card numbers');
     expect(rowsText().some((t) => t.includes('Subject added: Order lookup'))).toBe(true);
     expect(rowsText().some((t) => t.includes('New subject flagged'))).toBe(true);
@@ -86,13 +86,13 @@ describe('the conversation timeline', () => {
   });
 
   it('marks a hidden member in the full record', async () => {
-    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
+    render(<ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
     await screen.findByText('I cannot take card numbers');
     expect(rowsText().filter((t) => t.includes('hidden from other members'))).toHaveLength(1);
   });
 
   it('shows every earlier version of an edited message in the record, and only the latest in the current state', async () => {
-    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
+    render(<ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
     await screen.findByText('I cannot take card numbers');
     expect(screen.getByText(/Edited: 3 versions/)).toBeTruthy();
     expect(screen.getByText(/my order is 4410/)).toBeTruthy();
@@ -104,7 +104,7 @@ describe('the conversation timeline', () => {
   });
 
   it('offers no message controls on a membership change', async () => {
-    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
+    render(<ConversationsTab driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
     await screen.findByText('I cannot take card numbers');
     const join = screen.getAllByRole('row').find((r) => (r.textContent ?? '').includes('Membership: joined'))!;
     expect(within(join).queryByRole('button')).toBeNull();

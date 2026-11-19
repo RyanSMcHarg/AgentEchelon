@@ -119,10 +119,37 @@ async function maybeGetSummary(
   return getLatestSummary(channelArn);
 }
 
+/**
+ * THE LATEST SUMMARY OF EACH RELATED CONVERSATION (DESIGN-WORKFLOWS-AND-TASKS section 6, rules 2 and 4), gated as the
+ * conversation's own summary is, and checked only where a summary will be read: no rosters are read for a greeting, or
+ * where the data plane is off. A conversation with no summary yet is left out. Never rejects.
+ */
+async function relatedSummariesOf(
+  related: (() => Promise<ReadonlyArray<{ channelArn: string; relation: 'parent' | 'child' }>>) | undefined,
+  intent: string | undefined,
+  transcriptOf?: (channelArn: string) => Promise<string | null>,
+): Promise<Array<{ relation: 'parent' | 'child'; summary: string; transcript?: string }>> {
+  if (process.env.ENABLE_LIVE_DRIFT !== 'true' || isTrivial(intent) || !related) return [];
+  const checked = await related().catch(() => []);
+  const read = await Promise.all(checked.map(async (r) => {
+    if (typeof r?.channelArn !== 'string' || !r.channelArn.includes('/channel/') || (r.relation !== 'parent' && r.relation !== 'child')) return null;
+    // A CHILD'S MEETING TRANSCRIPT, where it held one: read under the same check as its summary.
+    const [summary, transcript] = await Promise.all([
+      getLatestSummary(r.channelArn).catch(() => null),
+      r.relation === 'child' && transcriptOf ? transcriptOf(r.channelArn).catch(() => null) : Promise.resolve(null),
+    ]);
+    if (!summary?.trim() && !transcript?.trim()) return null;
+    return { relation: r.relation, summary: summary?.trim() ?? '', ...(transcript?.trim() ? { transcript: transcript.trim() } : {}) };
+  }));
+  return read.filter((r): r is { relation: 'parent' | 'child'; summary: string; transcript?: string } => r !== null);
+}
+
 /** What a turn is grounded in. Both members absent means the turn is grounded in nothing, which is ordinary. */
 export interface TurnGrounding {
   retrievedContext?: RetrieveContextResult;
   conversationSummary?: string;
+  /** The latest summary of each related conversation the router checked (DESIGN-WORKFLOWS-AND-TASKS section 6). */
+  relatedSummaries?: Array<{ relation: 'parent' | 'child'; summary: string; transcript?: string }>;
 }
 
 /**
@@ -141,13 +168,19 @@ export async function resolveTurnGrounding(args: {
   userMessage: string;
   classification: string;
   intent?: string;
+  /** The related conversations this turn may read, checked when the grounding is resolved (DESIGN-WORKFLOWS-AND-TASKS section 6). */
+  related?: () => Promise<ReadonlyArray<{ channelArn: string; relation: 'parent' | 'child' }>>;
+  /** A related child's latest meeting transcript (`meeting-transcript.ts`), read only for a relative that passed the check. */
+  transcriptOf?: (channelArn: string) => Promise<string | null>;
 }): Promise<TurnGrounding> {
-  const [retrievedContext, conversationSummary] = await Promise.all([
+  const [retrievedContext, conversationSummary, relatedSummaries] = await Promise.all([
     maybeRetrieveContext(args.userMessage, args.classification, args.intent),
     maybeGetSummary(args.channelArn, args.intent),
+    relatedSummariesOf(args.related, args.intent, args.transcriptOf),
   ]);
   return {
     ...(retrievedContext ? { retrievedContext } : {}),
     ...(conversationSummary ? { conversationSummary } : {}),
+    ...(relatedSummaries.length ? { relatedSummaries } : {}),
   };
 }

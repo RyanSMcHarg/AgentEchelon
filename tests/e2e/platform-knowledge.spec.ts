@@ -22,29 +22,13 @@ import { signIn, createConversation, sendAndWaitForResponse } from './helpers/ag
 import { getStandardUser, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 import { WebSocketMonitor } from './helpers/websocket-monitor';
-import { aws, awsv } from './helpers/aws';
+import { turnRecord as recordOf } from './helpers/turn-record';
 
 const RUN = process.env.PLATFORM_KNOWLEDGE_E2E === '1';
 
-/**
- * THE TURN'S OWN RECORD of what it did: the tools that ran and the passages retrieved, written by the
- * processor to the message-analytics table under the answer's message id. This is the evidence a
- * grounded answer rests on, and it does not depend on how the model chose to phrase the reply.
- * Waited for, because the record is written beside the reply rather than before it.
- */
+/** The turn's own record (`helpers/turn-record.ts`), as text, so a passage or a tool name can be searched for. */
 async function turnRecord(messageId: string): Promise<string> {
-  const names: string[] = aws('dynamodb list-tables --query "TableNames"') || [];
-  const table = names.find((n) => /MessageAnalytics/i.test(n));
-  expect(table, 'no message-analytics table in this deployment').toBeTruthy();
-  const deadline = Date.now() + 60_000;
-  while (Date.now() < deadline) {
-    // argv, not a shell string: the key is JSON, and a shell would eat its quotes.
-    let r: any = null;
-    try { r = awsv(['dynamodb', 'get-item', '--table-name', table!, '--key', JSON.stringify({ messageId: { S: messageId } })]); } catch { /* read again */ }
-    if (r?.Item) return JSON.stringify(r.Item);
-    await new Promise((res) => setTimeout(res, 3_000));
-  }
-  throw new Error(`no analytics record for message ${messageId} in ${table} within 60s`);
+  return JSON.stringify(await recordOf(messageId));
 }
 
 // Watch the two blind spots an assertion on the answer text leaves: the server, and the browser console.
@@ -109,11 +93,14 @@ test.describe('platform self-knowledge', () => {
     expect(text).not.toMatch(/i (don't|do not) have|no information|cannot find|unable to find/);
 
     // THE BODY WAS RETRIEVED: a passage the turn was given carries the body-only detail. Read from the
-    // passages, not a file name, because the profile guide carries the same detail as the spec.
+    // passages, not a file name, because the profile guide carries the same detail as the spec. Either statement
+    // of it counts: the field table (`personaRef`, `profile-bodies.ts`) or the portability section ("the persona is
+    // inlined, never a pointer"). Which of the two ranks first varies between runs.
     const messageId = ws.lastBotMessageId;
     expect(messageId, 'the reply carried no message id to look its record up by').toBeTruthy();
     const record = await turnRecord(messageId!);
-    expect(record, 'no retrieved passage carried the persona body store (personaRef, profile-bodies)').toMatch(/personaRef|profile-bodies/);
+    expect(record, 'no retrieved passage carried where the persona body lives (personaRef, profile-bodies, or the persona inlined on export)')
+      .toMatch(/personaRef|profile-bodies|persona is inlined/);
   });
 
   /**
@@ -145,7 +132,7 @@ test.describe('platform self-knowledge', () => {
     // Read from the artifact rather than written here, for the same reason the generator derives
     // them: a fork must pass this against ITS authorship, not against mine.
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const about = require('../../backend/demo/platform-knowledge/basic/agentechelon-about.json');
+    const about = require('../../demo/stratum-company/platform-knowledge/basic/agentechelon-about.json');
     expect(about.author, 'the curated knowledge carries no author: check LICENSE and run the knowledge phase').toBeTruthy();
     expect(about.repository, 'the curated knowledge carries no repository: the sync found no forge remote').toBeTruthy();
 

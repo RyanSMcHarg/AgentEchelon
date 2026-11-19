@@ -193,6 +193,13 @@ describe('parseMessageContent — NAVIGATE_CHANNEL marker (drift redirect)', () 
     expect(result.navigateChannel).toBeNull();
   });
 
+  it('a reply that declares the move after its link shows only the label, and no marker', () => {
+    const raw = 'Created a new conversation. NAVIGATE_CHANNEL:arn:aws:chime:us-east-1:111:app-instance/i/channel/c2|Open it<!--turn:kind=drift;moves=m3;answers=m4-->';
+    const result = parseMessageContent(raw);
+    expect(result.navigateChannel?.channelName).toBe('Open it');
+    expect(result.content).toBe('Created a new conversation.');
+  });
+
   it('handles channel name with spaces in it', () => {
     const raw = "NAVIGATE_CHANNEL:arn:aws:chime:us-east-1:111:app-instance/i/channel/conv-123|My Long Channel Name";
     const result = parseMessageContent(raw);

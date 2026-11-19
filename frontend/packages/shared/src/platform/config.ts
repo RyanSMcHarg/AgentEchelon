@@ -98,6 +98,9 @@ export const PERSON_ROUTES = {
   enableBattle: '/channels/battle/enable',
   disableBattle: '/channels/battle/disable',
   battleOutcome: '/channels/battle/outcome',
+  startMeeting: '/meetings',
+  joinMeeting: '/meetings/join',
+  endMeeting: '/meetings/end',
 } as const;
 
 /**

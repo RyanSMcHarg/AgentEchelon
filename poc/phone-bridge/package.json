@@ -1,0 +1,24 @@
+{
+  "name": "agent-echelon-phone-bridge-poc",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Proof of concept: a Twilio phone leg into an Amazon Chime SDK WebRTC meeting, with no Amazon Chime SDK PSTN Audio",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "start": "node build.mjs && node src/server.mjs",
+    "restore": "node src/restore-webhook.mjs",
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "dependencies": {
+    "@aws-sdk/client-chime-sdk-meetings": "^3.700.0",
+    "@aws-sdk/client-secrets-manager": "^3.700.0",
+    "puppeteer-core": "^23.11.1",
+    "twilio": "^5.4.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "amazon-chime-sdk-js": "3.32.0",
+    "esbuild": "^0.27.0"
+  }
+}

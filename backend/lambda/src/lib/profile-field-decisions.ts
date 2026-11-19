@@ -32,7 +32,7 @@ export interface JsonDecision {
 export interface ReadonlyDecision {
   kind: 'readonly';
   /** What sets it, as a short key the console's locale explains. */
-  drivenBy: 'experiments' | 'model-bundle' | 'migration';
+  drivenBy: 'experiments' | 'model-bundle' | 'migration' | 'classification-pack';
   guide: FieldGuide;
 }
 
@@ -41,7 +41,7 @@ export type FieldDecision = ControlDecision | JsonDecision | ReadonlyDecision;
 /** Guide sections the console links to, by key (the console maps each to a documentation anchor). */
 export type FieldGuide = 'personaOrPack' | 'globalWorkflows' | 'onboarding' | 'boundary' | 'experiments' | 'models' | 'messages' | 'variables' | 'welcome' | 'goldenSet';
 
-const PATCH = 'npm run assistant -- draft <assistant> --patch <file.json>';
+const PATCH = 'npm run assistant -- draft <assistant> --config <configId> --patch <file.json>';
 
 export const PROFILE_FIELD_DECISIONS: Record<keyof ProfileDefinitionBody, FieldDecision> = {
   // The legacy spelling of `models.default`; the base-model select writes both (`editDraft` keeps them equal).
@@ -65,6 +65,9 @@ export const PROFILE_FIELD_DECISIONS: Record<keyof ProfileDefinitionBody, FieldD
   // Edited in the draft's own Event workflows section, the welcome among them: the assistant-joined workflow the room's
   // conversation type selects (W1, ADR-061 decision 1).
   eventWorkflows: { kind: 'control' },
+  // A REQUEST'S WORKFLOW (ADR-067 decision 1), edited as JSON until the Workflows list edits its run-level steps.
+  intentWorkflows: { kind: 'json', command: PATCH, guide: 'globalWorkflows' },
+  processes: { kind: 'json', command: PATCH, guide: 'globalWorkflows' },
   // The values a version names (ADR-060 decision 1). Named as JSON with a draft patch; the console lists them in its
   // variable picker beside the sources the classification publishes, which every condition and insertion reads.
   variables: { kind: 'json', command: PATCH, guide: 'variables' },
@@ -74,10 +77,12 @@ export const PROFILE_FIELD_DECISIONS: Record<keyof ProfileDefinitionBody, FieldD
   // When a workflow's confirmed step is put to the person (ADR-064 decision G), per workflow, named as JSON with a draft
   // patch; the console shows it beside the workflow selection.
   confirmBrief: { kind: 'json', command: PATCH, guide: 'globalWorkflows' },
-  // A version may not define a machine; they are global workflows (the platform's and the classification pack's).
-  machines: { kind: 'json', command: 'npm run deploy:stack -- Assistants-<classification>', guide: 'globalWorkflows' },
+  // The legacy top-level field (`editDraft` refuses it): a version's own machines ride its pack (`intentPack.machines`,
+  // ADR-066) and are edited as JSON with it; the platform's and the classification's are changed by a deploy.
+  machines: { kind: 'readonly', drivenBy: 'classification-pack', guide: 'globalWorkflows' },
   onboarding: { kind: 'json', command: PATCH, guide: 'onboarding' },
-  boundary: { kind: 'json', command: PATCH, guide: 'boundary' },
+  // One line of wording, edited in the draft's identity area. It describes the assistant's limits and enforces none.
+  boundary: { kind: 'control' },
   // The fewest regression entries per intent a draft of this assistant is measured on (ADR-065 decision 6), named as
   // JSON with a draft patch; the gate reads it from the active version.
   goldenSet: { kind: 'json', command: PATCH, guide: 'goldenSet' },

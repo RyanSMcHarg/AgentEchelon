@@ -78,6 +78,19 @@ export interface IntentClassification {
    * nothing downstream reads the person's words to choose a line. Set only on an acknowledgment.
    */
   acknowledgment?: AcknowledgmentKind;
+  /**
+   * THE OPEN TASK THIS MESSAGE CONTINUES, as the model decided from the message read with the conversation's task
+   * state (`ClassifyIntentOptions.waitingWork`). Set only when the model placed the message in that task; `intent` is
+   * then the task's type, so the turn runs on the task intent's route and is attributed to its work.
+   */
+  continuesTask?: { taskId: string; taskType: string };
+  /**
+   * THE OPEN TASKS THE MODEL DECIDED ABOUT: the ids it was offered as continuation categories and answered on. A task
+   * named here that `continuesTask` does not name is one the model read the message as not belonging to, so the
+   * router leaves it open and routes the message on its own intent. Absent when no model decided (a fast path, the
+   * keyword path, a failed call), and the router's structural rule (`opensOtherWorkThan`) decides.
+   */
+  waitingWorkDecided?: string[];
 }
 
 /** The kinds of acknowledgment the classifier tells apart. */
@@ -116,32 +129,70 @@ export interface ClassifyIntentOptions {
    */
   refused?: IntentDef[];
   /**
-   * WORK THIS PERSON HAS OPEN HERE, waiting on them: each task's type and the step it is at.
+   * WORK THIS PERSON HAS OPEN HERE: each task's id, type, the step it is at, how that step is named, whether it waits
+   * on the person, and the words that asked for it.
    *
-   * Without it the model reads the message alone, so "deliver it as a downloadable document", sent while
-   * a data extraction waits at `validating`, reads as a new report request: the router then opens a second
-   * task and strands the first (found live 2026-10-26). The model is told what is waiting and decides
-   * whether the message continues it (tenet D11: the component that understands the message decides).
-   * Only a type the classified pack serves is offered; the router's `opensOtherWorkThan` still decides
-   * from the label, so nothing here bypasses it.
+   * A message is routed on its content read with the conversation's task state (ADR-064, amended 2026-11-12). Read
+   * alone, "Q3, split by region, two pages" is `general`; read beside a report waiting on its requirements, it is
+   * that report's answer. Each task is offered to the model as a continuation category (`CONTINUES_<n>`), so the
+   * model returns one structured decision: the message continues that task, or it is a request of its own intent
+   * (tenet D11: the component that understands the message decides, once, and the decision is data). Only a type
+   * the classified pack serves is offered.
    */
-  waitingWork?: { taskType: string; step?: string }[];
+  waitingWork?: WaitingWork[];
+}
+
+/** One open task offered to the classifier as a place the message may belong. */
+export interface WaitingWork {
+  taskId?: string;
+  taskType: string;
+  step?: string;
+  /** How the step is named to the person (the machine's `label`). */
+  stepLabel?: string;
+  /** The step waits on this person's answer, rather than being worked for them. */
+  waitsOnPerson?: boolean;
+  /** The words that asked for the work (the task's `requestExcerpt`). */
+  request?: string;
 }
 
 /** At most this many waiting tasks are named to the classifier; a person rarely owes more. */
 const MAX_WAITING_WORK = 3;
+/** The longest quoted text a waiting task contributes to the prompt. */
+const MAX_WAITING_TEXT = 120;
 
-/** The prompt lines naming the work waiting on the person, or '' when there is none the pack serves. */
+/** Text quoted into the prompt: one line, no quotes or brackets, clipped. */
+function promptQuote(text: string | undefined): string | undefined {
+  const clean = (text ?? '').replace(/["\\`<>{}[\]]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, MAX_WAITING_TEXT);
+  return clean || undefined;
+}
+
+/** The waiting tasks the model is offered, in category order: the ones the classified pack serves, at most three. */
+export function offeredWaitingWork(waiting: ClassifyIntentOptions['waitingWork'], servedKeys: Set<string>): WaitingWork[] {
+  return (waiting ?? []).filter((w) => servedKeys.has(w.taskType)).slice(0, MAX_WAITING_WORK);
+}
+
+/** The category the model returns for the n-th offered task (1-based). */
+export function continuationCategory(n: number): string {
+  return `CONTINUES_${n}`;
+}
+
+/** The prompt lines naming the work open for the person as continuation categories, or '' when there is none the pack serves. */
 export function waitingWorkLines(waiting: ClassifyIntentOptions['waitingWork'], servedKeys: Set<string>): string {
-  const named = (waiting ?? [])
-    .filter((w) => servedKeys.has(w.taskType))
-    .slice(0, MAX_WAITING_WORK)
-    .map((w) => `- ${w.taskType.toUpperCase()}${w.step && /^[a-z0-9_]{1,64}$/.test(w.step) ? `, at its step "${w.step}"` : ''}`);
-  if (!named.length) return '';
-  return `\nThe person has work open here, waiting on them or still being done for them:\n${named.join('\n')}\n`
-    + 'When the message answers, approves, corrects or asks to finish that work, classify it as that work\'s category, '
-    + 'even when it uses words that fit another category (a "report", a "document", a "table"). '
-    + 'Classify it as another category only when it asks for something new.\n';
+  const offered = offeredWaitingWork(waiting, servedKeys);
+  if (!offered.length) return '';
+  const named = offered.map((w, i) => {
+    const step = w.step && /^[a-z0-9_]{1,64}$/.test(w.step) ? `, at its step "${w.step}"` : '';
+    const label = promptQuote(w.stepLabel);
+    const request = promptQuote(w.request);
+    return `- ${continuationCategory(i + 1)}: the open ${w.taskType.toUpperCase()} work${step}${label ? ` (${label})` : ''}, `
+      + `${w.waitsOnPerson ? 'waiting on the person\'s answer' : 'still being done for the person'}`
+      + `${request ? `, asked for as "${request}"` : ''}`;
+  });
+  return `\nThe person has work open here. Decide first whether the message belongs to it:\n${named.join('\n')}\n`
+    + 'Return that work\'s CONTINUES category when the message answers what the work is waiting for, gives details for it, '
+    + 'approves, corrects or changes it, or asks to finish it, even when the message is short, carries no topic words of its own, '
+    + 'or uses words that fit another category (a "report", a "document", a "table"). This comes before every category above. '
+    + 'Return another category only when the message asks for something that is not that work.\n';
 }
 
 /** Messages short enough, or fixed enough, that no model is worth asking. */
@@ -196,9 +247,9 @@ export async function classifyIntent(
 
 Categories:
 - GREETING: ONLY pure greetings with no question or topic — "hi", "hello", "hey there". If the message contains ANY question, request, or topic beyond the greeting, classify as GENERAL instead.
-- ACKNOWLEDGMENT_THANKS: The person thanks you and asks nothing else, like "thanks", "thank you"
-- ACKNOWLEDGMENT_FAREWELL: The person says goodbye and asks nothing else, like "bye", "goodbye"
-- ACKNOWLEDGMENT: Other confirmations that ask nothing, like "ok", "got it"
+- ACKNOWLEDGMENT_THANKS: The person only thanks you, like "thanks", "thank you"
+- ACKNOWLEDGMENT_FAREWELL: The person only says goodbye, like "bye", "goodbye"
+- ACKNOWLEDGMENT: The person only acknowledges what was said, like "ok", "got it". A message that tells you something new, or asks you to do anything (including to note, remember or confirm something), is never an acknowledgment of any kind
 - CONVERSATION_SUMMARY: Summarize, recap or catch the person up on THIS conversation - what was discussed, decided or asked here (e.g. "summarize what we discussed", "what did I miss?"). Answered from the conversation itself; this is never REPORT_GENERATION, even when the person says "summary" or "report"
 - SET_PREFERENCE: The person asks for a LASTING change to how they are answered in every conversation, or answers an offer to set one (e.g. "from now on just give me the number", "always explain what it means", "change my answer style", "no preference"). A request about the CURRENT answer only ("just give me the number for Q2") is not this
 - SHOW_PREFERENCES: The person asks what their saved preferences are, or how they are set to be answered (e.g. "what are my preferences?", "how do you answer me?")
@@ -244,12 +295,30 @@ Category:`;
     // The model returns the UPPERCASE category name; intent keys are lowercase. Match against the
     // active pack's known keys (universal + domain); unknown ⇒ GENERAL.
     const key = category.toLowerCase();
+    // THE DECISION ON THE OPEN WORK, carried on every answer the model gave: the offered task the message continues,
+    // or none of them.
+    const offered = offeredWaitingWork(opts?.waitingWork, servedKeys);
+    const decided = offered.flatMap((w) => (w.taskId ? [w.taskId] : []));
+    const decision = decided.length ? { waitingWorkDecided: decided } : {};
+    const continued = offered.find((_, i) => category.replace(/[^A-Z0-9_]/g, '') === continuationCategory(i + 1));
+    if (continued) {
+      return {
+        intent: continued.taskType,
+        confidence: 'high',
+        ...(continued.taskId ? { continuesTask: { taskId: continued.taskId, taskType: continued.taskType } } : {}),
+        ...decision,
+        ...instrumentation,
+      };
+    }
     let intent: string = IntentType.GENERAL;
     let confidence: IntentClassification['confidence'] = 'medium';
+    // AN ANSWER THAT NAMES NO CATEGORY DECIDED NOTHING about the open work: it reads as general and carries no decision,
+    // so the waiting task is weighed by the structural rule rather than read as placed elsewhere.
+    let recognized = true;
     if (key === 'greeting') { intent = IntentType.GREETING; confidence = 'high'; }
-    else if (key === 'acknowledgment') return { intent: IntentType.ACKNOWLEDGMENT, confidence: 'high', acknowledgment: 'confirmation', ...instrumentation };
-    else if (key === 'acknowledgment_thanks') return { intent: IntentType.ACKNOWLEDGMENT, confidence: 'high', acknowledgment: 'thanks', ...instrumentation };
-    else if (key === 'acknowledgment_farewell') return { intent: IntentType.ACKNOWLEDGMENT, confidence: 'high', acknowledgment: 'farewell', ...instrumentation };
+    else if (key === 'acknowledgment') return { intent: IntentType.ACKNOWLEDGMENT, confidence: 'high', acknowledgment: 'confirmation', ...decision, ...instrumentation };
+    else if (key === 'acknowledgment_thanks') return { intent: IntentType.ACKNOWLEDGMENT, confidence: 'high', acknowledgment: 'thanks', ...decision, ...instrumentation };
+    else if (key === 'acknowledgment_farewell') return { intent: IntentType.ACKNOWLEDGMENT, confidence: 'high', acknowledgment: 'farewell', ...decision, ...instrumentation };
     else if (key === 'general') { intent = IntentType.GENERAL; confidence = 'medium'; }
     else if (key === 'conversation_summary') { intent = IntentType.CONVERSATION_SUMMARY; confidence = 'high'; }
     else if (key === 'set_preference') { intent = IntentType.SET_PREFERENCE; confidence = 'high'; }
@@ -257,9 +326,9 @@ Category:`;
     else if (key === 'off_topic') { intent = IntentType.OFF_TOPIC; confidence = 'high'; }
     else if (servedKeys.has(key)) { intent = key; confidence = 'high'; }
     else if (refused.some((d) => d.key === key)) {
-      return { intent: key, confidence: 'high', refused: true, ...instrumentation };
-    }
-    return { intent, confidence, ...instrumentation };
+      return { intent: key, confidence: 'high', refused: true, ...decision, ...instrumentation };
+    } else recognized = false;
+    return { intent, confidence, ...(recognized ? decision : {}), ...instrumentation };
   } catch (error) {
     console.error('[IntentClassifier] LLM classification failed:', error);
     return classifyByKeywords(userMessage);

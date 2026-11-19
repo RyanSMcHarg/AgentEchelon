@@ -54,7 +54,6 @@ describe('a guest entry', () => {
   it('is fixed at one visitor classification and bound to it', () => {
     refused([self(), guest({ clearance: { fixed: ['basic'], classifications: ['basic'] } })], /fixed at one visitor classification/);
     refused([self(), guest({ clearance: { fixed: ['guest'], classifications: ['guest', 'basic'] } })], /fixed at one visitor classification/);
-    refused([self(), guest({ clearance: { oneChannel: 'guest', classifications: ['guest'] } })], /fixed at one visitor classification/);
     refused([self(), guest({ clearance: { mapping: { claim: 'x', values: { a: 'guest' } }, classifications: ['guest'] } })], /fixed at one visitor classification/);
   });
 

@@ -141,7 +141,9 @@ export async function uploadFile(
 export async function getDownloadUrl(
   fileKey: string,
   conversationId: string,
-  userId: string
+  userId: string,
+  /** `attachment`: the signed address saves the file under the platform's name for it, rather than showing it. */
+  opts: { disposition?: 'attachment' } = {},
 ): Promise<string> {
   const idToken = localStorage.getItem('idToken');
   if (!idToken) {
@@ -159,6 +161,7 @@ export async function getDownloadUrl(
       fileKey,
       conversationId,
       userId,
+      ...(opts.disposition ? { disposition: opts.disposition } : {}),
     }),
   });
 

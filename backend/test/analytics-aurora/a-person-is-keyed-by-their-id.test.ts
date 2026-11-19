@@ -58,7 +58,11 @@ describe('the writers and the migration', () => {
 
   it('every exchange writer copies the asking person off the user message', () => {
     const src = read('lambda/src/analytics-aurora/kinesis-archival.ts');
-    const inserts = src.split('INSERT INTO exchanges (').slice(1);
+    // A TURN THE PLATFORM STARTED (migration 106) answers no person, so its writer copies nobody: it is the one writer apart.
+    const platform = src.slice(src.indexOf('async function createPlatformExchanges('), src.indexOf('\n}\n', src.indexOf('async function createPlatformExchanges(')));
+    expect(platform).toContain('SELECT c.id, NULL, p.agent_id,');
+    expect(platform).not.toMatch(/person_id|user_role/);
+    const inserts = src.split('INSERT INTO exchanges (').slice(1).filter((ins) => !platform.includes(ins.slice(0, 400)));
     expect(inserts.length).toBe(3);
     for (const ins of inserts) {
       expect(ins.slice(0, 300)).toContain('user_role, person_id, assistant');

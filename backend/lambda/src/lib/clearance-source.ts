@@ -29,8 +29,8 @@
  * groups would move policy into the provider, which is the mistake this seam exists to prevent: the
  * deployment decides what a group means, not the directory it came from.
  *
- * COGNITO IS ONE SOURCE OF FOUR. A pool's groups are what a `groups` source reads, through this
- * provider; a `mapping`, a `fixed` set and the one-conversation session are sources of their own (below),
+ * COGNITO IS ONE SOURCE OF THREE. A pool's groups are what a `groups` source reads, through this
+ * provider; a `mapping` and a `fixed` set are sources of their own (below),
  * chosen per issuer by the seam factory (`lib/issuer-seams.ts`).
  */
 import {
@@ -86,8 +86,8 @@ export function clearanceClient(): CognitoIdentityProviderClient {
 // ── ONE SOURCE PER Q5 CLEARANCE SOURCE ───────────────────────────────────────────────────────────
 //
 // Each trusted issuer declares where its people's clearance comes from (`clearance` in the registry,
-// `lib/config/issuers.ts`): its pool's groups, a claim mapping, a fixed set, or the one-conversation
-// session. Each is one implementation of `IssuerClearanceSource`, chosen once per issuer by the seam
+// `lib/config/issuers.ts`): its pool's groups, a claim mapping, or a fixed set.
+// Each is one implementation of `IssuerClearanceSource`, chosen once per issuer by the seam
 // factory (`lib/issuer-seams.ts`). A source answers in its OWN terms - group names, or the
 // classifications its configuration names - and never applies the issuer's classifications or picks a token: what the
 // answer means is the registry's (`heldWithinIssuer`, `Directory.clearanceOf`).
@@ -99,7 +99,7 @@ export type HeldBySource =
 
 export interface IssuerClearanceSource {
   /** Which Q5 source this is, for logs and errors. */
-  readonly source: 'groups' | 'mapping' | 'fixed' | 'oneChannel';
+  readonly source: 'groups' | 'mapping' | 'fixed';
   readonly issuerId: string;
   /**
    * What the subject holds, read without a token (the membership audit, the reconcile, the router).
@@ -141,9 +141,4 @@ export function mappingClearanceSource(issuerId: string): IssuerClearanceSource 
 /** `fixed`: the set the issuer declares, whoever the subject is. */
 export function fixedClearanceSource(issuerId: string, classifications: readonly string[]): IssuerClearanceSource {
   return { source: 'fixed', issuerId, heldFor: async () => ({ classifications: [...classifications] }) };
-}
-
-/** `oneChannel`: the one classification the issuer's people reach their one conversation at. */
-export function oneChannelClearanceSource(issuerId: string, classification: string): IssuerClearanceSource {
-  return { source: 'oneChannel', issuerId, heldFor: async () => ({ classifications: [classification] }) };
 }

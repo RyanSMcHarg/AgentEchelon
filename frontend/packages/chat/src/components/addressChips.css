@@ -1,0 +1,22 @@
+/* A mention or private address in a message body. Accent-tinted and translucent, so the chip reads on
+   any message surface in light and dark; the text takes the theme's link color, which each theme sets
+   for contrast on its own surfaces (design-tokens.css). */
+.message-address-chip {
+  display: inline;
+  padding: 0 0.3em;
+  border-radius: var(--radius-sm, 4px);
+  font-weight: 600;
+  white-space: nowrap;
+  color: var(--link-color, var(--accent-600));
+  background: color-mix(in srgb, var(--accent-500) 14%, transparent);
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+/* A private address is the message's audience rather than a name in it: outlined and dashed, so a
+   private note does not read as an ordinary mention. */
+.message-address-chip--address {
+  background: transparent;
+  outline: 1px dashed color-mix(in srgb, var(--accent-500) 55%, transparent);
+  outline-offset: -1px;
+}

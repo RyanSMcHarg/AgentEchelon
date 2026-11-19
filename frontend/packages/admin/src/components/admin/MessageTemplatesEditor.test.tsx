@@ -14,7 +14,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
-import MessageTemplatesEditor, { previewMessageTemplate, templateInUse, sampleValue, withLanguageVariant, withVoice } from './MessageTemplatesEditor';
+import MessageTemplatesEditor, { previewMessageTemplate, templateInUse, sampleValue, whatItSays, withLanguageVariant, withVoice } from './MessageTemplatesEditor';
 import { parseTemplate } from '../../../../../../backend/lambda/src/lib/document-template.ts';
 import { noticeLine } from '../../../../../../backend/lambda/src/lib/assistant-notice.ts';
 import { shippedMessageTemplates } from '../../../../../../backend/lambda/src/lib/shipped-message-templates.ts';
@@ -35,6 +35,9 @@ const reworded = (name: string, section: string, text: string) => {
   return s.source.replace(`# ${section}\n${s.template.messageSections![section]}\n`, `# ${section}\n${text}\n`);
 };
 
+/** A template is read on its row, and opened from it to edit. */
+const openRow = async (name: string) => fireEvent.click(await screen.findByTestId(`message-template-open-${name}`));
+
 describe('the preview is what the runtime posts', () => {
   const values = { name: 'Riley', recap: 'the Q3 review', title: 'Q3 review' };
 
@@ -45,6 +48,11 @@ describe('the preview is what the runtime posts', () => {
     const preview = previewMessageTemplate(source, values);
     if (!('sections' in preview)) throw new Error(preview.error);
     expect(preview.sections.chat).toBe(noticeLine(undefined, 'memberWelcome', values, undefined, parseTemplate(source)));
+  });
+
+  it('every shipped template has words to show on its row', () => {
+    const silent = [...shippedMessageTemplates().values()].filter(({ source }) => !whatItSays(source)?.trim()).map(({ entry }) => entry.name);
+    expect(silent).toEqual([]);
   });
 
   it('a template that does not parse says why', () => {
@@ -97,8 +105,199 @@ describe('the editor', () => {
     vi.mocked(svc.saveMessageTemplate).mockResolvedValue({ name: 'member-welcome', contentHash: 'h', changed: true });
   });
 
+  it('LISTS EVERY TEMPLATE WITH ITS PURPOSE, WHOSE IT IS AND WHAT IT SAYS, before any is opened', async () => {
+    render(<MessageTemplatesEditor profileName="advisor" canSave />);
+    const row = await screen.findByTestId('message-template-row-member-welcome');
+    expect(row).toHaveTextContent(shipped('member-welcome').entry.description);
+    expect(row).toHaveTextContent('Welcome, [name].');
+    expect(screen.getByTestId('message-template-origin-member-welcome')).toHaveTextContent('Shipped');
+    expect(screen.getByTestId('message-template-row-join-recap')).toBeTruthy();
+    expect(screen.queryByTestId('message-template-detail')).toBeNull();
+  });
+
+  describe('a template under a name of its own', () => {
+    const openNew = async () => {
+      fireEvent.click(await screen.findByTestId('message-template-new'));
+      fireEvent.change(screen.getByTestId('message-template-new-message'), { target: { value: 'member-welcome' } });
+    };
+    const named = (name: string) => reworded('member-welcome', 'chat', 'Hi {{name}}, from the advisor.').replace('"name":"member-welcome"', `"name":"${name}"`);
+
+    it('CREATES ONE: starts from what the message says, stores it under the new name and names the message it words', async () => {
+      vi.mocked(svc.saveMessageTemplate).mockResolvedValue({ name: 'advisor-welcome', contentHash: 'h', changed: true });
+      render(<MessageTemplatesEditor profileName="advisor" canSave />);
+      await openNew();
+      expect((screen.getByTestId('message-template-new-text') as HTMLTextAreaElement).value).toContain('# chat');
+      expect((screen.getByTestId('message-template-new-text') as HTMLTextAreaElement).value).not.toContain('---');
+      expect(screen.getByTestId('message-template-new-save')).toBeDisabled();
+      fireEvent.change(screen.getByTestId('message-template-new-name'), { target: { value: 'advisor-welcome' } });
+      fireEvent.change(screen.getByTestId('message-template-new-description'), { target: { value: 'The advisor greets a member' } });
+      fireEvent.click(screen.getByTestId('message-template-new-save'));
+      await waitFor(() => expect(svc.saveMessageTemplate).toHaveBeenCalled());
+      const [assistant, source, message] = vi.mocked(svc.saveMessageTemplate).mock.calls[0];
+      expect([assistant, message]).toEqual(['advisor', 'member-welcome']);
+      const saved = parseTemplate(source);
+      expect([saved.name, saved.description]).toEqual(['advisor-welcome', 'The advisor greets a member']);
+      expect(await screen.findByTestId('message-template-new-status')).toHaveTextContent('once a version');
+    });
+
+    it.each([
+      ['a shipped name', 'join-recap', 'shipped template'],
+      ['a name this assistant holds', 'advisor-welcome', 'already has'],
+      ['a name the store refuses', 'Advisor Welcome', 'lowercase'],
+    ])('refuses %s before it reaches the server', async (_label, name, says) => {
+      vi.mocked(svc.listMessageTemplates).mockResolvedValue({ assistant: 'advisor', classification: 'basic', templates: [listing('member-welcome'), listing('join-recap')], family: { 'advisor-welcome': { contentHash: 'c', source: named('advisor-welcome'), history: [] } } });
+      render(<MessageTemplatesEditor profileName="advisor" canSave />);
+      await openNew();
+      fireEvent.change(screen.getByTestId('message-template-new-name'), { target: { value: name } });
+      expect(screen.getByTestId('message-template-new-name-hint')).toHaveTextContent(says);
+      expect(screen.getByTestId('message-template-new-save')).toBeDisabled();
+    });
+
+    it('a template that does not parse cannot be saved, and says why', async () => {
+      render(<MessageTemplatesEditor profileName="advisor" canSave />);
+      await openNew();
+      fireEvent.change(screen.getByTestId('message-template-new-name'), { target: { value: 'advisor-welcome' } });
+      fireEvent.change(screen.getByTestId('message-template-new-text'), { target: { value: 'no heading here' } });
+      expect(screen.getByTestId('message-template-new-error')).toBeTruthy();
+      expect(screen.getByTestId('message-template-new-save')).toBeDisabled();
+    });
+
+    it('changing the message restarts the words only while they are unwritten', async () => {
+      render(<MessageTemplatesEditor profileName="advisor" canSave />);
+      await openNew();
+      const text = () => (screen.getByTestId('message-template-new-text') as HTMLTextAreaElement).value;
+      const welcome = text();
+      fireEvent.change(screen.getByTestId('message-template-new-message'), { target: { value: 'join-recap' } });
+      expect(text()).not.toBe(welcome);
+      fireEvent.change(screen.getByTestId('message-template-new-text'), { target: { value: '# prompt\nMine' } });
+      fireEvent.change(screen.getByTestId('message-template-new-message'), { target: { value: 'member-welcome' } });
+      expect(text()).toBe('# prompt\nMine');
+    });
+
+    it('EDITS ONE IT HOLDS, opened on the message this version says from it, with its name kept', async () => {
+      vi.mocked(svc.listMessageTemplates).mockResolvedValue({ assistant: 'advisor', classification: 'basic', templates: [listing('member-welcome'), listing('join-recap')], family: { 'advisor-welcome': { contentHash: 'c', source: named('advisor-welcome'), history: [] } } });
+      render(<MessageTemplatesEditor profileName="advisor" canSave messages={{ 'member-welcome': 'advisor-welcome' }} />);
+      fireEvent.click(await screen.findByTestId('message-template-open-own-advisor-welcome'));
+      expect(screen.queryByTestId('message-template-new-name')).toBeNull();
+      expect((screen.getByTestId('message-template-new-message') as HTMLSelectElement).value).toBe('member-welcome');
+      fireEvent.click(screen.getByTestId('message-template-new-save'));
+      await waitFor(() => expect(svc.saveMessageTemplate).toHaveBeenCalledWith('advisor', expect.stringContaining('"name":"advisor-welcome"'), 'member-welcome'));
+    });
+
+    it('a search that excludes the open form leaves it open with its words', async () => {
+      vi.mocked(svc.listMessageTemplates).mockResolvedValue({ assistant: 'advisor', classification: 'basic', templates: [listing('member-welcome')], family: { 'advisor-welcome': { contentHash: 'c', source: named('advisor-welcome'), history: [] } } });
+      render(<MessageTemplatesEditor profileName="advisor" canSave />);
+      fireEvent.click(await screen.findByTestId('message-template-open-own-advisor-welcome'));
+      fireEvent.change(screen.getByTestId('message-template-new-text'), { target: { value: '# chat\nMine' } });
+      fireEvent.change(screen.getByTestId('message-template-find'), { target: { value: 'nothing matches this' } });
+      expect((screen.getByTestId('message-template-new-text') as HTMLTextAreaElement).value).toBe('# chat\nMine');
+    });
+
+    it('choosing a message for a form nobody has written in asks nothing on closing', async () => {
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+      render(<MessageTemplatesEditor profileName="advisor" canSave />);
+      await openNew();
+      fireEvent.change(screen.getByTestId('message-template-new-message'), { target: { value: 'join-recap' } });
+      fireEvent.click(screen.getByTestId('message-template-new-close'));
+      expect(confirm).not.toHaveBeenCalled();
+      expect(screen.queryByTestId('message-template-own-form')).toBeNull();
+      confirm.mockRestore();
+    });
+
+    it('asks before words not saved are dropped, and keeps them when told no', async () => {
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+      render(<MessageTemplatesEditor profileName="advisor" canSave />);
+      await openNew();
+      fireEvent.change(screen.getByTestId('message-template-new-name'), { target: { value: 'advisor-welcome' } });
+      fireEvent.click(screen.getByTestId('message-template-new-close'));
+      expect(confirm).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId('message-template-own-form')).toBeTruthy();
+      confirm.mockRestore();
+    });
+
+    it('one no version picks asks which message it words before it can be saved', async () => {
+      vi.mocked(svc.listMessageTemplates).mockResolvedValue({ assistant: 'advisor', classification: 'basic', templates: [listing('member-welcome')], family: { 'advisor-welcome': { contentHash: 'c', source: named('advisor-welcome'), history: [] } } });
+      render(<MessageTemplatesEditor profileName="advisor" canSave />);
+      fireEvent.click(await screen.findByTestId('message-template-open-own-advisor-welcome'));
+      expect(screen.getByTestId('message-template-new-save')).toBeDisabled();
+      fireEvent.change(screen.getByTestId('message-template-new-message'), { target: { value: 'member-welcome' } });
+      expect(screen.getByTestId('message-template-new-save')).not.toBeDisabled();
+    });
+
+    it('without activate-profiles there is nothing to create and the held one is only read', async () => {
+      vi.mocked(svc.listMessageTemplates).mockResolvedValue({ assistant: 'advisor', classification: 'basic', templates: [listing('member-welcome')], family: { 'advisor-welcome': { contentHash: 'c', source: named('advisor-welcome'), history: [] } } });
+      render(<MessageTemplatesEditor profileName="advisor" canSave={false} />);
+      await screen.findByTestId('message-template-own-named-advisor-welcome');
+      expect(screen.queryByTestId('message-template-new')).toBeNull();
+      expect(screen.queryByTestId('message-template-open-own-advisor-welcome')).toBeNull();
+    });
+  });
+
+  it('a shipped row: a save keeps its confirmation, and an unsaved rewording asks before another row opens', async () => {
+    const saved = reworded('member-welcome', 'chat', 'Welcome aboard, {{name}}.');
+    vi.mocked(svc.listMessageTemplates).mockResolvedValueOnce({ assistant: 'advisor', classification: 'basic', templates: [listing('member-welcome'), listing('join-recap')], family: {} })
+      .mockResolvedValue({ assistant: 'advisor', classification: 'basic', templates: [listing('member-welcome', { own: { contentHash: 'a', source: saved, history: [] } }), listing('join-recap')], family: {} });
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    render(<MessageTemplatesEditor profileName="advisor" canSave />);
+    await openRow('member-welcome');
+    fireEvent.change(screen.getByTestId('message-template-own'), { target: { value: saved } });
+    await openRow('join-recap');
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect((screen.getByTestId('message-template-own') as HTMLTextAreaElement).value).toBe(saved);
+    fireEvent.click(screen.getByTestId('message-template-save'));
+    await waitFor(() => expect(screen.getByTestId('message-template-origin-member-welcome')).toHaveTextContent("This assistant's"));
+    expect(screen.getByTestId('message-template-status')).toHaveTextContent('Saved');
+    confirm.mockRestore();
+  });
+
+  it('a rollback asks before dropping an edit, then shows what is in use', async () => {
+    const was = reworded('member-welcome', 'chat', 'Welcome back, {{name}}.');
+    const now = reworded('member-welcome', 'chat', 'Hello again, {{name}}.');
+    vi.mocked(svc.listMessageTemplates).mockResolvedValueOnce({ assistant: 'advisor', classification: 'basic', templates: [listing('member-welcome', { own: { contentHash: 'a', source: now, history: ['b'] } })], family: {} })
+      .mockResolvedValue({ assistant: 'advisor', classification: 'basic', templates: [listing('member-welcome', { own: { contentHash: 'b', source: was, history: [] } })], family: {} });
+    vi.mocked(svc.rollbackMessageTemplate).mockResolvedValue({ name: 'member-welcome', from: 'a', to: 'b' });
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValue(true);
+    render(<MessageTemplatesEditor profileName="advisor" canSave />);
+    await openRow('member-welcome');
+    fireEvent.change(screen.getByTestId('message-template-own'), { target: { value: 'typed and not saved' } });
+    fireEvent.click(screen.getByTestId('message-template-rollback'));
+    expect(svc.rollbackMessageTemplate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId('message-template-rollback'));
+    await waitFor(() => expect((screen.getByTestId('message-template-own') as HTMLTextAreaElement).value).toBe(was));
+    confirm.mockRestore();
+  });
+
+  it('a deployment line shows its words on the row, and opens on a template that can be saved', async () => {
+    render(<MessageTemplatesEditor profileName="advisor" canSave deploymentLines={{ 'member-welcome': 'Welcome to Stratum.' }} />);
+    expect(await screen.findByTestId('message-template-row-member-welcome')).toHaveTextContent('Welcome to Stratum.');
+    await openRow('member-welcome');
+    expect((screen.getByTestId('message-template-own') as HTMLTextAreaElement).value).toContain('# chat\nWelcome to Stratum.');
+    expect(screen.getByTestId('message-template-preview')).toHaveTextContent('Welcome to Stratum.');
+    expect(screen.getByTestId('message-template-save')).not.toBeDisabled();
+  });
+
+  it('finds a template by its words, and shows one saved under its own name', async () => {
+    vi.mocked(svc.listMessageTemplates).mockResolvedValue({
+      assistant: 'advisor', classification: 'basic', templates: [listing('member-welcome'), listing('join-recap')],
+      family: { 'advisor-welcome': { contentHash: 'c', source: reworded('member-welcome', 'chat', 'Hi {{name}}, from the advisor.').replace('"name":"member-welcome"', '"name":"advisor-welcome"'), history: [] } },
+    });
+    render(<MessageTemplatesEditor profileName="advisor" canSave />);
+    expect(await screen.findByTestId('message-template-own-named-advisor-welcome')).toHaveTextContent('Hi [name], from the advisor.');
+    fireEvent.change(screen.getByTestId('message-template-find'), { target: { value: 'from the advisor' } });
+    expect(screen.queryByTestId('message-template-row-member-welcome')).toBeNull();
+    expect(screen.getByTestId('message-template-own-named-advisor-welcome')).toBeTruthy();
+  });
+
+  it('with no draft open, says the pick changes in a draft and still saves the template', async () => {
+    render(<MessageTemplatesEditor profileName="advisor" canSave picksNote="in a draft" />);
+    await openRow('member-welcome');
+    expect(screen.getByTestId('message-choice-read-only')).toHaveTextContent('in a draft');
+    expect(screen.getByTestId('message-template-save')).toBeEnabled();
+  });
+
   it('says what is in use, previews it, and saves the edited source for this assistant', async () => {
     render(<MessageTemplatesEditor profileName="advisor" canSave />);
+    await openRow('member-welcome');
     await waitFor(() => expect(screen.getByTestId('message-template-in-use')).toHaveTextContent('the shipped template'));
     await waitFor(() => expect(screen.getByTestId('message-template-preview')).toHaveTextContent('Welcome, [name].'));
     const edited = reworded('member-welcome', 'chat', 'Welcome aboard, {{name}}.');
@@ -116,6 +315,7 @@ describe('the editor', () => {
     });
     const onMessagesChange = vi.fn();
     render(<MessageTemplatesEditor profileName="advisor" canSave onMessagesChange={onMessagesChange} messages={{ 'join-recap': '@shipped' }} />);
+    await openRow('member-welcome');
     const pick = await screen.findByTestId('message-choice-pick');
     expect(pick).toHaveValue('');
     expect([...(pick as HTMLSelectElement).options].map((o) => o.value)).toEqual(['', '@shipped', '@classification', 'advisor-welcome']);
@@ -129,16 +329,30 @@ describe('the editor', () => {
     expect(onMessagesChange).toHaveBeenLastCalledWith({ 'join-recap': '@shipped' });
   });
 
-  it('a condition before otherwise makes the entry a list of alternatives', async () => {
+  it('an alternative before otherwise asks for its condition, and is not saved until it has one, as the save requires', async () => {
     const onMessagesChange = vi.fn();
     render(<MessageTemplatesEditor profileName="advisor" canSave onMessagesChange={onMessagesChange} />);
+    await openRow('member-welcome');
     fireEvent.click(await screen.findByTestId('message-choice-add-alternative'));
-    expect(onMessagesChange).toHaveBeenLastCalledWith({ 'member-welcome': [{ template: '@classification' }, { template: '@shipped' }] });
     expect(screen.getByTestId('message-choice-alt-0-when')).toBeTruthy();
+    expect(screen.getByTestId('message-choice-alt-0-needs-when')).toHaveTextContent('not saved');
+    // A draft patch with an alternative carrying no `when` is refused by the save (`profile-copy-fields.ts`), so none is sent.
+    expect(onMessagesChange).not.toHaveBeenCalled();
+  });
+
+  it('a list whose every alternative but the last has a condition is saved as it stands', async () => {
+    const onMessagesChange = vi.fn();
+    const when = { source: 'conversation:type', op: 'eq', value: 'ops' };
+    render(<MessageTemplatesEditor profileName="advisor" canSave onMessagesChange={onMessagesChange}
+      messages={{ 'member-welcome': [{ template: '@classification', when } as never, { template: '@shipped' }] }} />);
+    await openRow('member-welcome');
+    fireEvent.change(await screen.findByTestId('message-choice-alt-1-template'), { target: { value: '@classification' } });
+    expect(onMessagesChange).toHaveBeenLastCalledWith({ 'member-welcome': [{ template: '@classification', when }, { template: '@classification' }] });
   });
 
   it('without edit-profiles the pick is shown and explained, not editable', async () => {
     render(<MessageTemplatesEditor profileName="advisor" canSave messages={{ 'member-welcome': '@shipped' }} />);
+    await openRow('member-welcome');
     expect(await screen.findByTestId('message-choice-pick')).toBeDisabled();
     expect(screen.getByTestId('message-choice-pick')).toHaveValue('@shipped');
     expect(screen.getByTestId('message-choice-read-only')).toHaveTextContent('edit-profiles');
@@ -146,6 +360,7 @@ describe('the editor', () => {
 
   it('will not save what does not parse', async () => {
     render(<MessageTemplatesEditor profileName="advisor" canSave />);
+    await openRow('member-welcome');
     await waitFor(() => screen.getByTestId('message-template-own'));
     fireEvent.change(screen.getByTestId('message-template-own'), { target: { value: '# chat\nno front matter' } });
     expect(screen.getByTestId('message-template-error')).toBeTruthy();
@@ -154,6 +369,7 @@ describe('the editor', () => {
 
   it('without activate-profiles it is read-only and says why', async () => {
     render(<MessageTemplatesEditor profileName="advisor" canSave={false} />);
+    await openRow('member-welcome');
     await waitFor(() => screen.getByTestId('message-template-own'));
     expect(screen.getByTestId('message-template-own')).toHaveAttribute('readonly');
     expect(screen.getByTestId('message-template-save')).toBeDisabled();
@@ -194,6 +410,7 @@ describe('a template speaks the deployment\'s languages, and a targeted message 
       templates: [listing('workflow-subject-welcome', { voiceable: true }), listing('member-welcome')],
     });
     render(<MessageTemplatesEditor profileName="advisor" canSave />);
+    await openRow('workflow-subject-welcome');
     await waitFor(() => expect(screen.getByTestId('message-template-language-map')).toHaveTextContent('English (en), Español (es), Polski (pl)'));
     expect(screen.getByTestId('message-template-language-map')).toHaveTextContent('languages in deploy.config.json');
     fireEvent.click(screen.getByTestId('message-template-language-es'));
@@ -212,6 +429,7 @@ describe('a template speaks the deployment\'s languages, and a targeted message 
       assistant: 'advisor', classification: 'basic', languages: LANGUAGES, family: {}, templates: [listing('member-welcome')],
     });
     render(<MessageTemplatesEditor profileName="advisor" canSave />);
+    await openRow('member-welcome');
     await waitFor(() => expect(screen.getByTestId('message-template-voice')).toHaveTextContent('said instantly'));
     expect(screen.queryByTestId('message-template-voice-toggle')).toBeNull();
   });

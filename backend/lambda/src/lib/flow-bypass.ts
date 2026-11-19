@@ -164,11 +164,16 @@ export function matchCommand(text: string): ChatCommand | null {
 
 /**
  * `@all` is MENTION-SHAPED: it addresses everyone and may appear anywhere in the message, so it is
- * matched unanchored. `\b` is what keeps `@allison` and a bare "all" out - over-matching silences a
- * real turn, which is worse than the duplicate this guard prevents.
+ * matched wherever it stands as a token of its own, punctuation and markup around it included. The inner part of an email
+ * address, `@allison`, `@all-hands` and a bare "all" are not it: over-matching silences a real turn and emails a room.
  */
-const AT_ALL = /@all\b/i;
-const AT_ALL_GLOBAL = /@all\b/gi;
+const AT_ALL = /(?<![\w.+-])@all\b(?!-\w)/i;
+const AT_ALL_GLOBAL = /(?<![\w.+-])@all\b(?!-\w)/gi;
+/** `@humans` addresses the people in the room and no assistant, so it starts no turn. */
+const AT_HUMANS = /(?<![\w.+-])@humans\b(?!-\w)/i;
+/** Either room-wide address as a token of its own, so an email address that contains one addresses nobody. */
+const ROOM_ADDRESS = /(?<![\w.+-])@(?:all|humans)\b(?!-\w)/i;
+const ROOM_ADDRESS_GLOBAL = /(?<![\w.+-])@(?:all|humans)\b(?!-\w)/gi;
 
 /**
  * A command is a SLASH COMMAND - a process invocation, parsed only at the start of the trimmed
@@ -219,8 +224,8 @@ export interface BypassMember {
  * says it over-matches to avoid, and the ASCII class quietly exempted most of the world's names from
  * the protection (tenet D11).
  *
- * NOT A REPLACEMENT FOR THE LITERAL TOKENS. `matchesAtAll` has no leading boundary, so `@all` matches
- * inside "hey@all" where this says no. Callers that gate a roster read on this must also test the
+ * NOT A REPLACEMENT FOR THE LITERAL TOKENS. `matchesAtAll` takes `@all` after punctuation, as in
+ * "(@all)", where this says no. Callers that gate a roster read on this must also test the
  * literals - see the call sites in the flow and the handler, which do.
  */
 export function mightMentionSomeone(text: string): boolean {
@@ -489,6 +494,8 @@ export function flowOwnsTheTurn(args: {
   // configuration, so a targeted message reaches Amazon Lex at every size and the flow must not claim
   // it at any size. See the header.
   if (resolvePrivateTarget(text, members)) return false;
+  // `@humans` IS ADDRESSED TO THE PEOPLE, so no assistant takes a turn on it at any size.
+  if (matchesAtHumans(text) && !matchesAtAll(text)) return false;
   // A ONE-TO-ONE IS THE FLOW'S TURN, unconditionally, because nothing else is invoked for it.
   //
   // THIS USED TO DEPEND ON A PER-PROFILE `turnEntry`, and that was unsound as well as complicated.
@@ -554,6 +561,21 @@ export function matchesBattleCommand(text: string): boolean {
 /** Is this text a bare `/stop` - the command and nothing else? A named shorthand over the registry. */
 export function matchesStopCommand(text: string): boolean {
   return matchCommand(text)?.token === '/stop';
+}
+
+/** Does this text address everyone in the conversation, by `@all` or `@humans` as a token of its own? This is what reaches the membership by email. */
+export function addressesTheRoom(text: string): boolean {
+  return ROOM_ADDRESS.test(text);
+}
+
+/** Does this text carry `@humans`? */
+export function matchesAtHumans(text: string): boolean {
+  return AT_HUMANS.test(text);
+}
+
+/** The message with every `@all` and `@humans` token removed, trimmed: how it reads once its audience is decided. */
+export function stripRoomAddress(text: string): string {
+  return text.replace(ROOM_ADDRESS_GLOBAL, '').trim();
 }
 
 /** The message with every `@all` token removed, trimmed. */

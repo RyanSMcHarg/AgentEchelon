@@ -15,7 +15,8 @@
  *   registry grants it;
  * - every call names the routing record of the turn it serves (`routeId`), and the record must exist in
  *   this classification's routing table, which only the platform's routing services write;
- * - a channel-keyed operation is served only for the conversation that record names.
+ * - a channel-keyed operation is served only for the conversation that record names, and a drift outcome
+ *   only for a drift event recorded in that conversation.
  *
  * Anything that is not a turn operation (backfills, admin reads, client events) is refused here; it runs
  * on the shared data plane, which no assistant session can invoke.
@@ -35,9 +36,6 @@ export const TURN_OPS: ReadonlySet<string> = new Set([
   'getSummary',
   'seedSummary',
   'seedDriftTopic',
-  'savePendingSuggestion',
-  'readPendingSuggestion',
-  'resolvePendingSuggestion',
 ]);
 
 export class TurnBindingRefused extends Error {
@@ -49,13 +47,28 @@ export class TurnBindingRefused extends Error {
 
 let ddb: DynamoDBClient | null = null;
 
+/** The conversation a drift event was recorded in, read from its row, or null when no such event exists. */
+async function driftEventChannelOf(eventId: string): Promise<string | null> {
+  const { query } = await import('./db-client.js');
+  const r = await query<{ parent_channel_arn: string | null }>(
+    'SELECT parent_channel_arn FROM drift_events WHERE event_id = $1',
+    [eventId],
+  );
+  return r.rows[0]?.parent_channel_arn ?? null;
+}
+
 /**
  * The request as this classification's turn data plane will run it, or a refusal. Returns the request
  * unchanged when this function is the shared data plane (no `DATA_PLANE_CLASSIFICATION`).
  */
 export async function bindTurnRequest<R extends { op?: string; input?: unknown; routeId?: string }>(
   req: R,
-  deps: { ddb?: Pick<DynamoDBClient, 'send'>; env?: NodeJS.ProcessEnv } = {},
+  deps: {
+    ddb?: Pick<DynamoDBClient, 'send'>;
+    env?: NodeJS.ProcessEnv;
+    /** Reads the conversation a drift event belongs to; defaults to the data plane's own database. */
+    driftEventChannel?: (eventId: string) => Promise<string | null>;
+  } = {},
 ): Promise<R> {
   const env = deps.env ?? process.env;
   const classification = (env.DATA_PLANE_CLASSIFICATION || '').trim();
@@ -74,8 +87,22 @@ export async function bindTurnRequest<R extends { op?: string; input?: unknown; 
 
   const input = { ...((req.input as Record<string, unknown>) || {}) };
   const channelArn = typeof input.channelArn === 'string' ? input.channelArn : '';
-  if (channelArn && record.channelArn !== channelArn) {
+  // A THREAD RELATIVE'S SUMMARY, AND NOTHING ELSE OF IT (DESIGN-WORKFLOWS-AND-TASKS section 6): the router named the turn's
+  // relatives from its server-side row, and only their latest summary is read; every other read stays the turn's own.
+  const aRelativesSummary = op === 'getSummary' && !!channelArn && (record.threadRelatives ?? []).includes(channelArn);
+  if (channelArn && record.channelArn !== channelArn && !aRelativesSummary) {
     throw new TurnBindingRefused('the conversation is not the one the turn was routed in');
+  }
+  // AN OUTCOME IS RECORDED ONLY ON A DRIFT EVENT OF THE ROUTED CONVERSATION. The op is keyed by event id, so the
+  // event's own row names its conversation, and that conversation must be the one the turn was routed in.
+  if (op === 'recordDriftOutcome') {
+    const eventId = typeof input.eventId === 'string' ? input.eventId : '';
+    if (!eventId) throw new TurnBindingRefused('no drift event named');
+    if (!record.channelArn) throw new TurnBindingRefused('the turn was routed in no conversation');
+    const eventChannel = await (deps.driftEventChannel ?? driftEventChannelOf)(eventId);
+    if (!eventChannel || eventChannel !== record.channelArn) {
+      throw new TurnBindingRefused('the drift event is not one of the conversation the turn was routed in');
+    }
   }
   // THE CLASSIFICATION IS THIS FUNCTION'S, never the payload's. Retrieval's scope follows from it.
   input.classification = classification;

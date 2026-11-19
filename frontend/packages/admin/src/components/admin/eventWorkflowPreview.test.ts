@@ -10,11 +10,12 @@
  *     from its steps;
  *   - a workflow's steps read in the order a run reaches them, with the template, prompt, role or machine each names.
  */
+import { agentStepOpsRoom } from '../../test/agentStepOpsRoom';
 import { describe, it, expect } from 'vitest';
 import { previewOpening, welcomeSays, workflowSteps } from './eventWorkflowPreview';
 import { welcomeFor } from './welcomeWorkflow';
-import { OPS_WELCOME, ADVISOR_WELCOME } from '../../../../../../backend/demo/welcomes';
-import { PLATFORM_EVENT_WORKFLOWS, type EventWorkflow } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
+import { OPS_WELCOME, ADVISOR_WELCOME } from '../../../../../../demo/portable-assistants/welcomes.ts';
+import { SHIPPED_EVENT_WORKFLOWS, type EventWorkflow } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
 import { composeOpening, selectOpening } from '../../../../../../backend/lambda/src/lib/welcome-orientation.ts';
 
 const mark = (field: string) => `‹${field}›`;
@@ -34,7 +35,7 @@ const opens = (opening: Record<string, unknown>, types?: string[], prompt?: stri
 
 describe('what one welcome says', () => {
   it('reads the opening of a typed text welcome and of a structured welcome from the workflow itself', () => {
-    expect(welcomeSays(OPS_WELCOME['welcome-ops']).opening?.text).toMatch(/^This conversation is open for an operations issue\.\n\{\{eventSummary\}\}\n/);
+    expect(welcomeSays(OPS_WELCOME['welcome-ops']).opening?.text).toMatch(/^\{\{eventSummary\}\}\nAsk me what's happening/);
     expect(welcomeSays(OPS_WELCOME.welcome).opening).toMatchObject({ companyName: 'Stratum Technologies', examples: expect.arrayContaining(['Which alarms are in alarm, and what do they cover?']) });
     expect(welcomeSays(ADVISOR_WELCOME['welcome-ops-team']).runs).toBe(false);
   });
@@ -69,16 +70,15 @@ describe('the opening, previewed with the router\'s composer', () => {
     const p = previewOpening(OPS_WELCOME['welcome-ops'], mark, 'ops');
     expect(p.source).toBe('text');
     expect(p.content).toBe([
-      'This conversation is open for an operations issue.',
       '‹eventSummary›',
-      'I can read this deployment\'s metrics and alarm state - ask me what is happening and I will start there.',
+      'Ask me what\'s happening; I\'ll start from the metrics and alarm state.',
     ].join('\n'));
     expect(p.placeholders).toEqual(['eventSummary']);
   });
 
   it('says the assistant\'s own role, and marks a version variable and an unknown role in place', () => {
-    const wf = opens({ text: 'I am the {{role}} assistant.\nThis is {{room.title}}.\n{{examples}}', examples: ['Try this'] });
-    expect(previewOpening(wf, mark, 'ops').content).toBe('I am the ops assistant.\nThis is ‹room.title›.\n- Try this');
+    const wf = opens({ text: 'I am the {{role}} assistant.\nThis is {{room.title}}.' });
+    expect(previewOpening(wf, mark, 'ops').content).toBe('I am the ops assistant.\nThis is ‹room.title›.');
     const unknown = previewOpening(wf, mark);
     expect(unknown.content.split('\n')[0]).toBe('I am the ‹role› assistant.');
     expect(unknown.placeholders).toEqual(['role', 'room.title']);
@@ -89,20 +89,20 @@ describe('the opening, previewed with the router\'s composer', () => {
   });
 
   it('shows the built-in opening for one that sets nothing, and none for a welcome that greets from its steps', () => {
-    const empty = previewOpening(PLATFORM_EVENT_WORKFLOWS.welcome, mark);
+    const empty = previewOpening(SHIPPED_EVENT_WORKFLOWS.welcome, mark);
     expect(empty.source).toBe('deployment');
     expect(empty.content).toBe(composeOpening(undefined, {}).content);
-    const steps = previewOpening(PLATFORM_EVENT_WORKFLOWS['opening-and-subject'], mark);
+    const steps = previewOpening(SHIPPED_EVENT_WORKFLOWS['opening-and-subject'], mark);
     expect(steps).toMatchObject({ source: 'steps', content: '' });
   });
 });
 
 describe('a workflow\'s steps, in the order a run reaches them', () => {
   it('reads each step with what it names, the end last', () => {
-    expect(workflowSteps(PLATFORM_EVENT_WORKFLOWS['ops-room'])).toEqual([
+    expect(workflowSteps(agentStepOpsRoom())).toEqual([
       { key: 'opening', kind: 'send', names: 'ops-room-opening' },
       { key: 'greet-lead', kind: 'send', names: 'ops-lead-welcome' },
-      { key: 'first-look', kind: 'agent', names: 'ops-first-look', as: 'ops' },
+      { key: 'first-look', kind: 'agent', names: 'ops-first-look' },
       { key: 'done', kind: 'end', disposition: 'success' },
     ]);
     expect(workflowSteps(opens({ text: 'Hi.' }, undefined, 'welcome-ask')).map((s) => s.kind)).toEqual(['opening', 'prompt', 'end']);
@@ -112,5 +112,7 @@ describe('a workflow\'s steps, in the order a run reaches them', () => {
     const wf = opens({ text: 'Hi.' });
     wf.states.stray = { send: { to: 'room', template: 'x' }, onSuccess: 'done' };
     expect(workflowSteps(wf).map((s) => s.key)).toEqual(['opening', 'done', 'stray']);
+    // It is marked: it never runs, and the reached steps carry no such mark.
+    expect(workflowSteps(wf).filter((s) => s.unreached).map((s) => s.key)).toEqual(['stray']);
   });
 });

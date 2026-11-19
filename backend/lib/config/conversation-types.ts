@@ -41,6 +41,25 @@ export type ConversationTypeKey = string;
 export type Initiation = 'user' | 'system' | 'schedule' | 'alert';
 
 /**
+ * WHAT A MEETING ALLOWS (SPEC-ASSISTANT-MEETINGS FR43), declared on the type its conversation is opened as. Being in a
+ * meeting's conversation gives nothing in the conversation it was started from: a person is added there only by that
+ * conversation's own rules.
+ */
+export interface MeetingSettings {
+  /**
+   * Whether a member of the conversation the meeting was started from may join it, which adds them to the meeting's
+   * conversation alone. False: only the people the meeting's conversation already holds may join.
+   */
+  parentMembersJoin: boolean;
+  /**
+   * Whether people who are not members of the conversation it was started from may be added to it, to the meeting's
+   * conversation alone, by a proposal its host or a moderator confirms (`add_to_meeting`, `lib/meeting-invites.ts`).
+   * False or absent: only the conversation's own members join.
+   */
+  addedPeople?: boolean;
+}
+
+/**
  * Which message flow a conversation associates, as a KEY the deployment resolves to a channel-flow ARN.
  *
  * Open string for growth, the same way {@link ConversationTypeKey} is: a deployment that publishes a
@@ -199,6 +218,20 @@ export interface ParticipantPolicy {
   defaultRole?: string;
   /** The participant roles people hold in a conversation of this type, by name. See {@link ParticipantRoleDeclaration}. */
   participantRoles?: Record<string, ParticipantRoleDeclaration>;
+  /**
+   * WHO HOSTS A MEETING HELD FROM A CONVERSATION OF THIS TYPE (SPEC-ASSISTANT-MEETINGS FR50): participant roles of
+   * `holders: 'one'`, and every person holding one of them is a host. A host starts the meeting, starts it again after it
+   * ended and ends it for everyone; members join it while it runs. Absent, or none held: whoever starts it hosts it.
+   */
+  meetingHost?: readonly string[];
+  /**
+   * WHO JOINS A MEETING HELD FROM A CONVERSATION OF THIS TYPE WITH THEIR MICROPHONE ON (SPEC-ASSISTANT-MEETINGS FR51):
+   * the holders of these participant roles, where a role the type gives every member by default (`defaultRole`) counts
+   * for the conversation's members. Everyone else, such as a person added to the meeting alone, joins muted and may
+   * unmute themselves. The meeting function decides it at each join and tells the app (`startMuted`). Absent: everyone
+   * joins with their microphone on.
+   */
+  meetingSpeakers?: readonly string[];
 }
 
 /**
@@ -253,6 +286,14 @@ export interface ChannelExpiration {
   criterion: ExpirationCriterion;
 }
 
+/** A child conversation's relation to its parent: see {@link ConversationTypeConfig.relation}. */
+export type ConversationRelation = 'move' | 'thread';
+
+/** The relation a type declares, `move` where it declares none. */
+export function relationOf(typeKey: string | undefined): ConversationRelation {
+  return (typeKey && CONVERSATION_TYPES[typeKey]?.relation) || 'move';
+}
+
 export interface ConversationTypeConfig {
   /**
    * The classifications a conversation of this type MAY carry - a CHECK, never a value the creator reads.
@@ -271,6 +312,13 @@ export interface ConversationTypeConfig {
    * Aurora mode regardless; this gate is layered on top of the Aurora hookup.)
    */
   driftEnabled: boolean;
+  /**
+   * HOW A CONVERSATION OF THIS TYPE RELATES TO THE ONE IT WAS OPENED FROM (DESIGN-WORKFLOWS-AND-TASKS section 6).
+   * `move` (absent): the subject left the parent, and the two share nothing but their links; drift and a new support
+   * case. `thread`: the child works part of the parent's subject, so the parent lists it, and a turn in either reads
+   * the other's latest summary where every person reading it is a member of both.
+   */
+  relation?: ConversationRelation;
   /**
    * WHICH message flow a conversation of this type associates - the Amazon Chime SDK channel flow that
    * makes the conversation addressable: `@assistant` and `@all` routing, marker stripping, and the
@@ -307,6 +355,15 @@ export interface ConversationTypeConfig {
   /** What initiates this conversation. Default `'user'`. */
   initiation?: Initiation;
   /**
+   * A LEAF OPENS NOTHING (DESIGN-PROCESSES O32): a conversation of this type is opened only by a workflow's `open` step, which
+   * may be the run of a conversation another one opened (one level below a child), and its own workflows open no
+   * conversation. The validator refuses an `open` step, an `open_conversation` proposal and a send `in: opened` in a leaf's
+   * workflows, and the router (for an `open` step) and the typed creator (for every open: a step, a proposal, an event
+   * opener) refuse an open asked from a leaf, of a type that is not a leaf from a child, and of anything from a grandchild
+   * (`openIsNestedBy`), so no chain grows past one leaf below a child.
+   */
+  leaf?: boolean;
+  /**
    * THE EVENTS THAT OPEN A CONVERSATION OF THIS TYPE (ADR-053 Phase 1), each one EventBridge rule targeting
    * the typed-conversation creator of the classification it resolves to. Absent: no event opens it. Only a
    * type an event or the platform opens may declare one, and no entry can name a classification for the
@@ -325,10 +382,28 @@ export interface ConversationTypeConfig {
   name?: string;
   /** Default agent handle(s) to enroll. Absent ⇒ the per-classification AppInstanceBot. */
   defaultAgents?: string[];
+  /**
+   * ASSISTANTS ENROLLED WHERE THE DEPLOYMENT DECLARES THEM: each is added to a room of the type when the classification has a
+   * live assistant of that handle, and passed over when the deployment declares none, so the type works on a deployment
+   * without them. A `defaultAgents` assistant is required; one here is not.
+   */
+  optionalAgents?: string[];
+  /**
+   * THE ASSISTANT ROLE THAT OWNS THIS TYPE'S EVENT WORKFLOWS (ADR-061 decision 2): every event in a room of this type runs
+   * the workflows on that role's assistant's served version, and posts as it (`lib/workflow-owner.ts`), while the primary
+   * keeps orchestrating the room. Absent: the room's primary owns them.
+   */
+  workflowOwner?: { assistantRole: string };
   /** Transports available to this type. Absent ⇒ `['chat']`. */
   commsChannels?: CommsChannel[];
   /** Feature toggles beyond drift. */
   capabilities?: Capabilities;
+  /**
+   * A MEETING'S OWN CONVERSATION (SPEC-ASSISTANT-MEETINGS FR27, FR43): present only on a type a meeting is held in. Every
+   * meeting runs in a conversation of such a type, opened from the conversation it was started in, and these are what
+   * that meeting allows. Absent: the type holds no meeting of its own.
+   */
+  meeting?: MeetingSettings;
   /** Who participates + how non-creator humans are resolved/admitted. */
   participants?: ParticipantPolicy;
   /** External vendor systems this type may use (broad per-vendor connectors). */
@@ -504,10 +579,15 @@ export const CONVERSATION_TYPES: Record<ConversationTypeKey, ConversationTypeCon
   //     opened it. Offering to split it is offering to split the thing it was opened for. This is also
   //     the dimension that proves the type is not inert - drift is ON for `general`, so a conversation
   //     that lost its stamp would drift.
-  //   `defaultAgents` names BOTH assistants rather than only the second one, so the type states its
-  //     whole roster instead of "the primary, plus". The primary is a member by creation (it is the
-  //     `CreateChannel` bearer), so adding it is a no-op - and a type whose roster reads as one name
-  //     would be a type that silently depends on which principal happened to create the conversation.
+  //   `defaultAgents` names BOTH assistants, so the type states its whole roster instead of "the primary,
+  //     plus". The primary is a member by creation, so adding it is a no-op - and a type whose roster
+  //     reads as one name would be a type that silently depends on which principal created the room.
+  //   The room's primary stays the classification's (the Advisor): in a group conversation a message that names
+  //     nobody is people talking to people, so the ops assistant is reached by mention whoever the primary is,
+  //     and the primary only answers `@all` and says the room's notices. The Advisor hands ops work to the ops
+  //     assistant as any roommate does.
+  //   `workflowOwner: { assistantRole: 'ops' }` makes the ops assistant's version the one the room's
+  //     events run (the opening, an alarm, an incident), and they post as it, whoever the primary is.
   //   `expiration` is 30 days rather than the platform's 90. An alert conversation is disposable and
   //     data minimization is the direction; the deployment's own limit
   //     ({@link MAX_CONVERSATION_TTL_DAYS}) still bounds it above.
@@ -521,14 +601,17 @@ export const CONVERSATION_TYPES: Record<ConversationTypeKey, ConversationTypeCon
     classifications: ['premium'],
     membershipSource: { group: 'ops' },
     driftEnabled: false,
+    // AN INCIDENT WORKS PART OF ITS TEAM ROOM'S SUBJECT, so the team room lists it and reads how it is going.
+    relation: 'thread',
     messageFlow: DEFAULT_MESSAGE_FLOW,
     defaultAgents: ['advisor', 'ops-premium'],
+    workflowOwner: { assistantRole: 'ops' },
     initiation: 'alert',
     // OPENED BY THE PLATFORM'S OWN OPS EVENT, on the default bus, for this deployment's instance only
     // (`scripts/send-ops-event.mjs` puts one). Its fields are where the event carries the person, the label,
     // the summary and the concerned conversation. A CloudWatch alarm or a vendor's partner bus is declared
     // the same way, as another entry with its own paths and fixed values (`lib/config/event-openers.ts`).
-    openedBy: [{ source: OPS_EVENT_SOURCE, detailType: OPS_INCIDENT_OPENED, matchInstance: true, fields: { ...PLATFORM_EVENT_FIELDS } }],
+    openedBy: [{ source: OPS_EVENT_SOURCE, detailType: OPS_INCIDENT_OPENED, matchInstance: true, fields: { ...PLATFORM_EVENT_FIELDS }, watches: { kind: 'ops-incident', path: '$.detail.incidentId' } }],
     expiration: { days: 30, criterion: 'LAST_MESSAGE_TIMESTAMP' },
     // THE ROOM'S SHAPE (DESIGN-CONVERSATION-TYPES section 6.1): the person the opening event names leads it, and every
     // other member responds. The lead is a moderator; as the person the room was opened for they already are one by
@@ -537,9 +620,18 @@ export const CONVERSATION_TYPES: Record<ConversationTypeKey, ConversationTypeCon
     participants: {
       participantRoles: {
         lead: { from: [{ event: 'forPerson' }], holders: 'one', confers: { moderator: true } },
+        // WHO IS ON CALL IS THE IDENTITY PROVIDER'S GROUP, so a rotation is a group change and the room follows it. They lead an
+        // incident a workflow opens (`open.for: { typeRole }`) and are the one who works with the ops assistant.
+        'on-call:ops': { from: [{ group: 'ops-on-call' }], holders: 'one', confers: { moderator: true } },
+        // THE SECONDARY ON-CALL, the identity provider's `ops-secondary` group, as the on-call is: a host of the room's meetings.
+        'secondary:ops': { from: [{ group: 'ops-secondary' }], holders: 'one', confers: { moderator: true } },
         responder: { from: [] },
       },
       defaultRole: 'responder',
+      // Every holder of these hosts the room's meetings: the incident's lead, the on-call and the secondary on-call.
+      meetingHost: ['lead', 'on-call:ops', 'secondary:ops'],
+      // The room's own people speak in its meetings; a person added to the meeting alone (an account's team) joins muted.
+      meetingSpeakers: ['lead', 'on-call:ops', 'secondary:ops', 'responder'],
     },
   },
 
@@ -548,15 +640,68 @@ export const CONVERSATION_TYPES: Record<ConversationTypeKey, ConversationTypeCon
   // Where the operations group works day to day, and the conversation an `ops` event usually concerns.
   // Opened once by the platform (`initiation: 'system'`, through the same creator an event uses, with no
   // conversation concerned), and its people are the `ops` group, kept in sync exactly as an `ops` room's
-  // are. Drift stays on: a team room carries many subjects, which is what drift is for.
+  // are. Drift stays on: a team room carries many subjects, which is what drift is for. Where the deployment declares the
+  // ops assistant it is a member and owns the room's workflows (an incident an event starts here is the ops assistant's),
+  // as in an `ops` room; where it declares none, the room has the classification's primary, which owns them
+  // (`workflow-owner.ts`), so the team room and its triggers work on every deployment that serves the type.
   'ops-team': {
+    // ONE STANDING CONVERSATION PER CLASSIFICATION, so its name is the type's own rather than an event's.
+    name: 'Ops Team Main',
     classifications: ['premium'],
     membershipSource: { group: 'ops' },
     driftEnabled: true,
     messageFlow: DEFAULT_MESSAGE_FLOW,
     defaultAgents: ['advisor'],
+    optionalAgents: ['ops-premium'],
+    workflowOwner: { assistantRole: 'ops' },
     initiation: 'system',
+    // Its lead is the on-call, as an incident's is, so the room needs nobody named to open it.
+    participants: {
+      participantRoles: {
+        'on-call:ops': { from: [{ group: 'ops-on-call' }], holders: 'one', confers: { moderator: true } },
+        'secondary:ops': { from: [{ group: 'ops-secondary' }], holders: 'one', confers: { moderator: true } },
+      },
+      // The on-call and the secondary on-call host the team room's meetings.
+      meetingHost: ['on-call:ops', 'secondary:ops'],
+    },
     expiration: { days: MAX_CONVERSATION_TTL_DAYS, criterion: 'LAST_MESSAGE_TIMESTAMP' },
+  },
+
+  // ── AN INCIDENT'S CUSTOMER MESSAGING (DESIGN-PROCESSES O26 to O33) ─────────────────────────────────
+  //
+  // Opened by an incident's run once customer impact is confirmed on a card, beside the incident and never in its way: the
+  // account team drafts and approves its customer notices here with Advisor, and the platform sends none of them.
+  //
+  //   `leaf: true` lets an incident (itself a child of its team conversation) open it, and keeps it from opening anything.
+  //   `membershipSource: { group: 'account-management' }` makes it the account team's: its people are the group that owns
+  //     customer accounts (the CSMs), kept in sync as an ops room's are with `ops`.
+  //   `lead:accounts`, the one holder of the `account-team-lead` group, leads it and approves each notice on its card. The
+  //     lead is also in `account-management`, or the creator refuses a room the reconcile would remove them from.
+  //   `defaultAgents` names Advisor, who drafts the notices, and the ops assistant, whose version owns the incident's process
+  //     and so the workflow this conversation runs (`workflowOwner`): its cards and its notices to the incident are its posts.
+  //   `relation: 'thread'`: it works part of its incident's subject, so the incident lists it.
+  //   `expiration` is an incident's 30 days.
+  //
+  // An implementation's own conversation types are to belong to the implementation rather than the core registry, which is not
+  // built; until then this type is declared here, as the ops types are.
+  'customer-messaging': {
+    classifications: ['premium'],
+    membershipSource: { group: 'account-management' },
+    driftEnabled: false,
+    relation: 'thread',
+    messageFlow: DEFAULT_MESSAGE_FLOW,
+    defaultAgents: ['advisor', 'ops-premium'],
+    workflowOwner: { assistantRole: 'ops' },
+    initiation: 'alert',
+    leaf: true,
+    expiration: { days: 30, criterion: 'LAST_MESSAGE_TIMESTAMP' },
+    participants: {
+      participantRoles: {
+        'lead:accounts': { from: [{ group: 'account-team-lead' }], holders: 'one', confers: { moderator: true } },
+        responder: { from: [] },
+      },
+      defaultRole: 'responder',
+    },
   },
 
   // ── AN ANONYMOUS VISITOR'S CONVERSATION (A7, L17) ────────────────────────────────────────────────
@@ -609,7 +754,89 @@ export const CONVERSATION_TYPES: Record<ConversationTypeKey, ConversationTypeCon
     seedFrom: ['guest-visitor'],
     expiration: { days: MAX_CONVERSATION_TTL_DAYS, criterion: 'LAST_MESSAGE_TIMESTAMP' },
   },
+
+  // ── A MEETING'S OWN CONVERSATION (SPEC-ASSISTANT-MEETINGS FR27, DESIGN-ASSISTANT-MEETINGS C.7) ──────────────────
+  //
+  // Every meeting runs in a conversation of its own, opened when the meeting starts, at the classification of the
+  // conversation it was started from, which it takes from that conversation's tag. Its chat is the meeting's chat, and
+  // its membership is who may join: the person who started it, then whoever joins. It holds none of the parent's history,
+  // and its people get nothing in the parent. The parent is told of the meeting by its cards, which link here.
+  //
+  //   No `classifications`: a meeting is held at whatever classification it was started at.
+  //   `relation: 'thread'`: it carries on part of its room's subject, so it is listed on the room's row and a room turn
+  //     reads its latest summary and its transcript as grounding, under the membership rule every `thread` child is read
+  //     under (DESIGN-WORKFLOWS-AND-TASKS section 6, rule 5).
+  //   `initiation: 'system'`: the platform opens it, for the person who started the meeting or for nobody when a
+  //     workflow did.
+  //   `driftEnabled: false`: a meeting is one subject already.
+  //   `meeting.parentMembersJoin`: a member of the conversation it was started from may join, and is added here alone.
+  //   `capabilities.sharing: false`: a person enters a meeting by its admission rule alone (a member of its room, or one a
+  //     host or moderator confirmed, FR42, FR43, FR53), never by a member's share. What its room's type turns off is off
+  //     here too (`lib/type-capability.ts`).
+  meeting: {
+    driftEnabled: false,
+    capabilities: { sharing: false },
+    messageFlow: DEFAULT_MESSAGE_FLOW,
+    initiation: 'system',
+    meeting: { parentMembersJoin: true, addedPeople: true },
+    relation: 'thread',
+    expiration: { days: MAX_CONVERSATION_TTL_DAYS, criterion: 'LAST_MESSAGE_TIMESTAMP' },
+  },
 };
+
+/** The type a meeting's own conversation is opened as. */
+export const MEETING_CONVERSATION_TYPE: ConversationTypeKey = 'meeting';
+
+/** Whether a conversation of this type opens nothing (`leaf`), so a child's run may open one. */
+export function isLeafType(typeKey: string | undefined): boolean {
+  return !!typeKey && CONVERSATION_TYPES[typeKey]?.leaf === true;
+}
+
+/**
+ * WHETHER A CONVERSATION OF THIS TYPE OPENS WITH A RUN (`conversation-opened`): an event opens it (`openedBy`), or it is a leaf,
+ * which a workflow's `open` step alone opens.
+ */
+export function opensWithARun(typeKey: string | undefined): boolean {
+  const config = typeKey ? CONVERSATION_TYPES[typeKey] : undefined;
+  return !!config && ((config.openedBy ?? []).length > 0 || config.leaf === true);
+}
+
+/** What a meeting held in a conversation of this type allows, or null when the type holds no meeting of its own. */
+export function meetingSettingsOf(typeKey: string | undefined): MeetingSettings | null {
+  return (typeKey && CONVERSATION_TYPES[typeKey]?.meeting) || null;
+}
+
+/**
+ * A TEAM ROOM TYPE: one the platform opens on its own and keeps as the one standing room per classification
+ * (`team-<type>-<classification>`), where an AWS event's workflow runs. A meeting's conversation is opened by the
+ * platform too, but from its parent, one per meeting, so it is not a team room.
+ */
+export function isTeamRoomType(typeKey: string | undefined): boolean {
+  const config = typeKey ? CONVERSATION_TYPES[typeKey] : undefined;
+  return !!config && config.initiation === 'system' && !config.meeting;
+}
+
+/** Why no AWS event reaches a conversation of a type: undeclared, a meeting's conversation, or a type no key is watched in. */
+export type EventUnreachableReason = 'undeclared' | 'meeting' | 'noWatchedKey';
+
+/**
+ * THE CONVERSATION TYPES AN AWS EVENT CAN REACH (DESIGN-EVENT-TARGETS sections 4 and 6), the one rule the workflow
+ * validator, the console and the trigger API read. An event reaches a team room type's one room, or the conversation of
+ * another type that watches the event's key, which an opener of that type records (`openedBy[].watches`). A meeting's
+ * conversation is opened from its parent, one per meeting, and is neither. Undefined when an event can reach the type.
+ */
+export function eventUnreachableReason(typeKey: string | undefined): EventUnreachableReason | undefined {
+  const config = typeKey ? CONVERSATION_TYPES[typeKey] : undefined;
+  if (!config) return 'undeclared';
+  if (config.meeting) return 'meeting';
+  if (isTeamRoomType(typeKey)) return undefined;
+  return (config.openedBy ?? []).some((o) => !!o.watches) ? undefined : 'noWatchedKey';
+}
+
+/** Whether an AWS event can reach a conversation of this type (`eventUnreachableReason`). */
+export function eventReachesType(typeKey: string | undefined): boolean {
+  return eventUnreachableReason(typeKey) === undefined;
+}
 
 /** The type guest start opens a visitor's conversation as. */
 export const GUEST_VISITOR_TYPE: ConversationTypeKey = 'guest-visitor';

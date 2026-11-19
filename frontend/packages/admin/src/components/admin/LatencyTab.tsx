@@ -12,7 +12,7 @@ import { InfoTooltip, DocLink, GuideLinks, guide } from './AdminHelp';
 import { DOC_LINKS } from '../../config/docLinks';
 import TurnLatencyAudit from './TurnLatencyAudit';
 import InteractionLatency from './InteractionLatency';
-import { coverage, latencyPopulation, weightedMetric, type WeightedMetric } from './latencyAggregate';
+import { coverage, latencyPopulation, ttffByEntry, weightedMetric, type WeightedMetric } from './latencyAggregate';
 import { queryAnalytics } from '../../services/analyticsService';
 import type { AnalyticsDateRange, AnalyticsResult } from '@ae/shared';
 
@@ -40,6 +40,12 @@ interface LatencyTabProps {
    */
   embedded?: boolean;
   openTtff?: boolean;
+  /**
+   * Whether multi-step task turns are counted, held by the dashboard where the Performance overview reads the same choice,
+   * so its TTFF card and this section always count the same turns. Absent, the section keeps its own choice.
+   */
+  includeTasks?: boolean;
+  onIncludeTasksChange?: (include: boolean) => void;
 }
 
 function latencyColor(ms: number): string {
@@ -109,12 +115,19 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
   analyticsMode,
   embedded,
   openTtff,
+  includeTasks: includeTasksHeld,
+  onIncludeTasksChange,
 }) => {
   // Response-type filter (by delivery_option). null = the default set (all NON-task response types, so
   // the perceived-single-reply headline excludes multi-step tasks); a Set = the operator's explicit
   // selection. Task turns show PER-TURN reply latency, not whole-task cycle time (a separate metric on
   // the Tasks / Effectiveness surface). Single-reply targets are shown only when no task type is selected.
-  const [includeTasks, setIncludeTasks] = React.useState(false);
+  const [includeTasksOwn, setIncludeTasksOwn] = React.useState(false);
+  const includeTasks = includeTasksHeld ?? includeTasksOwn;
+  const setIncludeTasks = (next: boolean | ((was: boolean) => boolean)) => {
+    const value = typeof next === 'function' ? next(includeTasks) : next;
+    if (onIncludeTasksChange) onIncludeTasksChange(value); else setIncludeTasksOwn(value);
+  };
   // Whether the TTFF breakdown is showing. Opened by pressing the TTFF card, which is the only card
   // on this tab that has a breakdown to open - see the MetricCard `onDrill` prop.
   const [ttffDrillOpen, setTtffDrillOpen] = React.useState(!!openTtff);
@@ -285,12 +298,9 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
   // recorded, and a split that quietly omits them reports a clean partition of a population it does
   // not cover. Naming the remainder is the difference between a split and a claim.
   const entryOf = (r: Record<string, unknown>) => String(r.turn_entry ?? 'unknown');
-  const entrySplit = ['flow', 'lex', 'platform']
-    .map((key) => {
-      const m = weightedMetric(scopedRows.filter((r) => entryOf(r) === key), 'avg_ttff_ms');
-      return { key, label: t(`admin.latency.entry.${key}`, { defaultValue: key }), turns: m.turns, ttff: m.value, metric: m };
-    })
-    .filter((s) => s.turns > 0);
+  // THE ONE CALCULATION the Performance overview's TTFF card reads too (`ttffByEntry`), so the two never disagree.
+  const entrySplit = ttffByEntry(rows, filters, includeTasks)
+    .map((s) => ({ ...s, label: t(`admin.latency.entry.${s.key}`, { defaultValue: s.key }) }));
   const unlabelledTurns = scopedRows
     .filter((r) => entryOf(r) === 'unknown')
     .reduce((s, r) => s + (Number(r.assistant_turn_count) || 0), 0);
@@ -544,7 +554,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
 
   return (
     <div className="admin-tab">
-      <h3>
+      <h2>
         {t('admin.latency.title')}
         {/* Each figure's definition is the glossary (`admin.metrics.*`) behind its card; this says only
             which turns THIS view counts, because the response-type filter changes that. */}
@@ -557,7 +567,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
             </>
           }
         />
-      </h3>
+      </h2>
       {analyticsMode === 'athena' && (
         // Every figure here is served from Aurora. Said rather than hiding the tab: an absent tab looks
         // like a missing capability, an empty one like a system with no traffic.
@@ -663,7 +673,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
           averages come from different turn counts, so the counts are shown. */}
       {ttffDrillOpen && ttffCaptured && (
         <div className="admin-section admin-metric-drill" role="region" aria-label={t('admin.latency.ttffBreakdown')}>
-          <h4>{t('admin.latency.ttffTitle', { value: formatMs(avgTtff) })}</h4>
+          <h3>{t('admin.latency.ttffTitle', { value: formatMs(avgTtff) })}</h3>
           <p className="admin-tab-description">{t('admin.latency.ttffLead')} {t('admin.latency.ttffInferred')}</p>
 
           {entrySplit.length > 1 && (
@@ -767,7 +777,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
           />
           </div>
 
-          <h5>{t('admin.latency.routerStepsTitle')}</h5>
+          <h4>{t('admin.latency.routerStepsTitle')}</h4>
           <p className="admin-tab-description">{t('admin.latency.routerStepsLead')}</p>
           {routerStepStats.length === 0 ? (
             <p className="admin-tab-empty">{t('admin.latency.noRouterSteps')}</p>
@@ -775,7 +785,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
             <>
               {stepPaths.map((p) => (
                 <div key={p.key}>
-                  {stepPaths.length > 1 && <h6>{p.label}</h6>}
+                  {stepPaths.length > 1 && <h5>{p.label}</h5>}
                   <DataTable
                     columns={[
                       // `stepEntry`, not `step`: the query groups by (step_name, turn_entry).
@@ -809,7 +819,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
 
       {workerDrillOpen && (
         <div className="admin-section admin-metric-drill" role="region" aria-label={t('admin.latency.workerBreakdown')}>
-          <h4>{t('admin.latency.workerTitle', { value: formatMs(avgTotal) })}</h4>
+          <h3>{t('admin.latency.workerTitle', { value: formatMs(avgTotal) })}</h3>
           <p className="admin-tab-description">{t('admin.latency.workerLead')}</p>
           <div className="admin-metrics-row">
         <MetricCard
@@ -898,7 +908,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
 
 
       <div className="admin-section">
-        <h3>{t('admin.latency.groupsTitle')}</h3>
+        <h2>{t('admin.latency.groupsTitle')}</h2>
         {/* The grain names all eight dimensions the query groups on, so two rows that agree on date and
             assistant do not read as a duplicate. */}
         <p className="admin-tab-description">{t('admin.latency.groupsLead')}</p>
@@ -959,10 +969,10 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
         />
         {turnDrill && (
           <div className="admin-section admin-metric-drill" role="region" aria-label={t('admin.latency.turnsInGroup')}>
-            <h4>
+            <h3>
               {t('admin.latency.turnsTitle')}
               <button className="btn-secondary" style={{ marginLeft: 'var(--space-3)' }} onClick={() => setTurnDrill(null)}>{t('admin.latency.close')}</button>
-            </h4>
+            </h3>
             <p className="admin-tab-description">
               {t('admin.latency.turnsLead', {
                 date: String(turnDrill.row.date ?? '').slice(0, 10),

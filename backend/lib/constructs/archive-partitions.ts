@@ -30,6 +30,28 @@ import { ANALYTICS_DB_NAME } from '../stacks/agent-classification-common';
 export const ARCHIVE_CONVERSATIONS_TABLE = 'conversations';
 export const ARCHIVE_CONVERSATIONS_PREFIX = 'conversations/';
 
+/**
+ * THE FIREHOSE `MetadataExtractionQuery` THAT SETS THE `user_type` PARTITION, one definition for both analytics modes.
+ *
+ * The partition holds the classification the PLATFORM declared for the turn, and nothing a member wrote:
+ *   - Only a record whose `Payload.Sender.Arn` is an assistant (`/bot/`) is read. Amazon Chime SDK sets the sender
+ *     from the caller's identity, and an assistant's Metadata is written by the platform. A person's Metadata is
+ *     member-writable, so a person's record partitions as `unknown` whatever its Metadata says.
+ *   - The read is `try ... catch`: Metadata that is not JSON, not an object, or carries a non-string classification
+ *     yields `unknown`, and the record lands in the queryable `conversations/` prefix. No Metadata a sender writes
+ *     can route a record to the Firehose error prefix, outside the table.
+ *   - The value is kept only in the classification-key shape (`[a-z0-9-]`, 1 to 63 characters), so every partition
+ *     written is one the registrar parses and registers.
+ * A nested `.analytics.classification` (an admin notice) is read first, else the flat `classification` key
+ * `buildAnalyticsMetadata()` emits. Firehose reads the record and nothing else, so `classification` stays in
+ * `FRONTEND_METADATA_KEYS` (Aurora mode's slimming keeps it in the Chime Metadata).
+ */
+export const ARCHIVE_PARTITION_QUERY =
+  '{user_type:((try (select(.Payload.Sender.Arn | strings | contains("/bot/")) | .Payload.Metadata | fromjson'
+  + ' | (.analytics.classification? // .classification) | strings'
+  + ' | select(length > 0 and length < 64 and (explode | all(. == 45 or (. >= 48 and . <= 57) or (. >= 97 and . <= 122)))))'
+  + ' catch empty) // "unknown")}';
+
 /** Register each `conversations/` partition the archive's Firehose writes into `bucket`, as it is written. */
 export function registerArchivePartitions(scope: Construct, bucket: s3.IBucket): lambdaNodeJs.NodejsFunction {
   const stack = cdk.Stack.of(scope);

@@ -193,6 +193,18 @@
   --danger-fill: #B91C1C;
   --link-color: var(--accent-600);
   --focus-ring: var(--accent-500);
+  /* A control boundary and a divider that read against every surface of the theme (WCAG 1.4.11, 3:1): a
+     button or field outline, and a line between regions that must be seen. */
+  --control-border-strong: #71717A;
+  --divider-strong: #8F8F99;
+  --btn-primary-border: var(--accent-700);
+  --btn-secondary-bg: var(--surface-0);
+  --btn-secondary-hover: var(--surface-100);
+  --btn-danger-hover: #991B1B;
+  /* A pressed toggle (muted, camera on, a layout chosen): its own fill, text and outline, at 4.5:1 and 3:1. */
+  --toggle-on-bg: #EDE9FE;
+  --toggle-on-text: #4C1D95;
+  --toggle-on-border: #6D28D9;
   --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2352525B' d='M3 4.5L6 7.5L9 4.5'/%3E%3C/svg%3E");
 
   /* === Layout === */
@@ -232,6 +244,15 @@
     --danger-border: #7F1D1D;
     --link-color: var(--accent-300);
     --focus-ring: var(--accent-400);
+    --control-border-strong: #8B8B94;
+    --divider-strong: #63636B;
+    --btn-primary-border: var(--accent-400);
+    --btn-secondary-bg: var(--surface-100);
+    --btn-secondary-hover: var(--surface-200);
+    --btn-danger-hover: #DC2626;
+    --toggle-on-bg: #2E1065;
+    --toggle-on-text: #EDE9FE;
+    --toggle-on-border: #A78BFA;
     --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23D4D4D8' d='M3 4.5L6 7.5L9 4.5'/%3E%3C/svg%3E");
 
     --cls-1: #5EEAD4;
@@ -288,6 +309,15 @@
   --danger-border: #7F1D1D;
   --link-color: var(--accent-300);
   --focus-ring: var(--accent-400);
+  --control-border-strong: #8B8B94;
+  --divider-strong: #63636B;
+  --btn-primary-border: var(--accent-400);
+  --btn-secondary-bg: var(--surface-100);
+  --btn-secondary-hover: var(--surface-200);
+  --btn-danger-hover: #DC2626;
+  --toggle-on-bg: #2E1065;
+  --toggle-on-text: #EDE9FE;
+  --toggle-on-border: #A78BFA;
   --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23D4D4D8' d='M3 4.5L6 7.5L9 4.5'/%3E%3C/svg%3E");
 
   --cls-1: #5EEAD4;

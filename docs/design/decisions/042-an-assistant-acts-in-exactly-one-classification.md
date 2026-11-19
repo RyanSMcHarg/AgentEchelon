@@ -33,7 +33,7 @@ tracking: |
 
 ## Status
 
-**Accepted 2026-09-16, BUILT and deployed.** `classificationChannelScopedAllow` takes an explicit `actor`, and an assistant resolves to `channelsAnAssistantMayActIn` - its own classification alone (`backend/lib/stacks/agent-classification-common.ts`). **Verified by:** `backend/test/lib/an-assistant-acts-in-exactly-one-classification.test.ts` at the registry level and `tests/e2e/assistant-classification-boundary.spec.ts` as a live deny-test against the deployed processor roles.
+**Accepted 2026-09-16, BUILT and deployed.** `classificationChannelScopedAllow` takes an explicit `actor`, and an assistant resolves to `channelsAnAssistantMayActIn` - its own classification alone (`backend/lib/stacks/agent-classification-common.ts`). **Verified by:** `backend/test/lib/an-assistant-acts-in-exactly-one-classification.test.ts` at the registry level and `tests/e2e/assistant-classification-boundary.spec.ts` as a live deny-test against the deployed acting roles (passed on dev, 2026-10-07).
 
 **The recommendation: an assistant ACTS in exactly one classification, and keeps READING context from the set its classification grants.** Those are two different questions that one resolver answered before the split. [ADR-046](./046-classifications-are-a-set-not-a-ladder.md) replaces the rank ordering with a set, so where the body below says "rank and below", it describes the grant set as it was argued, and the set its classification grants is the as-built reading.
 
@@ -173,17 +173,17 @@ Every ADMISSION path this platform owns binds correctly: `create-conversation` r
 
 6. **The containment claim in the specs is corrected rather than kept.** Two documents state that Layer 1 keeps a wrongly-added member inert. That is true of a human not cleared for the channel and false of an assistant of another classification, which is the case the same paragraph says Layer 1 does not stop.
 
-7. **This boundary is proven by a deny-test, not by reading a policy.** Tenet P4 asks for isolation provable by deny-test, and no test today proves an assistant cannot act in another classification's conversation. The tests that exist pin the permissive behavior.
+7. **This boundary is proven by a deny-test, not by reading a policy.** Tenet P4 asks for isolation provable by deny-test; `tests/e2e/assistant-classification-boundary.spec.ts` is that test (see "What proves it").
 
 ## What proves it, and what does not
 
 **Read from the deployment, 2026-09-16, read-only.** The premium processor role's `AllowGrantedClassificationChannelActions` statement and its classification list. The resource policies on three agent handlers, three async processors and one task service. The channel flow processor role's `Classification-*` invoke resource.
 
-**Read from code, not measured.** Every claim about which resolver builds which boundary, and every claim about what the handler and the processor do and do not check.
+**Read from code.** The before-state claims about which resolver builds which boundary, and what the handler and the processor check.
 
-**Existing tests this record leans on, and what they actually pin.** `backend/test/cdk-synth.test.ts` asserts the premium assistant reaches `basic, standard, probe, premium`, so it **pins the permissive behavior** and will fail when this changes, which is correct and is the signal rather than an obstacle. `tests/e2e/classification-context.spec.ts` is a real deny-test using `simulate-principal-policy`, and it asserts premium CAN read the lower context prefixes, which decision point 2 deliberately keeps true.
+**The split, by unit test.** `backend/test/lib/an-assistant-acts-in-exactly-one-classification.test.ts` asserts every declared classification's assistant boundary is exactly itself and the person boundary is unchanged. `backend/test/cdk-synth.test.ts` asserts the synthesized standard and premium assistant roles condition channel actions on their own classification alone (`['standard']`, `['premium']`). `tests/e2e/classification-context.spec.ts` is a deny-test using `simulate-principal-policy` that asserts premium can read the context prefixes its classification grants, which decision point 2 keeps true.
 
-**Not proven by anything, and this is the gap the change owes:** that an assistant cannot act in another classification's conversation. `tests/e2e/assistant-classification-boundary.spec.ts` simulates channel actions by each classification's assistant against another classification's channel, and `tests/e2e/no-platform-role-speaks-as-an-assistant.spec.ts` checks that the roles changing membership bearing an assistant are conditioned on the channel's and the bot's classification. Nothing can test which member is added, because IAM never sees it.
+**The boundary, by live deny-test.** `tests/e2e/assistant-classification-boundary.spec.ts` asserts each acting role is allowed on its own classification's channel and denied on every other, a session acts as its own assistant identity (`AppInstanceBot`) and is denied acting as any other, and the processor's own role sends nothing and cannot assume the acting role (passed on dev, 2026-11-05, with the archived-conversation test: all four; `node scripts/validate.mjs --only=identity-classification` from `backend/`). `tests/e2e/no-platform-role-speaks-as-an-assistant.spec.ts` asserts a send bearing any classification's assistant is denied to every speaking service (passed on dev, 2026-11-05: 140 roles, the 60 whose policies could grant a probed action simulated; `node scripts/validate.mjs --only=governance --spec=no-platform-role` from `backend/`). Nothing can test which member is added, because IAM never sees it.
 
 ## What is not yet knowable
 
@@ -197,7 +197,7 @@ Every ADMISSION path this platform owns binds correctly: `create-conversation` r
 - **`SPEC-CONVERSATION-SECURITY` section 4b repeats the same sentence** 176 lines above the corrected one, in the same file.
 - **`IDENTITY-AND-ACCESS-MODEL` states "IAM is the real boundary"** in the assistant capability section, which is the section a developer reasoning about this would read, and which the corrected table row contradicts.
 - **`AGENTS.md` stated the assistant direction inverted** and is corrected: an assistant is flagged when the channel's grants do not include its classification.
-- **`backend/test/cdk-synth.test.ts` will fail when this is built**, by design.
+- **`backend/test/cdk-synth.test.ts` asserts the narrowed boundary** (each assistant role conditioned on its own classification alone).
 - **`task-service.ts`'s `theirs > mine` becomes a rank rule in a world with no ladder for assistants**, and has to move with the decision rather than be left as the one component with the old rule.
 - **`backend/test/invoke-grants-stay-inside-this-deployment.test.ts` refuses a function pattern that starts with a wildcard**, and `backend/test/a-pattern-invoke-reaches-only-its-own-instance.test.ts` requires the `Instance` tag condition on every pattern grant, so narrowing the grants moves those tests too.
 - **Revisit when** Amazon Chime SDK authorizes `chime:CreateChannelMembership` against the member being added, so the member's `classification` tag could be conditioned and membership would be preventable rather than detectable (the channel and the bearer already are; `backend/scripts/deny-test-assistant-membership.mjs` is how a change would be noticed); or when a deployment has a reason for an assistant to act in a classification other than its own, which would make this a declared `grants` set rather than a rule.

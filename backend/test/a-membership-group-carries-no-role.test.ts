@@ -20,7 +20,7 @@ it('creates no group with a role, ops after every clearance group, and no two gr
   const identityGroups = groupsOf(identityTemplate());
   const basicGroups = groupsOf(basicClassificationTemplate());
   // Identity holds the admin plane's group and the membership groups; a classification's are its own stack's.
-  expect(identityGroups.map((g) => g.GroupName).sort()).toEqual(['admins', 'ops']);
+  expect(identityGroups.map((g) => g.GroupName).sort()).toEqual(['account-management', 'account-team-lead', 'admins', 'ops', 'ops-on-call', 'ops-secondary']);
   expect(basicGroups.map((g) => g.GroupName)).toEqual(['basic']);
   expect(basicGroups[0].Precedence).toBe(5);
   const groups = [...identityGroups, ...basicGroups];
@@ -29,7 +29,7 @@ it('creates no group with a role, ops after every clearance group, and no two gr
   expect(ops).toBeDefined();
   expect(ops!.Precedence).toBe(MEMBERSHIP_GROUP_PRECEDENCE_BASE);
   expect(groups.filter((g) => g.RoleArn !== undefined).map((g) => g.GroupName)).toEqual([]);
-  const clearance = groups.filter((g) => g.GroupName !== 'ops' && g.GroupName !== 'team-members');
+  const clearance = groups.filter((g) => g.GroupName !== 'ops' && g.GroupName !== 'ops-on-call' && g.GroupName !== 'ops-secondary' && g.GroupName !== 'account-management' && g.GroupName !== 'account-team-lead' && g.GroupName !== 'team-members');
   expect(ops!.Precedence).toBeGreaterThan(Math.max(...clearance.map((g) => g.Precedence)));
   expect(new Set(groups.map((g) => g.Precedence)).size).toBe(groups.length);
 });

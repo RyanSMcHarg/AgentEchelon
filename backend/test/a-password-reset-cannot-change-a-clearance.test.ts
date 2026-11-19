@@ -63,9 +63,14 @@ describe('the post-confirmation trigger', () => {
 
   it('still records a confirmed sign-up: unapproved, with its requested tier', async () => {
     await handler(event('PostConfirmation_ConfirmSignUp'));
-    expect(sentTypes()).toEqual(expect.arrayContaining(['AdminUpdateUserAttributes', 'AdminAddUserToGroup']));
+    expect(sentTypes()).toEqual(['AdminUpdateUserAttributes']);
     const approval = mockCognitoSend.mock.calls.map((c) => c[0]).find((c: any) => c.type === 'AdminUpdateUserAttributes') as any;
     expect(approval.input.UserAttributes).toEqual(expect.arrayContaining([{ Name: 'custom:approved', Value: 'false' }]));
+  });
+
+  it('adds a confirmed sign-up to no clearance group: the tier it asked for is only a request', async () => {
+    await handler(event('PostConfirmation_ConfirmSignUp'));
+    expect(sentTypes()).not.toContain('AdminAddUserToGroup');
   });
 
   it('creates no AppInstanceUser for a confirmed sign-up: the credential exchange mints the person at first sign-in', async () => {

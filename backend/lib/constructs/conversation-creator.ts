@@ -61,16 +61,40 @@ export function conversationCreatorName(classification: string): string {
   return name;
 }
 
+/** The stand-ins a name pattern carries in place of a classification: a runtime placeholder, and an IAM wildcard. */
+const CLASSIFICATION_STANDINS: readonly string[] = ['{classification}', '*'];
+
 /**
  * A classification's TYPED creator's fixed function name (`typed-conversation-from-event.ts`): the creator that opens a
  * typed conversation for an event, an operator, or a confirmed `open_conversation` proposal (ADR-061 decision 8).
  * Fixed, so the apply endpoint (`proposals-api.ts`) names it without a dependency on the classification's stack.
+ * Lambda's 64-character bound holds for a real classification's name; a pattern (`{classification}`, `*`) is not a name,
+ * and its own length bounds nothing.
  */
 export function typedCreatorName(classification: string): string {
   const name = `${STACK_PREFIX}Assistants-${classification}-TypedCreator`;
-  if (name.length > 64) throw new Error(`typedCreatorName: "${name}" is longer than Lambda's 64 characters`);
+  if (name.length > 64 && !CLASSIFICATION_STANDINS.includes(classification)) throw new Error(`typedCreatorName: "${name}" is longer than Lambda's 64 characters`);
   return name;
 }
+
+/** The function a trigger's rule targets at a classification, which hands the event to that classification's router. */
+export function eventTriggerRelayName(classification: string): string {
+  return `${STACK_PREFIX}Assistants-${classification}-EventTriggerRelay`;
+}
+
+/** The name every rule an event trigger creates begins with at a classification (`event-triggers-api.ts`). */
+export function eventTriggerRulePrefix(classification: string): string {
+  // A SEPARATOR AFTER THE INSTANCE PREFIX, as alarm names have, so `AgentEchelon-*` never matches `AgentEchelonTwo-*`.
+  return `${STACK_PREFIX}-${classification}-trigger-`;
+}
+
+/** The name every watch rule begins with at a classification (DESIGN-EVENT-TARGETS section 4), followed by a 12-hex id. */
+export function eventWatchRulePrefix(classification: string): string {
+  return `${STACK_PREFIX}-${classification}-watch-`;
+}
+
+/** An IAM resource pattern for exactly this classification's rules of one kind: twelve characters after the prefix, so `premium-watch` is never `premium`. */
+export const twelveCharIds = (prefix: string): string => `${prefix}????????????`;
 
 /**
  * INVOKE A CREATOR OF THIS INSTANCE, FOUND BY NAME AT CALL TIME: read the classification's key, and invoke a
@@ -106,7 +130,10 @@ export interface ConversationCreatorProps {
   /** The channel-context table (Conversations), by its published name and ARN. */
   channelContextTableName: string;
   channelContextTableArn: string;
-  /** Where the classification's message templates are: the room it opens is named from its `conversation-name` template. */
+  /**
+   * Where the classification's message templates are: the room it opens is named from its `conversation-name` template.
+   * The same bucket holds profile bodies under `profiles/*`, which the visitors' creator reads (below).
+   */
   templateBucketName: string;
   templateBucketArn: string;
 }
@@ -123,10 +150,6 @@ export class ConversationCreator extends Construct {
     const serviceAdminArn = `${appInstanceArn}/user/${RES_PREFIX}-admin`;
     const issuers = issuersOf(this);
 
-    // THE CONTEXT CLASSIFICATION: the one the trusted-issuer registry's oneChannel issuers name, at which a
-    // host's context conversations are created. Its creator also serves the context request, and its role also
-    // holds the re-open reads below.
-    const servesContext = classification === issuers.contextClassification();
     // THE VISITORS' CLASSIFICATION, whose creator also assesses and retires a visitor's conversation when its
     // visit carries over (FR26, P-12): it reads the visit's messages and deletes the channel as the service
     // admin, on a channel of its own classification only, and asks the visitor's assistant's model.
@@ -143,23 +166,6 @@ export class ConversationCreator extends Construct {
           statements: [
             ...driftChannelCreateStatements(classification as Classification, appInstanceArn,
               stack.region, stack.account, serviceAdminArn, { linkPostedOnSession: true }),
-            // A CONTEXT CONVERSATION'S RE-OPEN: whether the caller is already in it, and its Metadata refresh, as
-            // the service admin, in a channel of this classification. It also reads the channel to find whether a
-            // creation that stopped part way left it without its flow, and attaches the flow before any member
-            // (`reseatContextOpener`), through the creator grant's `AssociateChannelFlow`.
-            ...(servesContext ? [
-              new iam.PolicyStatement({
-                sid: 'ContextReopenOwnClassificationChannel',
-                actions: ['chime:UpdateChannel', 'chime:DescribeChannel', 'chime:DescribeChannelMembership', 'chime:ListChannelMemberships'],
-                resources: [`${appInstanceArn}/channel/*`],
-                conditions: ownClassification,
-              }),
-              new iam.PolicyStatement({
-                sid: 'ContextReopenAsTheServiceAdmin',
-                actions: ['chime:UpdateChannel', 'chime:DescribeChannel', 'chime:DescribeChannelMembership', 'chime:ListChannelMemberships'],
-                resources: [serviceAdminArn],
-              }),
-            ] : []),
             ...(servesVisits ? [
               new iam.PolicyStatement({
                 sid: 'VisitReadAndRetireOwnClassificationChannel',
@@ -212,22 +218,16 @@ export class ConversationCreator extends Construct {
       actions: ['dynamodb:UpdateItem'],
       resources: [props.channelContextTableArn],
     }));
-    // WHICH HOST TITLE A CONTEXT ROOM WAS NAMED FROM, and no other attribute of the row: a reopen renames the room from
-    // its context only while it still carries that title (SPEC-CONVERSATION-TYPES FR32).
-    role.addToPolicy(new iam.PolicyStatement({
-      sid: 'ReadTheTitleARoomWasNamedFrom',
-      actions: ['dynamodb:GetItem'],
-      resources: [props.channelContextTableArn],
-      conditions: {
-        'ForAllValues:StringEquals': { 'dynamodb:Attributes': ['topic'] },
-        StringEquals: { 'dynamodb:Select': 'SPECIFIC_ATTRIBUTES' },
-      },
-    }));
     // A room is created for its classification's primary and tagged with it (§3.8).
     for (const stmt of roomPrimaryReadStatements(stack, [classification])) role.addToPolicy(stmt);
     // THE ROOM IS NAMED FROM ITS ASSISTANT'S conversation-name TEMPLATE (`conversation-name.ts`): a visitor's and a
     // customer's room are created with that name, so the creator reads this classification's message templates.
     for (const stmt of messageTemplateReadStatements(stack, props.templateBucketArn, classification)) role.addToPolicy(stmt);
+    // THE VISITOR'S ASSISTANT'S VERSION IS READ WHOLE, its persona and pack bodies included: an assessment runs on
+    // the version that was approved or does not run (`resolveActiveProfile`), so its bodies must be readable here.
+    if (servesVisits) {
+      role.addToPolicy(new iam.PolicyStatement({ actions: ['s3:GetObject'], resources: [`${props.templateBucketArn}/profiles/*`] }));
+    }
 
     const fn = new lambdaNodeJs.NodejsFunction(this, 'Function', {
       functionName: conversationCreatorName(classification),
@@ -250,10 +250,8 @@ export class ConversationCreator extends Construct {
         // THE CLASSIFICATION THIS FUNCTION CREATES, and the only one.
         CREATOR_CLASSIFICATION: classification,
         TEMPLATE_BUCKET: props.templateBucketName,
-        // Whether it also creates a host's context conversations (the registry's oneChannel issuers).
-        ...(servesContext ? { CONTEXT_CONVERSATIONS: 'true' } : {}),
         // The visitor's assistant's model is named by catalog key and resolved to its id per account.
-        ...(servesVisits ? { AWS_ACCOUNT_ID: stack.account } : {}),
+        ...(servesVisits ? { AWS_ACCOUNT_ID: stack.account, PROFILE_BODY_BUCKET: props.templateBucketName } : {}),
       },
       role,
     });

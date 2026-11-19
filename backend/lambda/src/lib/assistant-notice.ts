@@ -81,10 +81,15 @@ export function noticeMetadata(
       return { systemAnnouncement: 'member_joined' };
     case 'memberWelcome': {
       const conversationId = (at.channelArn || '').split('/channel/')[1] || '';
-      // THE EMAIL'S SUBJECT IS THE TEMPLATE'S `email.subject`, rendered from the same checked values. A
-      // caller that still names a subject of its own (`notifySubject`, the event creator's topic label) keeps it.
-      const rendered = renderMessageTemplate(at.template ?? shippedMessageTemplate(noticeTemplateName(kind)), vars, { sections: ['email.subject'], refusedValue: 'empty' });
+      // THE EMAIL IS THE TEMPLATE'S `email.*` SECTIONS, rendered from the same checked values: its subject names the
+      // conversation by its title, else by the recap, which names what the person was added to. Its body is the
+      // template's `email.body`, so a line written for the chat (how to mention the assistant there) stays in the chat;
+      // a template with no `email.body` emails its chat line. A caller that names a subject of its own
+      // (`notifySubject`, the event creator's topic label) keeps it.
+      const values = { ...(vars.recap ? { title: vars.recap } : {}), ...vars };
+      const rendered = renderMessageTemplate(at.template ?? shippedMessageTemplate(noticeTemplateName(kind)), values, { sections: ['email.subject', 'email.body'], refusedValue: 'empty' });
       const subject = vars.notifySubject || (rendered.ok ? rendered.sections['email.subject'] : '') || undefined;
+      const body = (rendered.ok ? rendered.sections['email.body'] ?? '' : '').trim();
       return {
         systemAnnouncement: 'join_summary',
         // The person just added is told so as a `conversation-shared` notice, the kind they can mute, with
@@ -94,6 +99,7 @@ export function noticeMetadata(
           targets: [vars.notifyPerson],
           kind: 'conversation-shared',
           ...(conversationId ? { conversationId } : {}),
+          ...(body ? { body } : {}),
         }) : {}),
       };
     }

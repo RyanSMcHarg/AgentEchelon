@@ -25,8 +25,10 @@
  * as the persona: a manifest naming an `intentPackRef` would point the target at the SOURCE account's
  * bucket. `readDefinition` hydrates on every branch so the pointer is followed before export.
  */
+import { inCurrentForm } from './retired-fields.js';
 import { SSMClient, GetParameterCommand, PutParameterCommand } from '@aws-sdk/client-ssm';
 import { ssmJsonValue } from './ssm-json-value.js';
+import { resolveGuardrailSelection } from './guardrail-selection.js';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { BackendModelDefinition, BackendModelKey } from '../../../lib/config/model-strategy.js';
 import {
@@ -42,13 +44,14 @@ import {
   MAX_PERSONA_LENGTH,
   DEFAULT_MODEL,
 } from './active-profile.js';
-import { offloadBodies, hydrateBodies, withLayout } from './profile-bodies.js';
+import { offloadBodies, hydrateBodies, withConsoleBodies } from './profile-bodies.js';
+import { keptWelcomeErrors } from './kept-welcome.js';
 import { layoutFor, workflowLayoutErrors, type WorkflowLayout } from './workflow-layout.js';
 import { MAX_INTENT_PACK_BYTES } from './intent-pack.js';
 import { modelFits } from '../../../lib/config/model-availability.js';
 import { isImageRoute } from './image-route.js';
 import { retiredWelcomeErrors } from './profile-copy-fields.js';
-import { deploymentRouteErrors, goldenSetReachErrors, activeRouteKeys, classificationServedBy, DEPLOY_TIME_KEYS, eventWorkflowTemplateErrors, getDraft, versionConditionErrors, versionVariableErrors, welcomeWorkflowErrors, hasTaskStep, deploymentTaskMachines } from './profile-lifecycle.js';
+import { deploymentRouteErrors, goldenSetReachErrors, activeRouteKeys, classificationServedBy, DEPLOY_TIME_KEYS, eventWorkflowTemplateErrors, getDraft, versionConditionErrors, versionVariableErrors, welcomeWorkflowErrors, hasTaskStep, deploymentTaskMachines, withDeclaredWorkflows } from './profile-lifecycle.js';
 import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry';
 
 /**
@@ -109,6 +112,8 @@ export interface ProfileManifest {
    * `contentHash`, because it is no part of what the version does; an import lands it on the draft beside the body.
    */
   layout?: WorkflowLayout;
+  /** A welcome workflow the console keeps while the welcome says a template or a prompt (ADR-067 G40), outside the body on the layout's terms. */
+  keptWelcomeWorkflow?: import('./event-workflow.js').EventWorkflow;
   /** sha256 of the canonical body — carried through import as `createdFrom.contentHash` (audit chain). */
   contentHash: string;
   /**
@@ -127,7 +132,8 @@ export class ProfileManifestError extends Error {
   }
 }
 
-function contentHashOf(body: ProfileDefinitionBody): string {
+/** The `contentHash` a manifest carries: sha256 of the body with its top-level keys in order. Export and the shipped manifests compute it here. */
+export function contentHashOf(body: ProfileDefinitionBody): string {
   const ordered = Object.fromEntries(Object.entries(body).sort(([a], [b]) => a.localeCompare(b)));
   return createHash('sha256').update(JSON.stringify(ordered), 'utf8').digest('hex');
 }
@@ -192,7 +198,7 @@ async function readDefinition(
       /* fall through to the not-found error below, which names the version */
     }
     if (!value) throw new ProfileManifestError(`version ${version} not found for profile '${profileName}'`);
-    return { def: await withLayout(await hydrateBodies(JSON.parse(value) as ProfileDefinition)), sourceVersion: version };
+    return { def: await withConsoleBodies(await hydrateBodies(JSON.parse(value) as ProfileDefinition)), sourceVersion: version };
   }
   let activeRaw: string | undefined;
   try {
@@ -204,7 +210,7 @@ async function readDefinition(
   // Hydration is outside the catch: an unreadable BODY must not silently degrade an export of the
   // active version into an export of the compiled seed, which would look like a successful export of a
   // profile the operator never configured.
-  if (activeRaw) return { def: await withLayout(await hydrateBodies(JSON.parse(activeRaw) as ProfileDefinition)), sourceVersion: 'active' };
+  if (activeRaw) return { def: await withConsoleBodies(await hydrateBodies(JSON.parse(activeRaw) as ProfileDefinition)), sourceVersion: 'active' };
   const seed = serializeSeedDefinition(profileName);
   if (!seed) throw new ProfileManifestError(`unknown profile '${profileName}'`);
   return { def: JSON.parse(seed) as ProfileDefinition, sourceVersion: 'seed' };
@@ -283,8 +289,9 @@ export async function exportManifest(
     },
     contentHash: contentHashOf(body),
   };
-  const layout = layoutFor(def.layout, body.eventWorkflows);
+  const layout = layoutFor(def.layout, body.eventWorkflows, body.intentPack?.machines ?? null, body.intentWorkflows ?? null);
   if (layout) manifest.layout = layout;
+  if (def.keptWelcomeWorkflow) manifest.keptWelcomeWorkflow = def.keptWelcomeWorkflow;
   // Record what each selected context source MEANT here, so the target can reject a same-named source
   // with a different shape (§4/§6). Best-effort: an unreadable catalog on EXPORT degrades to a manifest
   // with no contracts, which import falls back to checking key presence alone. Failing the export would
@@ -331,6 +338,9 @@ export interface TargetContextSource {
   trust?: 'platform' | 'operator' | 'member';
   describesPerson?: boolean;
   availability?: 'always' | 'identity-settled' | 'conversation-settled';
+  /** Which roles can read it (`readableByRole`): an `s3-prefix` source under `context/` is read on the role's grant. */
+  type?: string;
+  prefix?: string;
 }
 
 /** One selectable guardrail on the TARGET, as published by the assistant-profile stack. */
@@ -418,7 +428,9 @@ export async function importManifest(
     if (!verifyManifestSignature(m, secret)) throw new ProfileManifestError('manifest signature invalid', ['signature does not match (tampered or wrong signing key)']);
   }
 
-  const body = (opts.adjustBody ?? ((b) => b))(bodyFrom(m.body as Partial<ProfileDefinitionBody>));
+  // AN EXPORT MADE BEFORE A FIELD RETIRED IMPORTS IN THE CURRENT FORM (ADR-067 stage 4): its retired fields are rewritten
+  // into what does the same, so a manifest from an earlier deployment still imports and runs.
+  let body = (opts.adjustBody ?? ((b) => b))(inCurrentForm(bodyFrom(m.body as Partial<ProfileDefinitionBody>)).body);
   // Body validation is deferred until `targetName` is known, because the baseline it is judged
   // against is the TARGET's existing routes.
 
@@ -559,6 +571,9 @@ export async function importManifest(
   // Without it an import is refused for an unreachable route the TARGET already serves - so a profile
   // whose pack narrowed after seeding could not be imported into either, and the export/import round
   // trip failed on a body this deployment itself produced.
+  // EVERY MULTI-STEP INTENT'S WORKFLOW IS DECLARED in what an import lands: an export that declares none for an
+  // intent carries that intent's standard workflow, written out.
+  if (targetName) body = await withDeclaredWorkflows(body, ssm, ssmRoot, targetName);
   errors.push(...validateDefinitionBody(body, await activeRouteKeys(ssm, ssmRoot, targetName)));
 
   // 4. contentHash is a best-effort PROVENANCE stamp, NOT an edit lock. Hand-editing the exported manifest
@@ -598,16 +613,14 @@ export async function importManifest(
         + 'refusing to land a version whose guardrail selection cannot be verified',
       ]);
     }
-    const byId = available.find((g) => g.guardrailId === body.guardrailId);
-    const byKey = available.find((g) => g.key === body.guardrailId);
-    if (byKey && !byId) {
-      console.log(`[profile-manifest] remapped guardrail key '${body.guardrailId}' to this instance's '${byKey.guardrailId}'`);
-      body.guardrailId = byKey.guardrailId;
-    } else if (!byId) {
-      const offered = available.map((g) => `'${g.key}'`).join(', ') || '(none provisioned)';
+    const resolved = resolveGuardrailSelection(body.guardrailId, available);
+    if ('guardrailId' in resolved) {
+      if (resolved.remappedFrom) console.log(`[profile-manifest] remapped guardrail key '${resolved.remappedFrom}' to this instance's '${resolved.guardrailId}'`);
+      body.guardrailId = resolved.guardrailId;
+    } else {
       errors.push(
         `guardrailId '${body.guardrailId}' is not provisioned for '${targetName}' on this instance; `
-        + `reject or remap to one of its selection keys: ${offered}`,
+        + `reject or remap to one of its selection keys: ${resolved.offered}`,
       );
     }
   }
@@ -720,15 +733,16 @@ export async function importManifest(
   }
 
   // THE LAYOUT IS CHECKED FOR ITS SHAPE ALONE (ADR-061 decision 7): it decides nothing a version does.
-  if (!errors.length) errors.push(...workflowLayoutErrors(m.layout));
+  if (!errors.length) errors.push(...workflowLayoutErrors(m.layout), ...keptWelcomeErrors(m.keptWelcomeWorkflow));
   if (errors.length) throw new ProfileManifestError('manifest failed target validation', errors);
   if (opts.checkOnly) return buildDefinition(targetName, body);
-  const layout = layoutFor(m.layout, body.eventWorkflows);
+  const layout = layoutFor(m.layout, body.eventWorkflows, body.intentPack?.machines ?? null, body.intentWorkflows ?? null);
 
   // Land as a DRAFT — never active. Provenance records where it came from (audit chain, §5).
   const draft: ProfileDefinition & { provenance?: unknown } = {
     ...buildDefinition(targetName, body),
     ...(layout ? { layout } : {}),
+    ...(m.keptWelcomeWorkflow ? { keptWelcomeWorkflow: m.keptWelcomeWorkflow } : {}),
     provenance: {
       createdFrom: {
         instanceId: m.provenance?.instanceId,

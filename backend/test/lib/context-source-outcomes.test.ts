@@ -137,6 +137,7 @@ describe('emitContextSourceOutcome', () => {
     ['error', 'ContextSourceFailed'],
     ['not-in-catalog', 'ContextSourceSkipped'],
     ['unavailable', 'ContextSourceSkipped'],
+    ['not-readable-by-role', 'ContextSourceSkipped'],
     ['no-record', 'ContextSourceSkipped'],
   ] as const)('maps outcome %s to metric %s', (outcome, metric) => {
     emitContextSourceOutcome({ classification: 'standard', sourceKey: 'k', outcome });

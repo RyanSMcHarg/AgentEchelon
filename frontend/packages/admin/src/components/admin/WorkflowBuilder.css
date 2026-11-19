@@ -17,6 +17,9 @@
   min-width: 0;
 }
 
+/* The task-step builder has no palette: the flow takes the room. */
+.admin-wfb-body-two { grid-template-columns: minmax(0, 1fr) minmax(260px, 360px); }
+
 .admin-wfb-palette, .admin-wfb-inspector {
   display: flex; flex-direction: column; gap: var(--space-3);
   padding: var(--space-3);
@@ -26,10 +29,10 @@
   min-width: 0;
 }
 .admin-wfb-group { display: flex; flex-direction: column; gap: var(--space-2); }
-.admin-wfb-group h6, .admin-wfb-preview h6, .admin-wfb-inspector-head h6 {
+.admin-wfb-group h5, .admin-wfb-preview h5, .admin-wfb-inspector-head h5 {
   margin: 0; font-size: var(--text-xs); font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-secondary);
 }
-.admin-wfb-inspector-head h6 { font-size: var(--text-lg); text-transform: none; letter-spacing: 0; color: var(--text-primary); }
+.admin-wfb-inspector-head h5 { font-size: var(--text-lg); text-transform: none; letter-spacing: 0; color: var(--text-primary); }
 .admin-wfb-inspector-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
 .admin-wfb-pal {
   display: flex; align-items: center; gap: var(--space-2);
@@ -111,9 +114,16 @@
 .admin-wfb-preview ol { margin: 0; padding-left: var(--space-5); display: flex; flex-direction: column; gap: var(--space-1); }
 .admin-wfb-act { color: var(--text-secondary); }
 
+/* On a phone the list view is the default (`WorkflowBuilder`), its controls full width and its steps one per row. */
+@media (max-width: 720px) {
+  .admin-wfb-bar { flex-wrap: wrap; gap: var(--space-2); }
+  .admin-wfb-bar > * { flex: 1 1 auto; }
+  .admin-wfb-canvas { height: clamp(280px, 60vh, 480px); }
+}
 @media (max-width: 1100px) {
-  .admin-wfb-body { grid-template-columns: minmax(0, 1fr); }
+  .admin-wfb-body, .admin-wfb-body-two { grid-template-columns: minmax(0, 1fr); }
   .admin-wfb-palette { flex-direction: row; flex-wrap: wrap; }
   .admin-wfb-group { flex: 1 1 160px; }
   .admin-wfb-canvas { height: clamp(320px, 55vh, 560px); }
 }
+.admin-wfb-field { display: flex; flex-direction: column; gap: var(--space-1); margin-bottom: var(--space-3); border: 0; padding: 0; }

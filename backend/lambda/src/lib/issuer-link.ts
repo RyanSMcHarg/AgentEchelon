@@ -11,7 +11,7 @@
  * ── REFUSED, AND NOTHING WRITTEN ─────────────────────────────────────────────────────────────────
  *
  *  - The second token fails any check (`LINK_TOKEN_REFUSED`).
- *  - Either side is a guest, a host assertion, a one-conversation issuer or a provisioned-only issuer
+ *  - Either side is a guest, a host assertion or a provisioned-only issuer
  *    (`LINK_NOT_SUPPORTED`): a visitor becomes a person by path A or B, and a provisioned subject is
  *    pre-assigned by `provisionSubject`. Linking a provisioned-only subject is **NOT BUILT**.
  *  - The second issuer is the first one (`LINK_SAME_ISSUER`): one person holds one subject per issuer.
@@ -27,7 +27,7 @@
  * session. The access log is the record every `Identities` write already goes to, so no new store.
  */
 import { GetCommand, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
-import { isGuestIssuer, isProvisionedOnly, oneChannelOf, subjectOf, type TrustedIssuer } from '../../../lib/config/issuers.js';
+import { isGuestIssuer, isProvisionedOnly, subjectOf, type TrustedIssuer } from '../../../lib/config/issuers.js';
 import type { EdgeIssuer } from '../../../lib/config/edge-verification.js';
 import { IDENTITIES_BY_PERSON, issuerSubjectKey, parseIssuerSubjectKey, revokedMarkerKey, type IdentityRow } from './person-identity.js';
 import { TokenRefused, verifyToken, type VerifiedToken } from './token-verification.js';
@@ -77,8 +77,7 @@ export function linkIssuersFromEnv(raw: string | undefined = process.env.LINK_IS
 
 /** Whether an issuer's people may hold a linked subject at all. */
 export function linkable(issuer: Pick<TrustedIssuer, 'kind' | 'clearance'> & { provisioning?: string } | null | undefined): boolean {
-  if (!issuer || isGuestIssuer(issuer) || issuer.kind === 'host-assertion' || isProvisionedOnly(issuer as TrustedIssuer)) return false;
-  return !oneChannelOf(issuer as TrustedIssuer);
+  return !!issuer && !isGuestIssuer(issuer) && issuer.kind !== 'host-assertion' && !isProvisionedOnly(issuer as TrustedIssuer);
 }
 
 export interface LinkDeps {

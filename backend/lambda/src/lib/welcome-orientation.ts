@@ -226,6 +226,20 @@ export function selectOpening(step: WelcomeOpeningStep | null | undefined): Open
 }
 
 /**
+ * THE OPENING A ROOM IS GREETED WITH: the assistant's own fields over the deployment's, field by field. A field the
+ * opening leaves blank is the deployment's, so setting only suggested prompts keeps the deployment's company, access line
+ * and note. `deployment` is passed only where the deployment's copy applies to the assistant (its classification's
+ * primary). The router and the console's preview both compose through this.
+ */
+export function withDeploymentOpening(
+  own: WelcomeOrientation | null | undefined,
+  deployment: WelcomeOrientation | null | undefined,
+): WelcomeOrientation | null {
+  if (!own && !deployment) return null;
+  return { ...(deployment ?? {}), ...(own ?? {}) };
+}
+
+/**
  * Would quoting `quote` back only repeat what `subject` already said?
  *
  * The drift topic label is derived FROM the originating message, so for a short question the label and
@@ -432,9 +446,8 @@ function safeMemberText(value: string | undefined, maxLen: number): string | und
 /**
  * THE FIELDS A WELCOME TEMPLATE MAY NAME, each declared once as a variable source (ADR-060, slice 1c), with the cap
  * the clause assembly applies to it. A conversation field is the channel-context row's text, member trust, read
- * through the resolver like every other inserted value; `role` and `examples` are the call site's own: the role this
- * deployment's assignment record names (platform text) and the version's suggested prompts (operator text, capped
- * when they were parsed), rendered as a list so `{{examples}}` belongs on a line of its own.
+ * through the resolver like every other inserted value; `role` is the call site's own: the role this deployment's
+ * assignment record names (platform text).
  */
 export const WELCOME_FIELDS = {
   topic: { source: 'conversation:topic', cap: MAX_TOPIC },
@@ -444,12 +457,13 @@ export const WELCOME_FIELDS = {
   visitSummary: { source: 'conversation:visitSummary', cap: MAX_VISIT_SUMMARY },
   parentRef: { source: 'conversation:parentRef', cap: MAX_PARENT_REF },
   role: { source: 'assistant:role' },
-  examples: { source: 'assistant:examples' },
+  // The assistant's own display name, as its active version names it (`displayName`): what the room sees it called.
+  assistantName: { source: 'assistant:name' },
 } as const satisfies Record<string, { source: string; cap?: number }>;
 export type WelcomeField = keyof typeof WELCOME_FIELDS;
 
 /** The fields the console offers to insert, in the order it lists them. */
-export const WELCOME_TOKENS = ['topic', 'eventSummary', 'priorSubject', 'priorMessage', 'visitSummary', 'role', 'examples'] as const;
+export const WELCOME_TOKENS = ['assistantName', 'topic', 'eventSummary', 'priorSubject', 'priorMessage', 'visitSummary', 'role'] as const;
 
 /** A legacy `{name}` token of letters, not already inside `{{...}}`. */
 const LEGACY_TOKEN = /(?<!\{)\{([a-zA-Z]+)\}(?!\})/g;
@@ -516,21 +530,20 @@ export function renderWelcomeTemplate(
    * instead. It is here so copy can name the job ("I am the operations assistant here") without the
    * resolver growing a second dimension that an assistant's identity already fixes.
    */
-  assistant: { role?: string } = {},
+  assistant: { role?: string; name?: string } = {},
   vars?: WelcomeVariables,
 ): { content: string; contributed: OrientationField[]; missing: OrientationField[] } {
   const contributed: OrientationField[] = [];
   const missing: OrientationField[] = [];
   const lookup = vars?.lookup ?? welcomeLookup();
   const site: ResolveSite = { callSite: vars?.callSite ?? WELCOME_SETTLES_NOTHING, audience: 'room', section: 'chat' };
-  const examples = (o.examples ?? []).filter((e) => typeof e === 'string' && e.trim()).slice(0, MAX_EXAMPLES);
   const ownVariable = (name: string) => Object.prototype.hasOwnProperty.call(vars?.variables ?? {}, name);
   const resolved = new Map<string, string | undefined>();
   const valueOf = (name: string): string | undefined => {
     if (resolved.has(name)) return resolved.get(name);
     let text: string | undefined;
     if (name === 'role') text = assistant.role;
-    else if (name === 'examples') text = examples.length ? examples.map((e) => `- ${e.trim()}`).join('\n') : undefined;
+    else if (name === 'assistantName') text = assistant.name?.trim() || undefined;
     else if (Object.prototype.hasOwnProperty.call(WELCOME_FIELDS, name) && !ownVariable(name)) {
       const { source, cap } = WELCOME_FIELDS[name as WelcomeField] as { source: string; cap: number };
       text = insertValue(name, lookup(source), o[name as ConversationField], site)?.slice(0, cap);
@@ -735,7 +748,7 @@ export interface WelcomeOpening {
 export function composeOpening(
   template: string | undefined,
   orientation: WelcomeOrientation,
-  assistant: { role?: string } = {},
+  assistant: { role?: string; name?: string } = {},
   /** The version's variables and the values the welcome holds, for a template that names a variable. */
   vars?: WelcomeVariables,
 ): WelcomeOpening {
@@ -743,6 +756,27 @@ export function composeOpening(
   const rendered = template ? renderWelcomeTemplate(template, orientation, assistant, vars) : null;
   const usedTemplate = !!rendered?.content.trim();
   return { content: rendered && usedTemplate ? rendered.content : composition.content, composition, rendered, usedTemplate };
+}
+
+/**
+ * THE ASSEMBLED OPENING AS TEXT A TEAM CAN EDIT. The words `composeWelcome` says in a fresh conversation for this
+ * orientation, written as an opening template, with `{{topic}}` where the room's own value goes and the suggested prompts
+ * as a bulleted list, so the same text renders the same words. The console opens a welcome the version does not have yet on this text.
+ */
+export function openingTextOf(o: WelcomeOrientation): string {
+  const parts: string[] = [];
+  if (o.companyName) {
+    parts.push(`Hi - I'm your assistant at ${o.companyName}${o.companyBlurb ? `, ${o.companyBlurb}` : ''}.`);
+  } else {
+    parts.push("Hi - I'm your assistant for this conversation.");
+    if (o.companyBlurb) parts.push(`You're working with ${o.companyBlurb}.`);
+  }
+  // ON THE LINE UNDER THE LEAD: a line whose field is empty is left out, so a blank line either side would stay behind.
+  parts[parts.length - 1] += '\nI can help with {{topic}}.';
+  if (o.accessBlurb) parts.push(o.accessBlurb);
+  if (o.examples?.length) parts.push(['A few things you can try:', ...o.examples.map((e) => `- ${e}`)].join('\n'));
+  if (o.platformNote) parts.push(o.platformNote);
+  return parts.join('\n\n');
 }
 
 /** Copy-only form of {@link composeWelcome}, for surfaces that need the text and nothing else. */

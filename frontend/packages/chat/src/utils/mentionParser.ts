@@ -1,4 +1,5 @@
 import type { ChannelMember } from '@ae/shared';
+import { nameTokenContinues } from '@ae/shared/utils/addressTokens.ts';
 
 /** Validation outcome surfaced to the UI when the user typed something the
  *  Chime SDK can't deliver. We don't silently drop mentions — the user must
@@ -8,7 +9,6 @@ export type MentionValidationError =
    *  Chime API (see reference_chime_target_fixed_one); reaching multiple
    *  people requires N separate sends, which we don't build until we have a
    *  use case. */
-  | 'multiple_humans'
   /** Multiple distinct bots were @-mentioned. CHIME.mentions itself is
    *  multi-entry but the resulting Target ambiguity + the cost of fanning
    *  out N bot replies isn't worth it; pick one assistant. */
@@ -41,6 +41,8 @@ export interface MentionParseResult {
   mentionBotArn?: string;
   /** True if `@all` (or `@everyone`) appears — caller should bypass Target and let the channel-flow processor broadcast. */
   isAtAll: boolean;
+  /** True if `@humans` appears: the message goes to the room and no assistant answers it. */
+  isAtHumans?: boolean;
   /** All ARNs the user mentioned, in text order. Used for UI display + the
    *  validation rules above; routing only ever uses `targetArn` /
    *  `mentionBotArn` derived from this list. */
@@ -52,7 +54,9 @@ export interface MentionParseResult {
   error?: MentionValidationError;
 }
 
-const AT_ALL_PATTERN = /(^|\s)@(all|everyone)\b/i;
+const AT_ALL_PATTERN = /(^|\s)@(all|everyone)\b(?!-\w)/i;
+/** `@humans`: the people in the room and no assistant, so no assistant takes a turn on it. */
+const AT_HUMANS_PATTERN = /(^|\s)@humans\b(?!-\w)/i;
 
 /**
  * The private prefix: `.name ` at the START of the message (ADR-034).
@@ -139,17 +143,10 @@ export function stripPrivatePrefixFrom(text: string): string {
  * Punctuation is read by what FOLLOWS it: it continues a token when an alphanumeric comes next
  * (`@alice.smith`) and ends one when anything else does (`ask @alice.`, `@alice, can you`). Mirrors
  * `tokenContinues` in `backend/lambda/src/lib/flow-bypass.ts` - the two sides must agree on where a
- * mention ends or they disagree about who was addressed.
+ * mention ends or they disagree about who was addressed. The message body draws a typed mention as a
+ * chip by the same rule (`@ae/shared/utils/addressTokens.ts`), so a name it resolves is a name it styles.
  */
-const NAME_PUNCTUATION = new Set(['.', '@', '-', '_', '+']);
-
-function tokenContinues(haystack: string, end: number): boolean {
-  const after = haystack[end];
-  if (!after) return false;
-  if (/\w/.test(after)) return true;
-  if (!NAME_PUNCTUATION.has(after)) return false;
-  return /[a-z0-9]/i.test(haystack[end + 1] || '');
-}
+const tokenContinues = nameTokenContinues;
 
 /**
  * Can this member be addressed with a dot at all?
@@ -192,7 +189,7 @@ export function privatePrefixFor(name: string, memberArn?: string): string {
   // callback - so the id goes where the flow can read it, in the text beside the name.
   //
   // Delimited whenever an id is written, because the bare form ends at whitespace and could not hold
-  // the pair. The reader sees the name; the SPA renders the token and the id never reaches them.
+  // the pair. The reader sees the name; `CollapsibleText` draws the token as a chip by name (`@ae/shared/utils/addressTokens.ts`).
   const id = memberArn ? memberArn.split('/').pop() : undefined;
   if (id) return `.<${name}|${id}> `;
   return /\s/.test(name) ? `.<${name}> ` : `.${name} `;
@@ -304,51 +301,6 @@ export function delimitedMentions(
 }
 
 /**
- * The message with every `@<Name|id>` shown as `@Name`, for what a person reads.
- *
- * The id is for the channel flow, which cannot see `CHIME.mentions` and so has to read it out of the
- * text. It is not for the reader, and leaving it in puts a raw identifier in the middle of a sentence.
- * A name carrying whitespace keeps its brackets, because the bare form ends at the first space.
- */
-export function withMentionNamesDisplayed(content: string): string {
-  return content.replace(/@<([^<>\n]{1,128})>/g, (_m, raw: string) => {
-    const cut = raw.lastIndexOf('|');
-    const name = cut > 0 && cut < raw.length - 1 ? raw.slice(0, cut) : raw;
-    return /\s/.test(name) ? `@<${name}>` : `@${name}`;
-  });
-}
-
-/**
- * The message as a PERSON should read it: the address shown by name, with the id taken back out.
- *
- * THE ID IS FOR THE SERVER, NOT FOR THE READER. The composer writes `.<Name|id>` so the backend can
- * resolve the addressee by id rather than by matching a display name, which is what makes a private
- * address land on the member the picker actually selected. Nothing was undoing it at display, so a
- * recipient of `.<Alice|4f3c-...> can you check this` read the literal `Name|id` token - the id, the
- * pipe and the angle brackets included. The comment on `privatePrefixToken` asserted the opposite
- * ("the SPA renders the token and the id never reaches them") and no code did it.
- *
- * ONLY THE ID IS REMOVED. The address itself stays visible, because it is information the reader
- * needs: a message addressed to one person reads differently from one addressed to the room, and
- * stripping it entirely would make a private note look like an open one. So `.<Alice|id> text` renders
- * as `.Alice text`, and the bare `.Alice text` form is already what it should be and is returned
- * unchanged.
- *
- * Content with no private address is returned unchanged, so a caller can apply this to every message.
- */
-export function withPrivateAddressDisplayed(content: string): string {
-  const address = privatePrefixAddress(content);
-  // No address, or a bare token that never carried an id: nothing to take out.
-  if (!address || !address.id) return content;
-  // Rebuild from the NAME half, keeping the delimited form only when the name needs it. A name with
-  // no whitespace reads better bare, which is also the form somebody typing by hand would produce.
-  const shown = /\s/.test(address.name) ? `.<${address.name}>` : `.${address.name}`;
-  // `$1` preserves a leading `/md`, exactly as `stripPrivatePrefixFrom` does: the rendering command is
-  // not part of the address.
-  return content.replace(PRIVATE_PREFIX_DELIMITED, (_m, md: string | undefined) => `${md || ''}${shown} `);
-}
-
-/**
  * Parse `@<member>` mentions out of message text and decide what should
  * become the SendChannelMessage Target and CHIME.mentions attribute.
  *
@@ -360,7 +312,7 @@ export function withPrivateAddressDisplayed(content: string): string {
  *    SDK `SendChannelMessage.Target` field is fixed at 1 item by the AWS
  *    API (TS type is `Target[]` but the API enforces "Array Members:
  *    Fixed number of 1 item.") — see `reference_chime_target_fixed_one`.
- *  - More than one distinct human → `error: 'multiple_humans'`.
+ *  - Any number of humans may be mentioned: a mention is ours to deliver, so a list needs no Target.
  *  - More than one distinct bot → `error: 'multiple_bots'`.
  *  - `@<member>` sets NO Target (ADR-034): addressing is not privacy. The
  *    mentioned members ride CHIME.mentions, and the channel flow routes an
@@ -432,7 +384,7 @@ export function parseMentions(
     // without this, `.Carol @<Sam|sub-1> hi` would pass the contradiction check and go out privately
     // to Carol carrying a live mention of Sam, which is the exact failure the loop below records for
     // the bare form.
-    if (AT_ALL_PATTERN.test(content) || delimitedMatches.length > 0 || candidates.some((m) => {
+    if (AT_ALL_PATTERN.test(content) || AT_HUMANS_PATTERN.test(content) || delimitedMatches.length > 0 || candidates.some((m) => {
       const needle = `@${m.name.toLowerCase()}`;
       // EVERY OCCURRENCE, NOT THE FIRST. `indexOf` returns one index, and if that occurrence failed
       // the boundary test the scan stopped and declared no mention - so ".Carol @Samuel and @Sam hi"
@@ -513,12 +465,13 @@ export function parseMentions(
     return { isAtAll: true, mentionedArns: [] };
   }
 
+  if (AT_HUMANS_PATTERN.test(content)) {
+    return { isAtAll: false, isAtHumans: true, mentionedArns, ...(matched.length > 0 ? { error: 'all_with_member' as const } : {}) };
+  }
+
   const humans = matched.filter((m) => !m.member.isBot);
   const bots = matched.filter((m) => m.member.isBot);
 
-  if (humans.length > 1) {
-    return { isAtAll: false, mentionedArns, error: 'multiple_humans' };
-  }
   if (bots.length > 1) {
     return { isAtAll: false, mentionedArns, error: 'multiple_bots' };
   }
@@ -552,12 +505,10 @@ export function parseMentions(
  *  (composer hint, error toast, etc.) render the same wording. */
 export function mentionValidationMessage(error: MentionValidationError): string {
   switch (error) {
-    case 'multiple_humans':
-      return "Pick one person — direct messages can only target one member at a time. Use @all to address everyone.";
     case 'multiple_bots':
       return "Pick one assistant — only one can be mentioned per message.";
     case 'all_with_member':
-      return "Use either @all or specific @-mentions, not both.";
+      return "Use either @all, @humans or specific @-mentions, not more than one.";
     case 'private_with_mention':
       return "A private message goes to one member only. Remove the @-mention, or remove the dot to send it to everyone.";
   }

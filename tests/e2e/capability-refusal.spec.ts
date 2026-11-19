@@ -134,7 +134,7 @@ test.describe.serial('a request for something the assistant does not offer is re
     const refusal = askerSees.find((m) => m.content.includes(REFUSED_IMAGE));
     expect(refusal, `no refusal reached the asker; bot messages seen: ${JSON.stringify(askerSees.map((m) => m.content.slice(0, 120)))}`).toBeTruthy();
     expect(refusal!.content, 'a basic-only person is sent to an administrator (FR4)').toContain(NEEDS_ACCESS);
-    for (const label of ['Basic', 'Standard', 'Premium']) {
+    for (const label of ['Public', 'Internal', 'Confidential', 'Basic', 'Standard', 'Premium']) {
       expect(refusal!.content, `the no-access line named a classification (FR4): ${label}`).not.toContain(label);
     }
 

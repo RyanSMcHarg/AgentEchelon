@@ -59,6 +59,15 @@ describe('assembleHostGrounding — P1 read split', () => {
     expect(mockDdbSend.mock.calls[0][0].input.Key).toEqual({ channelArn: ARN });
   });
 
+  // SPEC-WORKFLOWS-AND-TASKS WT120: the room's ops assistant reads the alarm its room watches, which the creator recorded on the
+  // server-only row, never anything a member could write.
+  it('forwards the alarm the room watches from the store, and never from Metadata', async () => {
+    mockDdbSend.mockResolvedValue({ Item: { channelArn: ARN, watchedAlarm: 'payments-api-5xx' } });
+    expect((await assembleHostGrounding(ARN, { watchedAlarm: 'LEAKED' } as never)).domainGrounding.watchedAlarm).toBe('payments-api-5xx');
+    mockDdbSend.mockResolvedValue({});
+    expect((await assembleHostGrounding(ARN, { watchedAlarm: 'LEAKED' } as never)).domainGrounding.watchedAlarm).toBeUndefined();
+  });
+
   it('never reads the private fields from Metadata — a stale leaked value there is ignored when the store is empty', async () => {
     mockDdbSend.mockResolvedValue({}); // store has no row ⇒ getChannelContext → null
     const { domainGrounding } = await assembleHostGrounding(ARN, {
@@ -216,7 +225,7 @@ describe('assembleHostGrounding — the roster is channel membership', () => {
   // The partner's pool, declared in the trusted-issuer registry beside this deployment's own.
   beforeAll(() => {
     process.env.TRUSTED_ISSUERS = JSON.stringify([
-      { id: 'partner', kind: 'cognito-pool', pool: 'us-east-1_partner', iss: FED_ISS, subject: ['sub'], clearance: { oneChannel: 'basic', classifications: ['basic'] }, admin: false, groupsClaim: 'cognito:groups' },
+      { id: 'partner', kind: 'cognito-pool', pool: 'us-east-1_partner', iss: FED_ISS, subject: ['sub'], clearance: { fixed: ['basic'], classifications: ['basic'] }, admin: false, groupsClaim: 'cognito:groups' },
     ]);
   });
   afterAll(() => { delete process.env.TRUSTED_ISSUERS; });

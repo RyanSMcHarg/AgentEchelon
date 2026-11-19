@@ -222,6 +222,10 @@ const CONTROLLED: Record<string, Controlled> = {
         'NOT AN ALERT: the one publisher of received vendor events (`ae.connector`), a different source the alert '
         + 'rule never matches, granted `events:PutEvents` for that source alone. A connector raises an alert '
         + 'through `postAdminNotice` like everything else.',
+      'backend/lambda/src/lib/meeting-lifecycle-publish.ts':
+        'NOT AN ALERT: the one publisher of a meeting\'s lifecycle events for its conversation\'s router (`agentechelon.meetings`, '
+        + '`meeting-lifecycle.ts`): its start and end, a change of transcription mode and a recording\'s finish. A source the '
+        + 'alert rule never matches, granted `events:PutEvents` for that source alone.',
     },
   },
 
@@ -292,6 +296,8 @@ const CONTROLLED: Record<string, Controlled> = {
       'backend/lambda/src/lib/offboarding.ts':
         'An admin-plane twin\'s `owner` tag, read before offboarding removes the twin, through the Amazon '
         + 'Chime SDK identity client. A twin is an AppInstanceUser, not a channel.',
+      'backend/lambda/src/event-triggers-api.ts':
+        'The watch rules a type holds, listed by their EventBridge tags for the console. A rule is not a channel.',
     },
   },
 
@@ -407,6 +413,8 @@ const CONTROLLED: Record<string, Controlled> = {
     sites: {
       'backend/lambda/src/lib/archive-reader.ts': 'THE archive reader: the one place the mode is selected for a read.',
       'backend/lambda/src/lib/data-plane-client.ts': 'The definition of the switch.',
+      'backend/lambda/src/lib/meeting-event-reader.ts': 'The meetings capability reads its own archive family (`meeting_events`), which the core reader does not know: putting it on `ArchiveReader` would make the core depend on a capability a deployment may leave out. It runs its Athena query through the canonical `runArchiveQuery` and selects the mode once, as `archiveReader()` does.',
+      'backend/lambda/src/lib/meeting-event-archive.ts': 'The meeting events WRITE path, not an archive read: every event is filed in the conversation archive first, and projected into Aurora only where a data plane is wired.',
       'backend/lambda/src/lib/event-archive.ts': "The event WRITE path (Firehose in Athena mode, the data plane in Aurora mode) for client events and platform events, and offboarding's erasure of a person's own projection rows (Aurora mode only), not an archive read.",
     },
   },

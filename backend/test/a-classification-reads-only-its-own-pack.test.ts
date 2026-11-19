@@ -1,7 +1,7 @@
 /**
  * A CLASSIFICATION READS ONLY ITS OWN INTENT PACK, AND ONLY ITS OWN DEPLOY WRITES IT (tenets D13, D15, P4).
  *
- * The pack's body lives at `classification-packs/{classification}/{sha256}/intentPack` in the attachments
+ * The pack's body lives at `classification-packs/{classification}/{sha256}/intentPack` in the profile
  * bucket and the classification's parameter holds a pointer. The prefix names the classification so IAM
  * can scope both verbs to it, which is only worth anything if the synthesized grants actually do. These
  * read the TEMPLATE, because a grant that is too wide does not fail a unit test: it fails nobody.
@@ -21,7 +21,7 @@ import { packPointerOf, MAX_INTENT_PACK_BYTES } from '../lambda/src/lib/intent-p
 const PACK = JSON.stringify({
   intents: [{ key: 'find_recipe', description: 'Find a recipe', keywords: ['recipe'], delivery: 'PLACEHOLDER_UPDATE' }],
 });
-const BUCKET = 'arn:aws:s3:::test-bucket';
+const BUCKET = CLASSIFICATION_TEST_PROPS.profileBucketArn;
 
 type Resource = { Type: string; Properties?: Record<string, any>; DependsOn?: string[] };
 
@@ -118,7 +118,7 @@ describe('a classification reads only its own intent pack', () => {
     expect(() => synth('basic', { assistantIntentPack: large })).not.toThrow();
   });
 
-  it('names the pack prefix as an object ARN in the deployment bucket', () => {
+  it('names the pack prefix as an object ARN in the profile bucket', () => {
     expect(JSON.stringify(all)).toContain(`${BUCKET}/classification-packs/basic/*`);
   });
 });

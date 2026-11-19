@@ -83,7 +83,7 @@ const fail = (m) => { failures.push(m); console.error(`  FAIL  ${m}`); };
  * THE VEND ROLES, from where each is built: every person vend role is on the instance's exchange path
  * (`/<instance>/exchange/`, `lib/constructs/exchange-role.ts`), named `<instance>-exchange-<token>`, whichever
  * stack built it (`Assistants-<classification>` for a conversational classification, `Identity` for the admin
- * plane and the one-conversation role). The admin backend's admin-plane role is AdminServices' (absent on a
+ * plane and the `restricted` role). The admin backend's admin-plane role is AdminServices' (absent on a
  * deployment without the `admin` capability), found by logical id.
  */
 async function exchangeRoleResources() {
@@ -92,7 +92,7 @@ async function exchangeRoleResources() {
   const listed = awsIam(['list-roles', '--path-prefix', `/${INSTANCE}/exchange/`]).Roles || [];
   for (const r of listed) {
     const token = r.RoleName.startsWith(namePrefix) ? r.RoleName.slice(namePrefix.length) : '';
-    // The one-conversation role asserts `restricted`, which is not a classification and is checked the same way.
+    // The `restricted` role asserts `restricted`, which is not a classification and is checked the same way.
     if (token) out.push({ logicalId: r.RoleName, roleName: r.RoleName, expected: token });
   }
   try {

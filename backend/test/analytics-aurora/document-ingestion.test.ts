@@ -17,6 +17,7 @@ const mockDbQuery = jest.fn();
 jest.mock('@aws-sdk/client-s3', () => ({
   S3Client: jest.fn().mockImplementation(() => ({ send: mockS3Send })),
   GetObjectCommand: jest.fn().mockImplementation((args) => ({ __type: 'GetObject', input: args })),
+  HeadObjectCommand: jest.fn().mockImplementation((args) => ({ __type: 'HeadObject', input: args })),
 }));
 
 jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
@@ -224,6 +225,8 @@ export {};
 describe('an object removed from the corpus', () => {
   it('deletes its chunks, as the writer role, and fetches and embeds nothing', async () => {
     mockDbQuery.mockResolvedValue({ rows: [], rowCount: 12 });
+    // The key has no current object: HEAD answers 404.
+    mockS3Send.mockRejectedValueOnce(Object.assign(new Error('Not Found'), { name: 'NotFound', $metadata: { httpStatusCode: 404 } }));
     const { handler } = await import('../../lambda/src/analytics-aurora/document-ingestion');
     const event = {
       Records: [{
@@ -242,10 +245,43 @@ describe('an object removed from the corpus', () => {
     expect(mockBedrockSend).not.toHaveBeenCalled();
   });
 
+  it('keeps the chunks of a document whose current version still stands, and ingests it as it stands', async () => {
+    // Deleting an old version, or deleting a delete marker to restore one, fires a removal event while the key
+    // still has a current object. Its chunks stay, and the current version is what is ingested.
+    mockS3Send.mockResolvedValueOnce({ ETag: '"current-etag"' });
+    // The current version is already ingested: its ETag has chunks, so nothing is deleted or re-embedded.
+    mockDbQuery.mockResolvedValue({ rows: [{ count: '1' }], rowCount: 1 });
+    const { handler } = await import('../../lambda/src/analytics-aurora/document-ingestion');
+    const event = {
+      Records: [{
+        eventName: 'ObjectRemoved:Delete',
+        s3: { bucket: { name: 'test-bucket' }, object: { key: 'rag/company/premium/doc.md' } },
+      }],
+    };
+    const result = await handler(event as never);
+    const sql = mockDbQuery.mock.calls.map((c) => String(c[0]));
+    expect(sql).not.toContain('DELETE FROM embeddings WHERE source_id = $1 AND source_type = $2');
+    expect(mockS3Send.mock.calls[0][0]).toMatchObject({ __type: 'HeadObject', input: { Bucket: 'test-bucket', Key: 'rag/company/premium/doc.md' } });
+    expect(result.ingested.map((r) => r.sourceId)).toEqual(['s3://test-bucket/rag/company/premium/doc.md']);
+  });
+
+  it('retries a removal whose current object cannot be checked, rather than purging on a guess', async () => {
+    mockS3Send.mockRejectedValueOnce(Object.assign(new Error('Slow Down'), { name: 'SlowDown', $metadata: { httpStatusCode: 503 } }));
+    const { handler } = await import('../../lambda/src/analytics-aurora/document-ingestion');
+    const event = {
+      Records: [{
+        eventName: 'ObjectRemoved:Delete',
+        s3: { bucket: { name: 'test-bucket' }, object: { key: 'rag/company/premium/doc.md' } },
+      }],
+    };
+    await expect(handler(event as never)).rejects.toThrow(/not ingested/);
+    expect(mockDbQuery.mock.calls.map((c) => String(c[0]))).not.toContain('DELETE FROM embeddings WHERE source_id = $1 AND source_type = $2');
+  });
+
   it('the stack sends removal events under rag/ to the ingestion function', () => {
     const fs = require('fs') as typeof import('fs');
     const path = require('path') as typeof import('path');
     const stack = fs.readFileSync(path.join(__dirname, '../../lib/stacks/archive-stack-aurora.ts'), 'utf8');
-    expect(stack).toContain("archiveBucket.addObjectRemovedNotification(\n      new s3n.LambdaDestination(documentIngestionLambda),\n      { prefix: 'rag/' },");
+    expect(stack).toContain("corpusBucket.addObjectRemovedNotification(\n      new s3n.LambdaDestination(documentIngestionLambda),\n      { prefix: 'rag/' },");
   });
 });

@@ -15,7 +15,7 @@ Related: [SPEC-CONVERSATION-SECURITY](../../specs/interaction/governance/SPEC-CO
 Amazon Chime SDK channel `Metadata` is a single JSON blob (capped at about 1 KB) returned by `DescribeChannel`, and `DescribeChannel` is part of the default `view` capability every channel member holds. **Anything written into channel metadata is disclosed to every member of that channel** - including members added later by a share, and federated guests.
 
 ### Fields as built
-Display-level data only. The create paths write these through `createConversationCore` in `backend/lambda/src/lib/channel-creation.ts` (person, drift, typed, a host's context create and add, the proactive briefing); a host's add (`membershipHandler` in `conversation-management.ts`) also refreshes them on an existing conversation:
+Display-level data only. The create paths write these through `createConversationCore` in `backend/lambda/src/lib/channel-creation.ts` (person, drift, typed, a host's add, the proactive briefing); a host's add (`membershipHandler` in `conversation-management.ts`) also refreshes them on an existing conversation:
 - `modelId`, `modelName` (display labels; nothing decides from them)
 - `modelTier` (the classification name; the non-authoritative mirror of the tag)
 - `membershipSource` (a display hint so the client can show Share disabled; the share Lambda refuses from the copy in the context store)
@@ -86,12 +86,12 @@ The admin credential exchange writes the owner tag (`ensureAdminIdentity` in `ba
 
 The sensitive host grounding a conversation carries - `participantProfile`, `domainContext`, `otherContexts`, and the resolved `userName` - is stored in a **server-only DynamoDB table** (`ChannelContextTable` in `conversations-stack.ts`, keyed by `channelArn`). The same table holds the member roster (`participants`, `memberIdentities`), `onboardingIntake`, `conversationType`, `membershipSource`, and the drift carry-over (`priorSubject`, `priorMessage`, `parentRef`). The owned fields are listed in `OWNED_FIELDS` in `channel-context-client.ts`; a field absent from that list is discarded on write.
 
-No member principal is granted access. Writers are the conversation-create Lambdas (person and context create, a host's add, the proactive briefing) and the assistant Lambdas (router handler, async processor, conversation split, event creation), each with `UpdateItem` (plus `GetItem` on the assistant side) and no `PutItem`, `DeleteItem` or `Scan`. Readers are the assistant Lambdas, the membership reconcile (a keys-only `Query` on the `ByConversationType` index), and the share-conversation Lambda in `notification-stack.ts` (`GetItem`, for `membershipSource`). Grants are in `conversations-stack.ts`, `assistant-profile-stack.ts` and `notification-stack.ts`.
+No member principal is granted access. Writers are the conversation-create Lambdas (person create, a host's add, the proactive briefing) and the assistant Lambdas (router handler, async processor, conversation split, event creation), each with `UpdateItem` (plus `GetItem` on the assistant side) and no `PutItem`, `DeleteItem` or `Scan`. Readers are the assistant Lambdas, the membership reconcile (a keys-only `Query` on the `ByConversationType` index), and the share-conversation Lambda in `notification-stack.ts` (`GetItem`, for `membershipSource`). Grants are in `conversations-stack.ts`, `assistant-profile-stack.ts` and `notification-stack.ts`.
 
 **OPEN:** nothing deletes a row, so a conversation's `onboardingIntake`, `memberIdentities` and `domainContext` outlive the channel's expiration (see the comment on the table in `conversations-stack.ts`).
 
 Read and written through `backend/lambda/src/lib/channel-context-client.ts`:
-- `putChannelContext(channelArn, { participantProfile, domainContext, otherContexts, userName, userLanguage, segment })` to write (a host's context create and add).
+- `putChannelContext(channelArn, { participantProfile, domainContext, otherContexts, userName, userLanguage, segment })` to write (a host's add).
 - `getChannelContext(channelArn)` to read (router grounding).
 
 **Routing signals.** `userLanguage` and `segment` decide which model answers the turn (`segment.country === 'CN'` routes to the Chinese model) and which language it replies in. Channel metadata is member-writable, so sourcing them from it would let a member choose the model serving their own conversation. They are written server-side and read only from the store. `host-grounding.ts` reads them from the store alone, and a value found in metadata is ignored and reported.

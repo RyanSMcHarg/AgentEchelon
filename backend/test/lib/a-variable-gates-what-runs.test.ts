@@ -462,7 +462,9 @@ describe('the processor resolves ctx: values from the sources its turn already r
   it('the router reads no catalog: a ctx: source is checked as the least-permitting entry and inserts its fallback (source)', () => {
     const router = read('router-agent-handler.ts');
     expect(router).not.toMatch(/readPublishedCatalog|context-sources`/);
-    expect(router).toMatch(/lookup: withUnreadCatalog\(versionLookup\(buildSourceTable\(\{ catalog: \[\] \}\), variables\)\)/);
+    // The router's resolver is the shared one the console's welcome preview calls too (`routerHeldVariables`).
+    expect(router).toMatch(/return routerHeldVariables\(variables,/);
+    expect(read('lib/variables.ts')).toMatch(/lookup: withUnreadCatalog\(versionLookup\(buildSourceTable\(\{ catalog: \[\] \}\), variables\), variables\)/);
     const lookup = versionLookup(buildSourceTable({ catalog: [] }), { stage: { source: 'ctx:deal.stage' } });
     expect(decidingValues([{ stage: 'won' }], { lookup, values: { 'ctx:deal.stage': 'won' }, site: { callSite: turnCallSite(undefined, 'c'), audience: 'addressed' } })).toEqual({});
   });

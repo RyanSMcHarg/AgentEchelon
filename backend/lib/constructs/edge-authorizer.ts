@@ -17,7 +17,7 @@
  *
  * Each HTTP API has its own edge authorizer, because an authorizer belongs to one API.
  *
- *  - `person` (`PersonApi`): a person reaches every route; a one-conversation person `ONE_CHANNEL_ROUTES`;
+ *  - `person` (`PersonApi`): a person reaches every route;
  *    a guest `GUEST_ROUTES`; a first sign-in the exchange alone.
  *  - `admin` (`AdminApi`): the one route there a token reaches, the console session, and only for an
  *    issuer that declares `admin: true`. Every other admin route is IAM. The admin exchange refuses again
@@ -46,7 +46,7 @@ import { HttpLambdaAuthorizer, HttpLambdaResponseType } from 'aws-cdk-lib/aws-ap
 import { Construct } from 'constructs';
 import * as path from 'path';
 import { EDGE_RESULT_TTL_SECONDS, edgeIssuers } from '../config/edge-verification';
-import { GUEST_ROUTES, ONE_CHANNEL_ROUTES, issuersOf } from './trusted-issuers';
+import { GUEST_ROUTES, issuersOf } from './trusted-issuers';
 import { INSTANCE_NAME } from '../stacks/agent-classification-common';
 import { grantTokenKinds } from './token-store';
 import { boundRole, functionLogsBoundary, permissionsBoundary } from './permissions-boundary';
@@ -69,10 +69,10 @@ const IDENTITY_SOURCE = ['$request.header.Authorization'];
 export type EdgePlane = 'person' | 'admin';
 
 /** The route lists one plane's function is handed, as `METHOD /path`. */
-export function edgeRoutesFor(plane: EdgePlane): { plane: EdgePlane; exchange: string[]; oneChannel: string[]; guest: string[]; admin: string[] } {
+export function edgeRoutesFor(plane: EdgePlane): { plane: EdgePlane; exchange: string[]; guest: string[]; admin: string[] } {
   return plane === 'admin'
-    ? { plane, exchange: [], oneChannel: [], guest: [], admin: [ADMIN_SESSION_ROUTE] }
-    : { plane, exchange: [EXCHANGE_ROUTE], oneChannel: [...ONE_CHANNEL_ROUTES], guest: [...GUEST_ROUTES], admin: [] };
+    ? { plane, exchange: [], guest: [], admin: [ADMIN_SESSION_ROUTE] }
+    : { plane, exchange: [EXCHANGE_ROUTE], guest: [...GUEST_ROUTES], admin: [] };
 }
 
 export interface EdgeAuthorizerProps {

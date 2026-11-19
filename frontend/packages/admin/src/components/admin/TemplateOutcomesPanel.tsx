@@ -44,10 +44,10 @@ const TemplateOutcomesPanel: React.FC<{
 
   return (
     <div className="admin-section" role="region" aria-label={t('admin.templateOutcomes.title')}>
-      <h4>
+      <h3>
         {t('admin.templateOutcomes.title')}{' '}
         <InfoTooltip label={t('admin.templateOutcomes.title')} content={t('admin.templateOutcomes.tip')} />
-      </h4>
+      </h3>
       {error && <p className="admin-error" role="alert">{error}</p>}
       {!error && rows === null && <p className="admin-help-text">{t('admin.templateOutcomes.loading')}</p>}
       {!error && rows !== null && rows.length === 0 && <p className="admin-tab-empty">{t('admin.templateOutcomes.empty')}</p>}

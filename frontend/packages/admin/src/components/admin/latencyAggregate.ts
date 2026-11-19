@@ -111,3 +111,26 @@ export function coverage(m: WeightedMetric, scopeTurns: number): string {
 export function measuredValue(m: WeightedMetric): number {
   return m.turns > 0 || m.rows > 0 ? m.value : NaN;
 }
+
+/** TTFF over the turns that arrived one way: `flow` (standard), `lex` (targeted) or `platform`. */
+export interface TtffByEntry {
+  key: 'flow' | 'lex' | 'platform';
+  turns: number;
+  ttff: number;
+  metric: WeightedMetric;
+}
+
+/**
+ * TTFF BY HOW THE TURN ARRIVED, over the surface's one population (`latencyPopulation`): the figure the Latency section
+ * leads with and the one the Performance overview's TTFF card shows, computed here once so the two can never disagree.
+ * An entry no turn arrived by is left out.
+ */
+export function ttffByEntry(rows: readonly LatencyRow[], filters: PerformanceFilters, includeTasks = false): TtffByEntry[] {
+  const scoped = latencyPopulation(rows, filters, includeTasks);
+  return (['flow', 'lex', 'platform'] as const)
+    .map((key) => {
+      const metric = weightedMetric(scoped.filter((r) => String(r.turn_entry ?? 'unknown') === key), 'avg_ttff_ms');
+      return { key, turns: metric.turns, ttff: metric.value, metric };
+    })
+    .filter((s) => s.turns > 0);
+}

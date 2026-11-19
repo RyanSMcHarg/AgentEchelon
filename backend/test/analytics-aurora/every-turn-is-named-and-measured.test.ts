@@ -198,7 +198,8 @@ describe('the drill reads the population the breakdown counts', () => {
     // The GROUP BY order: day, assistant, label, entry, role, version, round, classification.
     const param = ['$2::date', '$3', '$4', '$8', '$5', '$6', '$11', '$7'];
     dims.forEach((d, i) => {
-      expect(drill).toContain(`${d} = ${param[i]})`);
+      // The version is a list of the versions chosen, and every other grouping is one value.
+      expect(drill).toContain(param[i] === '$6' ? `${d} = ANY($6))` : `${d} = ${param[i]})`);
     });
   });
 

@@ -58,6 +58,7 @@ import {
   invokeBedrock, actAsAssistant, releaseAssistantIdentity, insertIntoCacheablePrefix, PROMPT_CACHE_MIN_PREFIX_CHARS,
 } from '../../lambda/src/lib/async-processor-core';
 import { buildDigestHint } from '../../lambda/src/lib/company-context';
+import { vendAssistantSession } from '../../lambda/src/lib/assistant-session';
 
 const config = { model: 'anthropic.claude-sonnet-4-6', maxTokens: 1024, userType: 'basic' as const };
 const STABLE = 'PERSONA AND HOST CONTEXT '.repeat(200);
@@ -102,6 +103,40 @@ describe('the company document menu is cached', () => {
     const system = mockBedrockSend.mock.calls[0][0].input.system;
     expect(JSON.stringify(system)).not.toContain('AVAILABLE COMPANY CONTEXT');
     expect(mockLoadDigest).not.toHaveBeenCalled();
+  });
+
+  it("has no menu when the version's tools do not include load_company_context", async () => {
+    await invokeBedrock(STABLE + SUFFIX, [{ role: 'user', content: 'hi' }], { ...config, tools: ['add_item'] }, undefined, true, false, undefined, STABLE.length);
+
+    const input = mockBedrockSend.mock.calls[0][0].input;
+    expect(JSON.stringify(input.system)).not.toContain('AVAILABLE COMPANY CONTEXT');
+    expect(mockLoadDigest).not.toHaveBeenCalled();
+  });
+
+  it("places the menu when the version's tools include load_company_context", async () => {
+    await invokeBedrock(STABLE + SUFFIX, [{ role: 'user', content: 'hi' }], { ...config, tools: ['load_company_context'] }, undefined, true, false, undefined, STABLE.length);
+
+    expect(mockBedrockSend.mock.calls[0][0].input.system[0]).toEqual({ text: STABLE + buildDigestHint(DIGEST) });
+  });
+
+  it('does not offer read_deployment_health to a turn acting in the primary role', async () => {
+    await invokeBedrock(STABLE + SUFFIX, [{ role: 'user', content: 'hi' }], config, undefined, true, false, undefined, STABLE.length);
+
+    const offered = (mockBedrockSend.mock.calls[0][0].input.toolConfig?.tools ?? []).map((t: { toolSpec?: { name: string } }) => t.toolSpec?.name);
+    expect(offered).toContain('load_company_context');
+    expect(offered).not.toContain('read_deployment_health');
+  });
+
+  it('offers read_deployment_health to a turn acting in the ops role', async () => {
+    releaseAssistantIdentity();
+    (vendAssistantSession as jest.Mock).mockResolvedValueOnce({
+      assistant: 'ops-basic', role: 'ops', botArn: 'arn:aws:chime:us-east-1:111122223333:app-instance/a/bot/o', credentials: ROLE_CREDS,
+    });
+    await actAsAssistant('corr-menu-ops');
+    await invokeBedrock(STABLE + SUFFIX, [{ role: 'user', content: 'hi' }], config, undefined, true, false, undefined, STABLE.length);
+
+    const offered = (mockBedrockSend.mock.calls[0][0].input.toolConfig?.tools ?? []).map((t: { toolSpec?: { name: string } }) => t.toolSpec?.name);
+    expect(offered).toContain('read_deployment_health');
   });
 
   it('appends the menu to an uncached prompt when the caller names no prefix', async () => {

@@ -175,18 +175,18 @@ describe('the route: the minimum is the active version\'s', () => {
     const { client } = mockStore.current!;
     // The active version declares a minimum; the empty set has no regression entry, so its own activation proceeds.
     await createDraft(client, ROOT, 'advisor', 'admin-sub');
-    await editDraft(client, ROOT, 'advisor', { goldenSet: { minRegressionPerIntent: 2 } }, 'admin-sub');
-    const first = await handler(evt('/admin/profiles/activate', { profileName: 'advisor' }));
+    const firstDraft = await editDraft(client, ROOT, 'advisor', { goldenSet: { minRegressionPerIntent: 2 } }, 'admin-sub');
+    const first = await handler(evt('/admin/profiles/activate', { profileName: 'advisor', configId: firstDraft.configId }));
     expect([first.statusCode, first.body]).toEqual([200, expect.any(String)]);
 
     // A draft that lowers it is measured against the active version's 2, not its own.
     await createDraft(client, ROOT, 'advisor', 'admin-sub');
-    await editDraft(client, ROOT, 'advisor', { goldenSet: { minRegressionPerIntent: 1 } }, 'admin-sub');
+    const lowered = await editDraft(client, ROOT, 'advisor', { goldenSet: { minRegressionPerIntent: 1 } }, 'admin-sub');
     const gate = parse(await handler(evt('/admin/profiles/golden-gate', { profileName: 'advisor' })));
     expect(gate.gate.minRegressionPerIntent).toBe(2);
     expect(gate.outcome).toMatchObject({ proceed: false, code: 'GOLDEN_SET_THIN', params: { min: 2 } });
     expect(mockAsked.at(-1)).toMatchObject({ op: 'gate', intents: expect.arrayContaining(['report_generation']) });
-    const refused = await handler(evt('/admin/profiles/activate', { profileName: 'advisor' }));
+    const refused = await handler(evt('/admin/profiles/activate', { profileName: 'advisor', configId: lowered.configId }));
     expect(refused.statusCode).toBe(409);
     expect(parse(refused).code).toBe('GOLDEN_SET_THIN');
   });

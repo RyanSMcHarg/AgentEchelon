@@ -72,11 +72,8 @@ jobs:
         run: npm ci
 
       - name: Jest
+        # Two workers, the jest config's default, which also fits a hosted runner's 2 cores.
         run: npx jest --shard=${{ matrix.shard }}/4 --ci
-        env:
-          # The jest config defaults to 4 workers, sized for a dev box. A hosted runner has 2 cores,
-          # and 4 ts-jest workers each holding a full TS program thrash it.
-          JEST_MAX_WORKERS: '2'
 
   frontend:
     name: Frontend lint + build

@@ -19,17 +19,20 @@ const en = require('../../../frontend/packages/shared/src/locales/en.json');
 beforeEach(() => mockDdbSend.mockReset());
 
 describe('sharing a conversation whose membership comes from a source', () => {
-  it('reads the source from the context row', async () => {
-    mockDdbSend.mockResolvedValue({ Item: { membershipSource: { S: 'group:ops' } } });
-    expect(await __forTests.enforcedMembershipSource('arn:ch')).toBe('group:ops');
-    expect(mockDdbSend.mock.calls[0][0].input).toMatchObject({ TableName: 'ctx-table', ProjectionExpression: 'membershipSource' });
+  it('reads the source and the type from one read of the context row', async () => {
+    mockDdbSend.mockResolvedValue({ Item: { membershipSource: { S: 'group:ops' }, conversationType: { S: 'general' } } });
+    expect(await __forTests.conversationRowOf('arn:ch')).toEqual({ membershipSource: 'group:ops', typeKey: 'general' });
+    expect(mockDdbSend).toHaveBeenCalledTimes(1);
+    expect(mockDdbSend.mock.calls[0][0].input).toMatchObject({ TableName: 'ctx-table', ProjectionExpression: 'membershipSource, conversationType' });
   });
 
-  it('allows the share when the row has no source, and when the row cannot be read', async () => {
+  it('reads no source on a row naming none, and refuses when the row cannot be read', async () => {
     mockDdbSend.mockResolvedValue({ Item: {} });
-    expect(await __forTests.enforcedMembershipSource('arn:ch')).toBe('');
+    expect(await __forTests.conversationRowOf('arn:ch')).toMatchObject({ membershipSource: '' });
+    const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     mockDdbSend.mockRejectedValue(Object.assign(new Error('x'), { name: 'ThrottlingException' }));
-    expect(await __forTests.enforcedMembershipSource('arn:ch')).toBe('');
+    expect(await __forTests.conversationRowOf('arn:ch')).toBeNull();
+    error.mockRestore();
   });
 
   it('refuses in the same words the client tooltip uses', () => {

@@ -273,7 +273,7 @@ async function main() {
       consoleCall,
       signInAgain: () => signIn().catch(() => null),
       readmit: { issuer: claims.iss, subject: claims.sub },
-      // The one-conversation vend names one conversation; it need not exist for the exchange to mint or refuse.
+      // The channel need not exist for the exchange to mint or refuse.
       body: { channelArn: `${appInstanceArn}/channel/deny-test-${randomUUID()}` },
     });
   }

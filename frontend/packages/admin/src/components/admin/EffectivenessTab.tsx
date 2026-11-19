@@ -14,6 +14,8 @@ import {
 import PerformanceFilterBar, { type PerformanceFilters } from './PerformanceFilters';
 import DeliveredDocumentsPanel from './DeliveredDocumentsPanel';
 import WorkflowTrajectoryPanel from './WorkflowTrajectoryPanel';
+import WorkflowEditionsPanel from './WorkflowEditionsPanel';
+import WorkflowEditorLink from './WorkflowEditorLink';
 import SafetyReadingsPanel from './SafetyReadingsPanel';
 import FrustrationPanel from './FrustrationPanel';
 import RetrievalSourcesPanel from './RetrievalSourcesPanel';
@@ -794,7 +796,7 @@ const ToolFailurePanel: React.FC<{ tool: ToolAgg; onOpenConversation?: (channelA
   return (
     <div className="admin-review-panel" style={{ marginTop: 12 }}>
       <div className="admin-conversation-header">
-        <h4 style={{ margin: 0 }}>{tool.name} — {tool.errors} of {tool.calls} calls failed</h4>
+        <h3 style={{ margin: 0 }}>{tool.name} — {tool.errors} of {tool.calls} calls failed</h3>
         <button className="btn-secondary" onClick={onClose}>Close ✕</button>
       </div>
 
@@ -881,10 +883,10 @@ const ToolLensPanel: React.FC<{
   const title = translate(titleKey);
   return (
     <div style={{ marginTop: 16 }}>
-      <h4 style={{ margin: '0 0 6px' }}>
+      <h3 style={{ margin: '0 0 6px' }}>
         {title}{' '}
         <InfoTooltip content={translate(tipKey)} label={translate('admin.effectiveness.column.aboutAria', { label: title })} />
-      </h4>
+      </h3>
       {tools === null ? (
         <p className="admin-tab-description">{translate('admin.effectiveness.loadingToolUsage')}</p>
       ) : tools.length === 0 ? (
@@ -1482,7 +1484,7 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
     ...(filters.assistant ? { agentType: filters.assistant } : {}),
     ...(filters.classification ? { conversationClassification: filters.classification } : {}),
     ...(filters.role ? { assistantRole: filters.role } : {}),
-    ...(filters.version ? { profileVersion: String(filters.version) } : {}),
+    ...(filters.version ? { profileVersion: filters.version.join(',') } : {}),
   }), [filters.assistant, filters.classification, filters.role, filters.version]);
   const [drillLoading, setDrillLoading] = useState(false);
   // Server-side pagination for the L2 list (exchanges / tasks): the backend returns one page + the
@@ -1543,7 +1545,7 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
           // ONE SOURCE FOR THE SCOPE, so the drill asks for exactly the population the bar shows.
           ...(filters.assistant ? { agentType: filters.assistant } : {}),
           ...(filters.role ? { assistantRole: filters.role } : {}),
-          ...(filters.version ? { profileVersion: filters.version } : {}),
+          ...(filters.version ? { profileVersion: filters.version.join(',') } : {}),
         };
         // Server-paginated L2 window: one page of rows + the total, so nothing is hidden past a cap.
         const pageWin = { limit: String(DRILL_PAGE_SIZE), offset: String(drillPage * DRILL_PAGE_SIZE) };
@@ -1619,7 +1621,7 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
             combinations read, which is a page of SPEC-ADMIN-CONSOLE-EFFECTIVENESS reproduced in a
             tooltip where it could silently diverge from it. Each column keeps its own `hdr()` tooltip,
             so a definition is still one hover from the column it describes - nearer than it was here. */}
-        <h3>
+        <h2>
           {translate('admin.effectiveness.title')}
           <InfoTooltip
             label={translate('admin.effectiveness.howToReadTheEffectiveness')}
@@ -1630,7 +1632,7 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
               </>
             }
           />
-        </h3>
+        </h2>
         {drill.level > 0 && <nav className="admin-breadcrumb" aria-label={translate('admin.effectiveness.drillPath')}>{crumbs}</nav>}
       </div>
 
@@ -1690,6 +1692,7 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
           <DeliveredDocumentsPanel dateRange={dateRange} />
           <TemplateOutcomesPanel dateRange={dateRange} assistant={filters.assistant} classification={filters.classification} />
           <WorkflowTrajectoryPanel dateRange={dateRange} assistant={filters.assistant} classification={filters.classification} />
+          <WorkflowEditionsPanel dateRange={dateRange} assistant={filters.assistant} classification={filters.classification} />
           <SafetyReadingsPanel dateRange={dateRange} assistant={filters.assistant} classification={filters.classification} />
           <ToolOutcomesPanel dateRange={dateRange} assistant={filters.assistant} classification={filters.classification} />
           <RetrievalSourcesPanel dateRange={dateRange} assistant={filters.assistant} classification={filters.classification} />
@@ -1700,8 +1703,16 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
       {drill.level === 1 && (() => {
         const row = intentRow(drill.intent);
         if (!row) return <div className="admin-info-banner">{translate('admin.effectiveness.noDataFor', { intent: drill.intent })}</div>;
+        // The definition that served the intent, when one did: over several, the row's name is only the most common, so the
+        // workflow opened is the assistant the view is narrowed to, or none.
+        const servedBy = (num(row.assistant_definition_count) > 1 ? '' : String(row.assistant ?? '')) || filters.assistant;
         return (
           <>
+          {/* THE INTENT'S WORKFLOW, in the editor of the assistant whose definition served it. */}
+          <p className="admin-help-text">
+            <WorkflowEditorLink assistant={servedBy} workflow={drill.intent} linkOnly
+              testId="effectiveness-intent-workflow-link">{translate('admin.workflowLink.intent', { intent: drill.intent })}</WorkflowEditorLink>
+          </p>
           <L1Intent
             row={row}
             toolLens={toolLens}
@@ -1712,7 +1723,7 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
             onOpenConversation={onOpenConversation}
             hideLowN={hideLowN}
           />
-          <IntentStepBreakdown intent={drill.intent} step={drill.step} dateRange={dateRange} filters={filters}
+          <IntentStepBreakdown intent={drill.intent} step={drill.step} dateRange={dateRange} filters={filters} assistant={servedBy}
             onStep={(step) => {
               setDrill({ level: 1, intent: drill.intent, ...(step ? { step } : {}) });
               // The step rides the URL beside the intent, so the narrowed view can be sent to someone.
@@ -1720,10 +1731,10 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
             }} />
           {ratings && (
             <div className="admin-section admin-metric-drill" role="region" aria-label={translate('admin.effectiveness.userRatings')}>
-              <h4>
+              <h3>
                 {translate('admin.effectiveness.ratingsTitle', { intent: ratings.intent })}
                 <button className="btn-secondary" style={{ marginLeft: 'var(--space-3)' }} onClick={() => setRatings(null)}>{translate('admin.effectiveness.close')}</button>
-              </h4>
+              </h3>
               <p className="admin-tab-description">
                 {translate('admin.effectiveness.everyRatedReplyInThe')}
               </p>
@@ -1767,6 +1778,14 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
             onRowClick={(row) => setDrill({ level: 3, intent: drill.intent, taskId: String(row.task_id) })}
             columns={[
               { key: 'task_id', label: 'Task', render: (v) => <button className="btn-link" onClick={() => setDrill({ level: 3, intent: drill.intent, taskId: String(v) })}>{shortId(v)}</button> },
+              {
+                // THE MACHINE EACH TASK RAN UNDER, in the editor of the assistant whose turns worked it.
+                key: 'task_type', label: translate('admin.effectiveness.taskWorkflow'), sortable: false,
+                render: (v, row) => (v ? (
+                  <WorkflowEditorLink assistant={String((row as Row).assistant ?? '') || filters.assistant} task={String(v)}
+                    testId={`effectiveness-task-workflow-link-${String((row as Row).task_id)}`}><code>{String(v)}</code></WorkflowEditorLink>
+                ) : '—'),
+              },
               { key: 'status', label: 'Status (lifecycle)' },
               { key: 'task_state', label: translate('admin.effectiveness.machineStateFlow'), render: (v) => (v ? String(v) : '—') },
               { key: 'exchange_count', label: 'Turns', sortable: true },

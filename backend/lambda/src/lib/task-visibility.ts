@@ -39,3 +39,17 @@ export function isPrivateVisibility(value: unknown): boolean {
 export function isTaskVisibility(value: unknown): value is TaskVisibility {
   return value === 'conversation' || value === 'private';
 }
+
+/**
+ * A REQUEST OPENED MID-TASK IS AS PRIVATE AS THE MESSAGE THAT ASKED IT (WT106): the stored message's Target decides, read
+ * once and only when a request opens. A message sent to the room gives `conversation`; a targeted message, a message with
+ * no id, and one that cannot be read give `private` (ADR-033: failing open discloses a private request).
+ */
+export async function requestVisibility(
+  client: import('@aws-sdk/client-chime-sdk-messaging').ChimeSDKMessagingClient, channelArn: string, messageId: string | undefined, botArn: string,
+): Promise<'conversation' | 'private'> {
+  if (!messageId) return 'private';
+  const { inboundTarget } = await import('./private-command.js');
+  const read = await inboundTarget(client, channelArn, messageId, botArn).catch(() => 'unreadable' as const);
+  return read === 'public' ? 'conversation' : 'private';
+}

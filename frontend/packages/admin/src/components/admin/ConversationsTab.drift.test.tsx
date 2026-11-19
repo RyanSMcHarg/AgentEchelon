@@ -22,7 +22,7 @@ function driftResult(stats: Record<string, string | number | null>): AnalyticsRe
 }
 
 async function openDriftView(driftData: AnalyticsResult) {
-  render(<ConversationsTab summaryData={null} driftData={driftData} isLoading={false} />);
+  render(<ConversationsTab driftData={driftData} isLoading={false} />);
   await userEvent.click(screen.getByRole('button', { name: /drift detection/i }));
 }
 
@@ -41,17 +41,25 @@ describe('ConversationsTab — drift reports precision, not volume', () => {
 
   it('renders the outcome rates from the recorded counts', async () => {
     await openDriftView(
-      driftResult({ total_events: '10', accepted_count: '6', pending_count: '0' }),
+      driftResult({ total_events: '10', moved_count: '6', pending_count: '0' }),
     );
 
     await waitFor(() => expect(screen.getByText('Acceptance')).toBeTruthy());
     expect(screen.getByText('60%')).toBeTruthy(); // 6 accepted of 10 offered
   });
 
+  it('says where the settled offers ended', async () => {
+    await openDriftView(driftResult({
+      total_events: '10', moved_count: '7', carried_on_count: '4', moved_unused_count: '2', move_failed_count: '1', declined_count: '2', unanswered_count: '1',
+    }));
+
+    await waitFor(() => expect(screen.getByTestId('drift-outcomes').textContent).toBe('Settled: 4 carried on, 2 never used, 2 declined, 1 not answered, 1 could not be moved.'));
+  });
+
   it('shows "Not measured" for accuracy until something has been judged', async () => {
     // A 0% would read as "always wrong" and a 100% as "always right"; both are claims no
     // evaluation supports while the judged set is empty.
-    await openDriftView(driftResult({ total_events: '10', accepted_count: '10' }));
+    await openDriftView(driftResult({ total_events: '10', moved_count: '10' }));
 
     await waitFor(() => expect(screen.getByText('Accuracy')).toBeTruthy());
     expect(screen.getByText('Not measured')).toBeTruthy();
@@ -61,7 +69,7 @@ describe('ConversationsTab — drift reports precision, not volume', () => {
     await openDriftView(
       driftResult({
         total_events: '10',
-        accepted_count: '5',
+        moved_count: '5',
         evaluated_count: '8',
         evaluated_correct_count: '6',
       }),
@@ -76,7 +84,7 @@ describe('ConversationsTab — drift reports precision, not volume', () => {
     await openDriftView(
       driftResult({
         total_events: '10',
-        accepted_count: '1',
+        moved_count: '1',
         evaluated_count: '10',
         evaluated_correct_count: '10',
       }),
@@ -97,7 +105,7 @@ describe('ConversationsTab — drift reports precision, not volume', () => {
 
   it('warns that acceptance is a floor while offers are unsettled', async () => {
     await openDriftView(
-      driftResult({ total_events: '10', accepted_count: '4', pending_count: '6' }),
+      driftResult({ total_events: '10', moved_count: '4', pending_count: '6' }),
     );
 
     await waitFor(() => expect(screen.getByText('40%')).toBeTruthy());

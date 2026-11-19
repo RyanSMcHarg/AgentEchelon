@@ -19,6 +19,18 @@ jest.mock('@aws-sdk/client-ssm', () => ({
   GetParameterCommand: class { constructor(public input: { Name: string }) {} },
 }));
 
+// THE CALLER STILL REACHES every conversation these rows name, so the queue read is what is under test. An item
+// from a conversation they no longer reach is dropped, proven in
+// `lib/a-person-route-reaches-only-a-conversation-its-caller-reaches.test.ts`.
+jest.mock('../lambda/src/lib/conversation-access', () => {
+  const admit = (channelArn: string) => ({ ok: true, channelArn, classification: 'premium' });
+  return {
+    callerReachesConversation: async (_e: unknown, channelArn: string) => admit(channelArn),
+    listReach: () => ({ reaches: async (arns: string[]) => new Map(arns.map((a) => [a, admit(a)])) }),
+  };
+});
+process.env.APP_INSTANCE_ARN = 'arn:aws:chime:us-east-1:111:app-instance/i';
+
 import type { APIGatewayProxyEvent } from 'aws-lambda';
 import { handler, titleOf, toOpenWorkItem, _resetMachinesCache } from '../lambda/src/user-tasks-api';
 import { asPerson, edgeContext } from './helpers/edge-context';

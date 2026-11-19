@@ -68,7 +68,7 @@ test.describe.serial('a workflow step opens a task for a person, who completes i
     const queueMachine = await draftWith(admin, welcome({ states: { ...welcome()[WORKFLOW].states, review: { ...welcome()[WORKFLOW].states.review, task: { machine: 'queued_request', for: 'subject', deadline: { afterMinutes: 60 } } } } }));
     expect(JSON.stringify(queueMachine.errors)).toContain('one of the turn queue\'s own machines');
     const shortDeadline = await draftWith(admin, welcome({ states: { ...welcome()[WORKFLOW].states, review: { ...welcome()[WORKFLOW].states.review, task: { machine: 'approval', for: 'subject', by: 'subject', deadline: { afterMinutes: 1 } } } } }));
-    expect(JSON.stringify(shortDeadline.errors)).toContain('every task a workflow assigns has an end');
+    expect(JSON.stringify(shortDeadline.errors)).toContain('every task a run waits on has an end');
     const badState = await draftWith(admin, welcome({ states: { ...welcome()[WORKFLOW].states, review: { ...welcome()[WORKFLOW].states.review, onSuccess: [{ to: 'thanks', when: { 'task:state': 'maybe' } }, { to: 'done' }] } } }));
     expect(JSON.stringify(badState.errors)).toContain('task:state');
   });

@@ -31,6 +31,7 @@ import { ReasonDeclinedError } from '../../services/adminReason';
 import { nearestTo, type MessageLink } from './messageLink';
 import type { AnalyticsResult } from '@ae/shared';
 import { classificationBadgeStyle, classificationName } from '@ae/shared/config/classifications.ts';
+import { readableAddressText } from '@ae/shared/utils/addressTokens.ts';
 
 /**
  * The principal an ARN names, for surfaces that must identify a person without their name.
@@ -51,6 +52,7 @@ import type {
   AdminConversationSummary,
   AdminMembershipEvent,
 } from '@ae/shared';
+import { useUrlView, viewParam } from './consoleViewUrl';
 
 /**
  * The reasons a flag can carry, and how each reads to a moderator.
@@ -75,7 +77,6 @@ const FLAG_REASON_KEYS: Record<FlagReason, string> = {
 };
 
 interface ConversationsTabProps {
-  summaryData: AnalyticsResult | null;
   driftData: AnalyticsResult | null;
   isLoading: boolean;
   /** When set (from Flagged/Ground-Truth links), open this channel's detail page. */
@@ -203,6 +204,11 @@ const DriftHealthPanel: React.FC<{ stats?: Record<string, string | number | null
           );
         })}
       </div>
+      {Object.values(m.outcomes).some((n) => n > 0) && (
+        <p data-testid="drift-outcomes" style={{ fontSize: 'var(--text-sm)', color: 'var(--text-muted)', margin: '4px 0 12px' }}>
+          {i18n.t('admin.conversations.driftOutcomes', m.outcomes)}
+        </p>
+      )}
       {(m.pending > 0 || m.awaitingEvaluation > 0) && (
         <p style={{ fontSize: 'var(--text-sm)', color: 'var(--text-muted)', margin: '4px 0 12px' }}>
           {m.pending > 0 && (
@@ -228,7 +234,9 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
   // Each control renders only for a role holding its capability (SPEC-ADMIN-CONSOLE FR0f, FR36); IAM
   // refuses the rest whatever renders.
   const can = useCan();
-  const [view, setView] = useState<'browser' | 'drift'>('browser');
+  const [view, setView] = useState<'browser' | 'drift'>(() => (viewParam('convView') === 'drift' ? 'drift' : 'browser'));
+  // THE DRIFT VIEW IS THE ADDRESS (`&convView=drift`): a link opens it, and Back returns to the browser.
+  useUrlView('convView', view === 'drift' ? 'drift' : null, (v) => setView(v === 'drift' ? 'drift' : 'browser'));
   // Which form of an open conversation is shown: the record, or its de-identified copy (FR54).
   const [detailForm, setDetailForm] = useState<'record' | 'deidentified'>('record');
   // The record by default; narrowed to what is there now on request (FR55).
@@ -310,11 +318,15 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
   // An event archived before visibility was recorded carries no `hidden` and stays, because the filter
   // must not guess that a member was visible or hidden.
   const selectedMessages = useMemo(() => {
-    const messageRows = messages.map((message) => ({
-      ...message,
-      kind: 'message' as const,
-      preview: message.content.length > 140 ? `${message.content.slice(0, 140)}...` : message.content,
-    }));
+    const messageRows = messages.map((message) => {
+      // A mention reads by name here as it does in the conversation; the Inspect drawer keeps the raw text.
+      const readable = readableAddressText(message.content);
+      return {
+        ...message,
+        kind: 'message' as const,
+        preview: readable.length > 140 ? `${readable.slice(0, 140)}...` : readable,
+      };
+    });
     const membershipRows = membershipHistory.map((e, i) => ({
       id: `membership-${i}`,
       kind: 'membership' as const,
@@ -682,7 +694,7 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
         <div className="admin-section admin-conversation-panel">
           <div className="admin-conversation-header">
             <div>
-              <h4>{selectedConversation.name}</h4>
+              <h3>{selectedConversation.name}</h3>
               <p>{selectedConversation.channelArn}</p>
             </div>
             {can('manage-membership') && (
@@ -726,7 +738,7 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
           ) : (
           <div className="admin-conversation-split">
             <div className="admin-section">
-              <h4>{t('admin.conversations.recentMessages')}</h4>
+              <h3>{t('admin.conversations.recentMessages')}</h3>
               <label className="admin-filter-group">
                 <input type="checkbox" checked={currentStateOnly} onChange={(e) => setCurrentStateOnly(e.target.checked)} />{' '}
                 {t('admin.conversations.clean.currentState')}
@@ -814,7 +826,7 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
                               <ol>
                                 {m.versions.slice(0, -1).map((v, i) => (
                                   <li key={i}>
-                                    {new Date(v.at).toLocaleString()}: {v.content}
+                                    {new Date(v.at).toLocaleString()}: {readableAddressText(v.content)}
                                   </li>
                                 ))}
                               </ol>
@@ -917,7 +929,7 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
             </div>
 
             <div className="admin-section admin-conversation-members">
-              <h4>{t('admin.conversations.members')}</h4>
+              <h3>{t('admin.conversations.members')}</h3>
               <DataTable
                 columns={[
                   // THE ONE PERSON-BEARING SURFACE NO SERVER OMISSION CAN REACH.
@@ -980,7 +992,7 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
               (message create/update/redact/delete, membership create/update/delete, channel). Lazy. */}
           <div className="admin-section">
             <div className="admin-tab-header" style={{ marginBottom: 'var(--space-2)' }}>
-              <h4 style={{ margin: 0 }}>All events (raw log)</h4>
+              <h3 style={{ margin: 0 }}>All events (raw log)</h3>
               <button
                 className="admin-filter-btn"
                 onClick={() => {
@@ -1040,7 +1052,7 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
       <div className="admin-tab-header">
         {/* What a moderator can do from here is a hint; the authority behind each action - who may
             redact, who may delete, and the membership an action is taken through - is SPEC-MODERATION. */}
-        <h3>
+        <h2>
           Conversations
           <InfoTooltip
             label={t('admin.conversations.whatYouCanDoFrom')}
@@ -1053,7 +1065,7 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
               </>
             }
           />
-        </h3>
+        </h2>
         {/* The two VIEW toggles are grouped together; Refresh is a distinct ACTION (not a third view),
             set apart so it doesn't read as another toggle. */}
         <div style={{ display: 'flex', gap: 'var(--space-4)', alignItems: 'center', flexWrap: 'wrap' }}>
@@ -1212,6 +1224,8 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
                     declined: 'Declined',
                     rejected_in_new_channel: t('admin.conversations.rejectedInNewChannel'),
                     abandoned: 'Abandoned',
+                    moved_unasked: t('admin.conversations.movedUnasked'),
+                    not_offered: t('admin.conversations.notOffered'),
                   };
                   return labels[String(v)] || String(v ?? '');
                 },

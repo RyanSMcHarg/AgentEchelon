@@ -59,6 +59,7 @@ import {
   getActiveTask,
   selectStoppableTasks,
   cancelStoppedTasks,
+  endDuelTasks,
   applyUserResponseToTask,
   recordNoTransitionTurn,
   markTaskPrivate,
@@ -72,6 +73,11 @@ import {
   type AdvanceResult,
   type LexEventForTask,
   type TaskCreateOptions,
+  ACTIVE_TASK_STATUSES,
+  attachRequestRun,
+  openTasksOpenedFrom as storeOpenTasksOpenedFrom,
+  openWorkflowTasksIn,
+  releaseAskedBy,
 } from './lib/task-tracking.js';
 import { isPrivateVisibility } from './lib/task-visibility.js';
 import type { DeliveryOption } from './lib/delivery-options.js';
@@ -79,18 +85,26 @@ import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
 import { ChimeSDKMessagingClient, ListTagsForResourceCommand } from '@aws-sdk/client-chime-sdk-messaging';
 import { chimeMessagingClient } from './lib/chime/clients.js';
 import { readChannelTags } from './lib/channel-classification.js';
+import { memoizedTagReader } from './lib/conversation-primary.js';
 import { loadProfileRegistry } from '../../lib/profile-registry';
 import { taskStateMachines as packTaskStateMachines } from './lib/intent-pack.js';
-import { PLATFORM_TASK_MACHINE_KEYS, type TaskStateMachine } from './lib/task-state-machines.js';
+import { machineHashOf, machinesOfTask } from './lib/version-machines.js';
+import { putRunEndedFact, putTaskSettledFact, type RunEndedFact, type TaskSettledFact } from './lib/archive-facts.js';
+import { PROCESS_ID } from './lib/event-workflow.js';
+import { formAnswersOf, pressTarget } from './lib/task-step.js';
+import { alongsideEndWaitId } from './lib/held-run.js';
+import { PLATFORM_TASK_MACHINE_KEYS, isPlatformMachineKey, requesterMovesOf, validateTaskStateMachine, type TaskStateMachine } from './lib/task-state-machines.js';
+import { personIdFromArn } from './lib/person-arn.js';
+import { versionDeclaredMachines } from './lib/version-machines.js';
 import { liveAssistantsForClassification } from './lib/default-agents.js';
 import { nameTaskThroughRouter } from './lib/say-through-router.js';
 import {
-  TASK_DEADLINE_ENDING, assigneeAdvanceRefusal, orderForPickup, pickupReadiness, settlementOutcome,
+  TASK_ARCHIVE_ENDING, TASK_DEADLINE_ENDING, TASK_RUN_ENDED_ENDING, assigneeAdvanceRefusal, orderForPickup, pickupReadiness, requestAwaitingRun, settlementOutcome,
   type AssigneeAdvanceRefusal,
 } from './lib/workflow-task.js';
 import { DeliveryOption as TaskDelivery } from './lib/delivery-options.js';
 import type { TaskAssignee, WorkflowRunRef } from './lib/task-tracking.js';
-import { claimEventRun as storeClaimEventRun, claimEventStep as storeClaimEventStep, recordEventGreeting as storeRecordEventGreeting, wasGreetedByEventRun as storeWasGreeted, type EventRunClaim } from './lib/event-run-store.js';
+import { claimEventRun as storeClaimEventRun, claimEventStep as storeClaimEventStep, holdRunWait as storeHoldRunWait, readRunWait as storeReadRunWait, readEventSteps as storeReadEventSteps, recordEventGreeting as storeRecordEventGreeting, wasGreetedByEventRun as storeWasGreeted, type EventRunClaim } from './lib/event-run-store.js';
 
 /**
  * An event run's records live in the task table, which `task-tracking.ts` alone names: the run's claims are written
@@ -108,6 +122,41 @@ async function recordEventGreetingOp(input: { channelArn: string; personArn: str
 async function wasGreetedByEventRunOp(input: { channelArn: string; personArn: string }): Promise<boolean> {
   if (!input?.channelArn || !input?.personArn || await refusesChannel(input.channelArn)) return false;
   return storeWasGreeted(input, eventRunTable());
+}
+
+/** A run's wait and the continuation it holds (WT20), in a conversation this service's classification serves only. */
+async function holdRunWaitOp(input: { waitId: string; channelArn: string; continuation: Record<string, unknown> }): Promise<EventRunClaim> {
+  if (!input?.waitId || !input?.channelArn || !input?.continuation || typeof input.continuation !== 'object' || await refusesChannel(input.channelArn)) {
+    return { claimed: false, reason: 'failed' };
+  }
+  return storeHoldRunWait(input, eventRunDeps());
+}
+
+/** The continuation a run's wait holds, read when its schedule fires. */
+async function readRunWaitOp(input: { waitId: string; channelArn: string }): Promise<Record<string, unknown> | null> {
+  if (!input?.waitId || !input?.channelArn || await refusesChannel(input.channelArn)) return null;
+  return storeReadRunWait(input, eventRunTable());
+}
+
+/** Which of a run's step claims are held, with their outcomes, in a conversation this service's classification serves only. */
+async function readEventStepsOp(input: { runKey: string; channelArn: string; steps: string[] }): Promise<Record<string, string> | null> {
+  if (!input?.runKey || !input?.channelArn || !Array.isArray(input.steps) || input.steps.some((s) => typeof s !== 'string') || await refusesChannel(input.channelArn)) return null;
+  return storeReadEventSteps(input, eventRunTable());
+}
+
+/**
+ * WHETHER THE RUN A TASK WENT ON ALONGSIDE HAS REACHED ITS END, from the run's own records: its end held on this task (the
+ * record names the run's continuation), or its end already claimed. A read that fails answers that it has not, so a press
+ * is confirmed rather than taken unasked.
+ */
+async function runReachedItsEnd(task: Task): Promise<boolean> {
+  const run = task.workflowRun;
+  if (!run?.holdsEnd) return true;
+  const [held, claims] = await Promise.all([
+    storeReadRunWait({ waitId: alongsideEndWaitId(task.taskId), channelArn: task.channelArn }, eventRunTable()).catch(() => null),
+    storeReadEventSteps({ runKey: run.runKey, channelArn: task.channelArn, steps: ['end'] }, eventRunTable()).catch(() => null),
+  ]);
+  return (typeof held?.runKey === 'string' && typeof held?.step === 'string') || claims?.end !== undefined;
 }
 
 /** An event run's claim, in a conversation this service's classification serves only. */
@@ -189,12 +238,30 @@ export type TaskServiceOp =
   | 'recordTaskDelivery'
   /** Discard the work a stop named, once the person has answered. See `cancelStoppedTasks`. */
   | 'cancelStoppedTasks'
+  /** Close the work an ended duel's sides opened. See `endDuelTasks`. */
+  | 'endDuelTasks'
   /** A workflow's task step opens its task (ADR-063 decision 1). See `openWorkflowTask`. */
   | 'openWorkflowTask'
   /** A person takes a choice on their task's card (ADR-063 decision 2). See `advanceAsAssignee`. */
   | 'advanceAsAssignee'
   /** A task step's deadline ends its task (ADR-063 decision 4). See `cancelForDeadline`. */
   | 'cancelForDeadline'
+  /** Archiving a conversation settles its open workflow tasks (ADR-017). See `settleArchivedTasks`. */
+  | 'settleArchivedTasks'
+  /** A run a settlement ended mid-way cancels its open work. See `endRunTasks`. */
+  | 'endRunTasks'
+  /** Which of a run's step claims are held. See `readEventStepsOp`. */
+  | 'readEventSteps'
+  /** The open tasks of one machine in every conversation a conversation's workflow opened (WT122). See `openTasksOpenedFrom`. */
+  | 'openTasksOpenedFrom'
+  | 'recordRunEnded'
+  | 'adminCancelRun'
+  | 'holdRunWait'
+  /** The task a requester may move while another person holds it (WT114). See `requesterMovableTask`. */
+  | 'requesterMovableTask'
+  /** A request whose task no router turn opened takes its intent's run (WT115, WT106). See `attachRequestRunOp`. */
+  | 'attachRequestRun'
+  | 'readRunWait'
   /** An assistant's ready work in one conversation, in the order it takes it up (ADR-063 decision 5). See `readyTasks`. */
   | 'readyTasks'
   /** Take up one entry of a task's state, once (ADR-063 decision 5). See `claimPickup`. */
@@ -250,10 +317,12 @@ export interface TasksForTurn {
  *
  * This read sits inside a person's wait, and the router has already made the same call earlier in the
  * same turn. The tag cannot change for a conversation, so a container that has seen one does not ask
- * again; only the first turn per conversation per container pays. A negative result is NOT cached: an
- * untagged conversation may be tagged moments later, and caching the refusal would outlive the fix.
+ * again; only the first turn per conversation per container pays. It is read through the container's one
+ * tag memo (`memoizedTagReader`), which keeps only a recognized classification: a negative result is NOT
+ * kept, because an untagged conversation may be tagged moments later and caching the refusal would
+ * outlive the fix.
  */
-const tagCache = new Map<string, string>();
+const tagReader = memoizedTagReader(chimeClient);
 
 /**
  * The conversation's classification, or the fact that it could not be read.
@@ -265,11 +334,8 @@ const tagCache = new Map<string, string>();
 type ChannelTag = { tag: string } | { unreadable: true };
 
 async function classificationOf(channelArn: string): Promise<ChannelTag> {
-  const cached = tagCache.get(channelArn);
-  if (cached) return { tag: cached };
   try {
-    const tag = (await readChannelTags(chimeClient, channelArn)).classification || '';
-    if (profiles.isKnownClassification(tag)) tagCache.set(channelArn, tag);
+    const tag = (await readChannelTags(tagReader, channelArn)).classification || '';
     return { tag };
   } catch (err) {
     // AN OUTAGE, SAID AS ONE. What the caller does with it is decided in `refusesChannel`, which is
@@ -288,13 +354,14 @@ async function classificationOf(channelArn: string): Promise<ChannelTag> {
  * cannot leak; the reverse is the leak this exists to prevent.
  */
 /**
- * WHICH LEG IS ASKING, because an unreadable tag means different things on the two (ADR-045).
+ * WHICH LEG IS ASKING, named in the security log so an operator can tell the two apart (ADR-045).
  *
- * `here`      the conversation the caller named and IAM already authorized them for. The tag read is
- *             a second opinion on a call that has already passed the enforced boundary.
- * `elsewhere` a row belonging to some OTHER conversation, reached by scanning. Nothing upstream
- *             authorized this conversation, so this per-row check is the ONLY gate, and an
- *             unreadable tag there converts "unknown" into "permitted".
+ * `here`      the conversation the caller named and IAM already authorized them for. This check is
+ *             the second enforcement layer on that call.
+ * `elsewhere` a row belonging to some OTHER conversation, reached by scanning. This per-row check is
+ *             the gate for that conversation.
+ *
+ * Both legs answer an unreadable tag the same way: refused.
  */
 type AdmissionLeg = 'here' | 'elsewhere';
 
@@ -318,39 +385,16 @@ async function refusesChannel(channelArn: string, leg: AdmissionLeg = 'here'): P
   // Both of those are settled before anything reaches here, which is why a refusal below means an
   // upstream fault rather than routine policy, and is logged as one.
   //
-  // AN UNREADABLE TAG NO LONGER REFUSES, and the trade is stated rather than implied. A failed tag
-  // read is not evidence of a violation; it is evidence that this check cannot run. Refusing on it
-  // let a Chime throttle impersonate a policy decision and silently drop legitimate work - a task
-  // status write that nothing retries, leaving the row in_progress in somebody's list for its full
-  // 24h TTL.
-  //
-  // The cost of proceeding is real and bounded: a misrouted call arriving DURING a tag-read outage
-  // is served. That is a compound failure of two independent things. The cost of refusing was
-  // certain and routine: every cold-container task operation broken by any throttle, silently. The
-  // tag is cached per container once read, so only the first read for a conversation is exposed.
-  // THE REASONING ABOVE HOLDS FOR THE `here` LEG ONLY, AND ADR-045 SPLITS THEM. "IAM has already
-  // authorised this call" is the whole argument for proceeding, and it is simply untrue of a row
-  // reached by scanning: nobody authorized THAT conversation, so this check is not a second opinion
-  // there, it is the only one. Proceeding on an unreadable tag put a premium task hint into a basic
-  // prompt, which is the leak commit c7cd138 closed by another route.
-  //
-  // This reverses ADR-042 decision 3a for the cross-conversation legs, and the cost that decision
-  // was protecting is real: a fire-and-forget status write on one of those legs is now DROPPED on a
-  // tag-read throttle rather than admitted. Rare, logged, and the alternative was serving content
-  // from a conversation whose classification nobody could establish.
+  // AN UNREADABLE TAG REFUSES, ON EVERY LEG. This check is one of the two enforcement layers on a
+  // task operation, and it holds only when it can establish the conversation's classification. A
+  // conversation whose classification cannot be read is not served; the refusal is logged as a
+  // security event naming the leg, and the caller sees an ordinary refusal it can retry. The tag is
+  // cached per container once read, so only the first read for a conversation depends on Chime.
   if ('unreadable' in found) {
-    if (leg === 'elsewhere') {
-      console.error('[task-service][SecurityEvent] the classification tag could not be read on a '
-        + 'cross-conversation row; REFUSING, because nothing upstream authorised this conversation', {
-        channelArn, serving: SERVICE_CLASSIFICATION,
-      });
-      return true;
-    }
-    console.error('[task-service][SecurityEvent] the classification tag could not be read; PROCEEDING, '
-      + 'because IAM has already authorised this call and this check cannot run without the tag', {
-      channelArn, serving: SERVICE_CLASSIFICATION,
+    console.error('[task-service][SecurityEvent] the classification tag could not be read; refusing', {
+      channelArn, leg, serving: SERVICE_CLASSIFICATION,
     });
-    return false;
+    return true;
   }
 
   const tag = found.tag;
@@ -452,11 +496,12 @@ export async function tasksForTurn(input: {
 export async function readTask(input: {
   taskId: string;
   channelArn: string;
+  consistent?: boolean;
 }): Promise<Task | null> {
-  const { taskId, channelArn } = input;
+  const { taskId, channelArn, consistent } = input;
   if (!taskId || !channelArn) return null;
   if (await refusesChannel(channelArn)) return null;
-  return getTask(taskId, channelArn).catch(() => null);
+  return getTask(taskId, channelArn, consistent ? { consistent: true } : {}).catch(() => null);
 }
 
 /**
@@ -483,7 +528,25 @@ export async function openTask(input: {
     console.warn('[task-service] refusing to open a task in this conversation', { channelArn });
     return null;
   }
-  return createTask(event, deliveryOption, taskType, correlationId, opts);
+  // A MACHINE A CALLER SENDS IS A VERSION'S OWN (ADR-066 decision 2): a platform key is resolved only from the platform
+  // set, so one sent here is dropped and the task opens on the platform's machine.
+  const sent = opts?.machines ? versionDeclaredMachines({ machines: opts.machines }) : undefined;
+  const withMachines = opts?.machines
+    ? { ...opts, machines: sent ? { ...packTaskStateMachines(), ...sent } : undefined }
+    : opts;
+  // THE MACHINE A TASK CARRIES IS HELD TO THE SAME RULE (ADR-067 stage 2): never under a platform key, and only one that
+  // validates; anything else is dropped and the task opens on the machine its type resolves to.
+  const origin = withMachines?.originMachine;
+  const originOk = !!origin && !!taskType && !isPlatformMachineKey(taskType) && (() => {
+    try { validateTaskStateMachine(taskType, origin); return true; } catch { return false; }
+  })();
+  const safeOpts = withMachines && origin && !originOk ? (({ originMachine: _dropped, ...rest }) => rest)(withMachines) : withMachines;
+  const task = await createTask(event, deliveryOption, taskType, correlationId, safeOpts);
+  // A REQUEST OPENED MID-TASK (WT106) is named to the router, which starts its intent's workflow on it, once.
+  if (task && requestAwaitingRun(task)) {
+    await nameTaskThroughRouter(SERVICE_CLASSIFICATION, { kind: 'request', channelArn, taskId: task.taskId }).catch(() => undefined);
+  }
+  return task;
 }
 
 /**
@@ -543,15 +606,26 @@ export async function advanceTask(input: {
   assistantId?: string;
   action?: Parameters<typeof advanceTaskStateTo>[0]['action'];
   conditionValues?: Parameters<typeof advanceTaskStateTo>[0]['conditionValues'];
+  /** The caller goes on with the run itself, in the turn it is in, so nothing else may. */
+  continuedByCaller?: boolean;
 }): Promise<AdvanceResult> {
-  const { taskId, channelArn, ...rest } = input;
+  const { taskId, channelArn, continuedByCaller, ...rest } = input;
   if (!taskId || !channelArn) return { ok: false, error: 'no_active_task' };
   if (await refusesChannel(channelArn)) return { ok: false, error: 'no_active_task' };
 
   const task = await getTask(taskId, channelArn).catch(() => null);
   if (!task) return { ok: false, error: 'no_active_task' };
   const result = await advanceTaskStateTo({ task, ...rest });
-  if (result.ok) await nameWhatChanged(task.taskId, channelArn, rest.machines);
+  if (result.ok) {
+    if (!continuedByCaller) await nameWhatChanged(task.taskId, channelArn, rest.machines);
+    // A FINISHED TASK TAKEN BACK (WT104): from an ending into a state with a way on, which is a reopen, named once per move.
+    const machine = machinesOfTask(task, { ...packTaskStateMachines(), ...(rest.machines ?? {}) })[task.taskType ?? ''];
+    const wasEnding = !!task.taskState && machine?.states[task.taskState]?.transitions.length === 0;
+    const nowOpen = (machine?.states[input.toState]?.transitions.length ?? 0) > 0;
+    if (wasEnding && nowOpen) {
+      await nameTaskThroughRouter(SERVICE_CLASSIFICATION, { kind: 'reopened', channelArn, taskId: task.taskId }).catch(() => undefined);
+    }
+  }
   return result;
 }
 
@@ -567,10 +641,25 @@ async function nameWhatChanged(taskId: string, channelArn: string, machines?: Re
   try {
     const task = await getTask(taskId, channelArn);
     if (!task) return;
-    const all = { ...packTaskStateMachines(), ...(machines ?? {}) };
+    const all = machinesOfTask(task, { ...packTaskStateMachines(), ...(machines ?? {}) });
+    // A STATE THAT SAYS A NOTICE ON ENTRY (WT23) is named to the router, which says it once per entry.
+    if (task.taskType && task.taskState && all[task.taskType]?.states[task.taskState]?.notice) {
+      await nameTaskThroughRouter(SERVICE_CLASSIFICATION, { kind: 'notice', channelArn, taskId }).catch(() => undefined);
+    }
     if (task.workflowRun && settlementOutcome(task, all)) {
       await nameTaskThroughRouter(SERVICE_CLASSIFICATION, { kind: 'settled', channelArn, taskId });
       return;
+    }
+    // AN ACCEPTED QUEUED REQUEST (WT115): the person accepted it, so the router starts its intent's workflow, once.
+    if (task.taskType === 'queued_request' && task.taskState === 'accepted' && requestAwaitingRun(task)) {
+      await nameTaskThroughRouter(SERVICE_CLASSIFICATION, { kind: 'request', channelArn, taskId });
+      return;
+    }
+    // A RUN THAT GOES ON ONCE ITS TASK OPENS (WT18) is named when the task is in any state but the one it opened in. The
+    // router's continuation claim takes it once, so a task that returns there and leaves again continues nothing twice.
+    const initial = task.taskType ? all[task.taskType]?.initial : undefined;
+    if ((task.workflowRun?.continueOn === 'entered' || task.askedBy?.continueOn === 'entered') && initial && task.taskState && task.taskState !== initial) {
+      await nameTaskThroughRouter(SERVICE_CLASSIFICATION, { kind: 'entered', channelArn, taskId });
     }
     if (task.assigneeType === 'assistant' && task.assigneeId && pickupReadiness(task, all, task.assigneeId).ready) {
       await nameTaskThroughRouter(SERVICE_CLASSIFICATION, { kind: 'ready', channelArn, taskId });
@@ -599,12 +688,24 @@ export async function openWorkflowTask(input: {
   machine: string;
   /** The version's own machine of that name, when it carries one; else the pack's. */
   machineDef?: TaskStateMachine;
+  /** The version the run's step opened the task from (`Task.originConfigId`). */
+  originConfigId?: string;
+  /** A `due` deadline (WT21): when the task is due, shown on it, which ends nothing. */
+  dueBy?: string;
+  /** How long the row is kept where no timeout bounds it (a due or remind deadline), in seconds. */
+  keepForSeconds?: number;
   requesterArn?: string;
   worker: TaskAssignee;
   assistantId: string;
   visibility?: 'conversation' | 'private';
   priority?: 'high' | 'normal' | 'low';
   workflowRun: WorkflowRunRef;
+  /** The run that asked for this work (WT118): continued on its ending, handed nothing it recorded. */
+  askedBy?: WorkflowRunRef;
+  /** What the asking assistant said it needs (WT118), the request the owning assistant's turn reads. */
+  requestExcerpt?: string;
+  /** The conversation whose workflow opened this task's conversation (`Task.openedFrom`), as the router read it from its row. */
+  openedFrom?: string;
 }): Promise<Task | null> {
   const { channelArn, taskId, machine } = input ?? ({} as typeof input);
   if (!channelArn || !taskId || !machine || !input.workflowRun?.runKey || await refusesChannel(channelArn)) return null;
@@ -623,11 +724,19 @@ export async function openWorkflowTask(input: {
     }
   }
   if (input.worker?.type !== 'user' && input.worker?.type !== 'assistant') return null;
+  // THE OPENER IS A CONVERSATION THIS SERVICE SERVES, of the same app instance, never the task's own: one it may not serve
+  // is no opener, and the task opens without it.
+  const opener = typeof input.openedFrom === 'string' && input.openedFrom !== channelArn
+    && input.openedFrom.startsWith(`${channelArn.split('/channel/')[0]}/channel/`) && !(await refusesChannel(input.openedFrom)) ? input.openedFrom : undefined;
   const existing = await getTask(taskId, channelArn).catch(() => null);
   if (existing) return existing;
   const now = Math.floor(Date.now() / 1000);
   // THE ROW OUTLIVES ITS DEADLINE by a day, so the deadline's firing and the settlement always find it.
-  const ttlSeconds = Math.max(60, (input.workflowRun.deadlineAt ?? now) - now) + 24 * 3600;
+  // A TASK NO TIMEOUT ENDS (a due or remind deadline, or none, where the run goes on once it opens or another assistant's
+  // run waits on it) is kept for a run's own lifetime, at most 45 days (WT26), so its settlement always finds it.
+  const ttlSeconds = !input.workflowRun.deadlineAt
+    ? Math.min(Math.max(60, input.keepForSeconds ?? 45 * 24 * 3600), 45 * 24 * 3600)
+    : Math.max(60, input.workflowRun.deadlineAt - now) + 24 * 3600;
   const requester = input.requesterArn && input.requesterArn.includes('/user/') ? input.requesterArn : '';
   const task = await createTask(
     { requestAttributes: { 'CHIME.channel.arn': channelArn, ...(requester ? { 'CHIME.sender.arn': requester } : {}) } },
@@ -641,8 +750,15 @@ export async function openWorkflowTask(input: {
       ...(input.visibility ? { visibility: input.visibility } : {}),
       ...(input.priority ? { priority: input.priority } : {}),
       workflowRun: input.workflowRun,
+      // THE VERSION'S MACHINE RIDES THE TASK (ADR-067 stage 2), with the version and its hash, so every reader moves it on
+      // the steps it opened on whatever the version serves next.
+      ...(input.machineDef ? { originMachine: input.machineDef, originMachineHash: machineHashOf(input.machineDef) } : {}),
+      ...(input.originConfigId ? { originConfigId: input.originConfigId } : {}),
+      ...(input.dueBy ? { dueBy: input.dueBy } : {}),
       ttlSeconds,
-      requestExcerpt: '',
+      ...(input.askedBy?.runKey ? { askedBy: input.askedBy } : {}),
+      ...(opener ? { openedFrom: opener } : {}),
+      requestExcerpt: typeof input.requestExcerpt === 'string' ? input.requestExcerpt : '',
       throwOnWriteFailure: true,
     },
   ).catch((err) => {
@@ -662,22 +778,94 @@ export async function openWorkflowTask(input: {
  */
 export async function advanceAsAssignee(input: {
   taskId: string; channelArn: string; callerPersonId: string; state: string; choice: string;
+  /** A form's answers (WT50), held to its fields; taken only with the form's success choice. */
+  answers?: Record<string, unknown>;
+  /** The message the person answered in, where they wrote their choice (a drift offer's reply), recorded on the move. */
+  messageId?: string;
+  /** The router goes on with the run in the turn that relayed this, so the settlement is not named a second time. */
+  continuedByCaller?: boolean;
 }): Promise<{ ok: true; to: string } | { ok: false; error: AssigneeAdvanceRefusal | 'REFUSED' }> {
   if (!input?.taskId || !input?.channelArn || await refusesChannel(input.channelArn)) return { ok: false, error: 'NOT_FOUND' };
   const task = await getTask(input.taskId, input.channelArn).catch(() => null);
-  const machines = packTaskStateMachines();
+  // THE TASK'S OWN STEPS (ADR-067 stage 2): a state only its version declares is a card a person can press.
+  const machines = machinesOfTask(task, packTaskStateMachines());
   const refusal = assigneeAdvanceRefusal(task, machines, input);
   if (refusal || !task) return { ok: false, error: refusal ?? 'NOT_FOUND' };
+  // A FORM'S ANSWERS (WT50) are held to its fields before anything moves, and kept on the task as the person wrote them.
+  const fields = task.workflowRun?.fields;
+  const answers = fields?.length && input.choice === 'answered' ? formAnswersOf(fields, input.answers) : undefined;
+  if (fields?.length && input.choice === 'answered' && !answers) return { ok: false, error: 'REFUSED' };
+  // A PRESS THAT WOULD END A RUN MID-WAY IS CONFIRMED FIRST (owner decision 2026-11-14): where the task's settlement ends its
+  // run (`confirmEnd`) and the run has not reached its end, the press moves the task to the state that asks, an edge the
+  // machine declares, and the person's confirmation there settles it.
+  const machine = task.taskType ? machines[task.taskType] : undefined;
+  const confirmable = !!task.workflowRun?.confirmEnd && pressTarget(machine, task.taskState ?? '', input.choice, task.workflowRun, false) !== input.choice;
+  const toState = confirmable ? pressTarget(machine, task.taskState ?? '', input.choice, task.workflowRun, await runReachedItsEnd(task)) : input.choice;
   // THE PERSON'S CHOICE, RELAYED THROUGH THE ONE ADVANCE (`advanceTask`): the state it leaves awaits that person, and the
   // edge is one the state declares as a choice, so the move is theirs and the runtime decides nothing.
   const result = await advanceTask({
-    taskId: task.taskId, channelArn: task.channelArn, toState: input.choice, by: 'system', reason: 'chosen by its assignee on the task card', machines,
+    taskId: task.taskId, channelArn: task.channelArn, toState, by: 'system', reason: toState === input.choice ? 'chosen by its assignee on the task card' : 'its assignee asked to settle it while its run has steps open', machines,
     ...(task.assistantId ? { assistantId: task.assistantId } : {}),
+    ...(answers ? { details: { form: answers } } : {}),
+    ...(typeof input.messageId === 'string' && input.messageId ? { messageId: input.messageId.slice(0, 128) } : {}),
+    ...(input.continuedByCaller ? { continuedByCaller: true } : {}),
   });
   if (!result.ok) return { ok: false, error: result.error === 'state_changed' ? 'STATE_MOVED' : 'REFUSED' };
   // The advance named the settlement already: an ending is read from the terminal state, whatever the lifecycle says.
   if (result.terminal) await updateTaskStatus(task.taskId, task.channelArn, result.terminal === 'success' ? 'completed' : 'failed');
+  // THE PRESS IS A FACT NO TURN RECORDS (WT61): one archive record of the move it made, ids and states only.
+  await putTaskSettledFact(settledFact(task, 'card', { fromState: input.state, toState: result.to, ...(result.terminal ? { terminal: result.terminal } : {}), personId: input.callerPersonId }));
   return { ok: true, to: result.to };
+}
+
+/**
+ * A RUN REACHED ITS END (WT62): the router names it, and this service, which alone may put to the archive's stream, writes
+ * the one fact, for a conversation of its own classification only.
+ */
+async function recordRunEnded(input: Omit<RunEndedFact, 'factId' | 'classification' | 'at'>): Promise<{ recorded: boolean }> {
+  if (!input?.channelArn || !input?.runKey || !input?.workflow || await refusesChannel(input.channelArn)) return { recorded: false };
+  if (input.disposition !== 'success' && input.disposition !== 'failure') return { recorded: false };
+  const steps = Array.isArray(input.steps)
+    ? input.steps.filter((x) => x && typeof x.step === 'string' && typeof x.outcome === 'string').slice(0, 32).map((x) => ({ step: x.step, outcome: x.outcome }))
+    : undefined;
+  const recorded = await putRunEndedFact({
+    factId: `${input.runKey}#end`, channelArn: input.channelArn, runKey: input.runKey, workflow: input.workflow, trigger: String(input.trigger ?? ''),
+    disposition: input.disposition, classification: SERVICE_CLASSIFICATION,
+    ...(steps ? { steps } : {}),
+    ...(typeof input.originConfigId === 'string' ? { originConfigId: input.originConfigId } : {}),
+    ...(typeof input.personId === 'string' ? { personId: input.personId } : {}),
+    // THE RUN'S PROCESS (SPEC-PROCESSES P8), kept only where every part has its shape.
+    ...processFieldsOf(input),
+    at: new Date().toISOString(),
+  });
+  return { recorded };
+}
+
+/** A run end's process fields, each only where it has its shape: an id and an edition are hashes, a team a team name. */
+function processFieldsOf(input: Pick<RunEndedFact, 'processId' | 'process' | 'processEdition' | 'ownerTeam'>): Pick<RunEndedFact, 'processId' | 'process' | 'processEdition' | 'ownerTeam'> {
+  if (typeof input.processId !== 'string' || !PROCESS_ID.test(input.processId)) return {};
+  return {
+    processId: input.processId,
+    ...(typeof input.process === 'string' && /^[a-z0-9][a-z0-9-]{0,62}$/.test(input.process) ? { process: input.process } : {}),
+    ...(typeof input.processEdition === 'string' && PROCESS_ID.test(input.processEdition) ? { processEdition: input.processEdition } : {}),
+    ...(typeof input.ownerTeam === 'string' && /^[a-z0-9][a-z0-9-]{0,47}$/.test(input.ownerTeam) ? { ownerTeam: input.ownerTeam } : {}),
+  };
+}
+
+/** The archive record of a settlement no turn records (WT61): the task's references, never its content. */
+function settledFact(task: Task, cause: TaskSettledFact['cause'], move: Pick<TaskSettledFact, 'fromState' | 'toState' | 'terminal' | 'personId'>): TaskSettledFact {
+  const at = new Date().toISOString();
+  return {
+    // Fixed when the fact is made, so a stream redelivery of the record lands on the row it already wrote; a task that
+    // loops through the same press twice makes two facts.
+    factId: [task.taskId, cause, move.toState ?? move.terminal ?? '', at].join('#'),
+    channelArn: task.channelArn, taskId: task.taskId, cause, classification: SERVICE_CLASSIFICATION,
+    ...(task.taskType ? { taskType: task.taskType } : {}), ...move,
+    ...(task.originConfigId ? { originConfigId: task.originConfigId } : {}), ...(task.originMachineHash ? { originMachineHash: task.originMachineHash } : {}),
+    ...(task.workflowRun ? { runKey: task.workflowRun.runKey, workflow: task.workflowRun.workflow } : {}),
+    ...(task.workflowRun?.process && PROCESS_ID.test(task.workflowRun.process.id) ? { processId: task.workflowRun.process.id } : {}),
+    at,
+  };
 }
 
 /**
@@ -688,10 +876,79 @@ export async function advanceAsAssignee(input: {
 async function cancelForDeadline(input: { taskId: string; channelArn: string }): Promise<{ cancelled: boolean }> {
   if (!input?.taskId || !input?.channelArn || await refusesChannel(input.channelArn)) return { cancelled: false };
   const task = await getTask(input.taskId, input.channelArn).catch(() => null);
-  if (!task?.workflowRun || settlementOutcome(task, packTaskStateMachines())) return { cancelled: false };
+  if (!task?.workflowRun || settlementOutcome(task, machinesOfTask(task, packTaskStateMachines()))) return { cancelled: false };
   await updateTaskStatus(task.taskId, task.channelArn, 'cancelled', undefined, TASK_DEADLINE_ENDING);
+  // THE DEADLINE'S ENDING IS A FACT NO TURN RECORDS (WT61).
+  await putTaskSettledFact(settledFact(task, 'deadline', { ...(task.taskState ? { fromState: task.taskState } : {}), terminal: 'deadline' }));
   await nameWhatChanged(task.taskId, task.channelArn);
   return { cancelled: true };
+}
+
+/**
+ * ARCHIVING A CONVERSATION SETTLES ITS OPEN WORKFLOW TASKS (ADR-017, WT122): the conversation management function archived
+ * it and named it to its router, which asks here. Each task a workflow step opened that is still open is cancelled, its
+ * ending recorded as the archive's, and its settlement named, so the run waiting on it goes on as its failure would take it
+ * (an incident's run ends, and the conversation that opened it is told). Only in an archived conversation of this
+ * service's classification: the tag is read again here, so a caller cannot end the work of a live one. Every page is read;
+ * a read that fails settles nothing and says so.
+ */
+export async function settleArchivedTasks(input: { channelArn: string }): Promise<{ settled: string[] } | { failed: true }> {
+  if (!input?.channelArn || await refusesChannel(input.channelArn)) return { failed: true };
+  const tags = await readChannelTags(chimeClient, input.channelArn).catch(() => null);
+  if (tags?.archived !== 'true') {
+    console.warn('[task-service] settling an archived conversation\'s tasks was asked for a conversation that is not archived; nothing is settled');
+    return { failed: true };
+  }
+  const open = await openWorkflowTasksIn(input.channelArn);
+  if (!open) return { failed: true };
+  const settled: string[] = [];
+  for (const task of open) {
+    if (!task.workflowRun || settlementOutcome(task, machinesOfTask(task, packTaskStateMachines()))) continue;
+    await updateTaskStatus(task.taskId, task.channelArn, 'cancelled', undefined, TASK_ARCHIVE_ENDING);
+    await putTaskSettledFact(settledFact(task, 'archive', { ...(task.taskState ? { fromState: task.taskState } : {}), terminal: TASK_ARCHIVE_ENDING }));
+    await nameWhatChanged(task.taskId, task.channelArn);
+    settled.push(task.taskId);
+  }
+  return { settled };
+}
+
+/**
+ * A RUN THAT ENDED MID-WAY CANCELS ITS OPEN WORK (`endsRun`, owner decision 2026-11-14): the router ended the run because the
+ * task it went on alongside settled, and asks here. Each open task the run's steps opened, and each request it made of
+ * another assistant, is cancelled with the run's end recorded as its reason, and its settlement named, so nothing is left
+ * pending. The run's end is already claimed, so no settlement named here continues it. The task that ended the run is
+ * settled and is not touched. Only in a conversation of this service's classification; a read that fails cancels nothing
+ * and says so.
+ */
+export async function endRunTasks(input: { channelArn: string; runKey: string; keepAlongside?: boolean }): Promise<{ cancelled: string[] } | { failed: true }> {
+  if (!input?.channelArn || !input?.runKey || await refusesChannel(input.channelArn)) return { failed: true };
+  const open = await openWorkflowTasksIn(input.channelArn);
+  if (!open) return { failed: true };
+  const cancelled: string[] = [];
+  for (const task of open) {
+    if (task.workflowRun?.runKey !== input.runKey && task.askedBy?.runKey !== input.runKey) continue;
+    // A RUN MOVED ON (O15) KEEPS WHAT IT WENT ON ALONGSIDE: an investigation outlives the resolve.
+    if (input.keepAlongside && task.workflowRun?.holdsEnd) continue;
+    if (settlementOutcome(task, machinesOfTask(task, packTaskStateMachines()))) continue;
+    await updateTaskStatus(task.taskId, task.channelArn, 'cancelled', undefined, TASK_RUN_ENDED_ENDING);
+    await putTaskSettledFact(settledFact(task, 'run-ended', { ...(task.taskState ? { fromState: task.taskState } : {}), terminal: TASK_RUN_ENDED_ENDING }));
+    await nameWhatChanged(task.taskId, task.channelArn);
+    cancelled.push(task.taskId);
+  }
+  return { cancelled };
+}
+
+/**
+ * THE OPEN TASKS OF ONE MACHINE IN EVERY CONVERSATION A CONVERSATION'S WORKFLOW OPENED (WT122): one query on the index the
+ * tasks table keeps by `openedFrom`, asked for an opener of this service's classification. Null on any failed read, never a
+ * short list. A task held in a conversation this service does not serve is not this opener's, and is left out.
+ */
+export async function openTasksOpenedFrom(input: { openedFrom: string; taskType: string }): Promise<Task[] | null> {
+  if (!input?.openedFrom || !input?.taskType || await refusesChannel(input.openedFrom)) return null;
+  const tasks = await storeOpenTasksOpenedFrom(input.openedFrom, input.taskType);
+  if (!tasks) return null;
+  const served = await Promise.all(tasks.map(async (t) => (t.openedFrom === input.openedFrom && !(await refusesChannel(t.channelArn)) ? t : null)));
+  return served.filter((t): t is Task => !!t);
 }
 
 /**
@@ -705,7 +962,7 @@ async function readyTasks(input: { channelArn: string; assistantId: string; mach
   const machines = { ...packTaskStateMachines(), ...(input.machines ?? {}) };
   const { live } = await getAssigneeChannelTasks(input.assistantId, input.channelArn, {});
   const rows = await Promise.all(live.map((t) => getTask(t.taskId, input.channelArn).catch(() => null)));
-  return orderForPickup(rows.filter((t): t is Task => !!t && pickupReadiness(t, machines, input.assistantId).ready));
+  return orderForPickup(rows.filter((t): t is Task => !!t && pickupReadiness(t, machinesOfTask(t, machines), input.assistantId).ready));
 }
 
 /** Take up one entry of a task's state, once (decision 5): the per-entry claim, keyed `pickup:<state>#<entry>`. */
@@ -793,6 +1050,40 @@ export async function adminListTasks(input: {
  * CONTENT DOES NOT TRAVEL. Same rule as every admin read here: a private task is counted and shown,
  * and what it says is not an operator's to read from this surface.
  */
+/**
+ * THE TASK A REQUESTER MAY MOVE WHILE ANOTHER PERSON HOLDS IT (ADR-067 G8, WT114): in this conversation, live, for this
+ * person, held by someone else (a person worker, or a role's holder), in a step that declares `requesterMoves`. The newest
+ * such task, read back whole, with the moves its step allows, or null. Refused for a conversation this service does not
+ * serve. Read through the owner index the person's own work is listed by, so nothing is scanned.
+ */
+export async function requesterMovableTask(input: {
+  channelArn: string;
+  personId: string;
+  machines?: Record<string, TaskStateMachine>;
+}): Promise<{ task: Task; moves: string[] } | null> {
+  const { channelArn, personId } = input ?? ({} as typeof input);
+  if (!channelArn || !personId || await refusesChannel(channelArn)) return null;
+  const known = { ...packTaskStateMachines(), ...(input.machines ?? {}) };
+  const rows = (await getTasksOwnedBy(personId).catch(() => []))
+    .filter((r) => r.channelArn === channelArn && r.principalId !== personId)
+    // A ROW WHOSE STEP OFFERS THE REQUESTER A MOVE IS READ FIRST, newest first, so other tasks never crowd it out of the ten
+    // read. The shared machines only rank: a task on its version's own machine is still read, and its own machine decides.
+    .map((r) => ({ r, offers: !!r.taskType && requesterMovesOf(known[r.taskType], r.taskState).length > 0 }))
+    .sort((a, b) => Number(b.offers) - Number(a.offers) || String(b.r.updatedAt ?? '').localeCompare(String(a.r.updatedAt ?? '')))
+    .slice(0, 10)
+    .map(({ r }) => r);
+  // READ TOGETHER, so the look-up is one round trip on the turn's path, then checked in the order ranked above.
+  const read = await Promise.all(rows.map((row) => getTask(row.taskId, channelArn).catch(() => null)));
+  for (const task of read) {
+    if (!task || !ACTIVE_TASK_STATUSES.includes(task.status) || personIdFromArn(task.userArn) !== personId) continue;
+    if (task.assigneeId === personId) continue;
+    const machine = machinesOfTask(task, { ...packTaskStateMachines(), ...(input.machines ?? {}) })[task.taskType ?? ''];
+    const moves = requesterMovesOf(machine, task.taskState);
+    if (moves.length) return { task, moves };
+  }
+  return null;
+}
+
 export async function adminListTasksOwnedBy(input: {
   ownerPersonId: string;
 }): Promise<ConversationTask[]> {
@@ -912,6 +1203,36 @@ export async function adminCancelTask(input: {
     console.error('[task-service][admin] cancel failed', { taskId, err: (err as Error)?.message });
     return false;
   }
+}
+
+/**
+ * AN OPERATOR CANCELS A RUN (ADR-067 WT27, decision OPEN 13): every live task the run opened in the conversation is
+ * cancelled through the operator's own cancel (`adminCancelTask`), so each settles on its own edge and the run goes on as
+ * each step's failure would take it, once per step under its continuation claim. The operator names one task of the run;
+ * its run is read from that task's row, so no run key leaves the platform and a private run is cancelled as a shared one is,
+ * in a conversation of this service's classification only. Undoing what a run sent to an outside tool is the connectors
+ * pass. Returns how many tasks it cancelled.
+ */
+export async function adminCancelRun(input: { taskId: string; channelArn: string; by: string }): Promise<{ cancelled: number }> {
+  const { taskId: named, channelArn, by } = input ?? ({} as typeof input);
+  if (!named || !channelArn || await refusesChannel(channelArn)) return { cancelled: 0 };
+  const runKey = (await getTask(named, channelArn).catch(() => null))?.workflowRun?.runKey;
+  if (!runKey) return { cancelled: 0 };
+  let cancelled = 0;
+  // READ TOGETHER, in batches, so a busy conversation's run is cancelled in a few round trips rather than one per task.
+  const ids = (await adminListTasks({ channelArn })).map((t) => t.taskId);
+  for (let i = 0; i < ids.length; i += 25) {
+    const batch = await Promise.all(ids.slice(i, i + 25).map((taskId) => getTask(taskId, channelArn).catch(() => null)));
+    for (const task of batch) {
+      // A REQUEST THIS RUN MADE OF ANOTHER ASSISTANT is that assistant's work (WT118), so it is not cancelled here; the run
+      // is released from it, and its ending continues nothing.
+      if (task?.askedBy?.runKey === runKey) { await releaseAskedBy(task.taskId, channelArn, runKey); continue; }
+      if (!task || task.workflowRun?.runKey !== runKey || !(ACTIVE_TASK_STATUSES as readonly string[]).includes(task.status)) continue;
+      if (await adminCancelTask({ taskId: task.taskId, channelArn, by: `${by || 'an operator'} (the run)` })) cancelled += 1;
+    }
+  }
+  console.log('[task-service][admin] operator cancelled a run', { channelArn, cancelled, by });
+  return { cancelled };
 }
 
 /**
@@ -1035,6 +1356,17 @@ async function activeTaskByType(input: {
  * REFUSAL IS ZERO, matching every other op here: the caller cannot tell a refused channel from work
  * that was already gone.
  */
+/** Close the work an ended duel's sides opened, in a conversation this classification serves. */
+async function closeDuelTasks(input: { channelArn: string; battleId: string }): Promise<{ closed: Array<{ taskId: string; assistantId?: string }> }> {
+  const { channelArn, battleId } = input;
+  if (!channelArn || !battleId || await refusesChannel(channelArn)) return { closed: [] };
+  const closed = await endDuelTasks(channelArn, battleId);
+  // A RUN WAITING ON A CLOSED TASK GOES ON, on its failure edge, as after a stop.
+  for (const { taskId } of closed.slice(0, 20)) await nameWhatChanged(taskId, channelArn);
+  console.log('[task-service][duel] closed the work an ended duel opened', { channelArn, battleId, closed: closed.length });
+  return { closed };
+}
+
 async function discardStoppedTasks(input: {
   channelArn: string;
   taskIds: string[];
@@ -1099,6 +1431,21 @@ async function recordTaskDeliveryOp(input: {
 }): Promise<void> {
   if (!input?.taskId || !input?.channelArn || await refusesChannel(input.channelArn)) return;
   await recordTaskDelivery(input.taskId, input.channelArn, input.delivery);
+}
+
+/**
+ * A REQUEST'S RUN, WHERE NO ROUTER TURN OPENED ITS TASK (WT115, WT106): the router started the request's intent workflow,
+ * and its own task step takes this task. Refused where the conversation is not this classification's, and where the task
+ * is not a request awaiting its run (`requestAwaitingRun`).
+ */
+export async function attachRequestRunOp(input: { taskId: string; channelArn: string; workflowRun: WorkflowRunRef; dueBy?: string; ttlSeconds?: number }): Promise<Task | null> {
+  if (!input?.taskId || !input?.channelArn || !input?.workflowRun?.runKey || await refusesChannel(input.channelArn)) return null;
+  const task = await getTask(input.taskId, input.channelArn).catch(() => null);
+  if (!task || !requestAwaitingRun(task)) return null;
+  return attachRequestRun(input.taskId, input.channelArn, input.workflowRun, {
+    ...(typeof input.dueBy === 'string' && Number.isFinite(Date.parse(input.dueBy)) ? { dueBy: input.dueBy } : {}),
+    ...(typeof input.ttlSeconds === 'number' && Number.isFinite(input.ttlSeconds) ? { ttlSeconds: input.ttlSeconds } : {}),
+  });
 }
 
 async function markTaskPrivateOp(input: { taskId: string; channelArn: string }): Promise<void> {
@@ -1167,6 +1514,8 @@ export const handler = async (event: TaskServiceRequest): Promise<unknown> => {
       return setTaskStatus(input as never);
     case 'cancelStoppedTasks':
       return discardStoppedTasks(input as never);
+    case 'endDuelTasks':
+      return closeDuelTasks(input as never);
     case 'advanceTaskState':
       return advanceTask(input as never);
     case 'adminListTasks':
@@ -1229,6 +1578,26 @@ export const handler = async (event: TaskServiceRequest): Promise<unknown> => {
       return advanceAsAssignee(input as never);
     case 'cancelForDeadline':
       return cancelForDeadline(input as never);
+    case 'settleArchivedTasks':
+      return settleArchivedTasks(input as never);
+    case 'endRunTasks':
+      return endRunTasks(input as never);
+    case 'readEventSteps':
+      return readEventStepsOp(input as never);
+    case 'openTasksOpenedFrom':
+      return openTasksOpenedFrom(input as never);
+    case 'recordRunEnded':
+      return recordRunEnded(input as never);
+    case 'adminCancelRun':
+      return adminCancelRun(input as never);
+    case 'attachRequestRun':
+      return attachRequestRunOp(input as never) as never;
+    case 'requesterMovableTask':
+      return requesterMovableTask(input as never) as never;
+    case 'holdRunWait':
+      return holdRunWaitOp(input as never);
+    case 'readRunWait':
+      return readRunWaitOp(input as never);
     case 'readyTasks':
       return readyTasks(input as never);
     case 'claimPickup':

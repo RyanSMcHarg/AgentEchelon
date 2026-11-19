@@ -29,6 +29,7 @@ import { GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { HANDLE, LINK } from './voice-fill.js';
 import { isProposalOp, type ProposalOp } from './event-workflow.js';
 import { newPlatformToken, putToken, tokenKey, tokenRecordOf, type TokenRecord } from './tokens.js';
+import type { MeetingInvite } from './meeting-invites.js';
 
 type Sender = { send(command: unknown): Promise<any> };
 
@@ -40,7 +41,13 @@ export const PROPOSAL_DRAFT_MAX = 1000;
 export const PROPOSAL_LABEL_MAX = 80;
 
 /** How the step addressed the person a proposal is for, which the apply endpoint checks again. */
-export type ProposalAddressee = 'invitation:inviter' | 'joined' | 'subject' | 'event:person' | `participantRole:${string}`;
+export type ProposalAddressee = 'invitation:inviter' | 'joined' | 'subject' | 'event:person' | `participantRole:${string}` | typeof MEETING_ADDER;
+
+/**
+ * THE PERSON AN `add_to_meeting` PROPOSAL IS ADDRESSED AS: the one who asked, as the meeting's host or a moderator of its
+ * room or its own conversation, which the apply endpoint reads again, live, before anything is added.
+ */
+export const MEETING_ADDER = 'meeting:host-or-moderator' as const;
 
 /** What a proposal record carries beside the fields every token record does. */
 export interface ProposalFields {
@@ -57,6 +64,12 @@ export interface ProposalFields {
   invitationId?: string;
   /** `open_conversation`: the declared conversation type the step opens. */
   conversationType?: string;
+  /** `add_to_meeting`: the meeting's own conversation the people are added to, and no other. */
+  meetingChannelArn?: string;
+  /** `add_to_meeting`: who is added, for which accounts, and the brief each is told when they join (`meeting-invites.ts`). */
+  invites?: MeetingInvite[];
+  /** `add_to_meeting`: the assistant that drafted it, as its AppInstanceBot ARN, which says each person's brief. */
+  briefBy?: string;
   /**
    * Set by the apply endpoint. `declined` at once; for an apply, `applying` while its act runs (the claim, so a second
    * apply is refused), then `applied` when the act was done, or `failed` when it may have been done in part and so is

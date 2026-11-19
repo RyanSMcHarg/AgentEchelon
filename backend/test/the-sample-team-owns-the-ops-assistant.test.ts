@@ -29,7 +29,7 @@ describe('the sample deployment carries a team that owns an assistant', () => {
   });
 
   it('provisions a member of the ops team and a team member in no team', () => {
-    expect(provision).toMatch(/testuser-team-ops@\$\{EMAIL_DOMAIN\}[^\n]*groups: \['premium', 'team-members', 'team-ops'\]/);
+    expect(provision).toMatch(/testuser-team-ops@\$\{EMAIL_DOMAIN\}[^\n]*groups: \['premium', 'team-members', 'team-ops', 'team-platform'\]/);
     expect(provision).toMatch(/testuser-team-none@\$\{EMAIL_DOMAIN\}[^\n]*groups: \['premium', 'team-members'\]/);
   });
 });

@@ -9,8 +9,8 @@
  * validate and activate accept the version and the step has an exit.
  */
 import { SSMClient } from '@aws-sdk/client-ssm';
-import { stratumIntentPack, ACCOUNT_BRIEF_INTENT, ACCOUNT_BRIEF_WORKFLOW } from '../demo/intent-packs';
-import { PREMIUM_PERSONA } from '../demo/personas';
+import { stratumIntentPack, ACCOUNT_BRIEF_INTENT, ACCOUNT_BRIEF_WORKFLOW } from '../../demo/stratum-company/intent-packs';
+import { PREMIUM_PERSONA } from '../../demo/stratum-company/personas';
 import { parseIntentPack, validateIntentPackBody, taskStateMachines, MAX_INTENT_PACK_BYTES } from '../lambda/src/lib/intent-pack';
 import { validateTaskStateMachines, validateTaskStateMachine } from '../lambda/src/lib/task-state-machines';
 import { serializeSeedDefinition, validateDefinitionBody, type ProfileDefinitionBody } from '../lambda/src/lib/active-profile';

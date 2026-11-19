@@ -22,6 +22,10 @@
  * its recipients the same way, and the directive that asks the bridge for one is built once
  * (`notifyDirective`).
  *
+ * CLEARED, NOT ONLY A MEMBER. Every recipient's current clearance reaches the conversation's
+ * classification, read from its immutable tag (`lib/email-clearance.ts`); a recipient it does not reach,
+ * or a conversation whose classification cannot be read, is emailed nothing.
+ *
  * The on-channel message stays in the conversation (the in-app surface); this just adds the
  * out-of-band transport for members who aren't watching it.
  */
@@ -30,14 +34,15 @@ import { sendEmailNotifications, escapeHtml, type EmailRecipient, type Notificat
 import { isAdminNotificationChannel } from './admin-channel-kind.js';
 import { BOUNDED_REQUEST_HANDLER } from './bounded-request-handler.js';
 import { sessionClient } from './assistant-session.js';
-import { delimitedMentionTokens } from './flow-bypass.js';
+import { addressesTheRoom, delimitedMentionTokens, stripRoomAddress } from './flow-bypass.js';
 import { appInstanceArnOf, isPersonArn, personIdFromArn, rosterOf, userArnFor } from './person-arn.js';
 import { defaultDirectory, type Directory } from './membership-source.js';
-import { conversationDeepLink, isDirectiveNoticeKind, notifyDirective, type DirectiveNoticeKind } from './notify-directive.js';
+import { conversationDeepLink, isDirectiveNoticeKind, meetingDeepLink, notifyDirective, type DirectiveLink, type DirectiveNoticeKind } from './notify-directive.js';
 import { randomUUID } from 'crypto';
 import { isTransactional, mayNotify, type NoticeKind } from './notice-preferences.js';
 import { defaultEmailConsent, type EmailConsent } from './email-consent.js';
 import { defaultEmailVoice, emailLine, emailVoiceForRoom, type EmailVoice } from './email-copy.js';
+import { conversationClassificationOf, personReaches } from './email-clearance.js';
 
 export { conversationDeepLink, notifyDirective };
 
@@ -63,6 +68,11 @@ export interface NotifyDirective {
   notify: NotifyOptions;
   /** Email subject; a sensible default is used when absent. */
   subject?: string;
+  /**
+   * The email's own body (`notifyBody`), the template's `email.body` section, for a message whose chat words are not the
+   * words its email carries. Absent, the email carries the message text.
+   */
+  body?: string;
   /** Limit delivery to these people (e.g. a task assignee, or a just-shared member); omit ⇒ all
    *  participants. */
   targets?: NotifyTarget[];
@@ -71,6 +81,10 @@ export interface NotifyDirective {
   conversationId?: string;
   /** The kind an addressed email is sent as (`notifyKind`), read with `targets` only; absent is `conversation`. */
   kind?: DirectiveNoticeKind;
+  /** Where the email's button leads (`notifyLink`), with `conversationId`: the conversation's meeting window. */
+  link?: DirectiveLink;
+  /** People a membership-wide email leaves out (`notifyExclude`), by AppInstanceUser id: it only ever narrows who is emailed. */
+  exclude?: string[];
 }
 
 /**
@@ -95,11 +109,16 @@ export function parseNotifyDirective(metadata?: string): NotifyDirective | null 
     return {
       notify: { email: true },
       subject: typeof m.notifySubject === 'string' ? (m.notifySubject as string) : undefined,
+      ...(typeof m.notifyBody === 'string' && m.notifyBody.trim() ? { body: m.notifyBody } : {}),
       ...(targets && targets.length ? { targets } : {}),
       ...(typeof m.notifyConversationId === 'string' && m.notifyConversationId
         ? { conversationId: m.notifyConversationId as string } : {}),
       // A kind outside the directive's set (a transactional one, a typo) is ignored, never honored.
       ...(targets && targets.length && isDirectiveNoticeKind(m.notifyKind) ? { kind: m.notifyKind } : {}),
+      // A link outside the directive's set is ignored: the email opens the conversation.
+      ...(m.notifyLink === 'meeting' ? { link: 'meeting' as const } : {}),
+      ...(Array.isArray(m.notifyExclude) && m.notifyExclude.some((p) => typeof p === 'string' && p)
+        ? { exclude: (m.notifyExclude as unknown[]).filter((p): p is string => typeof p === 'string' && !!p).slice(0, 50) } : {}),
     };
   } catch {
     return null;
@@ -200,6 +219,8 @@ export async function emailPeople(args: {
   bodyHtml?: string;
   /** A conversation to link into, by channel id; the link is built from this deployment's origin. */
   conversationId?: string;
+  /** Link into the conversation's meeting window rather than the conversation. */
+  link?: DirectiveLink;
   /** The conversation the mail is about, for its reply address and its assistant's voice. */
   channelArn?: string;
   appUrl?: string;
@@ -255,7 +276,7 @@ export async function emailPeople(args: {
 
   // THE DEEP LINK, when the caller names a conversation and the deployment knows its own origin. One
   // link, worded and styled the same, everywhere an email opens a conversation.
-  const link = conversationDeepLink(args.appUrl ?? APP_URL, args.conversationId);
+  const link = (args.link === 'meeting' ? meetingDeepLink : conversationDeepLink)(args.appUrl ?? APP_URL, args.conversationId);
   if (args.conversationId && !link) {
     console.warn('[channel-notify] a conversation link was asked for and cannot be built; sending without it', {
       hasAppUrl: Boolean(args.appUrl ?? APP_URL),
@@ -263,7 +284,7 @@ export async function emailPeople(args: {
   }
   const button = link
     ? `<p style="margin: 24px 0;"><a href="${escapeHtml(link)}" style="background: #2d2d2d; color: #fff; `
-      + `padding: 12px 24px; border-radius: 6px; text-decoration: none; display: inline-block;">${escapeHtml(copy.openConversation)}</a></p>`
+      + `padding: 12px 24px; border-radius: 6px; text-decoration: none; display: inline-block;">${escapeHtml(args.link === 'meeting' ? copy.joinMeeting : copy.openConversation)}</a></p>`
     : '';
   const res: NotificationResult = await send(toSend, {
     subject: args.subject,
@@ -285,10 +306,12 @@ export async function fanOutChannelNotification(args: {
   directive: NotifyDirective;
   /**
    * A PERSON wrote the message, not an assistant. Their directive is member-writable Metadata, so it
-   * may reach only the members they @mention: its `notifyTargets` are ignored (they bypass membership)
-   * and it never becomes a membership-wide email, even in the admin conversation.
+   * may reach only the members they @mention, or everyone by `@all` or `@humans` as a token of its own:
+   * its `notifyTargets` are ignored (they bypass membership).
    */
   personSent?: boolean;
+  /** The message is Targeted: only its target reads it, so only a platform target list may email it. */
+  privateMessage?: boolean;
   /** Who wrote it, so mentioning yourself does not email you. */
   senderArn?: string;
   /** The chat app's origin for a conversation link. Defaults to `APP_URL`. */
@@ -314,10 +337,9 @@ export async function fanOutChannelNotification(args: {
   // copy, and never from Metadata, which members can write. A tag that cannot be read is not the admin
   // conversation: an unreadable answer must not become an email to every member.
   //
-  // FUTURE SCOPE, not built: per-conversation email for other conversations, and "email only when the
-  // recipient is not connected when the message is sent" (email in place of an unfocused-tab browser
-  // notification is roadmap). The admin conversation and the communication-hub project hold the start
-  // of that design.
+  // THE EMAIL GOES TO WHOEVER THE MESSAGE ADDRESSES: `@all` and `@humans` are the live membership, a mention is that member, for a person and
+  // an assistant alike, each through the same clearance check and preferences. "Email only when the recipient is not connected
+  // when the message is sent" is roadmap.
   // ── THE GATE IS ABOUT A BROADCAST, SO IT GATES THE BROADCAST (review, 2026-09-17) ───────────────
   //
   // Applied to EVERY directive, this also blocked the one notification that is not a broadcast at
@@ -342,13 +364,14 @@ export async function fanOutChannelNotification(args: {
   const senderId = personIdFromArn(args.senderArn) || '';
   const mentioned = mentionedMemberIds(messageText).filter((id) => id !== senderId);
   const explicitlyTargeted = !args.personSent && Boolean(directive.targets && directive.targets.length);
-  const mentionTargeted = !explicitlyTargeted && mentioned.length > 0;
-  if (args.personSent && !mentionTargeted) {
-    console.log('[channel-notify] a person\'s email reaches only the members they mention; not sending', { channelArn });
+  const toEveryone = !explicitlyTargeted && !args.privateMessage && addressesTheRoom(messageText);
+  const mentionTargeted = !explicitlyTargeted && !args.privateMessage && !toEveryone && mentioned.length > 0;
+  if ((args.personSent || args.privateMessage) && !explicitlyTargeted && !mentionTargeted && !toEveryone) {
+    console.log('[channel-notify] a person\'s email reaches only the members they address; not sending', { channelArn });
     return { emailed: [], skipped: [], failed: [], emailOff: true };
   }
   const isEmailConversation = args.deps?.isEmailConversation ?? isAdminNotificationChannel;
-  if (!explicitlyTargeted && !mentionTargeted && !(await isEmailConversation(chime, channelArn).catch(() => false))) {
+  if (!explicitlyTargeted && !mentionTargeted && !toEveryone && !(await isEmailConversation(chime, channelArn).catch(() => false))) {
     console.log('[channel-notify] a membership-wide email is sent only in the admin conversation; not sending', {
       channelArn,
     });
@@ -376,7 +399,10 @@ export async function fanOutChannelNotification(args: {
     }
   } else {
     const memberIds = await readMemberIds(chime, channelArn, bearerArn);
-    let reachable = memberIds;
+    // The person who wrote to everyone is not emailed their own message.
+    let reachable = toEveryone && args.personSent ? memberIds.filter((id) => id !== senderId) : memberIds;
+    // AN ASSISTANT'S ROOM-WIDE NOTICE LEAVES OUT WHOM IT NAMES (`notifyExclude`): the person who started a meeting is not told it started.
+    if (!args.personSent && directive.exclude?.length) reachable = reachable.filter((id) => !directive.exclude!.includes(id));
     if (mentionTargeted) {
       reachable = memberIds.filter((id) => mentioned.includes(id));
       const notMembers = mentioned.filter((id) => !memberIds.includes(id));
@@ -393,6 +419,33 @@ export async function fanOutChannelNotification(args: {
   }
   if (!personArns.length) return { emailed: [], skipped: [...notReached], failed: [] };
 
+  // ── EVERY RECIPIENT IS CLEARED FOR THE CONVERSATION NOW (`lib/email-clearance.ts`) ─────────────
+  //
+  // The email carries the conversation's words, so each recipient's current clearance must reach the
+  // conversation's classification, whichever path named them: a mention, an explicit target or the
+  // membership. A recipient it does not reach is counted in `skipped`, and a conversation whose
+  // classification cannot be read emails nobody.
+  const directory = args.deps?.directory ?? defaultDirectory();
+  const classification = await conversationClassificationOf(chime, channelArn, '[channel-notify]');
+  if (!classification) {
+    console.warn('[channel-notify] the conversation\'s classification cannot be read; nobody is emailed', { channelArn });
+    return { emailed: [], skipped: [...notReached, ...personArns.map((arn) => personIdFromArn(arn) || arn)], failed: [] };
+  }
+  const cleared: string[] = [];
+  for (const arn of personArns) {
+    const answer = await personReaches(directory, arn, classification);
+    if (answer === 'cleared') {
+      cleared.push(arn);
+      continue;
+    }
+    notReached.push(personIdFromArn(arn) || arn);
+    console.warn('[channel-notify][SecurityEvent] a recipient\'s clearance does not reach the conversation; not emailed', {
+      channelArn, classification, reason: answer, personId: personIdFromArn(arn),
+    });
+  }
+  personArns = cleared;
+  if (!personArns.length) return { emailed: [], skipped: [...notReached], failed: [] };
+
   // ONE FAN-OUT. Each person's contact is resolved by the directory, through `Identities`, whichever
   // trusted issuer they sign in with; the deep link is built there from the directive's channel id.
   // In the words of the conversation's assistant, and replyable as the person (M-8).
@@ -404,13 +457,19 @@ export async function fanOutChannelNotification(args: {
   const res = await emailPeople({
     personArns,
     kind,
-    subject: directive.subject || voice.copy.defaultSubject,
-    bodyText: readableMentions(messageText),
+    // A PERSON'S METADATA IS THEIRS TO WRITE, so the subject line of what the platform sends for them is the platform's.
+    subject: (!args.personSent && directive.subject) || voice.copy.defaultSubject,
+    // THE BODY IS THE PLATFORM'S TOO: an assistant's message may carry its email's own words (`notifyBody`); a person's
+    // email is always what they wrote.
+    bodyText: !args.personSent && directive.body
+      ? readableMentions(directive.body)
+      : readableMentions(toEveryone ? stripRoomAddress(messageText) : messageText),
     channelArn,
     voice,
-    ...(directive.conversationId ? { conversationId: directive.conversationId } : {}),
+    // THE LINK IS THE PLATFORM'S TOO: a person's Metadata does not choose where an email the platform sends for them leads.
+    ...(!args.personSent && directive.conversationId ? { conversationId: directive.conversationId, ...(directive.link ? { link: directive.link } : {}) } : {}),
     ...(args.appUrl !== undefined ? { appUrl: args.appUrl } : {}),
-    deps: { directory: args.deps?.directory, send: args.deps?.send, consent: args.deps?.consent },
+    deps: { directory, send: args.deps?.send, consent: args.deps?.consent },
   });
   return { emailed: res.emailed, skipped: [...notReached, ...res.skipped], failed: res.failed };
 }

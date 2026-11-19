@@ -54,6 +54,22 @@ describe('the turn-state API is wired from the same switch as the writers', () =
     expect(vars.TURN_QUEUE_ENABLED).toBe('1');
   });
 
+  it('reads a message only in a conversation that carries a classification, bearing the caller (tenet D12)', () => {
+    const t = conversationsTemplate({ turnQueue: true });
+    const roleRef = turnStateApi(t).Properties?.Role?.['Fn::GetAtt']?.[0];
+    const statements = Object.values(t.findResources('AWS::IAM::Policy'))
+      .filter((p: any) => p.Properties?.Roles?.some((r: { Ref?: string }) => r.Ref === roleRef))
+      .flatMap((p: any) => p.Properties.PolicyDocument.Statement as any[])
+      .filter((s: any) => [s.Action].flat().includes('chime:GetChannelMessage'));
+    const legs = statements.map((s: any) => ({ resource: JSON.stringify(s.Resource), condition: s.Condition }));
+    expect(legs).toHaveLength(2);
+    // The channel leg is tag-conditioned; the bearer leg is the person, whose AppInstanceUser carries no such tag.
+    expect(legs.find((l) => l.resource.includes('/channel/*'))?.condition)
+      .toEqual({ Null: { 'aws:ResourceTag/classification': 'false' } });
+    expect(legs.find((l) => l.resource.includes('/user/*'))?.condition).toBeUndefined();
+    expect(legs.every((l) => !(l.resource.includes('/channel/*') && l.resource.includes('/user/*')))).toBe(true);
+  });
+
   it('stays a READER: it answers what is waiting and can never change it', () => {
     const t = conversationsTemplate({ turnQueue: true });
     const roleRef = turnStateApi(t).Properties?.Role?.['Fn::GetAtt']?.[0];

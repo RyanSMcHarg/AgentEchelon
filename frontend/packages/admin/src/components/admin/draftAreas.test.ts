@@ -3,7 +3,7 @@
  *
  * What it proves: every version field the console edits belongs to exactly one area, and a field no area owns is
  * still in the diff under `other`; the diff names each changed field as added, removed or changed, compares by
- * content (key order and an absent value do not count), splits the welcome (assistant-joined) from the other event
+ * content (key order and an absent value do not count), holds the welcome (assistant-joined) with the other event
  * workflows, and with nothing active reads every set field as added; a step's unsaved patch applies over the draft
  * with `null` removing a field; each area's sentence says what the draft holds, in the locale's words.
  */
@@ -44,7 +44,8 @@ describe('the areas', () => {
       }
     }
     for (const [path, areas] of owners) expect(areas, path).toHaveLength(1);
-    expect(owners.get('eventWorkflows.welcome')).toEqual(['welcome']);
+    // THE WELCOME IS A WORKFLOW, owned by the workflows area with every other one.
+    expect(owners.get('eventWorkflows.welcome')).toEqual(['events']);
     expect(owners.get('eventWorkflows.chase')).toEqual(['events']);
     expect(owners.get('models.routing')).toEqual(['routing']);
   });
@@ -54,10 +55,11 @@ describe('the diff against the active version', () => {
   it('names each changed field, area by area, and leaves unchanged areas out', () => {
     const draft = { ...ACTIVE, persona: 'You advise briefly.', tools: undefined, guardrailId: 'gr', eventWorkflows: { welcome: welcome('Hello.'), chase } };
     const diff = draftDiff(ACTIVE, draft);
-    expect(diff.map((d) => d.area)).toEqual(['identity', 'abilities', 'events']);
+    expect(diff.map((d) => d.area)).toEqual(['identity', 'abilities', 'settings', 'events']);
     expect(diff[0].changes).toEqual([{ path: 'persona', change: 'changed' }]);
-    expect(diff[1].changes).toEqual([{ path: 'guardrailId', change: 'added' }, { path: 'tools', change: 'removed' }]);
-    expect(diff[2].changes).toEqual([{ path: 'eventWorkflows.chase', change: 'added' }]);
+    expect(diff[1].changes).toEqual([{ path: 'tools', change: 'removed' }]);
+    expect(diff[2].changes).toEqual([{ path: 'guardrailId', change: 'added' }]);
+    expect(diff[3].changes).toEqual([{ path: 'eventWorkflows.chase', change: 'added' }]);
   });
 
   it('compares by content: key order and an absent value are no change', () => {
@@ -77,7 +79,7 @@ describe('the diff against the active version', () => {
     expect(diff.find((d) => d.area === 'identity')?.changes).toEqual([
       { path: 'displayName', change: 'added' }, { path: 'persona', change: 'added' },
     ]);
-    expect(diff.find((d) => d.area === 'welcome')?.changes).toEqual([{ path: 'eventWorkflows.welcome', change: 'added' }]);
+    expect(diff.find((d) => d.area === 'events')?.changes).toEqual([{ path: 'eventWorkflows.welcome', change: 'added' }]);
   });
 });
 
@@ -92,16 +94,17 @@ describe('one sentence per area', () => {
   it('says what the draft holds', () => {
     expect(areaSummary('identity', ACTIVE, t)).toBe('Advisor, with a persona of 11 characters.');
     expect(areaSummary('identity', { modelKey: 'x' }, t, 'tax-advisor')).toBe("tax-advisor, answering with the classification's persona.");
-    expect(areaSummary('abilities', ACTIVE, t)).toBe("Tools offered: 1; context sources read: 0; guardrail: the classification's.");
+    expect(areaSummary('abilities', ACTIVE, t)).toBe('Tools offered: 1; context sources read: 0.');
+    expect(areaSummary('settings', ACTIVE, t)).toBe("Guardrail: the classification's.");
     expect(areaSummary('models', ACTIVE, t)).toBe('Answers on sonnet and classifies on the platform classifier, with 1 intent route.');
     expect(areaSummary('routing', ACTIVE, t)).toBe('No routing rules; each turn takes the model its intent routes to.');
-    expect(areaSummary('welcome', ACTIVE, t)).toBe('Its own welcome greets every other room.');
-    expect(areaSummary('welcome', { modelKey: 'x', eventWorkflows: { w: welcome('Ops.', ['ops']) } }, t)).toBe('Its own welcome greets ops.');
-    expect(areaSummary('welcome', { modelKey: 'x' }, t)).toBe("The platform's welcome greets every room.");
     expect(areaSummary('messages', { modelKey: 'x', messages: { a: '@shipped', b: '@classification' } }, t))
       .toBe('2 messages say a template chosen for this version; the rest say their usual one.');
-    expect(areaSummary('events', { modelKey: 'x', eventWorkflows: { chase } }, t)).toBe('1 event workflow, on invitation-unredeemed.');
-    expect(areaSummary('events', ACTIVE, t)).toBe('No event workflows besides the welcome.');
+    // The welcome first, as every version has one, then the other workflows.
+    expect(areaSummary('events', { modelKey: 'x', eventWorkflows: { chase } }, t))
+      .toBe("Uses the platform's welcome. 1 event workflow, on invitation-unredeemed.");
+    expect(areaSummary('events', ACTIVE, t)).toBe('Its own welcome greets every other conversation, as the default. No event workflows besides the welcome.');
+    expect(areaSummary('events', { modelKey: 'x', eventWorkflows: { w: welcome('Ops.', ['ops']) } }, t)).toBe('Its own welcome greets ops. No event workflows besides the welcome.');
     expect(areaSummary('variables', { modelKey: 'x', variables: { team: { source: 'fact:team' } } }, t)).toBe('1 variable: team.');
   });
 });

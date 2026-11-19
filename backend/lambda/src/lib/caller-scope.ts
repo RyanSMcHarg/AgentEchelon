@@ -190,34 +190,45 @@ export function __clearScopeCache(): void {
   roleScopeByName = undefined;
 }
 
-// A14 Scoped for the ANALYTICS plane: drop result rows whose classification
-// DIMENSION is outside the scope. Generic (no per-query SQL) — a row is filtered
-// only if it carries a field that both names a classification axis AND holds a real
-// tier value, so a global aggregate (no tier column) passes through unscoped, and a
-// field literally named `classification` that holds a quality grade
-// (excellent/good/...) is NOT mistaken for a tier. Documented limitation: cross-tier
-// aggregates with no tier column are not narrowed (a deployer choice).
-// THE DECLARED CLASSIFICATION VALUES, from the registry.
+// A14 Scoped for the ANALYTICS plane: keep only the result rows a scoped caller may see.
 //
-// This was a hardcoded three, and unlike every other frozen ladder in this codebase it failed OPEN.
-// The set decides which row VALUES count as a classification at all; a value it does not recognise is
-// not narrowed, so an `admin`-classified analytics row passed through to every caller regardless of
-// their scope. Every other copy of this list denies someone wrongly - this one discloses.
+// A row's classification is the first classification-axis field holding a DECLARED classification
+// value (the registry's set, so a classification added later is recognized with no edit here). Then:
+//   - a row with an established classification is kept only when the scope reaches it;
+//   - a row that carries a classification-axis field naming no declared classification (NULL, empty,
+//     'unknown' or an undeclared value) is UNCLASSIFIABLE and is dropped (ADR-045 decision 4);
+//   - a row with no classification dimension at all is a global aggregate and is kept, unless the caller
+//     asks for `requireClassification`, which every content read does: content reaches a scoped caller
+//     only when its classification is established and in reach.
+// A field named `classification` alone is ambiguous: on the evaluation tables it holds a quality grade
+// (excellent/good/...), so it establishes a classification when it holds a declared value and is not
+// otherwise read as a classification axis.
 const classificationValues = (): Set<string> => new Set(profiles.classificationValues());
 const CLASSIFICATION_FIELDS = new Set([
   'classification', 'conversation_classification', 'tier', 'user_type', 'channel_tier', 'channeltier', 'modeltier',
   'channelclassification',
 ]);
+/** The classification-axis fields that only ever hold a classification. */
+const UNAMBIGUOUS_CLASSIFICATION_FIELDS = new Set([...CLASSIFICATION_FIELDS].filter((f) => f !== 'classification'));
 
-export function scopeAnalyticsRows<T>(rows: T[], scope: ClassificationScope): T[] {
+export interface ScopeRowsOptions {
+  /** Keep a row only when its classification is established and in reach (every content read). */
+  requireClassification?: boolean;
+}
+
+export function scopeAnalyticsRows<T>(rows: T[], scope: ClassificationScope, options: ScopeRowsOptions = {}): T[] {
   if (scope === null || !Array.isArray(rows)) return rows;
+  const declared = classificationValues();
   return rows.filter((row) => {
-    if (!row || typeof row !== 'object') return true;
+    if (!row || typeof row !== 'object') return !options.requireClassification;
+    let carriesAxis = false;
     for (const [k, v] of Object.entries(row as Record<string, unknown>)) {
-      if (typeof v === 'string' && CLASSIFICATION_FIELDS.has(k.toLowerCase()) && classificationValues().has(v)) {
-        return classificationAllowed(v, scope);
-      }
+      const key = k.toLowerCase();
+      if (!CLASSIFICATION_FIELDS.has(key)) continue;
+      if (typeof v === 'string' && declared.has(v)) return classificationAllowed(v, scope);
+      if (UNAMBIGUOUS_CLASSIFICATION_FIELDS.has(key)) carriesAxis = true;
     }
-    return true; // no tier dimension -> global aggregate, not narrowed
+    if (carriesAxis) return false; // unclassifiable: withheld from a scoped caller
+    return !options.requireClassification; // a global aggregate, unless the read is content
   });
 }

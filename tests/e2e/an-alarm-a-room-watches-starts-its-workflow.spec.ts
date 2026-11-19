@@ -6,30 +6,35 @@
  * `an-event-step-opens-a-task-the-room-works-on.test.ts`). What only a deployment proves is the path end to end:
  *  - the platform's ops event, naming an alarm, reaches the premium creator through its rule, and the room it opens
  *    records the alarm on its own context row and in the alarm's watch record;
- *  - `conversation-opened` runs the ops room's first look, which the room's ops assistant takes as itself (`as: { role:
- *    'ops' }`): it opens an `incident_first_look` task owned by the assistant and visible to the room, the ops
- *    assistant posts the first look, and the task moves to `findings_shared` once the turn posted;
+ *  - `conversation-opened` runs the ops room's first look, a task step held by the room's ops assistant (`by: {
+ *    assistantRole: 'ops' }`): it opens an `incident_first_look` task owned by that assistant and visible to the room, the
+ *    ops assistant's pickup turn posts the first look as itself, and the state's declared move (`auto`) takes the task to
+ *    `findings_shared` once the turn answered;
  *  - a CloudWatch alarm state change of this deployment's alarms reaches the router through the incident-watch rule,
  *    the router reads the alarm back under its prefix-scoped `DescribeAlarms`, and the room's incident watch posts the
- *    state as the primary and then the re-read as the ops assistant;
+ *    state and then the re-read, each as the ops assistant, which owns the room's workflows;
  *  - a state change on an alarm no room watches posts nothing.
  *
  * THE RUN OWNS EVERYTHING IT TOUCHES. Two alarms with this deployment's name prefix (one the room watches, one no room
  * watches), each with no actions and missing data treated as `ignore`, so the state the test sets is the state the
- * alarm keeps; a standing `ops-team` room for the event to concern; and the `ops` room the event opens. The room's
- * primary gets a version whose welcome runs the platform's `ops-room` for `ops` conversations and whose
+ * alarm keeps; a standing `ops-team` room for the event to concern; and the `ops` room the event opens. The ops
+ * assistant, which owns an `ops` room's workflows (`workflowOwner`), gets a version whose welcome runs the platform's `ops-room` for `ops` conversations and whose
  * `eventWorkflows` carries a copy of the platform's `incident-watch`, because an event that selects its workflow runs
- * the version's. Afterwards the alarms, their watch records, both rooms and their rows are deleted and the primary is
+ * the version's. Afterwards the alarms, their watch records, both rooms and their rows are deleted and the ops assistant is
  * rolled back to the version it had.
  *
  * GATED: it changes a deployed assistant's active version for its duration, so it runs only with
  * `INCIDENT_WATCH_E2E=1` (validate.mjs --only=incident-watch). Every other gate names the dependency that is absent.
+ *  - DESIGN-CONVERSATION-DASHBOARDS: the watch's required refresh publishes the room's dashboard as the ops assistant; a member
+ *    reads it with a credential the exchange vends for that one conversation, and is refused another's; a person outside the
+ *    room is refused the credential; and the page the ops assistant publishes on request opens on a member's signed link only.
  *
  * **Coverage:** `e2e/an-alarm-a-room-watches-starts-its-workflow.spec.ts`
  */
 import { test, expect, expectAlarm } from './helpers/fixtures';
 import { guardBackendErrors } from './helpers/turn-guards';
 import { getAdminUser, getOpsLeadUser, getTestCredentials, hasTestCredentials, missingUserReason, type TestUser } from './helpers/test-credentials';
+import { joinMembershipGroup } from './helpers/team-group';
 import { exchange, signedCall, type VendedCredentials } from './helpers/admin-api';
 import { ADMIN_API_URL, adminUrl } from './helpers/api-urls';
 import { idTokenFor, personArnOf } from './helpers/person';
@@ -39,9 +44,15 @@ import { looksLikeTaskPlaceholder } from './helpers/agent-helpers';
 import { channelTasks, graphEdges, hasEdge, pollFor, unmarshalItem, type TaskRow } from './helpers/task-backend';
 import { INSTANCE, SSM_ROOT, STACK_PREFIX, physicalIdsInClassificationStacks } from './helpers/stack-prefix';
 import { awsv, awsvText } from './helpers/aws';
-import { PLATFORM_EVENT_WORKFLOWS, alarmWatchKey } from '../../backend/lambda/src/lib/event-workflow';
+import { SHIPPED_EVENT_WORKFLOWS, alarmWatchKey } from '../../backend/lambda/src/lib/event-workflow';
 import { withWorkflowFor } from './helpers/version-under-test';
+import { replacingDraft, draftIdOf } from './helpers/profile-draft';
 import * as fs from 'fs';
+import { SignatureV4 } from '@smithy/signature-v4';
+import { HttpRequest } from '@smithy/protocol-http';
+import { Sha256 } from '@aws-crypto/sha256-js';
+import { personApiServes, personUrl } from './helpers/api-urls';
+import { sendTargetedAs } from './helpers/battle-state-backend';
 import * as os from 'os';
 import * as path from 'path';
 
@@ -157,7 +168,7 @@ test.describe.serial('an alarm a room watches starts its workflow (incident-watc
   guardBackendErrors('an-alarm-a-room-watches-starts-its-workflow');
 
   let admin: VendedCredentials | undefined;
-  let primary = '';
+  let owner = '';
   let previousVersion: number | undefined;
   let creator = '';
   let contextTable = '';
@@ -167,15 +178,18 @@ test.describe.serial('an alarm a room watches starts its workflow (incident-watc
   let leadArn = '';
   let teamRoom = '';
   let room = '';
-  /** The ops assistant's bot: the one that reads the deployment's health, never the room's primary. */
+  /** The ops assistant's bot: the one that reads the deployment's health, the room's primary and the owner of its workflows. */
   let opsBot = '';
   const alarmsMade: string[] = [];
+
+  /** What returns the team's membership group to how this run found it. */
+  let leaveTeamGroup: () => void = () => undefined;
 
   test.beforeAll(async () => {
     test.skip(!RUN, 'changes a deployed assistant\'s active version; set INCIDENT_WATCH_E2E=1 to run it (validate.mjs --only=incident-watch)');
     test.skip(!haveCreds(), 'needs AWS credentials - set AWS_PROFILE');
     test.skip(!hasTestCredentials(), 'test credentials are not available');
-    test.skip(!ADMIN_API_URL, 'VITE_ADMIN_API_URL is needed to give the room\'s primary its version');
+    test.skip(!ADMIN_API_URL, 'VITE_ADMIN_API_URL is needed to give the ops assistant its version');
     const adminUser = await getAdminUser();
     test.skip(!adminUser.password, missingUserReason('testAdmin'));
     const opsLead = await getOpsLeadUser();
@@ -206,9 +220,12 @@ test.describe.serial('an alarm a room watches starts its workflow (incident-watc
 
     leadArn = await personArnOf(opsLead!);
     expect(leadArn, 'the ops lead has no AppInstanceUser').toContain('/user/');
-    primary = liveAssistantFor('premium');
+    // THE ASSISTANT THAT OWNS AN OPS ROOM'S WORKFLOWS (`workflowOwner` on `ops`), whose version this run changes.
+    owner = liveAssistantFor('premium', 'ops');
 
     const creds = await getTestCredentials();
+    // THE STANDING TEAM CONVERSATION ADMITS ITS GROUP'S PEOPLE ONLY, so the lead is in that group for the run.
+    leaveTeamGroup = joinMembershipGroup('ops-team', opsLead!.email, creds.cognitoUserPoolId);
     const session = await exchange(idTokenFor(adminUser.email, adminUser.password, creds.cognitoClientId), { identity: 'console' });
     expect(session.status, JSON.stringify(session.body).slice(0, 300)).toBe(200);
     admin = session.body.credentials;
@@ -227,40 +244,41 @@ test.describe.serial('an alarm a room watches starts its workflow (incident-watc
       tryTo(`delete the room ${arn}`, () => awsv(['chime-sdk-messaging', 'delete-channel', '--channel-arn', arn, '--chime-bearer', bearer]));
       if (contextTable) tryTo(`delete the row of ${arn}`, () => deleteContextItem(contextTable, arn));
     }
+    tryTo('return the team group', () => leaveTeamGroup());
     if (admin && previousVersion !== undefined) {
-      const back = await signedCall(adminUrl('assistant-admin', '/admin/profiles/rollback'), admin, 'POST', { profileName: primary, version: previousVersion }).catch(() => undefined);
-      if (back?.status !== 200) console.warn(`cleanup: ${primary} was not rolled back to version ${previousVersion}: ${JSON.stringify(back?.body ?? {}).slice(0, 300)}`);
+      const back = await signedCall(adminUrl('assistant-admin', '/admin/profiles/rollback'), admin, 'POST', { profileName: owner, version: previousVersion }).catch(() => undefined);
+      if (back?.status !== 200) console.warn(`cleanup: ${owner} was not rolled back to version ${previousVersion}: ${JSON.stringify(back?.body ?? {}).slice(0, 300)}`);
     }
   });
 
-  test('the room\'s primary activates a version that runs the ops room\'s first look and the incident watch', async () => {
+  test('the ops assistant activates a version that runs the ops room\'s first look and the incident watch', async () => {
     test.setTimeout(180_000);
     const listing = await signedCall(adminUrl('assistant-admin', '/admin/profiles'), admin!);
-    previousVersion = (listing.body?.profiles ?? []).find((p: any) => p.profileName === primary)?.activeVersion ?? undefined;
-    expect(previousVersion, `${primary} has no active version to return to`).toBeDefined();
+    previousVersion = (listing.body?.profiles ?? []).find((p: any) => p.profileName === owner)?.activeVersion ?? undefined;
+    expect(previousVersion, `${owner} has no active version to return to`).toBeDefined();
 
-    const created = await signedCall(adminUrl('assistant-admin', '/admin/profiles/version'), admin!, 'POST', { profileName: primary });
+    const created = await replacingDraft((b) => signedCall(adminUrl('assistant-admin', '/admin/profiles/version'), admin!, 'POST', b), { profileName: owner });
     expect(created.status, JSON.stringify(created.body).slice(0, 400)).toBe(200);
     // The draft is a copy of the active version; its event workflows are kept, and only what this run needs is added:
     // `ops` conversations open with the platform's `ops-room`, and the version's one `alarm-state-changed` workflow is
     // the platform's incident watch.
-    const exported = await signedCall(adminUrl('assistant-admin', '/admin/profiles/export'), admin!, 'POST', { profileName: primary, draft: true });
+    const exported = await signedCall(adminUrl('assistant-admin', '/admin/profiles/export'), admin!, 'POST', { profileName: owner, draft: true });
     expect(exported.status, JSON.stringify(exported.body).slice(0, 400)).toBe(200);
     const body = (exported.body?.manifest?.body ?? {}) as { eventWorkflows?: Record<string, any>; workflows?: string[] };
     const kept = Object.fromEntries(Object.entries(body.eventWorkflows ?? {}).filter(([, wf]) => wf?.on !== 'alarm-state-changed'));
     const patch: Record<string, unknown> = {
       // THE ROOM'S TYPE SELECTS ITS conversation-opened WORKFLOW (W1): the platform's ops-room, copied into the version.
-      eventWorkflows: withWorkflowFor({ eventWorkflows: { ...kept, [WATCH_WORKFLOW]: JSON.parse(JSON.stringify(PLATFORM_EVENT_WORKFLOWS['incident-watch'])) } },
-        'ops-room', JSON.parse(JSON.stringify(PLATFORM_EVENT_WORKFLOWS['ops-room']))),
+      eventWorkflows: withWorkflowFor({ eventWorkflows: { ...kept, [WATCH_WORKFLOW]: JSON.parse(JSON.stringify(SHIPPED_EVENT_WORKFLOWS['incident-watch'])) } },
+        'ops-room', JSON.parse(JSON.stringify(SHIPPED_EVENT_WORKFLOWS['ops-room']))),
       // A version that selects its task workflows offers the one its first look opens.
       ...(Array.isArray(body.workflows) && body.workflows.length && !body.workflows.includes('incident_first_look')
         ? { workflows: [...body.workflows, 'incident_first_look'] } : {}),
     };
-    const edited = await signedCall(adminUrl('assistant-admin', '/admin/profiles/draft'), admin!, 'POST', { profileName: primary, patch });
+    const edited = await signedCall(adminUrl('assistant-admin', '/admin/profiles/draft'), admin!, 'POST', { profileName: owner, patch, configId: draftIdOf(created) });
     expect(edited.status, JSON.stringify(edited.body).slice(0, 400)).toBe(200);
-    const valid = await signedCall(adminUrl('assistant-admin', '/admin/profiles/validate'), admin!, 'POST', { profileName: primary });
+    const valid = await signedCall(adminUrl('assistant-admin', '/admin/profiles/validate'), admin!, 'POST', { profileName: owner });
     expect(valid.body?.errors ?? [], JSON.stringify(valid.body).slice(0, 600)).toEqual([]);
-    const activated = await signedCall(adminUrl('assistant-admin', '/admin/profiles/activate'), admin!, 'POST', { profileName: primary });
+    const activated = await signedCall(adminUrl('assistant-admin', '/admin/profiles/activate'), admin!, 'POST', { profileName: owner, configId: draftIdOf(edited) });
     expect(activated.status, JSON.stringify(activated.body).slice(0, 400)).toBe(200);
 
     // The alarms exist before any room watches them, so the state they are created in starts nothing.
@@ -317,15 +335,29 @@ test.describe.serial('an alarm a room watches starts its workflow (incident-watc
       'a task an event opens is the assistant\'s, visible to the room',
     ).toEqual({ assigneeType: 'assistant', assigneeId: opsBotId, assistantId: opsBotId, ownerPersonId: undefined, visibility: 'conversation' });
     expect(firstLooks(agentTable, room).length, 'one first look per run').toBe(1);
-    const posts = assistantPosts(room, leadArn);
-    const opening = posts.find((m) => m.text.includes(`This room is open for ${TOPIC}`));
+    const openingOf = (ps: ReturnType<typeof assistantPosts>) => ps.find((m) => m.text.includes(`This conversation is for ${TOPIC}`));
+    // THE FIRST LOOK IS THE OPS ASSISTANT'S ANSWER ON ITS `incident_first_look` TASK, read by that task's marker: the run also
+    // posts the opening and greets the lead between, and neither is the first look.
+    const lookOf = (ps: ReturnType<typeof assistantPosts>) => {
+      const o = openingOf(ps);
+      return o ? ps.find((m) => m.messageId !== o.messageId && m.senderArn === opsBot && Date.parse(m.createdAt) >= Date.parse(o.createdAt)
+        && m.content.includes('incident_first_look') && m.text && !looksLikeTaskPlaceholder(m.text)) : undefined;
+    };
+    const posts = await pollFor(() => assistantPosts(room, leadArn), (ps) => Boolean(lookOf(ps)), { timeoutMs: 60_000, intervalMs: 5_000 });
+    const opening = openingOf(posts);
     expect(opening, `the ops room's opening was not posted; seen ${JSON.stringify(posts.map((m) => m.text.slice(0, 120)))}`).toBeTruthy();
-    // THE FIRST LOOK IS THE OPS ASSISTANT'S (`as: { role: 'ops' }`): the primary posts the opening, and the health read is
-    // posted by the ops assistant on its own session, never by a primary, which the boundary refuses CloudWatch.
-    expect(opening!.senderArn, 'the opening is the room\'s primary\'s').not.toBe(opsBot);
-    const look = posts.find((m) => m.senderArn === opsBot && Date.parse(m.createdAt) >= Date.parse(opening!.createdAt) && m.text && !looksLikeTaskPlaceholder(m.text));
+    // THE ROOM'S WORKFLOWS ARE THE OPS ASSISTANT'S (ADR-061 decision 2): it posts the opening as the room's primary and the
+    // owner of its workflows, and the health read on its own session, which alone holds the deployment's telemetry.
+    expect(opening!.senderArn, 'the opening is the ops assistant\'s').toBe(opsBot);
+    const look = lookOf(posts);
     expect(look, `the ops assistant posted no first look; seen ${JSON.stringify(posts.map((m) => [m.senderArn.split('/bot/')[1], m.text.slice(0, 120)]))}`).toBeTruthy();
-    expect(posts.some((m) => m.text.includes('No ops assistant is in this room')), 'the room was told no ops assistant is here, with one in it').toBe(false);
+    // WHAT THE ROOM ACTUALLY READS, IN FULL, as its lead sees it through the API, so a run's replies are read and not only counted.
+    console.log(`[what the room reads] the first look:\n${posts.map((m) => `--- ${m.senderArn === opsBot ? 'Ops' : 'another assistant'}\n${m.text}`).join('\n')}`);
+    // THE FIRST LOOK REPORTS THE HEALTH IT READ: figures, not a line about standing by, which is what a turn that took its own
+    // automatic move ended on.
+    expect(look!.text, 'the first look reports what it read').toMatch(/\d/);
+    expect(look!.text, 'the first look reports what it read').not.toMatch(/standing by/i);
+    expect(posts.some((m) => m.text.includes('No ops assistant is in this conversation')), 'the room was told no ops assistant is here, with one in it').toBe(false);
   });
 
   test('a state change on the watched alarm runs the room\'s incident watch, and one on an alarm no room watches posts nothing', async () => {
@@ -346,14 +378,18 @@ test.describe.serial('an alarm a room watches starts its workflow (incident-watc
     const announced = (ps: ReturnType<typeof assistantPosts>) => ps.find((m) => Date.parse(m.createdAt) >= since && m.text.includes(WATCHED) && m.text.includes('is now ALARM'));
     const reread = (ps: ReturnType<typeof assistantPosts>) => {
       const a = announced(ps);
-      // The re-read is the ops assistant's: the primary announces the state, and the ops assistant reads the health again.
-      return a ? ps.find((m) => m.messageId !== a.messageId && m.senderArn === opsBot && Date.parse(m.createdAt) >= Date.parse(a.createdAt) && m.text && !looksLikeTaskPlaceholder(m.text)) : undefined;
+      // Both are the ops assistant's: it announces the state, refreshes the dashboard, and reads the health again. The re-read
+      // is its next post after the announcement that is not the dashboard refresh's, which its Metadata names (`"dashboard"`);
+      // a one-shot ask settles in its own turn, so its answer need not carry the task's marker.
+      return a ? ps.find((m) => m.messageId !== a.messageId && m.senderArn === opsBot && Date.parse(m.createdAt) >= Date.parse(a.createdAt)
+        && !m.metadata.includes('"dashboard"') && m.text && !looksLikeTaskPlaceholder(m.text)) : undefined;
     };
     const posts = await pollFor(() => assistantPosts(room, leadArn), (ps) => Boolean(announced(ps) && reread(ps)), { timeoutMs: 240_000, intervalMs: 5_000 });
     const seen = JSON.stringify(posts.filter((m) => Date.parse(m.createdAt) >= since).map((m) => m.text.slice(0, 160)));
     expect(announced(posts), `the incident watch did not announce the state; seen since the change ${seen}`).toBeTruthy();
     expect(reread(posts), `the incident watch did not post its re-read; seen since the change ${seen}`).toBeTruthy();
-    console.log(`announce: ${announced(posts)!.text.slice(0, 200)}\nre-read:  ${reread(posts)!.text.slice(0, 300)}`);
+    // WHAT THE ROOM ACTUALLY READS, IN FULL.
+    console.log(`[what the room reads] the alarm changed:\nannounce: ${announced(posts)!.text}\nre-read:\n${reread(posts)!.text}`);
     // The run keyed by the alarm's change opens no task of its own: the room still holds its one first look.
     expect(firstLooks(agentTable, room).length, 'the incident watch opens no second first look').toBe(1);
 
@@ -364,5 +400,112 @@ test.describe.serial('an alarm a room watches starts its workflow (incident-watc
     const mentions = assistantPosts(room, leadArn).filter((m) => m.text.includes(UNWATCHED));
     expect(mentions.map((m) => m.text.slice(0, 160)), 'a change on an alarm no room watches posted in the room').toEqual([]);
     expect(contextItem(contextTable, alarmWatchKey(UNWATCHED)), 'no room came to watch the second alarm').toBeUndefined();
+  });
+
+  // ── THE ROOM'S DASHBOARD (DESIGN-CONVERSATION-DASHBOARDS) ─────────────────────────────────────────────────────────────────
+  /** An S3 GET signed with the given credentials, as the chat app signs it with the member's own session. */
+  const s3Get = async (loc: { bucket: string; key: string; region: string }, c: Record<string, string>) => {
+    const host = `${loc.bucket}.s3.${loc.region}.amazonaws.com`;
+    const signer = new SignatureV4({ credentials: { accessKeyId: c.AccessKeyId, secretAccessKey: c.SecretAccessKey, sessionToken: c.SessionToken }, region: loc.region, service: 's3', sha256: Sha256 });
+    const req = await signer.sign(new HttpRequest({ method: 'GET', protocol: 'https:', hostname: host, path: `/${loc.key}`, headers: { host, 'x-amz-content-sha256': 'UNSIGNED-PAYLOAD' } }));
+    const res = await fetch(`https://${host}/${loc.key}`, { headers: req.headers as Record<string, string> });
+    return { status: res.status, text: await res.text() };
+  };
+  const dashboardMessages = (kind: 'snapshot' | 'page') => messageRowsVisibleTo(room, leadArn)
+    .filter((m) => m.senderArn === opsBot && m.metadata.includes('"dashboard"') && m.metadata.includes(`"kind":"${kind}"`));
+  const leadToken = async () => { const creds = await getTestCredentials(); return idTokenFor(lead!.email, lead!.password, creds.cognitoClientId); };
+
+  test('the watch refreshes the room\'s dashboard as the ops assistant, and a member reads it as themselves', async () => {
+    test.setTimeout(300_000);
+    test.skip(!room, 'no room opened');
+    // THE REQUIRED REFRESH: the alarm change above ran `refresh`, which asked Ops for `dashboard_refresh`, whose step publishes.
+    const msgs = await pollFor(() => dashboardMessages('snapshot'), (ms) => ms.length > 0, { timeoutMs: 180_000, intervalMs: 5_000 });
+    expect(msgs.length, 'the ops assistant posted no dashboard message in the room').toBe(1);
+    const roomId = room.split('/').pop()!;
+    const key = `dashboards/premium/${roomId}/snapshot.json`;
+
+    // A MEMBER'S OWN CREDENTIAL, FOR THIS ONE CONVERSATION, after the exchange's membership check.
+    const vend = await exchange(await leadToken(), { channelArn: room, capabilities: ['dashboard'] });
+    expect(vend.status, JSON.stringify(vend.body).slice(0, 300)).toBe(200);
+    expect(vend.body?.dashboard?.key, 'the vend names the one snapshot it reads').toBe(key);
+    const read = await s3Get(vend.body.dashboard, vend.body.credentials);
+    expect(read.status, read.text.slice(0, 300)).toBe(200);
+    const snap = JSON.parse(read.text) as { html: string; state?: string; conversationId: string };
+    expect(snap.conversationId).toBe(roomId);
+    expect(snap.html, 'the dashboard shows the alarm it watches').toContain(WATCHED);
+    expect(snap.html, 'the dashboard runs no script').not.toMatch(/<script/i);
+    console.log(`[what the room reads] the dashboard snapshot: state ${snap.state}, ${snap.html.length} characters of markup`);
+
+    // DENY: the same credential reads no other conversation's dashboard at the same classification.
+    if (teamRoom) {
+      const other = await s3Get({ ...vend.body.dashboard, key: `dashboards/premium/${teamRoom.split('/').pop()}/snapshot.json` }, vend.body.credentials);
+      expect(other.status, 'a member\'s dashboard credential reads another conversation\'s dashboard').toBe(403);
+    }
+    // DENY: a person at the same classification who is not in the room is refused the credential.
+    const creds = await getTestCredentials();
+    const outsider = creds.secondPremiumUser ?? creds.premiumUser;
+    const refused = await exchange(idTokenFor(outsider.email, outsider.password, creds.cognitoClientId), { channelArn: room, capabilities: ['dashboard'] });
+    expect(refused.status, `a non-member was vended a dashboard read: ${JSON.stringify(refused.body).slice(0, 200)}`).toBe(403);
+    expect(refused.body?.code).toBe('NOT_A_MEMBER');
+  });
+
+  test('the page the ops assistant publishes on request opens on a member\'s signed link, and on nothing else', async () => {
+    test.setTimeout(300_000);
+    test.skip(!personApiServes('dashboard-pages'), 'PersonApi does not serve the dashboard-pages capability, whose route the link is (/dashboard-link)');
+    test.skip(!room, 'no room opened');
+    sendTargetedAs(room.split('/').pop()!, leadArn, opsBot, 'Publish this room\'s dashboard as a page I can put on the wall screen.');
+    const pages = await pollFor(() => dashboardMessages('page'), (ms) => ms.length > 0, { timeoutMs: 180_000, intervalMs: 5_000 });
+    expect(pages.length, 'the ops assistant published no dashboard page').toBe(1);
+
+    const link = await fetch(personUrl('/dashboard-link'), {
+      method: 'POST', headers: { Authorization: `Bearer ${await leadToken()}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: room.split('/').pop() }),
+    });
+    const body = await link.json() as { url?: string };
+    expect(link.status, JSON.stringify(body).slice(0, 300)).toBe(200);
+    const page = await fetch(body.url!);
+    const html = await page.text();
+    expect(page.status, html.slice(0, 300)).toBe(200);
+    expect(html).toContain(WATCHED);
+    expect(html).not.toMatch(/<script/i);
+    expect(page.headers.get('content-security-policy') ?? '', 'the edge repeats the page\'s policy').toMatch(/default-src 'none'/);
+
+    // DENY: the page without its signature, and a link asked for by someone outside the room.
+    const unsigned = await fetch(body.url!.split('?')[0]);
+    expect(unsigned.status, 'the page opened without a signed link').toBe(403);
+    const creds = await getTestCredentials();
+    const outsider = creds.secondPremiumUser ?? creds.premiumUser;
+    const refused = await fetch(personUrl('/dashboard-link'), {
+      method: 'POST', headers: { Authorization: `Bearer ${idTokenFor(outsider.email, outsider.password, creds.cognitoClientId)}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: room.split('/').pop() }),
+    });
+    expect(refused.status, 'a non-member was signed a dashboard link').toBe(403);
+  });
+
+  // THE RUN, READ BACK THROUGH THE CONSOLE'S OWN ANALYTICS (WT118), as the team owning each assistant reads it: each declared
+  // intent is measured under its owner, with what started it as the breakdown. Waits out archival lag, in short polls.
+  test('the console\'s analytics show the run, each intent under what started it', async () => {
+    test.setTimeout(420_000);
+    test.skip(!room, 'no room opened');
+    const query = async (path: string, body: Record<string, unknown>) => {
+      const res = await signedCall(path, admin!, 'POST', body);
+      expect(res.status, JSON.stringify(res.body ?? {}).slice(0, 300)).toBe(200);
+      return ((res.body as { data?: Array<Record<string, unknown>> })?.data ?? []);
+    };
+    const triggers = (rows: Array<Record<string, unknown>>) => rows.filter((r) => r.dimension === 'trigger').map((r) => ({
+      workflow: r.workflow_name, startedBy: r.workflow_trigger, runs: r.runs, ended: r.ended, success: r.success_share, avgMs: r.avg_ms,
+    }));
+    const asked = (rows: Array<Record<string, unknown>>, intent: string) => triggers(rows).find((r) => r.workflow === intent && r.startedBy === 'assistant');
+    const rows = await pollFor(() => query(adminUrl('analytics', '/'), { queryType: 'workflow_editions' }), (r) => Boolean(asked(r, 'incident_first_look') && Number(asked(r, 'deployment_health')?.ended ?? 0) > 0), { timeoutMs: 300_000, intervalMs: 15_000 });
+    console.log(`[what the console shows] Workflow editions, started by:\n${JSON.stringify(triggers(rows), null, 1)}`);
+    const events = await query(adminUrl('analytics', '/events-log'), { queryType: 'channel_events', channelArn: room }).catch((err) => { console.warn(`events: ${(err as Error).message.slice(0, 200)}`); return []; });
+    console.log(`[what the console shows] the room's events, in order:\n${events.map((e) => `--- ${String(e.event_type ?? '')} ${String(e.sender_name ?? e.assistant ?? '')}\n${String(e.content ?? '').slice(0, 1500)}`).join('\n')}`);
+    expect(asked(rows, 'incident_first_look'), 'Ops\'s first look is measured under its own intent, started by another assistant').toBeTruthy();
+    expect(asked(rows, 'deployment_health'), 'Ops\'s re-read is measured under its own intent, started by another assistant').toBeTruthy();
+    // A ONE-TURN ANSWER ENDS ITS RUN: the owning team reads that it ended, how it went and how long it took. (A first look rests
+    // open until someone resolves it, so it has not ended.)
+    expect(asked(rows, 'deployment_health')?.ended, 'the asked turn recorded its run\'s end').toBeGreaterThan(0);
+    expect(asked(rows, 'deployment_health')?.success, 'the asked turn ended in success').toBeGreaterThan(0);
+    expect(asked(rows, 'deployment_health')?.avgMs, 'the asked turn recorded how long it took').toBeGreaterThan(0);
   });
 });

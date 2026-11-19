@@ -168,7 +168,14 @@ function comparable(t: Template): Template {
     // `Timestamp: Date.now()`, so each deploy re-runs them) differs between any two syntheses; the stamp
     // is not a change in what the stack holds.
     const stamped = (r.Type === 'AWS::CloudFormation::CustomResource' || r.Type.startsWith('Custom::')) && r.Properties && 'Timestamp' in r.Properties;
-    const properties = stamped ? (({ Timestamp: _stamp, ...rest }) => rest)(r.Properties as Record<string, unknown>) : r.Properties;
+    const unstamped = stamped ? (({ Timestamp: _stamp, ...rest }) => rest)(r.Properties as Record<string, unknown>) : r.Properties;
+    // A FUNCTION'S CODE IS NOT READ HERE. The matrix synthesizes with bundling switched off, and then CDK fingerprints an
+    // asset by the id of the first construct that staged that source with those options, so a function's Code names
+    // whichever function synthesized first, never what the code is. A capability that adds an identical function to an
+    // earlier stack would read as changing this one.
+    const properties = r.Type === 'AWS::Lambda::Function' && unstamped
+      ? (({ Code: _code, ...rest }) => rest)(unstamped as Record<string, unknown>)
+      : unstamped;
     resources[id] = { Type: r.Type, Properties: properties };
   }
   return { Parameters: t.Parameters ?? {}, Resources: resources, Outputs: t.Outputs ?? {}, Conditions: t.Conditions ?? {} };
@@ -178,6 +185,72 @@ function withoutEnvironment(r: Resource): Resource {
   if (r.Type !== 'AWS::Lambda::Function' || !r.Properties) return r;
   const { Environment: _environment, ...rest } = r.Properties;
   return { ...r, Properties: rest };
+}
+
+/**
+ * A statement a capability adds to a core bucket's policy, by Sid, with the stack that declares the capability. A bucket
+ * has one policy, so a capability that a bucket must let in attaches here and cannot do it from its own stack. Each
+ * entry is one named statement and holds only where the capability's stack is deployed.
+ */
+const CAPABILITY_BUCKET_STATEMENTS: Readonly<Record<string, string>> = {
+  DashboardPagesToTheirDistribution: 'DashboardPages',
+  MeetingRecordingsFromMediaPipelines: 'Meetings',
+  MeetingRecordingsListedByMediaPipelines: 'Meetings',
+};
+
+/**
+ * A statement a capability adds to a core function's role, by Sid, with the stack that declares the capability: a grant a
+ * core function needs only where the capability serves it, named so the capability's attach list and this check agree.
+ */
+const CAPABILITY_ROLE_STATEMENTS: Readonly<Record<string, string>> = {
+  MeetingFilesSignedForMembers: 'Meetings',
+  MeetingHostModeratorRead: 'Meetings',
+  MeetingDecidersModeration: 'Meetings',
+  ReadAMeetingConversationsRecord: 'Meetings',
+};
+
+/** A core bucket's lifecycle rule a capability adds, by id, with the stack that declares the capability. */
+const CAPABILITY_BUCKET_RULES: Readonly<Record<string, string>> = {
+  DeleteOldTranscripts: 'Meetings',
+  DeleteOldRecordings: 'Meetings',
+};
+
+/** A core bucket's object events to the default bus, which these capabilities' stacks turn on. */
+const CAPABILITY_BUCKET_EVENTS: readonly string[] = ['Meetings'];
+
+/** A role's policy, or a core bucket's properties, without what the capabilities `deployed` holds attach to it. */
+function withoutCapabilityGrants(r: Resource, deployed: (stack: string) => boolean): Resource {
+  if (r.Type === 'AWS::IAM::Policy' && r.Properties) {
+    const document = r.Properties.PolicyDocument as { Statement?: Array<{ Sid?: string }> } | undefined;
+    if (!document?.Statement) return r;
+    const Statement = document.Statement.filter((s) => !(s.Sid && CAPABILITY_ROLE_STATEMENTS[s.Sid] && deployed(CAPABILITY_ROLE_STATEMENTS[s.Sid])));
+    return { ...r, Properties: { ...r.Properties, PolicyDocument: { ...document, Statement } } };
+  }
+  if (r.Type === 'AWS::S3::Bucket' && r.Properties) {
+    const props = { ...r.Properties } as Record<string, unknown>;
+    const lifecycle = props.LifecycleConfiguration as { Rules?: Array<{ Id?: string }> } | undefined;
+    if (lifecycle?.Rules) {
+      props.LifecycleConfiguration = { ...lifecycle, Rules: lifecycle.Rules.filter((rule) => !(rule.Id && CAPABILITY_BUCKET_RULES[rule.Id] && deployed(CAPABILITY_BUCKET_RULES[rule.Id]))) };
+    }
+    if (CAPABILITY_BUCKET_EVENTS.some(deployed)) {
+      const notification = props.NotificationConfiguration as Record<string, unknown> | undefined;
+      if (notification) {
+        const { EventBridgeConfiguration: _events, ...rest } = notification;
+        if (Object.keys(rest).length) props.NotificationConfiguration = rest; else delete props.NotificationConfiguration;
+      }
+    }
+    return { ...r, Properties: props };
+  }
+  return r;
+}
+
+/** A bucket policy without the statements of the capabilities `deployed` holds. */
+function withoutCapabilityBucketStatements(r: Resource, deployed: (stack: string) => boolean): Resource {
+  if (r.Type !== 'AWS::S3::BucketPolicy' || !r.Properties) return withoutCapabilityGrants(r, deployed);
+  const document = r.Properties.PolicyDocument as { Statement?: Array<{ Sid?: string }> } | undefined;
+  if (!document?.Statement) return r;
+  const Statement = document.Statement.filter((s) => !(s.Sid && CAPABILITY_BUCKET_STATEMENTS[s.Sid] && deployed(CAPABILITY_BUCKET_STATEMENTS[s.Sid])));
+  return { ...r, Properties: { ...r.Properties, PolicyDocument: { ...document, Statement } } };
 }
 
 /** A CDK cross-stack reference's export: `<stack>:ExportsOutput...`, written when another stack reads a value. */
@@ -231,7 +304,16 @@ export function additivityViolations(before: Synthesized, after: Synthesized): s
     }
     const prevResources = prev.Resources ?? {};
     const nextResources = next.Resources ?? {};
+    // A FUNCTION'S PUBLISHED VERSION FOLLOWS ITS CONFIGURATION. CDK names `currentVersion` by a hash of the function's
+    // properties, so the environment change an attach point is allowed republishes it under a new id: the version in
+    // one template and the version in the other are the same function's, and an alias on it moves with it.
+    const versionOf = (id: string, r: Resource) => (r.Type === 'AWS::Lambda::Version' ? /^(.*CurrentVersion)[0-9a-f]{8,}$/.exec(id)?.[1] : undefined);
+    const republished = (id: string, r: Resource, other: Record<string, Resource>) => {
+      const base = versionOf(id, r);
+      return !!base && Object.entries(other).some(([oid, o]) => oid !== id && versionOf(oid, o) === base);
+    };
     for (const [id, r] of Object.entries(prevResources)) {
+      if (!nextResources[id] && republished(id, r, nextResources)) continue;
       if (!nextResources[id]) violations.push(`${stack}: ${id} (${r.Type}) is removed`);
       else if (nextResources[id].Type !== r.Type) violations.push(`${stack}: ${id} changes type ${r.Type} -> ${nextResources[id].Type}`);
     }
@@ -241,12 +323,13 @@ export function additivityViolations(before: Synthesized, after: Synthesized): s
     if (kind === 'env-only' || kind === 'env-and-add') {
       if (kind === 'env-only') {
         for (const id of Object.keys(nextResources)) {
-          if (!prevResources[id]) violations.push(`${stack}: ${id} (${nextResources[id].Type}) is added, and this stack may change only its environment`);
+          if (!prevResources[id] && !republished(id, nextResources[id], prevResources)) violations.push(`${stack}: ${id} (${nextResources[id].Type}) is added, and this stack may change only its environment`);
         }
       }
       for (const [id, r] of Object.entries(prevResources)) {
         const n = nextResources[id];
-        if (n && n.Type === r.Type && !isDeepStrictEqual(withoutEnvironment(r), withoutEnvironment(n))) {
+        const withoutAttached = (res: Resource) => withoutCapabilityBucketStatements(res, (s) => afterByNorm.has(norm(s)));
+        if (n && n.Type === r.Type && !isDeepStrictEqual(withoutEnvironment(withoutAttached(r)), withoutEnvironment(withoutAttached(n)))) {
           violations.push(`${stack}: ${id} (${r.Type}) changes beyond its environment`);
         }
       }

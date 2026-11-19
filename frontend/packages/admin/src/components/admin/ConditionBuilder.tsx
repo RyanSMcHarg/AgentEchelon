@@ -82,8 +82,10 @@ const ConditionBuilder: React.FC<{
   event?: string;
   only?: (src: PickableSource) => boolean;
   hiddenNote?: string;
+  /** The context sources the version reads, for a call site that reads them (the processor). */
+  contextSources?: readonly string[];
   testId: string;
-}> = ({ value, onChange, published, variables, selects, event, only, hiddenNote, testId }) => {
+}> = ({ value, onChange, published, variables, selects, event, only, hiddenNote, contextSources, testId }) => {
   const { t: translate } = useTranslation();
   const t = translate as unknown as T;
   const lookup = consoleLookup(published, variables);
@@ -155,19 +157,19 @@ const ConditionBuilder: React.FC<{
               </div>
             );
           })}
-          <VariablePicker published={published} variables={variables} purpose="decide" audience={selects} only={only} hiddenNote={hiddenNote}
+          <VariablePicker published={published} variables={variables} purpose="decide" audience={selects} only={only} hiddenNote={hiddenNote} contextSources={contextSources}
             testId={`${testId}-alt-${a}-picker`}
             onPick={(name, src) => set(alternatives.map((rs, i) => (i === a ? [...rs.filter((x) => x.key !== name), freshRow(name, src)] : rs)))} />
         </div>
       ))}
       <div className="admin-filter-group">
         {alternatives.length === 0 ? (
-          <VariablePicker published={published} variables={variables} purpose="decide" audience={selects} only={only} hiddenNote={hiddenNote}
+          <VariablePicker published={published} variables={variables} purpose="decide" audience={selects} only={only} hiddenNote={hiddenNote} contextSources={contextSources}
             testId={`${testId}-picker`} onPick={(name, src) => set([[freshRow(name, src)]])} />
         ) : (
           <>
             <span className="admin-field-label">{t('admin.conditions.addAlternative')}</span>
-            <VariablePicker published={published} variables={variables} purpose="decide" audience={selects} only={only} hiddenNote={hiddenNote}
+            <VariablePicker published={published} variables={variables} purpose="decide" audience={selects} only={only} hiddenNote={hiddenNote} contextSources={contextSources}
               testId={`${testId}-or-picker`} onPick={(name, src) => set([...alternatives, [freshRow(name, src)]])} />
           </>
         )}

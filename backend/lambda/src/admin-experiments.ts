@@ -36,6 +36,11 @@
  * (`challengerAssistant`, `alt-{role}-{classification}`). Arming checks that the classification's
  * assignment record provisions that alt (`lib/alt-assignment.ts`); the alt's bot ARN is read from the
  * record by whoever needs it and is never stored on the row.
+ *
+ * A team's experiments: a team route (`/admin/assistants/{assistant}/experiments/...`) stores its experiment under
+ * `<assistant>.<id>` and writes it on the team writer session (`team-scoped-writer.ts`), whose `dynamodb:LeadingKeys`
+ * condition admits only ids beginning with the path's assistant. Arming and promoting on a team route ask the profile
+ * writer to act for that assistant alone (`teamAssistant`).
  */
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
@@ -67,8 +72,10 @@ import { parseJsonBody, callerIsAdmin, callerCanManageProfiles, callerPersonId }
 import { modelCatalogKeys } from '../../lib/config/model-strategy.js';
 import { defaultProfileRegistry as profilesRegistry } from '../../lib/profile-registry';
 import { isBattleOn, __clearBattleEnablementCache } from './lib/battle-enablement.js';
-import { requireOwnedAssistant, isRefusal } from './lib/assistant-scope.js';
+import { requireOwnedAssistant, isRefusal, scopedAssistant } from './lib/assistant-scope.js';
 import { experimentBelongsTo } from './lib/experiment-ownership.js';
+import { onTeamRoute, writesAsTeam, TeamWriterRefused } from './lib/team-scoped-writer.js';
+import { isTeamExperimentId, teamExperimentId } from './lib/team-writer-tags.js';
 import { readAltAssignment, DUEL_ROLE, challengerOf, type AltAssignment, type LegacyBattleBinding } from './lib/alt-assignment.js';
 import { userArnFor } from './lib/person-arn.js';
 import { responder, originsFrom, DEV_ORIGIN } from './lib/http-response.js';
@@ -79,9 +86,14 @@ import { loadProfileRegistry } from '../../lib/profile-registry';
 // text battle, etc.). Without this the marshaller throws on every
 // UI-created experiment and the handler returns a bare 500 "Internal
 // error" — the failure the post-2 demo driver hit at "Create & Activate".
-const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
-  marshallOptions: { removeUndefinedValues: true },
-});
+const MARSHALL = { marshallOptions: { removeUndefinedValues: true } };
+// A TEAM ROUTE'S WRITES GO OUT ON ITS TEAM WRITER SESSION, which writes only rows whose id begins with the path's
+// assistant (`teamExperimentId`); reads, and every write on an administrator's route, go out on this function's own role.
+const ddb = writesAsTeam(
+  DynamoDBDocumentClient.from(new DynamoDBClient({}), MARSHALL),
+  'ddb-doc',
+  (credentials) => DynamoDBDocumentClient.from(new DynamoDBClient({ credentials }), MARSHALL),
+);
 const ssmClient = new SSMClient({});
 const lambdaClient = new LambdaClient({});
 /** The profile writer this handler asks to pin an experiment's two versions, to promote its candidate, and to name the alt as its duel side while a battle holds it. */
@@ -482,6 +494,8 @@ async function armRefusal(exp: Experiment): Promise<{ error: string; code: strin
 async function deriveVersions(
   exp: Experiment,
   actor: string,
+  /** The assistant of the team route the experiment is armed on: the profile writer derives as its team writer. */
+  teamAssistant?: string,
 ): Promise<{ variants: ExperimentVariant[] } | { refusal: { status: number; error: string; code: string } }> {
   if (!MANAGE_PROFILES_FUNCTION) return { variants: exp.variants };
   let answer: { ok?: boolean; controlPin?: ExperimentVariant['controlPin']; altPin?: ExperimentVariant['altPin']; status?: number; error?: string; code?: string };
@@ -489,7 +503,7 @@ async function deriveVersions(
     const res = await lambdaClient.send(new InvokeCommand({
       FunctionName: MANAGE_PROFILES_FUNCTION,
       InvocationType: InvocationType.RequestResponse,
-      Payload: Buffer.from(JSON.stringify({ aeDeriveExperimentVersions: { experiment: exp, actor } })),
+      Payload: Buffer.from(JSON.stringify({ aeDeriveExperimentVersions: { experiment: exp, actor, ...(teamAssistant ? { teamAssistant } : {}) } })),
     }));
     answer = res.Payload ? JSON.parse(Buffer.from(res.Payload).toString() || '{}') : {};
     if (res.FunctionError) answer = { ok: false, error: answer.error || 'the profile writer failed', code: 'DERIVATION_FAILED' };
@@ -580,6 +594,17 @@ async function setAltAssignment(args: {
         + 'is left untouched.',
         { experimentId: args.experimentId, tiers: args.exp.tiers },
       );
+      return;
+    }
+    // AN EXPERIMENT RELEASES ONLY THE ALT IT HOLDS. A classification runs one experiment at a time, so arming one
+    // ends or pauses the one before it, and that release can land after the new experiment already took the alt:
+    // an image battle armed one second before the text battle it displaces is paused would otherwise have its record
+    // cleared by that pause, and its alt refused by the vend ("the routed bot is not an assistant of this
+    // classification"). A record naming another experiment is that experiment's to clear.
+    if (!args.occupied && record.experimentId && record.experimentId !== args.experimentId) {
+      console.log('[admin-experiments] the alt is held by another experiment; this one releases nothing', {
+        experimentId: args.experimentId, heldBy: record.experimentId,
+      });
       return;
     }
     const altName = profilesRegistry.altAssistantName(record.classification, record.role);
@@ -678,7 +703,21 @@ async function withSideNames(exp: Experiment): Promise<Experiment & { sideNames?
   return { ...exp, sideNames: { ...(control ? { control } : {}), ...(treatment ? { treatment } : {}) } };
 }
 
-export const handler = async (
+/**
+ * A TEAM ROUTE WRITES AS ITS PATH'S ASSISTANT (`team-scoped-writer.ts`): every experiment row it writes goes out on the
+ * team writer session, which writes only the rows whose id begins with that assistant, behind the ownership check the
+ * route makes. An administrator's route writes on this function's own role.
+ */
+export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> =>
+  onTeamRoute(scopedAssistant(event), () => handleExperiments(event));
+
+/** The refusal a team route answers for an experiment whose id does not begin with its assistant. */
+const NOT_A_TEAM_ID = {
+  error: "This experiment's id does not begin with its assistant's name, so an administrator changes it",
+  code: 'EXPERIMENT_ID_NOT_THE_TEAMS',
+};
+
+const handleExperiments = async (
   event: APIGatewayProxyEvent,
 ): Promise<APIGatewayProxyResult> => {
   // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
@@ -717,6 +756,8 @@ export const handler = async (
     if (!target || !experimentBelongsTo(target, scope)) {
       return respond(404, { error: `Experiment "${scopedId}" not found` }, origin);
     }
+    // A TEAM WRITES ONLY THE ROWS ITS WRITER SESSION MAY: those whose id begins with its assistant. IAM refuses the rest.
+    if (!isTeamExperimentId(scope.assistant, scopedId)) return respond(409, NOT_A_TEAM_ID, origin);
   }
 
   try {
@@ -813,8 +854,9 @@ export const handler = async (
         experiments.push(...((result.Items || []) as Experiment[]));
         exclusiveStartKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
       } while (exclusiveStartKey);
-      await reconcileExpiredExperiments(experiments);
       const visible = scope ? experiments.filter((e) => experimentBelongsTo(e, scope)) : experiments;
+      // A team's list relabels only the rows its writer session writes; an administrator's list relabels every row.
+      await reconcileExpiredExperiments(scope ? visible.filter((e) => isTeamExperimentId(scope.assistant, e.experimentId)) : experiments);
       return respond(200, { experiments: await Promise.all(visible.map(withSideNames)) }, origin);
     }
 
@@ -863,7 +905,7 @@ export const handler = async (
         const res = await lambdaClient.send(new InvokeCommand({
           FunctionName: MANAGE_PROFILES_FUNCTION,
           InvocationType: InvocationType.RequestResponse,
-          Payload: Buffer.from(JSON.stringify({ aePromoteCandidate: { experiment: existing, actor } })),
+          Payload: Buffer.from(JSON.stringify({ aePromoteCandidate: { experiment: existing, actor, ...(scope ? { teamAssistant: scope.assistant } : {}) } })),
         }));
         answer = res.Payload ? JSON.parse(Buffer.from(res.Payload).toString() || '{}') : {};
         if (res.FunctionError) answer = { ok: false, error: answer.error || 'the profile writer failed', code: 'PROMOTION_FAILED' };
@@ -1002,7 +1044,7 @@ export const handler = async (
 
         // THE TWO VERSIONS ARE PINNED HERE, AT ARM (§3.5), and written with the status below. A resume pins
         // again, so a row armed before versions were pinned is armed this way when it is resumed.
-        const derived = await deriveVersions(existing, callerArn(callerSub));
+        const derived = await deriveVersions(existing, callerArn(callerSub), scope?.assistant);
         if ('refusal' in derived) return respond(derived.refusal.status, { error: derived.refusal.error, code: derived.refusal.code, from: existing.status, to }, origin);
         armedVariants = derived.variants;
         const refused = await armRefusal({ ...existing, variants: armedVariants });
@@ -1213,6 +1255,18 @@ export const handler = async (
         return respond(400, { error: 'experimentId is required' }, origin);
       }
       if (scope) {
+        // A TEAM'S EXPERIMENT IS STORED UNDER ITS ASSISTANT'S NAME (`<assistant>.<id>`), the key the team writer
+        // session's `dynamodb:LeadingKeys` condition reads. An id sent without it names the row it would be stored as,
+        // unless a row of that exact id exists already: that row is edited by an administrator.
+        if (!isTeamExperimentId(scope.assistant, input.experimentId)) {
+          const unprefixed = await getExistingExperiment(input.experimentId);
+          if (unprefixed) {
+            return experimentBelongsTo(unprefixed, scope)
+              ? respond(409, NOT_A_TEAM_ID, origin)
+              : respond(404, { error: `Experiment "${input.experimentId}" not found` }, origin);
+          }
+          input.experimentId = teamExperimentId(scope.assistant, input.experimentId);
+        }
         // A battle names the classification's challenger: an admin decision.
         if (input.battleEnabled) {
           return respond(403, { error: 'Battle is set for a classification by an admin', code: 'BATTLE_IS_CLASSIFICATION_LEVEL' }, origin);
@@ -1428,7 +1482,7 @@ export const handler = async (
         // ARMS the row (a create, or a paused or draft row set active) pins again, as Resume on the status
         // route does: the profile writer reuses a candidate that still says the same thing.
         if (!sanitized.servesVersions || existing?.status !== 'active') {
-          const derived = await deriveVersions(sanitized, callerArn(callerSub));
+          const derived = await deriveVersions(sanitized, callerArn(callerSub), scope?.assistant);
           if ('refusal' in derived) return respond(derived.refusal.status, { error: derived.refusal.error, code: derived.refusal.code }, origin);
           sanitized.variants = derived.variants;
           sanitized.servesVersions = true;
@@ -1486,6 +1540,10 @@ export const handler = async (
 
     return respond(404, { error: `No route for ${method} ${path}` }, origin);
   } catch (err) {
+    if (err instanceof TeamWriterRefused) {
+      console.error('[admin-experiments] the team writer session could not be opened', { reason: err.reason });
+      return respond(503, { error: "The team's write session could not be opened; the experiment was not changed. Try again", code: 'TEAM_WRITER_UNAVAILABLE' }, origin);
+    }
     console.error('[admin-experiments] error:', err);
     return respond(500, { error: 'Internal error' }, origin);
   }

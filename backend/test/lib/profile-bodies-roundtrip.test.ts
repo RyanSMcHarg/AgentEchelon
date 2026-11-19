@@ -19,6 +19,7 @@ import { createDraft, editDraft, activateDraft, activateExistingVersion } from '
 import {
   resolveActiveProfile,
   __clearActiveProfileCache,
+  ProfileVersionUnreadableError,
   serializeSeedDefinition,
   definitionParamName,
   buildDefinition,
@@ -152,7 +153,7 @@ describe('back-compat and failure', () => {
     expect(mockS3Calls).toEqual([]);
   });
 
-  it('an unreadable body falls back to the SEED, never to a personaless profile', async () => {
+  it('an unreadable body refuses the version whole, never serving it personaless or as the seed', async () => {
     const { client } = fakeSsmStore();
     await createDraft(client, ROOT, 'analyst', ACTOR);
     await editDraft(client, ROOT, 'analyst', { persona: BIG_PERSONA, tools: ['add_item'] }, ACTOR);
@@ -160,13 +161,11 @@ describe('back-compat and failure', () => {
 
     mockS3GetError = Object.assign(new Error('denied'), { name: 'AccessDenied' });
     __clearActiveProfileCache();
-    const resolved = await resolveActiveProfile('analyst', { ssm: client, ssmRoot: ROOT });
-
     // The whole version is refused, not just its persona: serving the rest would run an assistant that
-    // reports this configId while answering as the generic default.
-    expect(resolved.configId).toBe('seed');
-    expect(resolved.persona).toBeUndefined();
-    expect(resolved.profile.rateLimitPerHour).not.toBe(777);
+    // reports this configId while answering as the generic default, and the seed is wider than the version
+    // (every tool, not this version's `add_item` alone). The turn ends in its degraded reply.
+    await expect(resolveActiveProfile('analyst', { ssm: client, ssmRoot: ROOT, retryDelayMs: 0 }))
+      .rejects.toBeInstanceOf(ProfileVersionUnreadableError);
   });
 
   it('a read for the version\'s own fields (an email\'s copy) reads no body, and serves the version, not the seed', async () => {
@@ -185,7 +184,7 @@ describe('back-compat and failure', () => {
     expect(resolved.configId).toBe(active.configId);
     expect(mockS3Calls.filter((c) => c.verb === 'get')).toEqual([]);
     // Cached apart: a full read after it still hydrates, and still refuses an unreadable body.
-    expect((await resolveActiveProfile('analyst', { ssm: client, ssmRoot: ROOT })).configId).toBe('seed');
+    await expect(resolveActiveProfile('analyst', { ssm: client, ssmRoot: ROOT, retryDelayMs: 0 })).rejects.toBeInstanceOf(ProfileVersionUnreadableError);
   });
 
   it('rollback re-points at an existing body and writes nothing', async () => {

@@ -3,12 +3,9 @@
  *
  * EVERY LINK POINTS AT THE REPO, and that is the rule rather than a stopgap.
  *
- * Four of these used to point at blog posts on mcharg.site, and all four were dead. The failure was
- * silent in a way worth recording: that site is a client-rendered SPA with a catch-all route, so a
- * slug that does not exist returns HTTP 200 with the site's generic title. Nothing an automated
- * checker looks at goes red. The only reliable discriminator is that a real post prerenders its OWN
- * title, which is how the four were finally confirmed dead against a known-good slug and a
- * deliberately bogus one.
+ * A page on a client-rendered site with a catch-all route answers HTTP 200 with the site's generic title for a path
+ * that does not exist, so no automated checker can tell a dead link there from a live one. A file in this repo either
+ * exists or fails the test beside this registry.
  *
  * So a link from this console lives where its target is versioned with the code it describes. The
  * docs in this repo are published on the public GitHub repo, they move when the behavior they
@@ -61,6 +58,8 @@ export const DOC_LINKS = {
   adminIdentity: `${REPO_BASE}/docs/specs/interaction/governance/IDENTITY-AND-ACCESS-MODEL.md`,
   /** Adding a classification or a role, and managing a profile: the steps that need a deploy. */
   profileGuide: `${REPO_BASE}/docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md`,
+  /** How each kind of context is put in place, kept current and confirmed. */
+  contextGuide: `${REPO_BASE}/docs/guides/admin/HOW-TO-CREATE-AND-MAINTAIN-CONTEXT.md`,
   /** What a role is, what it reaches, and how a deployment adds one. */
   roleDesign: `${REPO_BASE}/docs/specs/interaction/assistants/DESIGN-ADDING-AN-ASSISTANT-ROLE.md`,
   /** The intent pack: what an assistant recognizes and the behavior each intent carries. */
@@ -71,6 +70,8 @@ export const DOC_LINKS = {
   turnQueue: `${REPO_BASE}/docs/specs/interaction/conversation/SPEC-TURN-QUEUE.md`,
   /** Where the queue's work happens: triage, clearing the queue, and targeted requests. */
   queueProcessing: `${REPO_BASE}/docs/specs/interaction/conversation/DESIGN-TASK-ACCESS-AND-QUEUE-PROCESSING.md`,
+  /** Processes: the workflows a team links by one process id, measured end to end. */
+  processes: `${REPO_BASE}/docs/specs/interaction/conversation/SPEC-PROCESSES.md`,
   /** A person's profile, onboarding and reply preferences. */
   userProfile: `${REPO_BASE}/docs/specs/interaction/conversation/SPEC-USER-PROFILE-AND-ONBOARDING.md`,
 } as const;
@@ -95,13 +96,14 @@ export const DOC_SECTIONS = {
   changeGuardrail: `${DOC_LINKS.profileGuide}#64-change-the-guardrail`,
   retrievalScope: `${DOC_LINKS.profileGuide}#65-change-context-retrieval-scope`,
   sizing: `${DOC_LINKS.profileGuide}#66-change-sizing-or-a-capability`,
-  globalWorkflows: `${DOC_LINKS.profileGuide}#29-global-workflows`,
+  globalWorkflows: `${DOC_LINKS.profileGuide}#29-workflows`,
   messageTemplates: `${DOC_LINKS.profileGuide}#210-message-templates`,
   variables: `${DOC_LINKS.profileGuide}#variables-and-conditions`,
   goldenSet: `${DOC_LINKS.profileGuide}#the-golden-set-a-draft-is-measured-on`,
   documentTemplates: `${DOC_LINKS.profileGuide}#document-templates`,
   deliveryChecks: `${DOC_LINKS.profileGuide}#211-what-the-runtime-checks-before-it-delivers`,
-  contextSources: `${DOC_LINKS.profileGuide}#33-context-sources-the-catalog`,
+  contextSources: `${DOC_LINKS.contextGuide}#records-in-a-system-you-already-run`,
+  contextDocuments: `${DOC_LINKS.contextGuide}#company-documents`,
   welcomeOrientation: `${DOC_LINKS.profileGuide}#36-welcome-orientation`,
   onboarding: `${DOC_LINKS.profileGuide}#4-how-onboarding-is-customized`,
   queueTriage: `${DOC_LINKS.queueProcessing}#23-what-the-triage-turn-is-told-and-what-it-may-do`,

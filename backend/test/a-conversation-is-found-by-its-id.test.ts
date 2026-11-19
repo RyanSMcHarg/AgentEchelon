@@ -53,7 +53,7 @@ const find = (id: string | undefined): APIGatewayProxyEvent => ({
   headers: { origin: 'http://localhost:5173' },
   pathParameters: null,
   queryStringParameters: id === undefined ? null : { id },
-  requestContext: { identity: { userArn: 'arn:aws:sts::1:assumed-role/ae-team-console/console-sub' } },
+  requestContext: { identity: { userArn: 'arn:aws:sts::1:assumed-role/agent-echelon-admin-console/console-sub' } },
 } as unknown as APIGatewayProxyEvent);
 const body = (res: { body: string }) => JSON.parse(res.body);
 

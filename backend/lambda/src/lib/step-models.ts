@@ -4,7 +4,9 @@
  * A route is keyed by its intent and carries a text model, an image model (`image`) and per-step overrides
  * (`steps`, keyed by a state of the intent's task machine). A turn bound to a task runs on the step's override when
  * the route names one, on the task intent's route when the step delivers the intent's work (a document or an image),
- * and otherwise on the message's own intent. What a step produces is the machine's statement (`produces`, with the
+ * and otherwise on the message's intent. A message is classified with the conversation's task state (ADR-064, amended
+ * 2026-11-12), so a message the classifier places in the open task carries the task's intent and runs on that intent's
+ * route; a message it reads as a request of its own runs on its own intent and leaves the task open. What a step produces is the machine's statement (`produces`, with the
  * retired `delivers: true` read as `produces: 'document'` only where a stored machine still says it).
  *
  * Pure, so the write path, the resolver, the grant and the console's mirror decide the same way.

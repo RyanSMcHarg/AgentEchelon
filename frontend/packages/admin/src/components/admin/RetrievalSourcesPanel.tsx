@@ -41,10 +41,10 @@ const RetrievalSourcesPanel: React.FC<{
 
   return (
     <div className="admin-section" role="region" aria-label={t('admin.retrievalSources.title')}>
-      <h4>
+      <h3>
         {t('admin.retrievalSources.title')}{' '}
         <InfoTooltip label={t('admin.retrievalSources.title')} content={t('admin.retrievalSources.tip')} />
-      </h4>
+      </h3>
       {error && <p className="admin-error" role="alert">{error}</p>}
       {!error && rows === null && <p className="admin-help-text">{t('admin.retrievalSources.loading')}</p>}
       {!error && rows !== null && rows.length === 0 && <p className="admin-tab-empty">{t('admin.retrievalSources.empty')}</p>}

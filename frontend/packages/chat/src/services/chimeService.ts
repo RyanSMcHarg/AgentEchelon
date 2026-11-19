@@ -1,3 +1,4 @@
+import { TARGET_MISMATCH_LOG, receivedTargetMismatch } from '../utils/targetIntegrity';
 import {
   ChimeSDKMessagingClient,
   DeleteChannelMembershipCommand,
@@ -35,6 +36,8 @@ import {
 import { liftTurnStateFields } from './turnStateFields';
 import { proposalFromMetadata } from './proposalService';
 import { taskCardFromMetadata } from './taskCardService';
+import { meetingCardFromMetadata } from './meetingService';
+import { dashboardFromMetadata } from './dashboardService';
 
 export interface ShareConversationResult {
   recipientName: string;
@@ -54,6 +57,33 @@ export function metadataClassification(value: unknown): UserTier | undefined {
 }
 
 /**
+ * A CHANNEL'S METADATA AS AN OBJECT, or an empty one: Metadata is member-writable, and `null`, a number, a string or an
+ * array parses without being one, so whatever it holds never breaks the list or a conversation's lookup.
+ */
+export function channelMetadataOf(raw: string | undefined | null): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch (e) {
+    console.warn('Failed to parse channel metadata:', e);
+    return {};
+  }
+}
+
+/** A conversation id as the platform names one. */
+const CONVERSATION_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * The room a meeting's own conversation belongs to, as Metadata names it, or nothing. A DISPLAY HINT only: it decides
+ * where the conversation is listed and nothing else (the server's own record says which room a meeting is held for).
+ */
+export function meetingOfFromMetadata(metadata: Record<string, unknown>): { meetingOf: string } | Record<string, never> {
+  const room = metadata.meetingOf;
+  return typeof room === 'string' && CONVERSATION_ID.test(room) ? { meetingOf: room } : {};
+}
+
+/**
  * One membership summary as the Conversation the sidebar renders, or null when the row carries no channel.
  *
  * Extracted from `listConversations` so a page can be converted the moment it arrives rather than after
@@ -63,12 +93,7 @@ function toConversation(membership: ChannelMembershipForAppInstanceUserSummary):
   const channel = membership.ChannelSummary;
   if (!channel?.ChannelArn) return null;
 
-  let metadata: Record<string, unknown> = {};
-  try {
-    if (channel.Metadata) metadata = JSON.parse(channel.Metadata) as Record<string, unknown>;
-  } catch (e) {
-    console.warn('Failed to parse channel metadata:', e);
-  }
+  const metadata = channelMetadataOf(channel.Metadata);
 
   // Archived conversations are RETAINED in the list (membership is not removed, so members keep read-only
   // access until the channel expires — SPEC-CONVERSATION-ARCHIVE, ADR-017). They are flagged here and hidden
@@ -100,6 +125,7 @@ function toConversation(membership: ChannelMembershipForAppInstanceUserSummary):
     archived: isArchived,
     ...(typeof metadata.membershipSource === 'string' && metadata.membershipSource
       ? { membershipSource: metadata.membershipSource as string } : {}),
+    ...meetingOfFromMetadata(metadata),
   };
 }
 
@@ -365,14 +391,7 @@ class ChimeService {
       const channel = response.Channel;
       if (!channel || !channel.ChannelArn) return null;
 
-      let metadata: any = {};
-      try {
-        if (channel.Metadata) {
-          metadata = JSON.parse(channel.Metadata);
-        }
-      } catch (e) {
-        console.warn('Failed to parse channel metadata:', e);
-      }
+      const metadata: any = channelMetadataOf(channel.Metadata);
 
       const lastMessageAt = channel.LastMessageTimestamp
         ? new Date(channel.LastMessageTimestamp)
@@ -392,6 +411,7 @@ class ChimeService {
         lastReadAt: undefined,
         ...(typeof metadata.membershipSource === 'string' && metadata.membershipSource
           ? { membershipSource: metadata.membershipSource } : {}),
+        ...meetingOfFromMetadata(metadata),
       };
     } catch (error) {
       console.warn(`getConversation: could not describe channel ${channelArn}:`, error);
@@ -418,7 +438,7 @@ class ChimeService {
     channelArn: string,
     content: string,
     metadata?: Record<string, unknown>,
-    options?: { targetArn?: string; mentionBotArn?: string; mentionArns?: string[] },
+    options?: { targetArn?: string; mentionBotArn?: string; mentionArns?: string[]; clientMessageId?: string },
   ): Promise<Message> {
     if (!this.messagingClient || !this.userArn) {
       throw new Error('Chime SDK not initialized');
@@ -433,8 +453,15 @@ class ChimeService {
         ChimeBearer: this.userArn,
       };
 
-      if (metadata) {
-        command.Metadata = JSON.stringify(metadata);
+      // THE CLIENT MESSAGE ID MAKES A RETRY ONE MESSAGE: it is the send's idempotency token (`ClientRequestToken`), and it
+      // rides the Metadata, so a send whose outcome was never heard is looked for among the conversation's messages
+      // before it is sent again (`sentByClientId`).
+      if (options?.clientMessageId) {
+        command.ClientRequestToken = options.clientMessageId;
+      }
+      const withClientId = options?.clientMessageId ? { ...(metadata ?? {}), clientMessageId: options.clientMessageId } : metadata;
+      if (withClientId) {
+        command.Metadata = JSON.stringify(withClientId);
       }
 
       if (options?.targetArn) {
@@ -486,11 +513,34 @@ class ChimeService {
         timestamp: new Date(),
         isBot: false,
         status: 'sent',
+        ...(options?.targetArn ? { targetArns: [options.targetArn] } : {}),
       };
     } catch (error) {
       console.error('Failed to send message:', error);
       throw error;
     }
+  }
+
+  /**
+   * Whether this person already sent, into the conversation, the message with this client id: a message among the
+   * conversation's recent ones whose service-stamped sender is this person and whose Metadata carries the id.
+   */
+  async sentByClientId(channelArn: string, clientMessageId: string): Promise<boolean> {
+    if (!this.messagingClient || !this.userArn) {
+      throw new Error('Chime SDK not initialized');
+    }
+    const response = await this.messagingClient.send(
+      new ListChannelMessagesCommand({ ChannelArn: channelArn, ChimeBearer: this.userArn, MaxResults: 50 }),
+    );
+    return (response.ChannelMessages || []).some((msg) => {
+      if (msg.Sender?.Arn !== this.userArn || !msg.Metadata) return false;
+      try {
+        const parsed: unknown = JSON.parse(msg.Metadata);
+        return !!parsed && typeof parsed === 'object' && (parsed as { clientMessageId?: unknown }).clientMessageId === clientMessageId;
+      } catch {
+        return false;
+      }
+    });
   }
 
   /**
@@ -528,7 +578,9 @@ class ChimeService {
         let metadata: any = {};
         try {
           if (msg.Metadata) {
-            metadata = JSON.parse(msg.Metadata);
+            // An object or nothing: Metadata is member-writable, and `null` or a bare string parses without being one.
+            const parsed: unknown = JSON.parse(msg.Metadata);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) metadata = parsed;
           }
         } catch (e) {
           // Ignore metadata parse errors
@@ -537,7 +589,8 @@ class ChimeService {
         const isBot = metadata.botResponse || msg.Sender?.Arn?.includes('/bot/');
         // Unwrap the Lex fulfillment envelope (e.g. the WelcomeIntent greeting)
         // BEFORE decoding, so users never see raw `{"Messages":[…]}` JSON.
-        const { content: cleanContent, activeTask: contentTask, navigateChannel, battle, battleWaiting } = parseMessageContent(decodeMessageText(unwrapLexEnvelope(msg.Content, msg.ContentType)));
+        const sentText = decodeMessageText(unwrapLexEnvelope(msg.Content, msg.ContentType));
+        const { content: cleanContent, activeTask: contentTask, navigateChannel, battle, battleWaiting } = parseMessageContent(sentText);
         const metadataTask = parseActiveTaskFromMetadata(metadata);
         const msgTargets = (msg as { Target?: Array<{ MemberArn?: string }> }).Target;
         const targetedToUser = Array.isArray(msgTargets)
@@ -573,9 +626,24 @@ class ChimeService {
           proposal: proposalFromMetadata(metadata),
           // A task a workflow assigned this person, by the function the live path uses too.
           taskCard: taskCardFromMetadata(metadata),
+          // A meeting's started or ended card, by the function the live path uses too, only from an assistant.
+          meetingCard: meetingCardFromMetadata(metadata, msg.Sender?.Arn),
+          dashboard: dashboardFromMetadata(metadata, msg.Sender?.Arn ?? ''),
           feedback: parseMessageFeedbackFromMetadata(metadata),
           status: 'sent',
           targetedToUser: targetedToUser || undefined,
+          ...(Array.isArray(msgTargets) && msgTargets.some((t) => t?.MemberArn)
+            ? { targetArns: msgTargets.map((t) => t?.MemberArn).filter((a): a is string => !!a) } : {}),
+          // The Target and the message's own words must agree (`targetIntegrity.ts`), as the live path checks.
+          ...(() => {
+            const targetMismatch = receivedTargetMismatch({
+              text: sentText, metadata,
+              targetArns: Array.isArray(msgTargets) ? msgTargets.map((t) => t?.MemberArn).filter((a): a is string => !!a) : [],
+              senderIsAssistant: isAssistantArn(msg.Sender?.Arn ?? ''),
+            });
+            if (targetMismatch) console.error(`${TARGET_MISMATCH_LOG} a loaded message disagrees with its Target`, { messageId: msg.MessageId, mismatch: targetMismatch });
+            return targetMismatch ? { targetMismatch } : {};
+          })(),
           // The answer's phase and the queue's depth and stage, by the SAME function the live path
           // uses. Without them a reload dropped the queue indicator, and the notice it dropped from is
           // the oldest one in the window - the person who has waited longest.

@@ -38,7 +38,8 @@ import { test, expect, expectAlarm } from './helpers/fixtures';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 import { signIn, createConversation } from './helpers/agent-helpers';
 import { getTestCredentials, hasTestCredentials, missingUserReason } from './helpers/test-credentials';
-import { personArnOf, personIdOf, testUserByPersonArn } from './helpers/person';
+import { idTokenFor, personArnOf, personIdOf, testUserByPersonArn } from './helpers/person';
+import { archive, openConversation, shareWith } from './helpers/person-session';
 import { getTestInbox, inboxSkipReason, waitForEmail, emailsTo } from './helpers/test-inbox';
 import { STACK_PREFIX, INSTANCE, instanceStacks, physicalIdsIn, ANY_FUNCTION } from './helpers/stack-prefix';
 import { aws, awsv } from './helpers/aws';
@@ -605,22 +606,97 @@ test.describe('A mention emails the member it names, and nobody else (SPEC-NOTIF
     ).toEqual([]);
 
     // ── 2. A PERSON WITHOUT A MENTION, THEN A PERSON WITH ONE ─────────────────────────────────────
-    // The unaddressed message goes FIRST, so the addressed one's arrival proves the first had its turn.
+    // The unaddressed message goes FIRST, so the addressed one's arrival proves the first had its turn. A person's
+    // message is emailed under the platform's subject, never the one its Metadata names, so it is found by its words.
     const unaddressedSubject = `Mention e2e unaddressed ${run}`;
     const personSubject = `Mention e2e person ${run}`;
-    post(senderArn, 'Everyone, the report is slow again.', unaddressedSubject);
-    post(senderArn, `${mention} can you look at the report latency?`, personSubject);
-    const fromPerson = await waitForEmail(inbox!, { to: named!.email, since, subjectIncludes: personSubject });
-    expect(fromPerson.text).toContain(`@${namedName} can you look at the report latency?`);
+    const unaddressedText = `Everyone, the report is slow again (${run}).`;
+    const personText = `can you look at the report latency (${run})?`;
+    post(senderArn, unaddressedText, unaddressedSubject);
+    post(senderArn, `${mention} ${personText}`, personSubject);
+    const fromPerson = await waitForEmail(inbox!, { to: named!.email, since, textIncludes: personText });
+    expect(fromPerson.text).toContain(`@${namedName} ${personText}`);
+    expect(fromPerson.subject, "a person's Metadata chose the subject of the email the platform sent").not.toContain(personSubject);
     expect(
-      emailsTo(inbox!, { to: sender.email, since, subjectIncludes: personSubject }),
+      emailsTo(inbox!, { to: sender.email, since, textIncludes: personText }),
       'a person who mentioned someone was emailed their own message',
     ).toEqual([]);
     for (const who of [named!.email, sender.email]) {
       expect(
-        emailsTo(inbox!, { to: who, since, subjectIncludes: unaddressedSubject }),
+        emailsTo(inbox!, { to: who, since, textIncludes: unaddressedText }),
         `a person's message that mentions no one emailed ${who}: their own Metadata reached the room`,
       ).toEqual([]);
+    }
+  });
+});
+
+test.describe('A room address emails the people, and a private message emails only its platform targets (SPEC-NOTIFICATION-BRIDGE)', () => {
+  test('@humans emails the room, an address that contains @all emails nobody, and a private message reaches only who the platform names', async () => {
+    test.skip(!haveCreds(), 'needs AWS credentials - set AWS_PROFILE');
+    test.skip(!hasTestCredentials(), 'needs the provisioned test users');
+    test.setTimeout(600_000);
+
+    const creds = await getTestCredentials();
+    const sender = creds.premiumUser;
+    const other = creds.secondPremiumUser;
+    test.skip(!sender?.password, missingUserReason('premiumUser'));
+    test.skip(!other?.password, missingUserReason('secondPremiumUser'));
+    const inbox = await getTestInbox();
+    const unavailable = inboxSkipReason(inbox, sender.email, other!.email);
+    test.skip(Boolean(unavailable), unavailable);
+
+    const ownerToken = idTokenFor(sender.email, sender.password, creds.cognitoClientId);
+    const senderArn = await personArnOf(sender);
+    const otherArn = await personArnOf(other!);
+    const { channelArn, conversationId } = await openConversation(ownerToken, `Room address email e2e ${Date.now()}`);
+    try {
+      expect((await shareWith(ownerToken, channelArn, 'Room address email e2e', other!.email)).status, 'the owner shares the room').toBe(200);
+      let botArn = '';
+      for (let i = 0; i < 12 && !botArn; i += 1) {
+        botArn = memberArns(channelArn, senderArn).find((a) => a.includes('/bot/')) || '';
+        if (!botArn) await new Promise((r) => setTimeout(r, 5_000));
+      }
+      expect(botArn, 'the room has an assistant member to post as').toBeTruthy();
+
+      const run = `${Date.now()}`;
+      const since = Date.now() - 5_000;
+      const post = (bearer: string, content: string, subject: string, extra: Record<string, unknown> = {}, target?: string) => awsv(['chime-sdk-messaging', 'send-channel-message',
+        '--channel-arn', channelArn, '--content', content, '--type', 'STANDARD', '--persistence', 'PERSISTENT',
+        '--metadata', JSON.stringify({ notify: { email: true }, notifySubject: subject, notifyConversationId: conversationId, ...extra }),
+        ...(target ? ['--target', `MemberArn=${target}`] : []),
+        '--chime-bearer', bearer]);
+      // A person's message is emailed under the platform's subject, so every message here is found by its own words.
+      const none = (said: string, why: string) => {
+        for (const who of [sender.email, other!.email]) {
+          expect(emailsTo(inbox!, { to: who, since, textIncludes: said }), `${why}: ${who} was emailed`).toEqual([]);
+        }
+      };
+
+      // ── AN ADDRESS THAT CONTAINS @all ADDRESSES NOBODY. Sent first, so the @humans email after it proves it was read. ──
+      const addressText = `please write to x@all.example about the invoice ${run}`;
+      post(senderArn, addressText, `Room address e2e address ${run}`);
+      // ── A PERSON'S PRIVATE MESSAGE, EVEN ONE THAT SAYS @all, EMAILS NOBODY ──
+      const privateText = `this is just between us ${run}`;
+      post(senderArn, `@all ${privateText}`, `Room address e2e private ${run}`, {}, otherArn);
+      // ── @humans EMAILS THE PEOPLE IN THE ROOM, NOT THE ONE WHO WROTE IT ──
+      const humansText = `the deck is ready for review ${run}`;
+      post(senderArn, `@humans ${humansText}`, `Room address e2e humans ${run}`);
+      const humans = await waitForEmail(inbox!, { to: other!.email, since, textIncludes: humansText });
+      expect(humans.text).not.toContain('@humans');
+      expect(emailsTo(inbox!, { to: sender.email, since, textIncludes: humansText }), 'the writer of @humans was emailed their own message').toEqual([]);
+      none(addressText, 'an email address that contains @all addressed the room');
+      none(privateText, 'a person\'s private message was emailed');
+
+      // ── AN ASSISTANT'S PRIVATE MESSAGE REACHES ONLY ITS PLATFORM TARGETS. The untargeted one goes first. ──
+      const botPrivateSubject = `Room address e2e assistant private ${run}`;
+      post(botArn, `@all a note for one person ${run}`, botPrivateSubject, {}, otherArn);
+      const targetedSubject = `Room address e2e targeted ${run}`;
+      post(botArn, 'Your report is ready.', targetedSubject, { notifyTargets: [{ person: otherArn }] }, otherArn);
+      await waitForEmail(inbox!, { to: other!.email, since, subjectIncludes: targetedSubject });
+      expect(emailsTo(inbox!, { to: sender.email, since, subjectIncludes: targetedSubject }), 'a targeted notice reached someone it did not name').toEqual([]);
+      none(botPrivateSubject, 'an assistant\'s private message with no target list was emailed');
+    } finally {
+      await archive(ownerToken, channelArn);
     }
   });
 });

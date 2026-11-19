@@ -8,7 +8,7 @@
  * chose, with `task:state` readable on that step's edges and nowhere else.
  */
 import {
-  continueAfter, eventWorkflowErrors, runEventWorkflow, versionEventWorkflowsErrors,
+  SHIPPED_EVENT_WORKFLOWS, continueAfter, eventWorkflowErrors, runEventWorkflow, versionEventWorkflowsErrors,
   type EventRunContext, type EventRunDeps, type EventWorkflow,
 } from '../../lambda/src/lib/event-workflow';
 import {
@@ -62,7 +62,7 @@ describe('T1: the task step is declared and validated (ADR-063 decision 1)', () 
 
   it('a free principal id, the room, or an unknown field is refused: references only', () => {
     refused((wf) => { wf.states.review.task.for = 'arn:aws:chime:us-east-1:1:app-instance/x/user/abc'; }, /review\.task\.for/);
-    refused((wf) => { wf.states.review.task.by = 'room'; }, /names one person, never the room/);
+    refused((wf) => { wf.states.review.task.by = 'room'; }, /names one person, never the conversation/);
     refused((wf) => { wf.states.review.task.assignee = 'subject'; }, /assignee is not a field of a task step/);
     refused((wf) => { wf.states.review.task.for = { assistantRole: 'ops' }; }, /an assistant does the work \(by\), and is never a task's requester/);
   });
@@ -81,9 +81,17 @@ describe('T1: the task step is declared and validated (ADR-063 decision 1)', () 
     expect(eventWorkflowErrors('x', ops).join('\n')).not.toMatch(/holder/);
   });
 
-  it('a deadline is required and bounded (decision F1); visibility and priority are closed', () => {
-    refused((wf) => { delete wf.states.review.task.deadline; }, /every task a workflow assigns has an end/);
+  it('a deadline is required unless the run goes on once the task opens, and bounded (decision F1); visibility and priority are closed', () => {
+    refused((wf) => { delete wf.states.review.task.deadline; }, /every task a run waits on has an end/);
     refused((wf) => { wf.states.review.task.deadline = { afterMinutes: 1 }; }, /from 5 to 43200/);
+    // `continue` takes only `opened`. With it the run does not wait on the task, so the deadline may be left out, and one
+    // that is declared is still bounded.
+    refused((wf) => { wf.states.review.task.continue = 'settled'; }, /continue is opened or alongside, or absent to go on once the task settles/);
+    refused((wf) => { wf.states.review.task.continue = 'opened'; wf.states.review.task.deadline = { afterMinutes: 1 }; }, /from 5 to 43200/);
+    const onOpen = clone(APPROVE) as any;
+    onOpen.states.review.task.continue = 'opened';
+    delete onOpen.states.review.task.deadline;
+    expect(eventWorkflowErrors('x', onOpen)).toEqual([]);
     refused((wf) => { wf.states.review.task.visibility = 'public'; }, /visibility is conversation or private/);
     refused((wf) => { wf.states.review.task.priority = 'urgent'; }, /priority is high, normal, low/);
   });
@@ -111,9 +119,13 @@ describe('T1: the task step is declared and validated (ADR-063 decision 1)', () 
     expect(eventWorkflowErrors('approve', own, { machines: { sign_off: signOff } })).toEqual([]);
   });
 
-  it('an assistant role the classification does not declare is said, never refused, as `as` is', () => {
+  it('an assistant role the classification does not declare is said, never refused', () => {
     const wf = clone(APPROVE) as any;
-    wf.states.review.task.by = { assistantRole: 'ops' };
+    // A REQUEST TO ANOTHER ASSISTANT'S ROLE leaves who sees it, its urgency and its deadline to the owner (WT118).
+    wf.states.review.task = { machine: wf.states.review.task.machine, by: { assistantRole: 'ops' } };
+    delete wf.states.review.onDeadline;
+    // Its edges read how the work ended: the owner's states are its own.
+    wf.states.review.onSuccess = 'done';
     expect(eventWorkflowErrors('x', wf)).toEqual([]);
     expect(stepRoleWarnings({ eventWorkflows: { x: wf } } as any, []).join('\n')).toMatch(/assigns its task to the ops assistant/);
     expect(stepRoleWarnings({ eventWorkflows: { x: wf } } as any, ['ops'])).toEqual([]);
@@ -158,6 +170,18 @@ describe('T1: the machines (ADR-063 decisions 1, 2 and 5)', () => {
     bad({ initial: 'a', states: { a: { transitions: ['b'], awaits: { party: 'requester' }, rests: true }, b: { transitions: [], terminal: 'success' } } }, /rests but awaits somebody/);
     expect(DEFAULT_TASK_STATE_MACHINES.incident_first_look.states.findings_shared.rests).toBe(true);
     expect(Object.entries(DEFAULT_TASK_STATE_MACHINES.queue_drain.states).filter(([, d]) => d.transitions.length).every(([, d]) => d.rests === true)).toBe(true);
+  });
+
+  it('a declared move (`auto`) is one of the state\'s own transitions, on a state the assistant works (ADR-067 G39)', () => {
+    const end = { transitions: [], terminal: 'success' as const };
+    bad({ initial: 'a', states: { a: { transitions: ['b'], auto: 'c' }, b: end } }, /declares auto "c", which is not one of its transitions/);
+    bad({ initial: 'a', states: { a: { transitions: ['b'], awaits: { party: 'worker' }, auto: 'b' }, b: end } }, /declares auto but awaits somebody/);
+    bad({ initial: 'a', states: { a: { transitions: ['b'], rests: true, auto: 'b' }, b: end } }, /declares auto but rests/);
+    expect(() => validateTaskStateMachine('m', { initial: 'a', states: { a: { transitions: ['b'], auto: 'b' }, b: end } })).not.toThrow();
+    // The shipped first look declares its move: once its turn has answered, the task rests on its findings.
+    const firstLook = DEFAULT_TASK_STATE_MACHINES.incident_first_look;
+    expect(firstLook.states.reading_health.auto).toBe('findings_shared');
+    expect(() => validateTaskStateMachine('incident_first_look', firstLook)).not.toThrow();
   });
 });
 
@@ -257,6 +281,44 @@ describe('T1/T2: the run opens the task once and the settlement continues it onc
     const out = await continueAfter('approve', APPROVE, ctx(), { step: 'review', outcome: taskEndedOutcome('success', 'approved') }, again.d);
     expect(out.ran).toBe(false);
     expect(again.sent).toEqual([]);
+  });
+
+  describe('why a task step failed decides its edge (`task:outcome`, ADR-067 G23), and `continue: opened` goes on once', () => {
+    const OPS = SHIPPED_EVENT_WORKFLOWS['ops-room'];
+    const lead = 'arn:aws:chime:us-east-1:1:app-instance/i/user/lead';
+    const opsCtx = (): EventRunContext => ({ ...ctx(), event: 'conversation-opened', subject: undefined, eventPerson: lead, roles: { lead: [lead] } });
+
+    it('nobody to do the work says the absent message; a task that could not open says the first look is unavailable', async () => {
+      const absent = deps(undefined, { openTask: async () => 'no-worker' });
+      const a = await runEventWorkflow('ops-room', OPS, opsCtx(), absent.d);
+      expect(a.steps.map((s) => [s.step, s.outcome])).toEqual([['opening', 'posted'], ['greet-lead', 'posted'], ['first-look', 'no-worker'], ['tell-absent', 'posted']]);
+      expect(absent.sent).toEqual(['opening', 'greet-lead', 'tell-absent']);
+      expect(a.ended).toBe('success');
+      const failed = deps(undefined, { openTask: async () => 'failed' });
+      const f = await runEventWorkflow('ops-room', OPS, opsCtx(), failed.d);
+      expect(failed.sent).toEqual(['opening', 'greet-lead', 'tell-unavailable']);
+      expect(f.ended).toBe('success');
+      // The run's machines are the ones its edges read, and the version's own may stand in for the platform's.
+      const own = deps(undefined, { openTask: async () => 'no-worker', machines: { incident_first_look: DEFAULT_TASK_STATE_MACHINES.incident_first_look } });
+      await runEventWorkflow('ops-room', OPS, opsCtx(), own.d);
+      expect(own.sent).toEqual(['opening', 'greet-lead', 'tell-absent']);
+    });
+
+    it('opened, the run waits; the task leaving its first state continues it on onSuccess, once', async () => {
+      const claims = new Set<string>();
+      const first = deps(claims);
+      const run = await runEventWorkflow('ops-room', OPS, opsCtx(), first.d);
+      expect(run.steps.at(-1)).toEqual({ step: 'first-look', outcome: 'opened' });
+      expect(run.ended).toBeUndefined();
+      const on = deps(claims);
+      const out = await continueAfter('ops-room', OPS, opsCtx(), { step: 'first-look', outcome: 'opened' }, on.d);
+      expect(out).toEqual({ ran: true, steps: [], ended: 'success' });
+      expect(on.sent).toEqual([]);
+      // A second continuation for the step (the task returning to its first state, or a redelivery) runs nothing.
+      const again = deps(claims);
+      expect(await continueAfter('ops-room', OPS, opsCtx(), { step: 'first-look', outcome: 'opened' }, again.d)).toEqual({ ran: false, steps: [] });
+      expect(again.sent).toEqual([]);
+    });
   });
 
   it('an outcome reads as its edge and nothing else', () => {

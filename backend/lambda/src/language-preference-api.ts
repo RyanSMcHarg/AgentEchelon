@@ -17,7 +17,7 @@
  * `#` (a person's notice preferences, contact copies), so it can neither read an onboarding answer nor change anything
  * else (`conversations-stack.ts`, deny-tested in `a-person-sets-their-own-language.test.ts`).
  *
- * A guest, a one-conversation session and a host assertion resolve to nobody here: they have no account to set.
+ * A guest and a host assertion resolve to nobody here: they have no account to set.
  */
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';

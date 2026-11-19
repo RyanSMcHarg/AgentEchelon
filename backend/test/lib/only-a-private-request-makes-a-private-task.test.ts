@@ -132,7 +132,7 @@ describe('the request decides the task visibility, not the answer', () => {
 describe('a declared "untargeted" is checked against the stored message', () => {
   it('verifies a declared false, because the declaring path cannot see `Target`', () => {
     expect(router).toContain('if (declared === false && channelArn && verifyId)');
-    expect(router).toContain('inboundWasTargeted(chimeClient, channelArn, verifyId');
+    expect(router).toContain('inboundTarget(chimeClient, channelArn, verifyId');
   });
 
   it('only ever upgrades to private, never downgrades to shared', () => {
@@ -145,13 +145,15 @@ describe('a declared "untargeted" is checked against the stored message', () => 
     expect(block).not.toContain('targeted = false;');
   });
 
-  it('keeps the declaration when the message cannot be read, rather than making every turn private', () => {
+  it('opens the task as private when the stored message cannot be read, or the read fails', () => {
+    // Privacy wins over the receipt: an unknown `Target` is not shown to the room, because
+    // the row records the request's own text and a disclosure cannot be taken back (ADR-033). Unset reads as private.
     const at = router.indexOf('if (declared === false && channelArn && verifyId)');
-    const block = router.slice(at, at + 1400);
-    // A try/catch that keeps the declaration: overriding on a failed read would reinstate the four
-    // receipts by another route, since `inboundWasTargeted` already answers false when it cannot read.
+    const block = router.slice(at, at + 1600);
+    expect(block).toContain("stored === 'unreadable'");
     expect(block).toContain('catch');
-    expect(block).toContain('keeping the declaration');
+    expect(block.match(/targeted = undefined;/g)?.length).toBe(2);
+    expect(block).not.toContain('keeping the declaration');
   });
 
   it('pays the read only when a task is opened, so it is off the time-to-first-frame path', () => {

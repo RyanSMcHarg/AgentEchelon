@@ -35,8 +35,6 @@ const SERVED_FOR_OTHERS: Record<string, string> = {
     'RFC 8058 one-click unsubscribe, posted by a mail client from the List-Unsubscribe header, and the preference page\'s own form; the URL is read from the email, which this scan does not read',
   'admin POST /admin/assistants/{assistant}/profiles/variant-version':
     'a team member\'s battle candidate: the catalog grants it (edit-profiles), and no console view or e2e spec issues it yet',
-  'admin POST /admin/tasks/channel/{channelId}/cancel':
-    'an operator stopping a task (tasks-manage): vended per conversation, called by an operator or a host console; no view here issues it',
   'admin POST /users/readmit':
     'readmitting an offboarded subject (manage-users): called by the offboarding deny-test (backend/scripts/deny-test-offboarded-sign-in.mjs), which this scan does not read',
   'admin POST /users/provision':

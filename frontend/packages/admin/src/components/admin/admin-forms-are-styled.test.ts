@@ -26,6 +26,8 @@ const read = (f: string) => fs.readFileSync(path.join(HERE, f), 'utf8');
 const profiles = read('ProfilesTab.tsx');
 /** The assistant's page, which holds the external links the tab's page used to. */
 const page = read('AssistantPage.tsx');
+/** The step model control the intent card and the workflow editor share. */
+const routeModels = read('IntentRouteModels.tsx');
 /** The draft's controls, one area at a time: where the assistant's form fields now live. */
 const draftFields = read('DraftAreaFields.tsx');
 const groundTruth = read('GroundTruthTab.tsx');
@@ -59,10 +61,14 @@ describe('the assistants configuration uses the shared primitives', () => {
 
   it('classes every select, including the per-intent routing pair', () => {
     // The models are edited in Scope and models on the page: one select for the classifier or the default model
-    // (`ModelChoice`), a primary + fallback pair on each intent card (its text and image models share one pair), and an
-    // override per workflow step (ADR-064). `.select` stands alone (DESIGN-SYSTEM).
-    expect((page.match(/<select\b/g) ?? []).length).toBe(4);
-    expect((page.match(/<select [^>]*className="select"/g) ?? []).length).toBe(4);
+    // (`ModelChoice`) and a primary + fallback pair on each intent card (its text and image models share one pair). A
+    // workflow step's model and fallback are the shared `StepModelControl` (ADR-064), which the card and the workflow
+    // editor both render. `.select` stands alone (DESIGN-SYSTEM).
+    expect((page.match(/<select\b/g) ?? []).length).toBe(3);
+    expect((page.match(/<select [^>]*className="select"/g) ?? []).length).toBe(3);
+    const stepControl = routeModels.slice(routeModels.indexOf('export const StepModelControl'));
+    expect((stepControl.match(/<select\b/g) ?? []).length).toBe(2);
+    expect((stepControl.match(/<select className="select"/g) ?? []).length).toBe(2);
     expect(draftFields).not.toMatch(/<select\b/);
   });
 
@@ -162,5 +168,30 @@ describe('outbound links are consistently safe', () => {
     }
     // The page opens every AWS console page through DocLink, which carries the pair once for the whole console.
     expect(page).toMatch(/<DocLink href=/);
+  });
+});
+
+describe('the create-experiment form keeps its fields inside their containers', () => {
+  const ruleOf = (selector: string) => {
+    const at = css.indexOf(`${selector} {`);
+    expect(at, `${selector} has a rule`).toBeGreaterThan(-1);
+    return css.slice(at, css.indexOf('}', at));
+  };
+
+  it('insets the objective group, so its controls never meet its border', () => {
+    const rule = ruleOf('.experiment-objective-block');
+    expect(rule).toMatch(/padding: var\(--space-\d\) var\(--space-\d\)/);
+    expect(rule).toContain('border: 1px solid');
+  });
+
+  it('keeps a short last field in its column instead of spanning the form', () => {
+    expect(ruleOf('.experiment-create-form .admin-form-grid > label:last-child')).toContain('grid-column: auto');
+  });
+
+  it('carries no inline margin or alignment on the form controls', () => {
+    const tab = read('ExperimentsTab.tsx');
+    const form = tab.slice(tab.indexOf('experiment-create-form'), tab.indexOf("admin.experiments.form.createAndActivate"));
+    expect(form).not.toMatch(/style=\{\{ marginTop: '12px' \}\}/);
+    expect(form).not.toMatch(/style=\{\{ alignSelf: 'end' \}\}/);
   });
 });

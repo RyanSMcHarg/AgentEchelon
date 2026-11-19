@@ -43,7 +43,7 @@ describe('each HTTP API allows exactly the origins that call it', () => {
         capabilities: ['chat', 'admin', 'experiments'],
         issuers: [
           { id: 'deployment', kind: 'cognito-pool', pool: 'self', clearance: { groups: true, classifications: ['basic', 'standard', 'premium', 'admin'] }, admin: true },
-          { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', audience: 'host-client', allowedOrigins: [HOST], clearance: { oneChannel: 'basic', classifications: ['basic'] } },
+          { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', audience: 'host-client', allowedOrigins: [HOST], clearance: { fixed: ['basic'], classifications: ['basic'] } },
         ],
       },
     });

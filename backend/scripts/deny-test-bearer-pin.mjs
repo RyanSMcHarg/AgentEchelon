@@ -20,8 +20,14 @@
  *        - the same calls bearing B are AccessDenied;
  *        - the same calls bearing `A-admin` are AccessDenied (a non-admin session);
  *        - a signed `chime:Connect` WebSocket upgrade as B is refused, and as A it is not.
- *      The same live checks run for a host app's pool the trusted-issuer registry declares with the
- *      one-conversation session, through the same exchange, when the test secret names its user.
+ *      The same live checks run for a host app's pool the trusted-issuer registry declares, through the
+ *      same exchange, when the test secret names its user.
+ *
+ * THE CHANNEL IS MADE AS A REAL CONVERSATION IS: the service admin (`app-instance-admin-arn`) creates it
+ * with both people as members, tagged with its classification and audience, and promotes its owner to
+ * moderator (`lambda/src/lib/channel-creation.ts`). A channel created bearing A with `MemberArns` naming
+ * only B does not make A a member, so A's own-bearer send is refused by the membership check
+ * (ForbiddenException) whatever IAM decides, and the control measures nothing.
  *
  * B is a member of the channel, so a refusal of B's bearer is IAM's and not the membership check: a
  * non-member is refused by the Amazon Chime SDK with a different error, which this script does not count
@@ -46,10 +52,12 @@ import { createRequire } from 'node:module';
 import { CloudFormationClient, DescribeStackResourcesCommand, DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { CognitoIdentityProviderClient, InitiateAuthCommand } from '@aws-sdk/client-cognito-identity-provider';
+import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import {
   ChimeSDKMessagingClient,
   CreateChannelCommand,
   CreateChannelMembershipCommand,
+  CreateChannelModeratorCommand,
   DeleteChannelCommand,
   GetMessagingSessionEndpointCommand,
   ListChannelMessagesCommand,
@@ -57,7 +65,7 @@ import {
 } from '@aws-sdk/client-chime-sdk-messaging';
 
 const require = createRequire(import.meta.url);
-const { resolveStackPrefix } = require('./lib/stack-lookup.cjs');
+const { resolveStackPrefix, resolveInstanceName } = require('./lib/stack-lookup.cjs');
 const { appInstanceArnOf, userArnFor } = require('./lib/person-arn.cjs');
 const { exitWhenDrained } = require('./lib/exit-when-drained.cjs');
 
@@ -90,7 +98,7 @@ function awsIam(args) {
 
 /**
  * The exchange roles, by logical id, from the stacks that hold them: a conversational classification's vend
- * role is its `Assistants-<classification>` stack's, the admin plane's and the one-conversation role are
+ * role is its `Assistants-<classification>` stack's, the admin plane's and the `restricted` role are
  * Identity's, and the admin backend's admin-plane role is AdminServices' (absent on a deployment without the
  * `admin` capability).
  */
@@ -317,30 +325,38 @@ async function liveChecks(label, creds, selfArn, otherArn, channelArn) {
   }
 }
 
-/** A channel created by the runner, with both people as members, removed afterwards. */
-async function withChannel(creatorArn, memberArn, classification, fn) {
+/**
+ * A conversation made the way a real one is: created bearing the service admin, with the owner and the other
+ * person as members, the owner promoted to moderator, and tagged with its classification and the members
+ * audience. Removed afterwards, bearing the service admin.
+ */
+async function withChannel(serviceAdminArn, ownerArn, memberArn, classification, fn) {
   const admin = new ChimeSDKMessagingClient({ region: REGION });
   let channelArn;
   try {
     const created = await admin.send(new CreateChannelCommand({
-      AppInstanceArn: appInstanceArnOf(creatorArn),
+      AppInstanceArn: appInstanceArnOf(ownerArn),
       Name: `deny-test-bearer-pin-${Date.now()}`,
       Mode: 'RESTRICTED',
       Privacy: 'PRIVATE',
-      ChimeBearer: creatorArn,
-      MemberArns: [memberArn],
+      ChimeBearer: serviceAdminArn,
+      MemberArns: [ownerArn, memberArn],
       ClientRequestToken: `denytestpin${Date.now()}`,
-      ...(classification ? { Tags: [{ Key: 'classification', Value: classification }] } : {}),
+      ...(classification ? { Tags: [{ Key: 'classification', Value: classification }, { Key: 'audience', Value: 'members' }] } : {}),
     }));
     channelArn = created.ChannelArn;
+    await admin.send(new CreateChannelModeratorCommand({ ChannelArn: channelArn, ChannelModeratorArn: ownerArn, ChimeBearer: serviceAdminArn }));
   } catch (e) {
-    console.error('SETUP FAILED: the runner could not create the test channel:', String(e?.message || e));
+    console.error('SETUP FAILED: the runner could not create the test conversation:', String(e?.message || e));
+    if (channelArn) {
+      try { await admin.send(new DeleteChannelCommand({ ChannelArn: channelArn, ChimeBearer: serviceAdminArn })); } catch { /* reported below */ }
+    }
     process.exit(2);
   }
   try {
     await fn(channelArn);
   } finally {
-    try { await admin.send(new DeleteChannelCommand({ ChannelArn: channelArn, ChimeBearer: creatorArn })); }
+    try { await admin.send(new DeleteChannelCommand({ ChannelArn: channelArn, ChimeBearer: serviceAdminArn })); }
     catch (e) { console.error(`  (cleanup) could not delete ${channelArn}: ${String(e?.message || e)}`); }
   }
 }
@@ -361,36 +377,47 @@ async function main() {
   const aEx = await exchange(exchangeUrl, await idToken(idp, secret.cognitoClientId, secret.basicUser.email, secret.basicUser.password));
   const bEx = await exchange(exchangeUrl, await idToken(idp, secret.cognitoClientId, secret.premiumUser.email, secret.premiumUser.password));
   const appInstanceArn = appInstanceArnOf(aEx.userArn);
+  // The identity every real conversation is created bearing (`CREATOR_BEARER_ARN_PARAM`).
+  const serviceAdminParam = `/${resolveInstanceName(process.env)}/app-instance-admin-arn`;
+  let serviceAdminArn;
+  try {
+    serviceAdminArn = (await new SSMClient({ region: REGION }).send(new GetParameterCommand({ Name: serviceAdminParam }))).Parameter?.Value;
+  } catch (e) {
+    console.error(`setup error: could not read ${serviceAdminParam}: ${String(e?.message || e)}`);
+    exitWhenDrained(2);
+    return;
+  }
+  if (!serviceAdminArn) { console.error(`setup error: ${serviceAdminParam} is empty`); exitWhenDrained(2); return; }
 
   await simulationHalf(roles, appInstanceArn);
 
   console.log('\n2. LIVE: the deployment pool\n');
-  await withChannel(aEx.userArn, bEx.userArn, 'basic', (channelArn) =>
+  // A is the basic test user (`secret.basicUser`), so its conversation is tagged `basic`, as its own vend's classification.
+  await withChannel(serviceAdminArn, aEx.userArn, bEx.userArn, 'basic', (channelArn) =>
     liveChecks('pool session for A', aEx.credentials, aEx.userArn, bEx.userArn, channelArn));
 
-  // A HOST APP'S POOL, declared in the trusted-issuer registry with the one-conversation session. Its
-  // people use the same exchange as everyone else; the registry decides what they are vended.
+  // A HOST APP'S POOL, declared in the trusted-issuer registry. Its people use the same exchange as
+  // everyone else; the registry decides what they are vended.
   console.log('\n3. LIVE: a host app\'s pool\n');
   if (!secret.federatedUser || !secret.federatedClientId) skip('the test secret names no federatedUser and federatedClientId');
   else {
     const fedIdp = new CognitoIdentityProviderClient({ region: secret.federatedRegion || REGION });
     const fedToken = await idToken(fedIdp, secret.federatedClientId, secret.federatedUser.email, secret.federatedUser.password);
-    // The one-conversation vend names one conversation, so the channel exists first, with B as its creator.
-    // The guest is then made a member of it, as a guest is of its own conversation, so its own-bearer
-    // control can SUCCEED. A non-member's own-bearer call is refused by the membership check
+    // The channel is created at the classification the person is vended, with B as its owner, and the
+    // person is then made a member of it, as a host's add does, so their own-bearer control can SUCCEED. A non-member's own-bearer call is refused by the membership check
     // (ForbiddenException), which says IAM admitted it but proves no path works, so it is not a control.
-    await withChannel(bEx.userArn, aEx.userArn, null, async (channelArn) => {
-      const fedEx = await exchange(exchangeUrl, fedToken, { channelArn });
+    const fedEx = await exchange(exchangeUrl, fedToken);
+    await withChannel(serviceAdminArn, bEx.userArn, aEx.userArn, fedEx.tier, async (channelArn) => {
       try {
         await new ChimeSDKMessagingClient({ region: REGION }).send(new CreateChannelMembershipCommand({
-          ChannelArn: channelArn, MemberArn: fedEx.userArn, Type: 'DEFAULT', ChimeBearer: bEx.userArn,
+          ChannelArn: channelArn, MemberArn: fedEx.userArn, Type: 'DEFAULT', ChimeBearer: serviceAdminArn,
         }));
       } catch (e) {
-        console.error('SETUP FAILED: the runner could not make the guest a member of its conversation:', String(e?.message || e));
+        console.error('SETUP FAILED: the runner could not make the host pool person a member of the conversation:', String(e?.message || e));
         process.exitCode = 2;
         return;
       }
-      await liveChecks('one-conversation session', fedEx.credentials, fedEx.userArn, bEx.userArn, channelArn);
+      await liveChecks('host pool session', fedEx.credentials, fedEx.userArn, bEx.userArn, channelArn);
     });
     if (process.exitCode === 2) return;
   }

@@ -36,3 +36,20 @@ describe('the held question', () => {
     expect(src('lib/answer-prompt.ts')).toMatch(/systemPrompt \+= heldQuestionDirective\(c\.heldQuestion\);/);
   });
 });
+
+describe('a short decline that holds a question', () => {
+  const router = fs.readFileSync(path.resolve(__dirname, '../../lambda/src/router-agent-handler.ts'), 'utf8');
+
+  it('is relabeled before the quick reply, so the held question gets a turn ("no" is a greeting to the fast path)', () => {
+    // Labeled a greeting, "no" to a drift offer would be answered "Hey, what can I help you with?".
+    const relabel = router.indexOf("'[Router] a declined drift offer holds a question; not treating the reply as a greeting'");
+    const drift = router.indexOf("markRouterStep('drift_checked');");
+    const quick = router.indexOf('const quickResponse = quickReply(');
+    expect(drift).toBeGreaterThan(0);
+    expect(relabel).toBeGreaterThan(drift);
+    expect(relabel).toBeLessThan(quick);
+    const block = router.slice(router.lastIndexOf('if (!driftResponse && turnHeldQuestion', relabel), relabel + 400);
+    expect(block).toContain('classification.intent === IntentType.GREETING || classification.intent === IntentType.ACKNOWLEDGMENT');
+    expect(block).toContain('classification.intent = IntentType.GENERAL;');
+  });
+});

@@ -28,7 +28,9 @@ describe('one room per opening event', () => {
   });
 
   it('claims after every refusal and before anything is created, returns the room a redelivery finds, and names the room it opened', () => {
-    const creator = read('typed-conversation-from-event.ts');
+    // The event path, from its handler on: a meeting's own conversation is opened by `meetingConversation`, above it.
+    const source = read('typed-conversation-from-event.ts');
+    const creator = source.slice(source.indexOf('export const handler'));
     const at = (t: string) => creator.indexOf(t);
     expect(at('const opening = openingKey(event);')).toBeGreaterThan(at("throw new Error('detail.watchesAlarm is not an alarm name')"));
     expect(at('const opening = openingKey(event);')).toBeGreaterThan(at('if (!allowed.admitted.has(forUserArn))'));

@@ -13,11 +13,14 @@ import { getModelCatalog } from '../../lib/config/model-strategy';
 import {
   MAX_EVENT_WORKFLOW_STEPS,
   MAX_VERSION_EVENT_WORKFLOWS,
-  PLATFORM_EVENT_WORKFLOWS,
+  PLATFORM_RUN_NAMES,
+  SHIPPED_EVENT_WORKFLOWS,
+  eventWorkflowErrors,
   versionEventWorkflowsErrors,
   workflowFor,
   type EventWorkflow,
 } from '../../lambda/src/lib/event-workflow';
+import { MEETING_SUMMARY_RUN } from '../../lambda/src/lib/meeting-summary-turn';
 import { bodyFrom, buildDefinition } from '../../lambda/src/lib/active-profile';
 import { patchShapeErrors } from '../../lambda/src/lib/profile-copy-fields';
 import {
@@ -31,10 +34,17 @@ import {
 } from '../../lambda/src/lib/profile-lifecycle';
 import { exportManifest, importManifest, ProfileManifestError } from '../../lambda/src/lib/profile-manifest';
 import { fakeSsmStore } from '../helpers/fake-ssm-store';
+import { AGENT_STEP_OPS_ROOM } from '../helpers/agent-step-ops-room';
 
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
-const OWN: EventWorkflow = clone(PLATFORM_EVENT_WORKFLOWS['ops-room']);
+// A version's own ops room as a draft declares it, its first look an agent step, which these rules edit. The step opens
+// no task: `agent.workflow` is retired and refused on a draft, so it is left out here.
+const OWN: EventWorkflow = clone(AGENT_STEP_OPS_ROOM);
 OWN.states.opening.send!.template = 'ops-room-opening';
+delete OWN.states['first-look'].agent!.workflow;
+// And the room's own assistant's turn: a step naming another assistant's role (`as`) is retired too (WT118).
+delete OWN.states['first-look'].agent!.as;
+delete (OWN.states['first-look'].agent!.fallback as { absent?: unknown }).absent;
 const SRC = path.join(__dirname, '..', '..', 'lambda', 'src');
 const read = (f: string) => fs.readFileSync(path.join(SRC, f), 'utf8');
 
@@ -51,11 +61,11 @@ describe('the declaration', () => {
     expect(new Set([a, b, c]).size).toBe(3);
   });
 
-  it('a patch may carry it, and a task machine still may not', () => {
+  it('a patch may carry it, and an intent\'s machine rides the pack rather than a top-level field (ADR-066)', () => {
     expect(patchShapeErrors({ eventWorkflows: { 'ops-mine': OWN } })).toEqual([]);
     const lifecycle = read('lib/profile-lifecycle.ts');
-    expect(lifecycle).toMatch(/machines are global workflows and are not part of a version/);
-    expect(lifecycle).toMatch(/EVENT WORKFLOWS ARE THE EXCEPTION, BY DECISION \(ADR-061 decision 1, as built\)/);
+    expect(lifecycle).toMatch(/A VERSION'S MACHINES ARE DECLARED IN ITS INTENT PACK \(ADR-066 decision 1\), as its event workflows are declared in/);
+    expect(lifecycle).toMatch(/a version declares its intents' machines in its intent pack, as intentPack\.machines keyed by intent/);
   });
 });
 
@@ -84,6 +94,13 @@ describe('validation, the platform rules and the version\'s own', () => {
     }, new RegExp(`at most ${MAX_EVENT_WORKFLOW_STEPS} steps`));
     refused((w) => { w['ops-mine'].states.opening.send.template = 'x'.repeat(40_000); }, /at most 32000 characters/);
     refused((w) => { w['Bad Name'] = clone(OWN); }, /not a workflow name/);
+  });
+
+  it('a run the platform makes itself keeps its name: no version\'s workflow is named for it', () => {
+    expect(PLATFORM_RUN_NAMES).toContain(MEETING_SUMMARY_RUN);
+    refused((w) => { w[MEETING_SUMMARY_RUN] = clone(OWN); delete w['ops-mine']; }, /meeting-summary names a run the platform makes itself/);
+    // And an intent's workflow, which the same rules read.
+    expect(eventWorkflowErrors(MEETING_SUMMARY_RUN, {}, { intent: MEETING_SUMMARY_RUN }).join()).toMatch(/names a run the platform makes itself/);
   });
 
   it('a workflow its event selects is accepted, and two that would answer for one type are refused (W1)', () => {
@@ -143,10 +160,10 @@ describe('export and import (SPEC-PORTABLE-PROFILES)', () => {
 
 describe('the runtime reads the served version\'s own workflow', () => {
   it('chooses the version\'s own over a platform workflow of the same name', () => {
-    const mine = clone(PLATFORM_EVENT_WORKFLOWS['ops-room']);
+    const mine = clone(AGENT_STEP_OPS_ROOM);
     mine.states['first-look'].agent!.deadlineMs = 5_000;
     expect(workflowFor({ 'ops-room': mine }, 'ops-room')).toBe(mine);
-    expect(workflowFor({}, 'ops-room')).toBe(PLATFORM_EVENT_WORKFLOWS['ops-room']);
+    expect(workflowFor({}, 'ops-room')).toBe(SHIPPED_EVENT_WORKFLOWS['ops-room']);
     expect(workflowFor(undefined, 'nope')).toBeUndefined();
   });
 

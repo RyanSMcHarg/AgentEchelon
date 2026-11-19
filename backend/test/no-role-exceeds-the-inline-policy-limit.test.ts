@@ -31,6 +31,10 @@ const props = {
   appInstanceArn: cdk.Fn.importValue('AgentEchelonMessaging:ExportsOutputFnGetAttAppInstanceArn'),
   attachmentsBucketName: cdk.Fn.importValue('AgentEchelonConversations:ExportsOutputRefAttachmentsBucketName'),
   attachmentsBucketArn: cdk.Fn.importValue('AgentEchelonConversations:ExportsOutputFnGetAttAttachmentsBucketArn'),
+  companyBucketName: cdk.Fn.importValue('AgentEchelonConversations:ExportsOutputRefCompanyBucketName'),
+  companyBucketArn: cdk.Fn.importValue('AgentEchelonConversations:ExportsOutputFnGetAttCompanyBucketArn'),
+  profileBucketName: cdk.Fn.importValue('AgentEchelonConversations:ExportsOutputRefProfileBucketName'),
+  profileBucketArn: cdk.Fn.importValue('AgentEchelonConversations:ExportsOutputFnGetAttProfileBucketArn'),
   imageGuardrailByRegion: { 'us-west-2': { id: 'abcdefghij12', version: '1' } },
   // The largest shape a deployment builds: every capability an assistant stack is wired to, declared.
   battle: true,

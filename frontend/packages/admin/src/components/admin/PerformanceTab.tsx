@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import DataTable from './DataTable';
 import { InfoTooltip } from './AdminHelp';
 import PerformanceFilterBar, { type PerformanceFilters } from './PerformanceFilters';
+import { ttffByEntry, type LatencyRow } from './latencyAggregate';
 import { evaluateTarget, targetFor, STATUS_VAR, type TargetStatus } from './metricTargets';
 import { queryAnalytics } from '../../services/analyticsService';
 import type { AnalyticsDateRange, AnalyticsResult } from '@ae/shared';
@@ -44,6 +45,8 @@ interface PerformanceTabProps {
   filters: PerformanceFilters;
   onFiltersChange: (next: PerformanceFilters) => void;
   filterRows: Row[];
+  /** Whether multi-step task turns are counted, the choice the Latency section shows and changes. */
+  includeTasks?: boolean;
   view: PerfView;
   onViewChange: (next: PerfView) => void;
   /** The Latency detail, rendered by the parent; `openTtff` opens it at the first-update breakdown. */
@@ -75,11 +78,12 @@ export function weighted(rows: Row[], avgKey: string, nKey: string): { value: nu
 const sum = (rows: Row[], key: string): number => rows.reduce((s, r) => s + (num(r[key]) || 0), 0);
 
 const OUTCOMES = ['answered', 'task', 'refused', 'handed', 'stopped'] as const;
-const PATHS = ['flow', 'lex', 'unknown'] as const;
+// EVERY TURN, WHOEVER STARTED IT: a turn a workflow, an event, a task step or a meeting started is a path of its own.
+const PATHS = ['flow', 'lex', 'platform', 'unknown'] as const;
 /** The label of one statistic: its name, and the definition beside it. */
 const STAT_LABEL = 'perf-stat-label';
 
-const PATH_COLOR: Record<string, string> = { flow: '#1F5F8B', lex: '#7B5EA7', unknown: '#8A94A3' };
+const PATH_COLOR: Record<string, string> = { flow: '#1F5F8B', lex: '#7B5EA7', platform: '#2E7D74', unknown: '#8A94A3' };
 const FILL: Record<TargetStatus | 'neutral', string> = { good: '#2F7D4E', warn: '#C98A12', bad: '#B42318', neutral: '#8A94A3' };
 const MAX_INTENTS = 6;
 const OTHER = '__other__';
@@ -110,7 +114,7 @@ const WelcomeLane: React.FC<{ data: AnalyticsResult | null }> = ({ data }) => {
   const unmeasured = rows.reduce((s, r) => s + (Number(r.welcomes) || 0) - (Number(r.measured) || 0), 0);
   return (
     <section className="perf-welcome" aria-label={t('admin.performance.welcome.title')}>
-      <h4>{t('admin.performance.welcome.title')}</h4>
+      <h3>{t('admin.performance.welcome.title')}</h3>
       <p className="admin-tab-description">{t('admin.performance.welcome.lead')}</p>
       {rows.length === 0 ? (
         <p className="admin-tab-empty">{t('admin.performance.welcome.empty')}</p>
@@ -133,7 +137,7 @@ const WelcomeLane: React.FC<{ data: AnalyticsResult | null }> = ({ data }) => {
 };
 
 const PerformanceTab: React.FC<PerformanceTabProps> = ({
-  flowData, welcomeData, effectivenessData, dateRange, isLoading, filters, onFiltersChange, filterRows,
+  flowData, welcomeData, effectivenessData, dateRange, isLoading, filters, onFiltersChange, filterRows, includeTasks = false,
   view, onViewChange, renderLatency, renderEffectiveness, onOpenConversation,
 }) => {
   const { t } = useTranslation();
@@ -150,10 +154,21 @@ const PerformanceTab: React.FC<PerformanceTabProps> = ({
   }, [detailKey]);
   useEffect(() => { setTurnId(null); }, [view]);
 
-  const flowRows = useMemo(() => ((flowData?.data ?? []) as Row[]), [flowData]);
-  const effRows = useMemo(() => ((effectivenessData?.data ?? []) as Row[]), [effectivenessData]);
+  const allFlowRows = useMemo(() => ((flowData?.data ?? []) as Row[]), [flowData]);
+  const allEffRows = useMemo(() => ((effectivenessData?.data ?? []) as Row[]), [effectivenessData]);
   const tier = filters.classification;
-  const { rows: folded, intents, folded: foldedNames } = useMemo(() => foldIntents(flowRows), [flowRows]);
+  const { rows: allFolded, intents: allIntents, folded: foldedNames } = useMemo(() => foldIntents(allFlowRows), [allFlowRows]);
+  // AN OPEN INTENT NARROWS THE WHOLE PAGE: the cards and the flow above the detail describe that intent, and the bar says so.
+  const scopedIntent = view.view === 'intent' ? view.key : null;
+  const { flowRows, effRows, folded, intents } = useMemo(() => {
+    const inScope = (r: Row) => scopedIntent === null || (scopedIntent === OTHER ? foldedNames.includes(String(r.intent)) : String(r.intent) === scopedIntent);
+    return {
+      flowRows: allFlowRows.filter(inScope),
+      effRows: allEffRows.filter(inScope),
+      folded: scopedIntent === null ? allFolded : allFolded.filter((r) => r.intent === scopedIntent),
+      intents: scopedIntent === null ? allIntents : allIntents.filter((i) => i === scopedIntent),
+    };
+  }, [allFlowRows, allEffRows, allFolded, allIntents, foldedNames, scopedIntent]);
   const intentLabel = (k: string) => (k === OTHER ? t('admin.performance.otherIntents', { count: foldedNames.length }) : k);
   const effByIntent = useMemo(() => new Map(effRows.map((r) => [String(r.intent), r])), [effRows]);
 
@@ -161,8 +176,12 @@ const PerformanceTab: React.FC<PerformanceTabProps> = ({
 
   const totalTurns = sum(flowRows, 'turns');
   const byPath = (p: string) => flowRows.filter((r) => r.path === p);
-  const ttffStd = weighted(byPath('flow'), 'avg_ttff_ms', 'ttff_n');
-  const ttffLex = weighted(byPath('lex'), 'avg_ttff_ms', 'ttff_n');
+  // THE TTFF CARD IS THE LATENCY SECTION'S OWN FIGURE: the same rows, the same turns (task turns by the one shared choice) and
+  // the same calculation (`ttffByEntry`), so the overview and the section below it never disagree.
+  const entryTtff = ttffByEntry(filterRows as LatencyRow[], filters, includeTasks);
+  const ttffOf = (key: string) => { const e = entryTtff.find((x) => x.key === key); return { value: e ? e.ttff : NaN, n: e ? e.turns : 0 }; };
+  const ttffStd = ttffOf('flow');
+  const ttffLex = ttffOf('lex');
   const e2e = weighted(flowRows, 'avg_e2e_ms', 'e2e_n');
   const worker = weighted(flowRows, 'avg_total_ms', 'total_n');
 
@@ -179,7 +198,7 @@ const PerformanceTab: React.FC<PerformanceTabProps> = ({
   type Card = { label: string; value: string; sub: string; st: TargetStatus | null; open?: PerfView; tip?: string; def?: string };
   const cardRows: Array<{ title: string; cards: Card[] }> = [
     { title: t('admin.performance.speedAndCost'), cards: [
-      { label: t('admin.performance.card.turns'), def: t('admin.performance.pathHelp'), value: fmt(totalTurns), sub: t('admin.performance.card.turnsSub', { flowPath: fmt(sum(byPath('flow'), 'turns')), lexPath: fmt(sum(byPath('lex'), 'turns')), unrecorded: fmt(sum(byPath('unknown'), 'turns')) }), st: null, open: { view: 'latency' } },
+      { label: t('admin.performance.card.turns'), def: t('admin.performance.pathHelp'), value: fmt(totalTurns), sub: t('admin.performance.card.turnsSub', { flowPath: fmt(sum(byPath('flow'), 'turns')), lexPath: fmt(sum(byPath('lex'), 'turns')), platformPath: fmt(sum(byPath('platform'), 'turns')), unrecorded: fmt(sum(byPath('unknown'), 'turns')) }), st: null, open: { view: 'latency' } },
       { label: t('admin.performance.card.e2e'), def: t('admin.metrics.avg_e2e_ms.description'), value: formatMs(e2e.value), sub: t('admin.performance.card.over', { count: e2e.n }), st: status(e2e.value, 'avg_e2e_ms', tier), open: { view: 'latency' } },
       { label: t('admin.performance.card.ttff'), def: t('admin.metrics.ttff_ms.description'), value: formatMs(ttffStd.value), sub: t('admin.performance.card.ttffSub', { lexPath: formatMs(ttffLex.value) }), st: status(ttffStd.value, 'ttff_ms', tier), open: { view: 'ttff' } },
       { label: t('admin.performance.card.worker'), def: t('admin.metrics.avg_total_ms.description'), value: formatMs(worker.value), sub: t('admin.performance.card.over', { count: worker.n }), st: status(worker.value, 'avg_total_ms', tier), open: { view: 'latency' } },
@@ -283,12 +302,18 @@ const PerformanceTab: React.FC<PerformanceTabProps> = ({
   return (
     <div className="admin-tab">
       <div className="admin-tab-header">
-        <h3>
+        <h2>
           {t('admin.performance.title')}{' '}
           <InfoTooltip label={t('admin.performance.title')} content={t('admin.performance.tip')} />
-        </h3>
+        </h2>
       </div>
-      <PerformanceFilterBar rows={filterRows} value={filters} onChange={onFiltersChange} />
+      <PerformanceFilterBar rows={filterRows} value={filters} onChange={onFiltersChange}
+        scope={scopedIntent && (
+          <span className="admin-chip" data-testid="perf-intent-scope">
+            {t('admin.performance.intentScope', { intent: intentLabel(scopedIntent) })}{' '}
+            <button type="button" className="btn-link" data-testid="perf-intent-clear" onClick={() => onViewChange({ view: 'overview' })}>{t('admin.performance.showAllIntents')}</button>
+          </span>
+        )} />
 
       {cardRows.map((row) => (
         <div key={row.title} className="perf-card-row">
@@ -320,7 +345,7 @@ const PerformanceTab: React.FC<PerformanceTabProps> = ({
       <div className="perf-flow" role="region" aria-label={t('admin.performance.flowTitle')}>
         <div className="perf-flow-head">
           <div>
-            <h4>{t('admin.performance.flowTitle')}</h4>
+            <h3>{t('admin.performance.flowTitle')}</h3>
             <p className="admin-tab-description">{t('admin.performance.flowDescription')}</p>
           </div>
           <button type="button" className={view.view === 'latency' ? 'btn-primary' : 'btn-secondary'} onClick={() => onViewChange({ view: 'latency' })}>
@@ -396,7 +421,7 @@ const PerformanceTab: React.FC<PerformanceTabProps> = ({
                 slice={view}
                 rows={view.view === 'intent' && view.key === OTHER ? folded.filter((r) => r.intent === OTHER) : flowRows.filter((r) => String(r[view.view === 'intent' ? 'intent' : view.view]) === view.key)}
                 title={view.view === 'intent' ? intentLabel(view.key) : view.view === 'path' ? pathLabel(view.key) : outcomeLabel(view.key)}
-                totalTurns={totalTurns}
+                totalTurns={sum(allFlowRows, 'turns')}
                 onOpen={onViewChange}
                 onOpenTurn={setTurnId}
                 dateRange={dateRange}
@@ -405,7 +430,7 @@ const PerformanceTab: React.FC<PerformanceTabProps> = ({
               />
               {view.view === 'intent' && view.key !== OTHER && (
                 <div className="perf-embedded">
-                  <h4>{t('admin.performance.qualityFor', { intent: view.key })}</h4>
+                  <h3>{t('admin.performance.qualityFor', { intent: view.key })}</h3>
                   {renderEffectiveness(view.key)}
                 </div>
               )}
@@ -425,7 +450,7 @@ export function flowParams(filters: PerformanceFilters): Record<string, string> 
   const p: Record<string, string> = {};
   if (filters.assistant) p.agentType = filters.assistant;
   if (filters.role) p.assistantRole = filters.role;
-  if (filters.version) p.profileVersion = filters.version;
+  if (filters.version) p.profileVersion = filters.version.join(',');
   if (filters.classification) p.conversationClassification = filters.classification;
   if (filters.entry) p.turnEntry = filters.entry;
   if (filters.duel) p.duelRound = filters.duel;
@@ -502,7 +527,7 @@ const FlowSlice: React.FC<{
 
   return (
     <div className="perf-slice">
-      <h4>{title}</h4>
+      <h3>{title}</h3>
       {slice.view === 'intent' && slice.key === OTHER && (
         <p className="admin-tab-description">{t('admin.performance.otherIncludes', { intents: foldedNames.join(', ') })}</p>
       )}
@@ -527,7 +552,7 @@ const FlowSlice: React.FC<{
           </div>
         </div>
       )}
-      <h5>{t(`admin.performance.splitTitle.${splitBy}`)}</h5>
+      <h4>{t(`admin.performance.splitTitle.${splitBy}`)}</h4>
       <div className="perf-split">
         {split.map((s) => (
           <button
@@ -540,7 +565,7 @@ const FlowSlice: React.FC<{
           </button>
         ))}
       </div>
-      <h5>{t('admin.performance.turnsTitle')}</h5>
+      <h4>{t('admin.performance.turnsTitle')}</h4>
       <p className="admin-help-text">{t('admin.performance.turnsNote')}</p>
       {error && <p className="admin-error" role="alert">{error}</p>}
       {!error && turns === null && <p className="admin-help-text">{t('admin.performance.loading')}</p>}
@@ -604,22 +629,25 @@ const TurnRecord: React.FC<{
   const ttff = v('ttff_ms'), e2e = v('e2e_ms');
   const tail = total - (guard || 0) - (resolve || 0) - (latency || 0);
   const posting = e2e - ttff - total;
-  type Seg = { name: string; ms: number; closes?: string; color: string };
+  // EACH STEP SAYS WHAT IT IS: a router step by the description the Latency tab gives it, a worker segment by its own.
+  type Seg = { name: string; ms: number; closes?: string; color: string; help: string };
+  const seg = (key: string) => ({ name: t(`admin.performance.seg.${key}`), help: t(`admin.performance.segHelp.${key}`) });
   const segs: Seg[] = ([
     ...routerSteps.map((s) => ({
       name: t(`admin.latency.routerStep.label.${String(s.step_name)}`, { defaultValue: String(s.step_name) }),
+      help: t([`admin.latency.routerStep.help.${String(s.step_name)}`, 'admin.latency.routerStep.help.fallback']),
       ms: num(s.step_ms),
       closes: ROUTER_STEP_CLOSES[String(s.step_name)] ? t(`admin.performance.closes.${ROUTER_STEP_CLOSES[String(s.step_name)]}`) : undefined,
       color: '#4A7FA8',
     })),
-    { name: t('admin.performance.seg.placeholder'), ms: NaN, closes: t('admin.performance.closes.ttff', { value: formatMs(ttff) }), color: '#7A8A9C' },
-    { name: t('admin.performance.seg.admission'), ms: guard, color: '#9FB3C8' },
-    { name: t('admin.performance.seg.lookup'), ms: resolve, closes: v('poll_ms') > 0 ? t('admin.performance.closes.scanned', { value: formatMs(v('poll_ms')) }) : undefined, color: '#C98A12' },
-    { name: t('admin.performance.seg.model'), ms: model, color: '#1F5F8B' },
-    { name: t('admin.performance.seg.tool'), ms: tool, color: '#4A7FA8' },
-    { name: t('admin.performance.seg.loopRest'), ms: latency - (model || 0) - (tool || 0), closes: t('admin.performance.closes.bedrock', { value: formatMs(latency) }), color: '#6E8FAE' },
-    { name: t('admin.performance.seg.tail'), ms: tail, closes: t('admin.performance.closes.worker', { value: formatMs(total) }), color: '#B9C6D6' },
-    { name: t('admin.performance.seg.posting'), ms: posting, closes: t('admin.performance.closes.e2e', { value: formatMs(e2e) }), color: '#7A8A9C' },
+    { ...seg('placeholder'), ms: NaN, closes: t('admin.performance.closes.ttff', { value: formatMs(ttff) }), color: '#7A8A9C' },
+    { ...seg('admission'), ms: guard, color: '#9FB3C8' },
+    { ...seg('lookup'), ms: resolve, closes: v('poll_ms') > 0 ? t('admin.performance.closes.scanned', { value: formatMs(v('poll_ms')) }) : undefined, color: '#C98A12' },
+    { ...seg('model'), ms: model, color: '#1F5F8B' },
+    { ...seg('tool'), ms: tool, color: '#4A7FA8' },
+    { ...seg('loopRest'), ms: latency - (model || 0) - (tool || 0), closes: t('admin.performance.closes.bedrock', { value: formatMs(latency) }), color: '#6E8FAE' },
+    { ...seg('tail'), ms: tail, closes: t('admin.performance.closes.worker', { value: formatMs(total) }), color: '#B9C6D6' },
+    { ...seg('posting'), ms: posting, closes: t('admin.performance.closes.e2e', { value: formatMs(e2e) }), color: '#7A8A9C' },
   ] as Seg[]).filter((s) => s.closes || (Number.isFinite(s.ms) && s.ms > 0));
   const barTotal = segs.reduce((s, x) => s + (Number.isFinite(x.ms) && x.ms > 0 ? x.ms : 0), 0);
   const verdict = turn.verdict as Row | null;
@@ -629,7 +657,7 @@ const TurnRecord: React.FC<{
     <div className="perf-turn">
       <div className="perf-turn-head">
         <div>
-          <h4>{t('admin.performance.turnTitle', { when: new Date(String(turn.created_at)).toLocaleString() })}</h4>
+          <h3>{t('admin.performance.turnTitle', { when: new Date(String(turn.created_at)).toLocaleString() })}</h3>
           <div className="admin-help-text">
             {[t(`admin.performance.path.${String(turn.path)}`), String(turn.intent), t(`admin.performance.outcome.${String(turn.outcome)}`), String(turn.assistant), String(turn.conversation_classification), turn.profile_version != null ? `v${String(turn.profile_version)}` : ''].filter(Boolean).join(' · ')}
           </div>
@@ -658,7 +686,7 @@ const TurnRecord: React.FC<{
         <tbody>
           {segs.map((s, i) => (
             <tr key={i}>
-              <td><i style={{ background: s.color }} />{s.name}</td>
+              <td><i style={{ background: s.color }} />{s.name}<InfoTooltip label={t('admin.performance.aboutMetric', { label: s.name })} content={s.help} /></td>
               <td>{Number.isFinite(s.ms) && s.ms > 0 ? formatMs(s.ms) : ''}</td>
               <td className="perf-closes">{s.closes ?? ''}</td>
             </tr>
@@ -667,7 +695,7 @@ const TurnRecord: React.FC<{
       </table>
       <div className="perf-turn-panels">
         <div>
-          <h5>{t('admin.performance.verdicts')}</h5>
+          <h4>{t('admin.performance.verdicts')}</h4>
           {verdict ? (
             <ul className="perf-kv">
               <li><span>{t('admin.performance.column.relevance')}</span><strong>{Number.isFinite(num(verdict.relevance_score)) ? `${num(verdict.relevance_score).toFixed(0)} · ${String(verdict.classification ?? '')}` : '—'}</strong></li>
@@ -681,9 +709,29 @@ const TurnRecord: React.FC<{
           ) : <p className="admin-help-text">{t('admin.performance.notJudged')}</p>}
         </div>
         <div>
-          <h5>{t('admin.performance.spend')}</h5>
+          <h4>{t('admin.performance.spend')}</h4>
           <ul className="perf-kv">
             <li><span>{t('admin.performance.model')}</span><strong>{String(turn.bedrock_model ?? '—')}</strong></li>
+            {turn.model_from ? (
+              <li>
+                <span className={STAT_LABEL}>{t('admin.performance.modelFrom')}<InfoTooltip label={t('admin.performance.aboutMetric', { label: t('admin.performance.modelFrom') })} content={t('admin.performance.modelFromHelp')} /></span>
+                <strong data-testid="turn-model-from">{t([`admin.performance.modelFromRule.${String(turn.model_from)}`, 'admin.performance.modelFromRule.unknown'], { from: String(turn.model_from) })}</strong>
+              </li>
+            ) : null}
+            {turn.routed_as ? (
+              <li>
+                <span className={STAT_LABEL}>{t('admin.performance.routedAs')}<InfoTooltip label={t('admin.performance.aboutMetric', { label: t('admin.performance.routedAs') })} content={t('admin.performance.routedAsHelp')} /></span>
+                <strong data-testid="turn-routed-as">{t([`admin.performance.routedAsDecision.${String(turn.routed_as)}`, 'admin.performance.routedAsDecision.unknown'], { decision: String(turn.routed_as) })}</strong>
+              </li>
+            ) : null}
+            {turn.task_step ? (
+              <li>
+                <span>{t('admin.performance.taskStep')}</span>
+                <strong>{turn.task_state && turn.task_state !== turn.task_step
+                  ? t('admin.performance.taskStepMoved', { from: String(turn.task_step), to: String(turn.task_state) })
+                  : String(turn.task_step)}</strong>
+              </li>
+            ) : null}
             <li><span>{t('admin.performance.tokens')}</span><strong>{`${fmt(v('input_tokens'))} / ${fmt(v('output_tokens'))}`}</strong></li>
             {turn.task_id ? <li><span>{t('admin.performance.task')}</span><strong>{String(turn.task_id).slice(0, 8)}</strong></li> : null}
           </ul>

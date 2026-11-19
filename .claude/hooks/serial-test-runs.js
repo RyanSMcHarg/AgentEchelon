@@ -3,8 +3,8 @@
  * PreToolUse hook - one test run at a time, and never the shape that kills the machine.
  *
  * The backend suite runs as 4 Jest shards. Started CONCURRENTLY they hard-lock this machine: each
- * Jest process runs 4 workers holding a full TypeScript program with `cache: false`, so four
- * shards is 16 compiling workers plus their parents. It has cost a session's uncommitted work.
+ * Jest process runs its worker pool (`maxWorkers`, 2 by default), and some suites synthesize
+ * every CDK stack inside a worker, so concurrent shards multiply that. It has cost a session's uncommitted work.
  * The repo has known this for a while - `backend/jest.config.js` caps the worker pool for the same
  * reason, and AGENTS.md says one shard per call - but knowing it only helped when
  * someone remembered. This refuses instead.
@@ -18,8 +18,7 @@
  *      is the exact form the crash took.
  *   3. A whole-backend-suite run in one call. It exceeds the 10-minute limit a tool call gets and
  *      is killed mid-run, which surfaces as "Jest worker encountered N child process exceptions" -
- *      a dying pool that reads exactly like a product regression. A previous session lost five
- *      attempts to that misreading.
+ *      a dying pool that reads exactly like a product regression.
  *   4. ANY test invocation while a run already holds the lock, including a cheap single-file one.
  *      Serial means serial; the message says who holds it and for how long.
  *
@@ -210,8 +209,8 @@ function main() {
 
   if (kinds.includes('shard')) {
     deny(
-      'Refused: `--shard` by hand. Four shards started at once hard-locks this machine (16 '
-      + 'ts-jest workers, each holding a full TS program with cache disabled), and one shard per '
+      'Refused: `--shard` by hand. Shards started at once hard-lock this machine (each runs its '
+      + 'own worker pool, and some suites synthesize every CDK stack), and one shard per '
       + 'call is slow to drive and easy to abandon half-run.\n\n'
       + `Run the whole suite serially instead, in the BACKGROUND (it exceeds 10 minutes):\n  ${RUNNER}\n\n`
       + 'It holds an exclusive lock, runs shards 1..N one after another, and prints a per-shard '
@@ -243,7 +242,7 @@ function main() {
     deny(
       'Refused: the whole backend suite in one call. It exceeds the 10-minute limit and is killed '
       + 'mid-run, reporting "Jest worker encountered N child process exceptions" - a dying worker '
-      + 'pool, not a regression. A previous session lost five attempts to that misreading.\n\n'
+      + 'pool, not a regression.\n\n'
       + `Run it sharded and serial, in the BACKGROUND:\n  ${RUNNER}\n\n`
       + 'To check one area quickly, name the tests: `cd backend && npx jest test/<pattern>`.',
     );

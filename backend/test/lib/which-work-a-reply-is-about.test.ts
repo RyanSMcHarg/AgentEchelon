@@ -342,10 +342,11 @@ describe('the router builds the list from both kinds of work', () => {
   );
 
   it('combines the assignee-held rows with the ones this person OWNS here', () => {
-    // The fix for the inert rule. `heldByPerson` is the assignee partition, and a person is the
+    // WORK IN FLIGHT IS IN THE SET. `heldByPerson` is the assignee partition, and a person is the
     // assignee only while a step awaits them, so on its own it can only ever offer parked work.
-    // The owner-scoped read is what puts work in flight in the set (ADR-024 D8).
-    expect(router).toContain('...ownedHere.filter((o) => !heldByPerson.some((h) => h.taskId === o.taskId))');
+    // The owner-scoped read is what puts work in flight in the set (ADR-024 D8), limited to work the person or an
+    // assistant holds: a request another person holds is reached through the requester's path, with its moves (WT114).
+    expect(router).toContain('...ownedHere.filter((o) => !heldByPerson.some((h) => h.taskId === o.taskId) && heldForThem(o))');
     expect(router).toContain('candidateRows.map((t) => ({');
   });
 
@@ -354,7 +355,7 @@ describe('the router builds the list from both kinds of work', () => {
     // which is the layer that makes the owner narrowing a second check rather than the only one
     // (tenet D3). Reaching around it would leave one layer where the tenet asks for two.
     expect(router).toContain('referentCandidatesFor({');
-    expect(router).toContain("import { referentCandidates as referentCandidatesFor } from './lib/task-store.js';");
+    expect(router).toMatch(/import \{[^}]*\breferentCandidates as referentCandidatesFor\b[^}]*\} from '\.\/lib\/task-store\.js';/);
   });
 
   it('carries the owner from the speaker rather than composing one', () => {

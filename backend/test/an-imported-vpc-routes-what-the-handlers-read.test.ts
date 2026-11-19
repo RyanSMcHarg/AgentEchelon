@@ -98,7 +98,7 @@ describe('what the in-VPC handlers need', () => {
     expect(s3).toEqual(expect.arrayContaining([
       `s3:ListBucket arn:aws:s3:::${REGISTRY}`,
       `s3:GetObject arn:aws:s3:::${REGISTRY}/registry/classification/row`,
-      `s3:GetObject arn:aws:s3:::${ARCHIVE}/rag/doc.md`,
+      `s3:GetObject arn:aws:s3:::${ARCHIVE}/delivered-documents/doc`,
       `s3:PutObject arn:aws:s3:::${ARCHIVE}/delivered-documents/doc`,
     ]));
     expect(reqs.map((r: { service: string }) => r.service)).toEqual(expect.arrayContaining(['secretsmanager', 'bedrock-runtime']));

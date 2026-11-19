@@ -261,7 +261,12 @@ suite('experiment results reconcile in the console, per experiment type', () => 
     await signIn(adminPage, creds.testAdmin.email, creds.testAdmin.password);
     await adminPage.locator('.admin-section-rail button:has-text("Experiments")').click();
 
-    const compare = adminPage.locator('.exp-compare').filter({ hasText: experimentId });
+    // The comparison is on the experiment's own page, titled by what it compares rather than by its id, so the page
+    // is opened from the row by the id its name button carries.
+    const open = adminPage.locator(`[data-experiment-id="${experimentId}"]`).first();
+    await expect(open, `the console lists ${experimentId}`).toBeVisible({ timeout: 60_000 });
+    await open.click();
+    const compare = adminPage.locator('[data-testid="experiment-page"] .exp-compare').first();
     await expect(compare, `the console shows a comparison for ${experimentId}`).toBeVisible({ timeout: 60_000 });
 
     // The sample row is the aggregate the drill-down has to reproduce.

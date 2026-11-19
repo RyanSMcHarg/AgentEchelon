@@ -9,18 +9,33 @@ jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
   ensureSchema: jest.fn(async () => undefined),
 }));
 
-import { erasePersonProjection, PERSON_OWN_TABLES, PERSON_KEPT_TABLES } from '../../lambda/src/analytics-aurora/person-erasure';
+import { erasePersonProjection, PERSON_OWN, PERSON_OWN_TABLES, PERSON_KEPT_TABLES } from '../../lambda/src/analytics-aurora/person-erasure';
 
 beforeEach(() => mockClientQuery.mockReset());
 
 describe('erasePerson', () => {
-  it('deletes the person\'s own rows from each of their tables, by person_id, and counts them', async () => {
-    mockClientQuery.mockResolvedValueOnce({ rowCount: 2 }).mockResolvedValueOnce({ rowCount: 3 }).mockResolvedValueOnce({ rowCount: 0 });
+  it('deletes the person\'s own rows from each of their tables, by the column that names them, and counts them', async () => {
+    mockClientQuery.mockImplementation(async (sql: string) => ({
+      rowCount: sql.includes('channel_membership') ? 3 : sql.includes('cross_conversation_context') ? 2 : sql.includes('meeting_events') ? 4 : 0,
+    }));
     const res = await erasePersonProjection({ personId: 'person-1' });
-    expect(res).toEqual({ removed: 5, byTable: { cross_conversation_context: 2, channel_membership: 3, conversation_creation_tasks: 0 } });
-    expect(mockClientQuery.mock.calls.map(([sql, params]) => [sql, params])).toEqual(
-      PERSON_OWN_TABLES.map((t) => [`DELETE FROM ${t} WHERE person_id = $1`, ['person-1']]),
-    );
+    expect(res).toEqual({ removed: 9, byTable: { channel_membership: 3, conversation_creation_tasks: 0, cross_conversation_context: 2, meeting_events: 4 } });
+    expect(PERSON_OWN_TABLES).toEqual(['channel_membership', 'conversation_creation_tasks', 'cross_conversation_context', 'meeting_events']);
+    expect(mockClientQuery.mock.calls.map(([sql, params]) => [sql, params])).toEqual([
+      ['DELETE FROM channel_membership WHERE person_id = $1', ['person-1']],
+      ['DELETE FROM conversation_creation_tasks WHERE person_id = $1', ['person-1']],
+      // THE BOUNDED TABLES ARE DELETED AS THE WRITER ROLE, the only identity their row-level security lets delete a row.
+      ['SET LOCAL ROLE ae_writer', undefined],
+      ['DELETE FROM cross_conversation_context WHERE person_id = $1', ['person-1']],
+      ['DELETE FROM meeting_events WHERE person_key = $1', ['person-1']],
+    ]);
+  });
+
+  it('erases every bounded table that names a person, so none is left to the database to refuse silently', () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { BOUNDED_TABLES } = require('../../lambda/src/analytics-aurora/classification-boundary-sql') as typeof import('../../lambda/src/analytics-aurora/classification-boundary-sql');
+    expect(PERSON_OWN.filter((t) => t.bounded).map((t) => t.table).every((t) => (BOUNDED_TABLES as readonly string[]).includes(t))).toBe(true);
+    expect(PERSON_OWN.filter((t) => !t.bounded).map((t) => t.table).some((t) => (BOUNDED_TABLES as readonly string[]).includes(t))).toBe(false);
   });
 
   it('never touches the conversation\'s record', async () => {

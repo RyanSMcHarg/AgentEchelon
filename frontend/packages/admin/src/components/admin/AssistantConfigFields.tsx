@@ -14,12 +14,19 @@ import { useTranslation } from 'react-i18next';
 import { GuideLinks, guide, guideSection, InfoTooltip, type Guide } from './AdminHelp';
 import { DOC_SECTIONS } from '../../config/docLinks';
 import { setTurnLimit } from '../../services/rosterService';
-import WelcomeEditorGuide from './WelcomeEditorGuide';
-import { welcomeFor, welcomeTypes, withWelcome, type WelcomePromptOption } from './welcomeWorkflow';
+import { welcomeContextFor } from './WelcomeEditorGuide';
+import { type WelcomePromptOption } from './welcomeWorkflow';
+import { SHIPPED_EVENT_WORKFLOWS, welcomeWorkflowOf } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
 import WorkflowBuilder from './WorkflowBuilder';
-import VariablePicker from './VariablePicker';
+import IntentWorkflowsFields from './IntentWorkflowsFields';
+import { useTaskMachineSource } from './useTaskMachineSource';
+import WelcomeModeEditor from './WelcomeModeEditor';
+import { declaredTypesFor } from './EventWorkflowEditor';
+import { welcomeHolding, welcomeNameFor, welcomeTypeOf } from './welcomeWorkflow';
 import { parseTemplate } from '../../../../../../backend/lambda/src/lib/document-template.ts';
 import { s3PrefixUrl } from '../../services/awsConsole';
+import { readableByRole } from '../../../../../../backend/lambda/src/lib/context-source-reach.ts';
+import { resolveGuardrailSelection } from '../../../../../../backend/lambda/src/lib/guardrail-selection.ts';
 import type {
   AssistantCopy,
   ClassificationCatalog,
@@ -137,10 +144,10 @@ export const ClassifierModeRow: React.FC<{ selected: ProfileListing }> = ({ sele
 };
 
 /**
- * The tested instruction an experiment left on the version, and the boundary, read-only with their edit paths. On a
+ * The tested instruction an experiment left on the version, and on the active version the boundary line. On a
  * draft, `moveAction` is the action that moves the instruction into the persona (`MoveIntoPersona`).
  */
-export const PersonaExtras: React.FC<{ config: ProfileDefinitionBody; decisions: Record<string, FieldDecision>; moveAction?: React.ReactNode }> = ({ config, decisions, moveAction }) => {
+export const PersonaExtras: React.FC<{ config: ProfileDefinitionBody; decisions: Record<string, FieldDecision>; moveAction?: React.ReactNode; editing?: boolean }> = ({ config, decisions, moveAction, editing }) => {
   const { t } = useTranslation();
   return (
     <dl className="admin-config-list">
@@ -148,10 +155,12 @@ export const PersonaExtras: React.FC<{ config: ProfileDefinitionBody; decisions:
         path={<><EditPath field="systemPromptAddendum" decision={decisions.systemPromptAddendum} />{moveAction}</>}>
         {config.systemPromptAddendum ? <code>{config.systemPromptAddendum}</code> : <Muted>{t('admin.assistantPage.notSet')}</Muted>}
       </Row>
-      <Row testId="field-boundary" label={t('admin.assistantPage.field.boundary')} help={t('admin.assistantPage.help.boundary')}
-        path={<EditPath field="boundary" decision={decisions.boundary} />}>
-        {config.boundary ? <span>{config.boundary}</span> : <Muted>{t('admin.assistantPage.notSet')}</Muted>}
-      </Row>
+      {/* ON A DRAFT IT IS EDITED IN THE IDENTITY AREA ABOVE. */}
+      {!editing && (
+        <Row testId="field-boundary" label={t('admin.assistantPage.field.boundary')} help={t('admin.assistantPage.help.boundary')}>
+          {config.boundary ? <span>{config.boundary}</span> : <Muted>{t('admin.assistantPage.notSet')}</Muted>}
+        </Row>
+      )}
     </dl>
   );
 };
@@ -160,7 +169,7 @@ export const PersonaExtras: React.FC<{ config: ProfileDefinitionBody; decisions:
  * The retired welcome and lines, onboarding and reply preferences, as the active version carries them. The welcome
  * itself is the version's assistant-joined workflows, which the Workflows section lists with every other event workflow.
  */
-export const WordsGroup: React.FC<{ config: ProfileDefinitionBody; decisions: Record<string, FieldDecision> }> = ({ config, decisions }) => {
+export const WordsGroup: React.FC<{ config: ProfileDefinitionBody; decisions: Record<string, FieldDecision>; catalog?: ClassificationCatalog; profileName?: string }> = ({ config, decisions, catalog, profileName }) => {
   const { t } = useTranslation();
   const copyKeys = Object.keys(config.copy ?? {});
   return (
@@ -194,6 +203,12 @@ export const WordsGroup: React.FC<{ config: ProfileDefinitionBody; decisions: Re
             <summary>{config.onboarding.greeting ?? ''}</summary>
             <ul>{(config.onboarding.fields ?? []).map((f) => <li key={f.key}><code>{f.key}</code> {f.prompt}</li>)}</ul>
           </details>
+        ) : catalog?.onboardingIntake && (!catalog.primaryAssistant || catalog.primaryAssistant === profileName) ? (
+          <details data-testid="field-onboarding-deployment">
+            <summary>{t('admin.assistantPage.help.onboardingDeployment', { param: `/agent-echelon/assistant/${catalog.classification}/onboarding-intake` })}</summary>
+            {catalog.onboardingIntake.greeting && <p>{catalog.onboardingIntake.greeting}</p>}
+            <ul>{catalog.onboardingIntake.questions.map((q) => <li key={q}>{q}</li>)}</ul>
+          </details>
         ) : <Muted>{t('admin.assistantPage.notSet')}</Muted>}
       </Row>
       <Row testId="field-replyPreferences" label={t('admin.assistantPage.field.replyPreferences')} help={t('admin.assistantPage.help.replyPreferences')}
@@ -214,7 +229,7 @@ export const ContextGroup: React.FC<{
 }> = ({ config, configLoading, catalog, role }) => {
   const { t } = useTranslation();
   const read = !configLoading && !!config;
-  // EACH PREFIX IS A LOCATION IN THE DEPLOYMENT'S ATTACHMENTS BUCKET, named with its bucket and linked to it, so
+  // EACH PREFIX IS A LOCATION IN THE DEPLOYMENT'S COMPANY BUCKET, named with its bucket and linked to it, so
   // nobody has to guess where `context/premium/` is.
   const bucket = catalog?.contextBucket;
   const prefixes = (list: string[] | undefined) => (list?.length
@@ -223,11 +238,19 @@ export const ContextGroup: React.FC<{
       : <code key={p} className="admin-chip">{p}</code>))
     : <Muted>{t('admin.assistantPage.none')}</Muted>);
   const roleReach = role ? catalog?.roles?.[role]?.contextPrefixes : undefined;
+  // THE COMPANY DOCUMENT MENU AND ITS TOOL, as the turn decides them: offered when the version's tools allow
+  // load_company_context (no list allows every tool) and the role reads company context.
+  const companyDocuments = !read ? null
+    : config?.tools && !config.tools.includes('load_company_context') ? 'NoTool'
+      : roleReach && roleReach.length === 0 ? 'NoReach'
+        : roleReach ? 'Included' : null;
   return (
     <dl className="admin-config-list">
-      {/* The company document menu and its tool are part of every turn, whatever the version selects. */}
-      <Row testId="field-companyDocuments" label={t('admin.assistantPage.field.companyDocuments')} help={t('admin.assistantPage.help.companyDocuments')}>
-        <Muted>{t('admin.assistantPage.help.alwaysIncluded')}</Muted>
+      <Row testId="field-companyDocuments" label={t('admin.assistantPage.field.companyDocuments')} help={t('admin.assistantPage.help.companyDocuments')}
+        path={<GuideLinks guides={[guideSection(t('admin.assistantPage.guideLead'), 'contextDocuments')]} />}>
+        {companyDocuments
+          ? <Muted>{t(`admin.assistantPage.help.companyDocuments${companyDocuments}`)}</Muted>
+          : !read ? <VersionNotRead loading={configLoading} /> : <Muted>{t('admin.assistantPage.unreadable')}</Muted>}
       </Row>
       <Row testId="field-contextSources" label={t('admin.assistantPage.field.contextSources')} help={t('admin.assistantPage.help.contextSources')}
         path={<GuideLinks guides={[guideSection(t('admin.assistantPage.guideLead'), 'contextSources')]} />}>
@@ -323,7 +346,7 @@ export const PlatformSection: React.FC = () => {
     { id: 'deliveryCheck', guide: guideSection(t('admin.assistantPage.platform.deliveryCheckGuide'), 'deliveryChecks') },
   ];
   return (
-    <section id="assistant-config-platform" className="admin-config-group" aria-labelledby="assistant-config-platform-title" data-testid="assistant-config-platform">
+    <section id="assistant-config-platform" aria-labelledby="assistant-config-platform-title" data-testid="assistant-config-platform">
       <h4 id="assistant-config-platform-title">{t('admin.assistantPage.platform.title')} <span className="admin-badge">{t('admin.assistantPage.platform.badge')}</span></h4>
       <p className="admin-config-group-help">{t('admin.assistantPage.platform.help')}</p>
       <dl className="admin-config-list">
@@ -343,7 +366,6 @@ export const PlatformSection: React.FC = () => {
 
 
 /** Lines of a textarea, trimmed, blanks dropped. */
-const lines = (s: string) => s.split('\n').map((l) => l.trim()).filter(Boolean);
 
 /**
  * THE TEMPLATES THIS ASSISTANT SAYS, read for the welcome's prompt turn and the event workflows' pickers: its own, its
@@ -384,199 +406,83 @@ export const GuardrailAndSources: React.FC<{
   config: ProfileDefinitionBody | null;
   catalog?: ClassificationCatalog;
   onPatch: (patch: ProfileDraftPatch) => void;
-}> = ({ config, catalog, onPatch }) => {
+  /** The assistant's role, which decides which company-context sources its turns can read. */
+  role?: string;
+  /** Which half this section edits. */
+  only: 'guardrail' | 'sources';
+}> = ({ config, catalog, onPatch, role, only }) => {
   const { t: translate } = useTranslation();
   const t = translate as unknown as T;
-  const [guardrail, setGuardrail] = useState(config?.guardrailId ?? '');
+  const showGuardrail = only === 'guardrail';
+  const showSources = only === 'sources';
+  // A STORED CATALOG KEY ('strict') IS SHOWN AS THE GUARDRAIL IT NAMES: the draft edit stores the id it maps to.
+  const [guardrail, setGuardrail] = useState(() => {
+    const stored = config?.guardrailId ?? '';
+    const resolved = stored && catalog?.guardrails ? resolveGuardrailSelection(stored, catalog.guardrails) : undefined;
+    return resolved && 'guardrailId' in resolved ? resolved.guardrailId : stored;
+  });
   const [sources, setSources] = useState<string[]>(config?.contextSources ?? []);
   const catalogSources = catalog?.contextSources ?? [];
+  // WHAT THE ROLE CAN READ, by the rule the turn applies (`readableByRole`). Unknown while the role's reach is unread.
+  const rolePrefixes = role ? catalog?.roles?.[role]?.contextPrefixes : undefined;
   return (
     <>
-      <label><span className="admin-field-label">{t('admin.assistantPage.field.guardrail')} <InfoTooltip label={t('admin.assistantPage.field.guardrail')} content={t('admin.assistantPage.help.guardrail')} /></span>
+      {showGuardrail && <label><span className="admin-field-label">{t('admin.assistantPage.field.guardrail')} <InfoTooltip label={t('admin.assistantPage.field.guardrail')} content={t('admin.assistantPage.help.guardrail')} /></span>
         <select data-testid="draft-guardrail" className="select" value={guardrail}
           onChange={(e) => { setGuardrail(e.target.value); onPatch({ guardrailId: e.target.value || null }); }}>
           <option value="">{t('admin.assistantPage.help.guardrailDefault')}</option>
           {(catalog?.guardrails ?? []).map((g) => <option key={g.key} value={g.guardrailId}>{g.key}</option>)}
         </select>
-      </label>
+      </label>}
 
-      <div className="profiles-persona-field" data-testid="draft-context-sources">
-        <h5>{t('admin.assistantPage.field.contextSources')} <InfoTooltip label={t('admin.assistantPage.field.contextSources')}
-          content={`${t('admin.assistantPage.help.contextSources')} ${t('admin.assistantPage.field.companyDocuments')}: ${t('admin.assistantPage.help.companyDocuments')}`} /></h5>
+      {showSources && <div className="profiles-persona-field" data-testid="draft-context-sources">
+        <h4>{t('admin.assistantPage.field.contextSources')} <InfoTooltip label={t('admin.assistantPage.field.contextSources')}
+          content={`${t('admin.assistantPage.help.contextSources')} ${t('admin.assistantPage.field.companyDocuments')}: ${t('admin.assistantPage.help.companyDocuments')}`} /></h4>
         {catalogSources.length === 0
           ? <span className="admin-muted">{t(catalog?.contextSources ? 'admin.assistantPage.none' : 'admin.assistantPage.unreadable')}</span>
           : (
             <div className="admin-filter-group">
               {catalogSources.map((s) => {
                 const at = sources.indexOf(s.key);
+                // A SOURCE THE ROLE CANNOT READ is not offered; one a version already selects stays uncheckable, explained.
+                const unreadable = !!rolePrefixes && !readableByRole(s, rolePrefixes);
                 return (
-                  <label key={s.key} className="admin-check" title={s.description}>
-                    <input type="checkbox" checked={at >= 0} onChange={(e) => {
+                  <label key={s.key} className="admin-check" title={s.description} data-testid={`draft-context-source-${s.key}`}>
+                    <input type="checkbox" checked={at >= 0} disabled={unreadable && at < 0} onChange={(e) => {
                       const next = e.target.checked ? [...sources, s.key] : sources.filter((k) => k !== s.key);
                       setSources(next);
                       onPatch({ contextSources: next.length ? next : null });
                     }} />
                     <code>{s.key}</code>{at >= 0 && <span className="admin-field-hint"> #{at + 1}</span>}
+                    {unreadable && <span className="admin-field-hint" data-testid={`draft-context-source-unreadable-${s.key}`}> {t('admin.assistantPage.help.sourceNotReadableByRole', { role, prefix: s.prefix })}</span>}
                   </label>
                 );
               })}
             </div>
           )}
-      </div>
+      </div>}
     </>
   );
 };
 
 /**
- * HOW IT GREETS: the welcome, per kind of conversation, as the workflow WelcomeIntent starts (W1). Its opening step's
- * text and suggested prompts, previewed with the router's own selection, and a prompt turn after it; a welcome that
- * greets and then continues points to Event workflows. A draft cloned from a version stored before W1 says so and
- * clears the retired field.
+ * A DRAFT CLONED FROM A VERSION STORED BEFORE W1 carries the retired `welcome` field, which nothing reads: what it is,
+ * and a control that clears it. The welcome itself is the version's workflow on assistant-joined, in the builder.
  */
-export const WelcomeFields: React.FC<{
-  config: ProfileDefinitionBody | null;
-  catalog?: ClassificationCatalog;
-  onPatch: (patch: ProfileDraftPatch) => void;
-  /** The assistant's role, for the opening's preview. */
-  role?: string;
-  /** The assistant, whose prompt templates a prompt welcome may name. */
-  profileName?: string;
-  /** The tool registry, whose read tools a prompt welcome may use. */
-  tools?: ToolDescriptor[];
-}> = ({ config, catalog, onPatch, role, profileName, tools = [] }) => {
+export const RetiredWelcomeNote: React.FC<{ config: ProfileDefinitionBody | null; onPatch: (patch: ProfileDraftPatch) => void }> = ({ config, onPatch }) => {
   const { t: translate } = useTranslation();
   const t = translate as unknown as T;
-  /** The conversation type whose welcome is being edited; empty for the welcome of every other room. */
-  const [welcomeType, setWelcomeType] = useState('');
-  const [newWelcomeType, setNewWelcomeType] = useState('');
-  /** Kinds of room added here that have no welcome of their own yet. */
-  const [addedTypes, setAddedTypes] = useState<string[]>([]);
-  const { prompts, unreadable: promptsUnreadable } = useTemplateOptions(profileName);
-  const [eventWorkflows, setEventWorkflows] = useState<NonNullable<ProfileDefinitionBody['eventWorkflows']>>(() => ({ ...(config?.eventWorkflows ?? {}) }));
-  /** The retired `welcome` a draft cloned from a version stored before W1 carries, until it clears it. */
-  const [retiredWelcome, setRetiredWelcome] = useState(() => config?.welcome !== undefined && config?.welcome !== null);
-  const published = catalog?.variables;
-  const versionVariables = config?.variables;
-
-  const saveWorkflows = (next: NonNullable<ProfileDefinitionBody['eventWorkflows']>) => {
-    setEventWorkflows(next);
-    onPatch({ eventWorkflows: Object.keys(next).length ? next : null });
-  };
-  /** The welcome being edited: the version's own for this kind of room, read from the draft's workflows. */
-  const current = welcomeFor(eventWorkflows, welcomeType);
-  const openingText = current.opening?.text ?? '';
-  const examples = (current.opening?.examples ?? []).join('\n');
-  /** The opening step with one field changed; a blank field is left out, as the step's shape requires. */
-  const setOpening = (field: 'text' | 'examples', value: string) => {
-    const { [field]: _old, ...rest } = current.opening ?? {};
-    const next = field === 'examples'
-      ? (lines(value).length ? { ...rest, examples: lines(value) } : rest)
-      : (value.trim() ? { ...rest, text: value } : rest);
-    saveWorkflows(withWelcome(eventWorkflows, welcomeType, { opening: next }));
-  };
-  const setPrompt = (template: string, tools?: string[]) => saveWorkflows(withWelcome(eventWorkflows, welcomeType, {
-    prompt: template ? { template, ...((tools ?? current.prompt?.tools ?? []).length ? { tools: tools ?? current.prompt?.tools } : {}) } : null,
-  }));
-  const insertToken = (token: string) => setOpening('text', openingText && !openingText.endsWith('\n') ? `${openingText} ${token}` : `${openingText}${token}`);
-  const roomTypes = [...new Set([...welcomeTypes(eventWorkflows), ...addedTypes])];
-  const addWelcomeType = () => {
-    const type = newWelcomeType.trim();
-    if (!type) return;
-    setAddedTypes((cur) => (cur.includes(type) ? cur : [...cur, type]));
-    setWelcomeType(type);
-    setNewWelcomeType('');
-  };
-  const readTools = tools.filter((d) => !d.changesState);
-  const promptTemplates = (prompts ?? []).filter((p) => p.kind === 'prompt');
-
+  const [retired, setRetired] = useState(() => config?.welcome !== undefined && config?.welcome !== null);
+  if (!retired) return null;
   return (
-    <>
-      <div className="profiles-persona-field" data-testid="draft-welcome">
-        <h5>{t('admin.assistantPage.field.welcome')} <InfoTooltip label={t('admin.assistantPage.field.welcome')}
-          content={`${t('admin.assistantPage.help.welcome')} ${t('admin.assistantPage.help.welcomeIsWorkflow')}`} /></h5>
-        <div className="admin-filter-group">
-          <label><span className="admin-field-label">{t('admin.assistantPage.help.welcomeType')} <InfoTooltip label={t('admin.assistantPage.help.welcomeType')} content={t('admin.assistantPage.help.welcomeTypeHelp')} /></span>
-            <select data-testid="draft-welcome-type" className="select" value={welcomeType} onChange={(e) => setWelcomeType(e.target.value)}>
-              <option value="">{t('admin.assistantPage.help.welcomeTypeDefault')}</option>
-              {roomTypes.map((type) => <option key={type} value={type}>{type}</option>)}
-            </select>
-          </label>
-          <label><span className="admin-field-label">{t('admin.assistantPage.help.welcomeTypeAdd')}</span>
-            <input type="text" className="input" data-testid="draft-welcome-new-type" value={newWelcomeType}
-              onChange={(e) => setNewWelcomeType(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addWelcomeType(); } }} />
-          </label>
-          <button type="button" className="btn-secondary" data-testid="draft-welcome-add-type" disabled={!newWelcomeType.trim()} onClick={addWelcomeType}>
-            {t('admin.assistantPage.help.welcomeTypeAddButton')}
-          </button>
-        </div>
-        <p className="admin-field-hint" data-testid="draft-welcome-workflow">{current.name
-          ? t('admin.assistantPage.help.welcomeWorkflowName', { name: current.name })
-          : t('admin.assistantPage.help.welcomeWorkflowNone')}</p>
-        <label><span className="admin-field-label">{welcomeType
-          ? t('admin.assistantPage.help.welcomeTemplateForType', { type: welcomeType })
-          : t('admin.assistantPage.help.welcomeTemplate')} <InfoTooltip label={t('admin.assistantPage.help.welcomeTemplate')} content={welcomeType
-            ? t('admin.assistantPage.help.welcomeTemplateForTypeHelp', { type: welcomeType })
-            : t('admin.assistantPage.help.welcomeTemplateHelp')} /></span>
-          <textarea data-testid="draft-welcome-template" className="textarea" rows={4} value={openingText}
-            onChange={(e) => setOpening('text', e.target.value)} />
-        </label>
-        <WelcomeEditorGuide workflows={eventWorkflows} conversationType={welcomeType}
-          classification={catalog?.classification} role={role} onInsert={insertToken} />
-        {/* A version's variable inserted by name; the room reads the opening, so a fact about a person is not offered. */}
-        <VariablePicker variablesOnly published={published} variables={versionVariables} purpose="insert" audience="room" testId="welcome-variable-picker"
-          onPick={(name) => insertToken(`{{${name}}}`)} />
-        <label><span className="admin-field-label">{t('admin.assistantPage.help.welcomeExamples')} <InfoTooltip label={t('admin.assistantPage.help.welcomeExamples')} content={t('admin.assistantPage.help.welcomeExamplesHelp')} /></span>
-          <textarea data-testid="draft-welcome-examples" className="textarea" rows={4} value={examples}
-            onChange={(e) => setOpening('examples', e.target.value)} />
-        </label>
-        {current.runs ? (
-          <p className="admin-field-hint" data-testid="draft-welcome-runs">{t('admin.assistantPage.help.welcomeRunsEdit', { name: current.name })}</p>
-        ) : (
-          <div data-testid="draft-welcome-prompt">
-            <label><span className="admin-field-label">{t('admin.assistantPage.help.welcomePrompt')} <InfoTooltip label={t('admin.assistantPage.help.welcomePrompt')} content={promptsUnreadable || !profileName
-              ? t('admin.assistantPage.help.welcomePromptUnreadable')
-              : t('admin.assistantPage.help.welcomePromptHelp')} /></span>
-              <select data-testid="draft-welcome-prompt-template" className="select" value={current.prompt?.template ?? ''}
-                disabled={!prompts && !current.prompt} onChange={(e) => setPrompt(e.target.value)}>
-                <option value="">{t('admin.assistantPage.help.welcomePromptNone')}</option>
-                {current.prompt && !promptTemplates.some((p) => p.name === current.prompt!.template) && (
-                  <option value={current.prompt.template}>{t('admin.assistantPage.help.welcomePromptUnlisted', { name: current.prompt.template })}</option>
-                )}
-                {promptTemplates.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
-              </select>
-            </label>
-            {(promptsUnreadable || !profileName) && <span className="admin-field-hint" data-testid="draft-welcome-prompt-unreadable">{t('admin.assistantPage.help.welcomePromptUnreadable')}</span>}
-            {current.prompt && (
-              <div>
-                <span className="admin-field-label">{t('admin.assistantPage.help.welcomeTools')} <InfoTooltip label={t('admin.assistantPage.help.welcomeTools')} content={t('admin.assistantPage.help.welcomeToolsHelp')} /></span>
-                {readTools.map((d) => (
-                  <label key={d.name} className="admin-check" title={d.description}>
-                    <input type="checkbox" data-testid={`draft-welcome-tool-${d.name}`} checked={(current.prompt!.tools ?? []).includes(d.name)}
-                      onChange={(e) => {
-                        const now = current.prompt!.tools ?? [];
-                        setPrompt(current.prompt!.template, e.target.checked ? [...now, d.name] : now.filter((x) => x !== d.name));
-                      }} />
-                    <code>{d.name}</code>
-                  </label>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-
-      {retiredWelcome && (
-        <div className="profiles-persona-field" role="note" data-testid="draft-retired-welcome">
-          <h5>{t('admin.assistantPage.field.retiredWelcome')} <InfoTooltip label={t('admin.assistantPage.field.retiredWelcome')} content={t('admin.assistantPage.help.retiredWelcome')} /></h5>
-          <p className="admin-field-hint">{t('admin.assistantPage.help.retiredWelcomeDraft')}</p>
-          <button type="button" className="btn-secondary" data-testid="draft-retired-welcome-clear"
-            onClick={() => { setRetiredWelcome(false); onPatch({ welcome: null }); }}>
-            {t('admin.assistantPage.help.retiredWelcomeClear')}
-          </button>
-        </div>
-      )}
-    </>
+    <div className="profiles-persona-field" role="note" data-testid="draft-retired-welcome">
+      <h4>{t('admin.assistantPage.field.retiredWelcome')} <InfoTooltip label={t('admin.assistantPage.field.retiredWelcome')} content={t('admin.assistantPage.help.retiredWelcome')} /></h4>
+      <p className="admin-field-hint">{t('admin.assistantPage.help.retiredWelcomeDraft')}</p>
+      <button type="button" className="btn-secondary" data-testid="draft-retired-welcome-clear"
+        onClick={() => { setRetired(false); onPatch({ welcome: null }); }}>
+        {t('admin.assistantPage.help.retiredWelcomeClear')}
+      </button>
+    </div>
   );
 };
 
@@ -588,7 +494,7 @@ export const RetiredCopyNote: React.FC<{ config: ProfileDefinitionBody | null; o
   if (!retiredCopy.length) return null;
   return (
     <div className="profiles-persona-field" role="note" data-testid="draft-retired-copy">
-      <h5>{t('admin.assistantPage.field.copy')} <InfoTooltip label={t('admin.assistantPage.field.copy')} content={t('admin.assistantPage.help.copy')} /></h5>
+      <h4>{t('admin.assistantPage.field.copy')} <InfoTooltip label={t('admin.assistantPage.field.copy')} content={t('admin.assistantPage.help.copy')} /></h4>
       <p className="admin-field-hint">{t('admin.assistantPage.help.copyDraft', { keys: retiredCopy.join(', ') })}</p>
       <button type="button" className="btn-secondary" data-testid="draft-retired-copy-clear"
         onClick={() => { setRetiredCopy([]); onPatch({ copy: null }); }}>
@@ -612,29 +518,92 @@ export const EventWorkflowsFields: React.FC<{
   tools?: ToolDescriptor[];
   /** The draft's saved canvas layout. */
   layout?: WorkflowLayout;
+  /** The draft's kept welcome (ADR-067 G40). */
+  keptWelcome?: import('../../../../../../backend/lambda/src/lib/event-workflow.ts').EventWorkflow;
   /** The errors of the draft's last Validate, anchored to the steps they name. */
   serverErrors?: readonly string[];
   /** The workflow the builder opens on. */
   focusWorkflow?: string;
-}> = ({ config, catalog, onPatch, profileName, tools = [], layout: savedLayout, serverErrors, focusWorkflow }) => {
+  /** The assistant's role, for a welcome's preview. */
+  role?: string;
+  /** The name the assistant was provisioned with, which a welcome says when the version names none. */
+  provisionedName?: string;
+}> = ({ config, catalog, onPatch, profileName, tools = [], layout: savedLayout, keptWelcome, serverErrors, focusWorkflow, role, provisionedName }) => {
   const { t: translate } = useTranslation();
   const t = translate as unknown as T;
   const { prompts, unreadable } = useTemplateOptions(profileName);
   const [eventWorkflows, setEventWorkflows] = useState<NonNullable<ProfileDefinitionBody['eventWorkflows']>>(() => ({ ...(config?.eventWorkflows ?? {}) }));
   const [layout, setLayout] = useState<WorkflowLayout | undefined>(savedLayout);
+  /** The conversation type picked in the welcome form, or null while it shows the welcome that was opened. */
+  const [welcomeType, setWelcomeType] = useState<string | null>(null);
+  useEffect(() => setWelcomeType(null), [focusWorkflow]);
+  // A TASK STEP'S OWN STEPS OPEN ON THE SAME BUILDER (ADR-067 stage 4).
+  const taskMachines = useTaskMachineSource(config, catalog, onPatch);
+  // THE WELCOME BEING EDITED: the one opened, or the one for the type picked. A type with no welcome yet starts from the
+  // words in use, and reaches the draft only when something changes.
+  const welcomeName = welcomeType === null ? focusWorkflow : welcomeNameFor(eventWorkflows, welcomeType) ?? (welcomeType ? `welcome-${welcomeType}` : 'welcome');
+  const defaultMissing = welcomeName === 'welcome' && !eventWorkflows.welcome && !welcomeWorkflowOf(eventWorkflows, undefined).declared;
+  const typeMissing = !!welcomeType && !!welcomeName && !eventWorkflows[welcomeName];
+  const holding = catalog?.welcomeOrientation && (!catalog.primaryAssistant || catalog.primaryAssistant === profileName)
+    ? welcomeHolding(SHIPPED_EVENT_WORKFLOWS.welcome, catalog.welcomeOrientation)
+    : SHIPPED_EVENT_WORKFLOWS.welcome;
+  const defaultName = welcomeNameFor(eventWorkflows, '');
+  const welcomeFocus = welcomeName && (eventWorkflows[welcomeName]?.on === 'assistant-joined' || defaultMissing || typeMissing) ? welcomeName : undefined;
+  // A SHIPPED WORKFLOW OPENED FOR EDIT: shown on the builder, and in the draft as this assistant's own once something changes.
+  const shippedFocus = focusWorkflow && !welcomeFocus && !eventWorkflows[focusWorkflow] ? SHIPPED_EVENT_WORKFLOWS[focusWorkflow] : undefined;
+  const shownType = welcomeType ?? welcomeTypeOf(welcomeName ? eventWorkflows[welcomeName] : undefined);
   return (
     <div className="profiles-persona-field" data-testid="draft-event-workflows">
-      <h5>{t('admin.assistantPage.field.eventWorkflows')} <InfoTooltip label={t('admin.assistantPage.field.eventWorkflows')} content={t('admin.assistantPage.help.eventWorkflows')} /></h5>
+      {!focusWorkflow && <h4>{t('admin.assistantPage.field.eventWorkflows')} <InfoTooltip label={t('admin.assistantPage.field.eventWorkflows')} content={t('admin.assistantPage.help.eventWorkflows')} /></h4>}
+      <RetiredWelcomeNote config={config} onPatch={onPatch} />
       {/* A step's template is chosen from the listing, so a listing that could not be read is said, not shown as an empty list. */}
       {unreadable ? <p role="alert" className="admin-error" data-testid="draft-event-templates-unreadable">{t('admin.assistantPage.help.eventTemplatesUnreadable')}</p> : null}
-      <WorkflowBuilder workflows={eventWorkflows} templates={prompts} tools={tools} published={catalog?.variables} variables={config?.variables}
-        layout={layout} profileName={profileName} serverErrors={serverErrors} initialWorkflow={focusWorkflow}
-        onLayoutChange={(next) => { setLayout(next ?? undefined); onPatch({ layout: next }); }}
-        onChange={(next) => {
+      {/* THE WELCOME IS REQUIRED: every version greets the conversations no typed welcome names. One
+          with no welcome of its own runs the built-in one, said here; its row in the list opens it to edit. */}
+      {!focusWorkflow && !welcomeWorkflowOf(eventWorkflows, undefined).declared && (
+        <p className="admin-field-hint" data-testid="draft-welcome-required">
+          {t('admin.workflowEditor.welcomeBuiltIn')}
+        </p>
+      )}
+      {(() => {
+        const options = {
+          templates: prompts, tools, published: catalog?.variables, variables: config?.variables,
+          versionTools: config?.tools, classification: catalog?.classification,
+          welcomeContext: welcomeContextFor({ version: { ...config, eventWorkflows }, catalog, assistant: profileName, role, provisionedName }),
+        };
+        const onLayoutChange = (next: WorkflowLayout | null) => { setLayout(next ?? undefined); onPatch({ layout: next }); };
+        const onChange = (next: NonNullable<ProfileDefinitionBody['eventWorkflows']> | null) => {
           const all = next ?? {};
           setEventWorkflows(all);
           onPatch({ eventWorkflows: Object.keys(all).length ? all : null });
-        }} />
+        };
+        // A WELCOME OPENED FOR EDIT GETS ITS OWN FORM (ADR-067 stage 1): Template, Prompt or Workflow, the builder only in Workflow.
+        return welcomeFocus ? (
+          <>
+            <label><span className="admin-field-label">{t('admin.workflowsList.welcomeFor')}</span>
+              <select className="select" data-testid="welcome-for-type" value={shownType} onChange={(e) => setWelcomeType(e.target.value)}>
+                <option value="">{t('admin.workflowsList.welcomeForDefault')}</option>
+                {declaredTypesFor('assistant-joined', catalog?.classification).map((type) => <option key={type} value={type}>{type}</option>)}
+              </select>
+              <span className="admin-field-hint">{t('admin.workflowsList.welcomeForHelp')}</span>
+            </label>
+            <WelcomeModeEditor key={welcomeFocus} name={welcomeFocus} workflows={eventWorkflows} {...options}
+              builtIn={defaultMissing ? holding
+                : typeMissing ? { ...(defaultName ? eventWorkflows[defaultName] : holding), types: [welcomeType!] } : undefined}
+              layout={layout} profileName={profileName}
+              kept={keptWelcome} onKeptChange={(next) => onPatch({ keptWelcomeWorkflow: next })}
+              serverErrors={serverErrors} onLayoutChange={onLayoutChange} onChange={onChange} />
+          </>
+        ) : (
+          <WorkflowBuilder workflows={shippedFocus ? { ...eventWorkflows, [focusWorkflow!]: shippedFocus } : eventWorkflows} {...options}
+            layout={layout} profileName={profileName} serverErrors={serverErrors} initialWorkflow={focusWorkflow}
+            taskMachines={taskMachines} onLayoutChange={onLayoutChange} onChange={onChange} />
+        );
+      })()}
+      {/* THE WORKFLOW EACH MULTI-STEP INTENT RUNS (ADR-067 decision 1), beside the event workflows on the same builder. */}
+      {!focusWorkflow && <IntentWorkflowsFields config={config} catalog={catalog} onPatch={onPatch} profileName={profileName} tools={tools}
+        prompts={prompts} serverErrors={serverErrors} focusIntent={focusWorkflow} taskMachines={taskMachines}
+        layout={layout} onLayoutChange={(next) => { setLayout(next ?? undefined); onPatch({ layout: next }); }} />}
     </div>
   );
 };

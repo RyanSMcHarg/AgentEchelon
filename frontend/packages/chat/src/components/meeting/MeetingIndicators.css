@@ -1,0 +1,11 @@
+/* A PERSON'S AUDIO SIGNS, on the roster and on a tile: a struck microphone while muted, a red one on a poor network. */
+.ae-meeting-mic { display: inline-flex; align-items: center; gap: 3px; color: var(--text-secondary, #a1a1aa); }
+.ae-meeting-mic--host { color: var(--text-primary, #e7e7ea); }
+.ae-meeting-mic-text { font-size: var(--text-xs, 0.75rem); }
+.ae-meeting-mic--network { color: var(--danger-500, #ef4444); }
+
+/* MICROPHONE, CAMERA AND SCREEN ARE DRAWN ALIKE; speaking is the microphone flickering. The flicker is a change of opacity,
+   never a movement, so it stays where motion is reduced: it is how a person sees who is talking. */
+.ae-meeting-activity { color: var(--text-secondary, #a1a1aa); }
+.ae-meeting-mic--speaking { animation: ae-meeting-mic-flicker 0.45s ease-in-out infinite alternate; }
+@keyframes ae-meeting-mic-flicker { from { opacity: 0.25; } to { opacity: 1; } }

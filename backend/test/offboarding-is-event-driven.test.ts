@@ -26,7 +26,7 @@ const HOST_POOL = 'us-east-1_HostPool';
 // `cloudtrail-cognito`, the default for a Cognito pool).
 const app = new cdk.App({ context: { issuers: [
   { id: 'deployment', kind: 'cognito-pool', pool: 'self', clearance: { groups: true, classifications: ['basic', 'standard', 'premium', 'admin'] }, admin: true },
-  { id: 'host', kind: 'cognito-pool', pool: HOST_POOL, clearance: { oneChannel: 'basic', classifications: ['basic'] } },
+  { id: 'host', kind: 'cognito-pool', pool: HOST_POOL, clearance: { fixed: ['basic'], classifications: ['basic'] } },
 ] } });
 const messaging = new MessagingStack(app, 'TestMessagingOffboarding', { env, appInstanceName: 'test-instance' });
 const cog = new IdentityStack(app, 'TestIdentityOffboarding', { env, appInstanceArn: messaging.appInstanceArn, battle: true });

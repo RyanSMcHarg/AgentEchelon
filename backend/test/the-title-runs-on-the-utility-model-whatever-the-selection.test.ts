@@ -22,6 +22,10 @@ const PROPS = {
   appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
   attachmentsBucketName: 'agent-echelon-attachments-test',
   attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
+  companyBucketName: 'agent-echelon-company-test',
+  companyBucketArn: 'arn:aws:s3:::agent-echelon-company-test',
+  profileBucketName: 'agent-echelon-profile-test',
+  profileBucketArn: 'arn:aws:s3:::agent-echelon-profile-test',
 };
 
 /** The shipped set, with `premium` selecting no Claude Haiku. */

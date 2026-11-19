@@ -20,7 +20,7 @@ const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : [v]);
 describe('the Identities table', () => {
   const template = identityTemplate({ issuers: [
   { id: 'deployment', kind: 'cognito-pool', pool: 'self', clearance: { groups: true, classifications: ['basic', 'standard', 'premium', 'admin'] }, admin: true },
-  { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostPool', clearance: { oneChannel: 'basic', classifications: ['basic'] } },
+  { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostPool', clearance: { fixed: ['basic'], classifications: ['basic'] } },
 ] });
   const tables = template.findResources('AWS::DynamoDB::Table');
   const [tableId, table] = Object.entries(tables).find(([id]) => id.startsWith('IdentitiesTable'))!;

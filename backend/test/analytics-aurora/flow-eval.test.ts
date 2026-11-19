@@ -129,8 +129,9 @@ describe('flow-eval (Pass B)', () => {
    * deployment: 32 of 50 flows over a fortnight, 64%, in a state with no exit.
    */
   describe('the stale-flow sweep (Pass D)', () => {
+    // Found by what it says, not by position: the ended-battle pass (Pass D0) is an UPDATE of the same table, run just before.
     const sweepCall = () => mockedQuery.mock.calls.find(([sql]) => /UPDATE intent_flows/.test(sql as string)
-      && /status = 'abandoned'/.test(sql as string));
+      && /stale-flow-sweep/.test(sql as string));
 
     /** Pass A empty, Pass B empty, Pass C empty - so only the sweep does anything. */
     function onlyTheSweep(sweptRows: { id: string }[]) {
@@ -139,6 +140,7 @@ describe('flow-eval (Pass B)', () => {
         .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any)  // Pass B
         .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any)  // Pass E
         .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any)  // Pass C
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any)  // Pass D0, the ended-battle flows
         .mockResolvedValueOnce({ rows: sweptRows, rowCount: sweptRows.length } as any);
     }
 

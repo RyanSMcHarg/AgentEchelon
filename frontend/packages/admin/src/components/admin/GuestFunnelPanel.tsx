@@ -96,7 +96,7 @@ const GuestFunnelPanel: React.FC<Props> = ({ funnelData, refusalsData, isLoading
   return (
     <>
       <div className="admin-section" data-testid="guest-panel">
-        <h3>{t('admin.guestFunnel.guestTitle')}</h3>
+        <h2>{t('admin.guestFunnel.guestTitle')}</h2>
         <p className="admin-tab-description">
           {t('admin.guestFunnel.starts', { count: journeys.get('guest_started') ?? 0 })}
         </p>
@@ -115,7 +115,7 @@ const GuestFunnelPanel: React.FC<Props> = ({ funnelData, refusalsData, isLoading
                   })}
           </p>
         )}
-        <h4>{t('admin.guestFunnel.refusalsTitle')}</h4>
+        <h3>{t('admin.guestFunnel.refusalsTitle')}</h3>
         <DataTable
           columns={[
             { key: 'reason', label: t('admin.guestFunnel.reasonColumn') },
@@ -128,11 +128,11 @@ const GuestFunnelPanel: React.FC<Props> = ({ funnelData, refusalsData, isLoading
       {/* ASKED FOR ONLY WHERE IT IS SERVED: without an approval step there is no list, and no route for it. */}
       {(registrationsApi || killSwitch?.registrationApproval === 'admin') && <GuestRegistrations api={registrationsApi} />}
       <div className="admin-section" data-testid="guest-funnel">
-        <h3>{t('admin.guestFunnel.funnelTitle')}</h3>
+        <h2>{t('admin.guestFunnel.funnelTitle')}</h2>
         <p className="admin-tab-description">{t('admin.guestFunnel.funnelHelp')}</p>
-        <h4>{t('admin.guestFunnel.pathA')}</h4>
+        <h3>{t('admin.guestFunnel.pathA')}</h3>
         <FunnelChart steps={stepsOf(PATH_A)} successStepId="guest_bound" isLoading={isLoading} />
-        <h4>{t('admin.guestFunnel.pathB')}</h4>
+        <h3>{t('admin.guestFunnel.pathB')}</h3>
         <FunnelChart steps={stepsOf(PATH_B)} successStepId="claim_redeemed" isLoading={isLoading} />
         <p className="admin-tab-description" data-testid="guest-funnel-not-built">
           {t('admin.guestFunnel.notBuilt', { stages: notBuilt.join(', ') })}

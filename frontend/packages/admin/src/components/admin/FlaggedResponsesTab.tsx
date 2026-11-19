@@ -33,7 +33,7 @@ function severityBadge(classification: string): React.ReactNode {
   const colors: Record<string, string> = {
     poor: '#ef4444',
     error_response: '#dc2626',
-    appropriate_refusal: '#6366f1',
+    appropriate_refusal: '#3b82f6',
     acceptable: '#f59e0b',
   };
   const color = colors[classification] || '#6b7280';
@@ -116,7 +116,7 @@ const FlaggedResponsesTab: React.FC<FlaggedResponsesTabProps> = ({ data, isLoadi
         </div>
         <div className="admin-review-panel">
           <div className="admin-conversation-header">
-            <h4>{t('admin.flagged.reviewExchange')}</h4>
+            <h3>{t('admin.flagged.reviewExchange')}</h3>
             {expanded.channel_arn && onOpenConversation && (
               <button className="btn-secondary" onClick={() => onOpenConversation(String(expanded.channel_arn))}>
                 Open conversation ↗
@@ -175,7 +175,7 @@ const FlaggedResponsesTab: React.FC<FlaggedResponsesTabProps> = ({ data, isLoadi
   return (
     <div className="admin-tab">
       <div className="admin-tab-header">
-        <h3>{t('admin.flagged.flaggedResponses')}</h3>
+        <h2>{t('admin.flagged.flaggedResponses')}</h2>
         <div className="admin-filter-group">
           {(['pending', 'reviewed', 'all'] as const).map((f) => (
             <button

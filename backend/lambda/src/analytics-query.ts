@@ -104,6 +104,9 @@ const AURORA_ONLY_TYPES = new Set<string>([
   'intent_exchanges',
   // An intent's step and model breakdown (ADR-064) reads the Aurora columns task_step and steps[]; not built for Athena.
   'intent_steps',
+  // Runs per workflow edition (WT109) and rework per task (WT105) read the Aurora run and task columns.
+  'workflow_editions',
+  'task_rework',
   // Per-turn evidence behind one row of the latency breakdown: exchanges joined to the turn ledger,
   // both Aurora-side.
   'latency_exchanges',

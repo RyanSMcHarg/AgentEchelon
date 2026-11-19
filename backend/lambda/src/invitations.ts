@@ -8,7 +8,7 @@
  *
  * ── `POST /invitations` ──────────────────────────────────────────────────────────────────────────
  *
- * An ordinary signed-in person (the edge and `callerPerson` refuse a guest, a one-conversation person and a
+ * An ordinary signed-in person (the edge and `callerPerson` refuse a guest and a
  * host assertion). In this order, and nothing later runs when anything earlier refuses:
  *
  *  1. The caller is a member: `DescribeChannel` with the caller as the bearer, so Amazon Chime SDK itself
@@ -60,7 +60,8 @@
  */
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, TransactWriteCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
-import { DescribeChannelCommand, DescribeChannelModeratorCommand } from '@aws-sdk/client-chime-sdk-messaging';
+import { DescribeChannelCommand } from '@aws-sdk/client-chime-sdk-messaging';
+import { personModeratesChannel } from './lib/channel-moderator.js';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { SSMClient } from '@aws-sdk/client-ssm';
 import { randomUUID } from 'crypto';
@@ -69,6 +70,7 @@ import { invitationPolicyOf, type RedemptionMode } from '../../lib/config/conver
 import { PARTICIPANT_ROLE_NAME, invitableRoleOf, participantRoleOf } from '../../lib/config/participant-roles.js';
 import { isRoleHeldElsewhere, moderationOrigin, parseHoldings, recordHolding, removeHolding } from './lib/participant-roles.js';
 import { callerHolderToken, callerPerson } from './lib/auth.js';
+import { callerReachesConversation, conversationChannelArn, refusalAnswer } from './lib/conversation-access.js';
 import { responder, type HttpResult } from './lib/http-response.js';
 import { CLASSIFICATION_TAG, readChannelTags } from './lib/channel-classification.js';
 import { appInstanceAdminBearer, chimeMessagingClient } from './lib/chime/clients.js';
@@ -130,6 +132,8 @@ export interface InvitationsDeps {
   nameEvent?: (classification: string, channelArn: string, invitationId: string, invitationKey?: string) => Promise<boolean>;
   /** Asks the conversation's router to delete the invitation's deadline schedule. Default `cancelDeadlinesThroughRouter`. */
   cancelDeadline?: (classification: string, cancel: { channelArn: string; invitationId?: string }) => Promise<boolean>;
+  /** Where the shared check reads the caller's live clearance. Default: the deployment's, on a function wired for it. */
+  clearance?: Pick<Directory, 'clearedByGroups'>;
 }
 
 let defaultDoc: Sender | null = null;
@@ -175,13 +179,6 @@ function bodyOf(event: any): Record<string, unknown> | null {
   }
 }
 
-/** A channel ARN of this app instance, named literally, or null. */
-function channelOf(raw: unknown, appInstanceArn: string): string | null {
-  const arn = typeof raw === 'string' ? raw : '';
-  const prefix = `${appInstanceArn}/channel/`;
-  if (!appInstanceArn || !arn.startsWith(prefix)) return null;
-  return /^[A-Za-z0-9._-]{1,64}$/.test(arn.slice(prefix.length)) ? arn : null;
-}
 
 // ── WHAT A CONVERSATION IS, FROM ITS OWN RECORDS ─────────────────────────────────────────────────
 
@@ -245,17 +242,10 @@ async function conversationRecords(channelArn: string, d: InvitationsDeps): Prom
   return { channelArn, classification: profiles.resolveClassification(tag)!, archived: String(tags.archived) === 'true', conversationType, ...(participantRoles !== undefined ? { participantRoles } : {}) };
 }
 
-/** Whether `personArn` moderates the conversation, asked as the service admin. */
+/** Whether `personArn` moderates the conversation, asked as the service admin through the one moderator check; any failure denies. */
 async function isModerator(channelArn: string, personArn: string, d: InvitationsDeps): Promise<boolean> {
   const bearer = await bearerOf(d)();
-  if (!bearer) return false;
-  try {
-    await messagingOf(d).send(new DescribeChannelModeratorCommand({ ChannelArn: channelArn, ChannelModeratorArn: personArn, ChimeBearer: bearer }));
-    return true;
-  } catch (err) {
-    if (nameOf(err) === 'NotFoundException' || nameOf(err) === 'ForbiddenException') return false;
-    throw err;
-  }
+  return !!bearer && personModeratesChannel(messagingOf(d), channelArn, personArn, { bearer });
 }
 
 // ── THE INVITATION EMAIL ─────────────────────────────────────────────────────────────────────────
@@ -287,7 +277,7 @@ export async function createInvitation(event: any, d: InvitationsDeps = {}): Pro
   const callerArn = caller.personArn ?? userArnFor(e.appInstanceArn, caller.personId);
   const body = bodyOf(event);
   if (!body) return refuse(400, 'INVITATION_INVALID', 'the body is not JSON');
-  const channelArn = channelOf(body.channelArn, e.appInstanceArn);
+  const channelArn = conversationChannelArn(body.channelArn, e.appInstanceArn);
   if (!channelArn) return refuse(400, 'INVITATION_INVALID', 'channelArn names one conversation of this instance');
   const inviteeName = typeof body.name === 'string' ? body.name.trim() : '';
   if (!inviteeName || inviteeName.length > NAME_MAX) return refuse(400, 'INVITATION_INVALID', `name is the invitee's display name, 1 to ${NAME_MAX} characters`);
@@ -322,6 +312,14 @@ export async function createInvitation(event: any, d: InvitationsDeps = {}): Pro
   const holder = callerHolderToken(event);
   if (!holder || !profiles.grantsFor(holder).includes(facts.classification)) {
     return refuse(403, 'NOT_CLEARED', 'your clearance does not reach this conversation');
+  }
+  // CLEARANCE IS READ LIVE BEFORE ANYTHING IS MINTED, as the list and revoke routes read it (`memberScope`). The
+  // token's claim above only narrows: a person downgraded at the console keeps that claim for the token's life,
+  // and an invitation they mint in that time adds somebody else at a classification they no longer hold.
+  const access = await callerReachesConversation(event, channelArn, { appInstanceArn: e.appInstanceArn, client: messagingOf(d), ...(d.clearance ? { directory: d.clearance } : {}) });
+  if (!access.ok) {
+    const { statusCode, body: refusal } = refusalAnswer(access);
+    return refuse(statusCode, refusal.code, refusal.error);
   }
   // THE ROLE, BEFORE ANYTHING IS MINTED (DESIGN-CONVERSATION-TYPES section 6.1).
   let roleConfersModerator = false;
@@ -517,16 +515,24 @@ export async function revokeRecord(record: InvitationRecord, revokedBy: string, 
   return revoked;
 }
 
+/**
+ * A conversation's invitations are seen and revoked only by a current member cleared for it
+ * (`lib/conversation-access.ts`): their membership proven as them, their clearance against its classification tag.
+ */
 async function memberScope(event: any, channelRaw: unknown, d: InvitationsDeps): Promise<{ callerArn: string; channelArn: string; moderator: boolean } | HttpResult> {
   const caller = await callerPerson(event);
   if (!caller || caller.source !== 'edge') return refuse(401, 'UNAUTHENTICATED', 'a signed-in member sees a conversation\'s invitations');
   const e = env(d);
   if (!e.tokensTable || !e.appInstanceArn) return refuse(500, 'SERVER_MISCONFIG', 'invitations are not configured');
   const callerArn = caller.personArn ?? userArnFor(e.appInstanceArn, caller.personId);
-  const channelArn = channelOf(channelRaw, e.appInstanceArn);
+  const channelArn = conversationChannelArn(channelRaw, e.appInstanceArn);
   if (!channelArn) return refuse(400, 'INVITATION_INVALID', 'channelArn names one conversation of this instance');
+  const access = await callerReachesConversation(event, channelArn, { appInstanceArn: e.appInstanceArn, client: messagingOf(d), ...(d.clearance ? { directory: d.clearance } : {}) });
+  if (!access.ok) {
+    const { statusCode, body } = refusalAnswer(access);
+    return refuse(statusCode, body.code, body.error);
+  }
   try {
-    await conversationFacts(channelArn, callerArn, d);
     return { callerArn, channelArn, moderator: await isModerator(channelArn, callerArn, d) };
   } catch (err) {
     if (err instanceof Refused) return refuse(err.status, err.code, err.message);
@@ -577,7 +583,7 @@ export interface AdminOperation {
 
 export async function adminOperation(input: AdminOperation, d: InvitationsDeps = {}): Promise<{ ok: boolean; status: number; body: unknown }> {
   const e = env(d);
-  const channelArn = channelOf(input.channelArn, e.appInstanceArn);
+  const channelArn = conversationChannelArn(input.channelArn, e.appInstanceArn);
   if (!channelArn || !e.tokensTable) return { ok: false, status: 400, body: { error: 'channelArn names one conversation of this instance', code: 'INVITATION_INVALID' } };
   const now = nowOf(d);
   if (input.op === 'admin-list') {
@@ -626,7 +632,7 @@ export interface NudgeOperation {
 export async function nudgeOperation(input: NudgeOperation, d: InvitationsDeps = {}): Promise<{ ok: boolean; status: number; body: unknown }> {
   const e = env(d);
   const no = (status: number, code: string, error: string) => ({ ok: false, status, body: { error, code } });
-  const channelArn = channelOf(input.channelArn, e.appInstanceArn);
+  const channelArn = conversationChannelArn(input.channelArn, e.appInstanceArn);
   const address = typeof input.address === 'string' ? input.address.trim() : '';
   if (!channelArn || !e.tokensTable || typeof input.invitationId !== 'string' || typeof input.confirmedBy !== 'string') return no(400, 'INVITATION_INVALID', 'a reminder names one invitation of one conversation and who confirmed it');
   if (!ADDRESS.test(address)) return no(400, 'ADDRESS_INVALID', 'a reminder goes to one email address');

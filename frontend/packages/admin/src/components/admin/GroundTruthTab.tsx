@@ -71,13 +71,13 @@ const GroundTruthTab: React.FC<GroundTruthTabProps> = ({ data, isLoading, onSubm
             judge can be calibrated at all, and what a labeling program would cost, is SPEC-EVALUATION,
             "Where this sits against the industry bar" - too long for a page and too important to
             paraphrase here. */}
-        <h3>
+        <h2>
           {t('admin.groundTruth.groundTruthCalibration')}
           <InfoTooltip
             label={t('admin.groundTruth.howCalibrationIsMeasuredHere')}
             content={t('admin.groundTruth.howItWorks')}
           />
-        </h3>
+        </h2>
         {onSubmitScore && (
           <button
             className="btn-primary"
@@ -112,7 +112,7 @@ const GroundTruthTab: React.FC<GroundTruthTabProps> = ({ data, isLoading, onSubm
 
       {showScoring && onSubmitScore && (
         <div className="admin-scoring-form">
-          <h4>{t('admin.groundTruth.submitHumanScore')}</h4>
+          <h3>{t('admin.groundTruth.submitHumanScore')}</h3>
           {labeling && (
             <div className="admin-help-text">
               <p><strong>{t('admin.goldenSet.column.request')}:</strong> {labeling.request}</p>

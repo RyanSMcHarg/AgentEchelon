@@ -477,6 +477,24 @@ export interface Task {
    */
   workflowRun?: WorkflowRunRef;
   /**
+   * THE CONVERSATION WHOSE WORKFLOW OPENED THE ONE THIS TASK IS HELD IN, as its channel ARN: written on a task a
+   * `conversation-opened` run opens in a conversation a workflow opened, read from that conversation's own parent link. The
+   * key of `openedFrom-taskType-index`, so the opener reads the open work of every conversation it opened in one query (an
+   * incident's team conversation, WT122). Absent on every other task, which the index then does not hold.
+   */
+  openedFrom?: string;
+  /**
+   * THE RUN THAT ASKED FOR THIS WORK (WT118): another assistant's run whose step is a request to this assistant's role. The
+   * task belongs to its own assistant's run (`workflowRun`); the asking run is continued on how the task ended, and is
+   * handed nothing the task recorded.
+   */
+  askedBy?: WorkflowRunRef;
+  /**
+   * A REQUEST OPENED MID-TASK AWAITS ITS INTENT'S RUN (WT106): set when a task's turn opened it, cleared by the write that
+   * records the run (`attachRequestRun`). Only the platform writes it.
+   */
+  awaitsIntentRun?: true;
+  /**
    * THE INTENT THE REQUEST THAT OPENED THIS TASK WAS CLASSIFIED AS (ADR-064 decision B). A task whose type the pack
    * declares as an intent is configured under that intent; a platform machine (`queued_request`, `queue_drain`, ...)
    * is not an intent, so its steps route, and its turns are attributed, under this one. Written once at creation, only
@@ -489,6 +507,28 @@ export interface Task {
    * router, and never from a caller's `details`, so nobody chooses an arm by writing a field.
    */
   experimentArm?: TaskExperimentArm;
+  /**
+   * THE VERSION THIS TASK STARTED ON (ADR-066 decision 5): the `configId` of the version the opening turn was served, the
+   * experiment arm's where the turn was on one. Every reader resolves the task's machine through it (`machinesForTask`,
+   * version-machines.ts), so an edit or a rollback never strands the task in a state the new machine lacks. Provenance on
+   * the row (tenet D9): where the task came from, written once at creation, only by the platform. Absent on a task written
+   * before it existed and on a task no version opened (the queue's, a workflow step's), which follow the global set.
+   */
+  originConfigId?: string;
+  /**
+   * THE CONTENT HASH OF THE MACHINE THIS TASK STARTED ON (`machineHashOf`, version-machines.ts), beside `originConfigId`:
+   * unchanged by a version edit that leaves the machine as it was, so a turn's record says which workflow it ran.
+   */
+  originMachineHash?: string;
+  /**
+   * THE MACHINE THIS TASK STARTED ON, when a version declared it (ADR-067 stage 2): written once at creation, beside its
+   * hash, and read by every component that moves or shows the task (`machinesOfTask`, version-machines.ts): the task
+   * service at a card press, a deadline and a naming, `/tasks/mine` for what it needs, the router at a continuation. A
+   * version is immutable by `configId`, so this is the version's own machine, carried where the task is: no reader needs a
+   * read of another assistant's version, and none is granted. Absent, the task follows the classification's and the
+   * platform's set, as a task written before it did.
+   */
+  originMachine?: TaskStateMachine;
   // Work-item tasks: a task is anchored to a context (plan) + (optionally) a
   // work item, and assigned to a participant. itemId is the cascade key (drop the item ⇒
   // cancel its tasks); dueBy drives reminders. All optional — enterprise tasks leave them unset.
@@ -531,7 +571,71 @@ export interface WorkflowRunRef {
   values?: Record<string, string>;
   /** When the step's deadline falls, epoch seconds, so the row outlives it and the router can name its schedule. */
   deadlineAt?: number;
+  /** The version the run started on (ADR-067 stage 2, WT17), so its continuation reads that version's workflow. */
+  origin?: RunOrigin;
+  /**
+   * WHEN THE RUN GOES ON (WT18): absent, at the task's settlement; `entered`, the first time the task leaves the state it
+   * opened in, which the task service names once (`kind: 'entered'`).
+   */
+  continueOn?: 'entered';
+  /**
+   * THE RUN WENT ON ALONGSIDE THE TASK (`continue: 'alongside'`), and its end waits on it: the task's settlement takes the
+   * run's end, never a step.
+   */
+  holdsEnd?: true;
+  /**
+   * A JOIN OF THE RUN WAITS ON THE TASK (`wait: { join }`): its settlement also meets that join's own record, so the join
+   * hears it whichever comes first.
+   */
+  joined?: true;
+  /** THE TASK'S SETTLEMENT ENDS THE RUN where it stands (`endsRun`, on a task the run went on alongside). */
+  endsRun?: true;
+  /** ITS SUCCESS MOVES THE RUN ON TO THIS STEP instead (`movesTo`, O15). */
+  movesTo?: string;
+  /** The state a settling press moves the task to while the run has not reached its end (`confirmEnd`). */
+  confirmEnd?: string;
+  /** An intent's run only: the task its own step opened (`EventRunContext.runTaskId`); absent on that task itself. */
+  runTaskId?: string;
+  /** `task-reopened` only: the task that reopened, and which reopen. */
+  reopened?: { taskId: string; n: number };
+  /** `event-received` only: the rule that matched, and the window. */
+  ruleEvent?: { rule: string; window: number; watch?: { kind: string; key: string } };
+  /** A meeting's events only: the meeting the run is for. */
+  meeting?: { meetingId: string };
+  /** The run's process (SPEC-PROCESSES P2): its id, name, edition and the run's owner team, carried to the task's settlement. */
+  process?: { id: string; name: string; edition?: string; ownerTeam?: string };
+  /** A `remind` deadline (WT21): how often, in minutes, and how many reminders in all. */
+  remind?: { everyMinutes: number; times: number };
+  /** A form's fields (WT50), which its card shows and its answers are held to. */
+  fields?: import('./task-step.js').FormField[];
+  /** The content hash of the workflow the run started on (WT60), which its messages carry as its edition. */
+  workflowHash?: string;
+  /**
+   * WHAT STARTED THE RUN (WT118): a person's request, another assistant's run asking for it, or a platform event. Each
+   * declared intent is measured as one population whoever started it, and this is the breakdown.
+   */
+  trigger?: RunTrigger;
+  /**
+   * THE REQUESTS THAT LED TO THIS RUN (WT118), as `<assistant>:<intent or workflow>`, oldest first: an assistant asked by
+   * a chain is never asked again for the same intent within it, and a chain never grows past `MAX_ASK_CHAIN`, so two
+   * assistants can never ask each other without end.
+   */
+  askChain?: string[];
 }
+
+/** The longest chain of requests between assistants one run may start (WT118): the asking run, and two it leads to. */
+export const MAX_ASK_CHAIN = 3;
+
+/**
+ * THE VERSION A RUN STARTED ON (ADR-067 stage 2): its `configId`, and its SSM parameter version where it was an active
+ * version, which names it in one read. A run continues on it, so an activation that removes or changes the run's
+ * workflow never strands a run that is waiting.
+ */
+export interface RunOrigin { configId: string; version?: number }
+
+/** What started a run (WT118): a person, another assistant's run, or a platform event. */
+export type RunTrigger = 'person' | 'assistant' | 'event';
+export const RUN_TRIGGERS: readonly RunTrigger[] = ['person', 'assistant', 'event'];
 
 /**
  * The active-task mirror row. **`principalId` is the OWNER's principal id** (ADR-024 D2), not
@@ -594,6 +698,12 @@ export interface UserTask {
   openingIntent?: string;
   /** Mirror of `Task.experimentArm`, so the router serves a resumed task its arm with no second read. */
   experimentArm?: TaskExperimentArm;
+  /** Mirror of `Task.originConfigId`, so a reader of the mirror resolves the task's machine with no second read. */
+  originConfigId?: string;
+  /** Mirror of `Task.originMachineHash`. */
+  originMachineHash?: string;
+  /** Mirror of `Task.originMachine`, so `/tasks/mine` reads what the task's own step needs with no second read. */
+  originMachine?: TaskStateMachine;
   createdAt: string;
   updatedAt: string;
   ttl: number;
@@ -704,10 +814,22 @@ export interface TaskCreateOptions {
   worker?: TaskAssignee;
   /** The run a task step opened this task for (ADR-063 decision 3). */
   workflowRun?: WorkflowRunRef;
+  /** The conversation whose workflow opened this task's conversation (`Task.openedFrom`). */
+  openedFrom?: string;
+  /** The run that asked for this work, where another assistant's run requested it (WT118, `Task.askedBy`). */
+  askedBy?: WorkflowRunRef;
   /** The intent the request that opened this task was classified as (`Task.openingIntent`, ADR-064 decision B). */
   openingIntent?: string;
+  /** A request a task's turn opened mid-task (WT106): the router starts its intent's workflow on it. */
+  awaitsIntentRun?: true;
   /** The experiment arm the turn that opened this task was served (`Task.experimentArm`, ADR-064 decision J). */
   experimentArm?: TaskExperimentArm;
+  /** The version the turn that opened this task was served, by `configId` (`Task.originConfigId`, ADR-066 decision 5). */
+  originConfigId?: string;
+  /** The content hash of the machine the task starts on (`Task.originMachineHash`). */
+  originMachineHash?: string;
+  /** The version's own machine the task starts on (`Task.originMachine`), when one declared it. */
+  originMachine?: TaskStateMachine;
   /**
    * WHOSE WORK THIS IS - the assistant the chain belongs to, as a principal id. Fixed for the task's
    * life, unlike `owner`, which changes hands at every `awaits` boundary. Defaults to the owner
@@ -747,6 +869,16 @@ export interface TaskCreateOptions {
    * fail-open/fail-safe split the claim policies already draw.
    */
   throwOnWriteFailure?: boolean;
+  /**
+   * RAISE ONLY WHERE THE TASK'S OWN ROW DID NOT LAND (ADR-067 stage 3): a run that waits on the row needs to know it exists,
+   * while a person's list that missed its mirror row is repaired by the task's next write.
+   */
+  throwOnTaskWriteFailure?: boolean;
+  /**
+   * WRITE THE ROW ONLY WHERE NONE EXISTS UNDER ITS ID, and hand back the row that does: a task whose id is its request's is
+   * written once, whoever opens it, and a second open never resets a task already under way.
+   */
+  createOnly?: boolean;
   dueBy?: string;
   /** Row TTL in seconds from now. Defaults to DEFAULT_TASK_TTL_SECONDS (24h); plan tasks pass
    *  TRIP_TASK_TTL_SECONDS (or end + buffer) so they don't expire before the work happens. */
@@ -837,6 +969,12 @@ export async function createTask(
   const assistantId = opts?.assistantId
     ?? (opts?.owner?.type === 'assistant' ? opts.owner.id : undefined);
 
+  // A ROW ALREADY UNDER THIS ID IS THE TASK (`createOnly`), read back before a reference is numbered for it.
+  if (opts?.createOnly && TASKS_TABLE && opts.taskId) {
+    const found = await dynamoClient.send(new GetCommand({ TableName: TASKS_TABLE, Key: { taskId, channelArn }, ConsistentRead: true }));
+    if (found.Item) return found.Item as Task;
+  }
+
   // THE REFERENCE A PERSON TYPES (ADR-035). Only when the row will actually be written: a create with no
   // table would burn a number for an item that never exists.
   const taskRef = TASKS_TABLE && channelArn && !UNREFERENCED_TASK_TYPES.has(taskType || '')
@@ -868,8 +1006,14 @@ export async function createTask(
     ...(assistantId ? { assistantId } : {}),
     ...(opts?.worker ? { workerId: opts.worker.id, workerType: opts.worker.type } : {}),
     ...(opts?.workflowRun ? { workflowRun: opts.workflowRun } : {}),
+    ...(opts?.openedFrom ? { openedFrom: opts.openedFrom } : {}),
+    ...(opts?.askedBy ? { askedBy: opts.askedBy } : {}),
+    ...(opts?.awaitsIntentRun && !opts?.workflowRun ? { awaitsIntentRun: true as const } : {}),
     ...(opts?.openingIntent ? { openingIntent: opts.openingIntent } : {}),
     ...(opts?.experimentArm?.experimentId && opts.experimentArm.variantId ? { experimentArm: opts.experimentArm } : {}),
+    ...(opts?.originConfigId ? { originConfigId: opts.originConfigId } : {}),
+    ...(opts?.originMachineHash ? { originMachineHash: opts.originMachineHash } : {}),
+    ...(opts?.originMachine ? { originMachine: opts.originMachine } : {}),
     details: opts?.details ?? {},
     createdAt: now,
     updatedAt: now,
@@ -883,13 +1027,21 @@ export async function createTask(
       await dynamoClient.send(new PutCommand({
         TableName: TASKS_TABLE,
         Item: task,
+        ...(opts?.createOnly ? { ConditionExpression: 'attribute_not_exists(taskId)' } : {}),
       }));
       console.log(`Task created: ${taskId} (type: ${taskType || 'general'}, state: ${initialState || 'none'})`);
     } catch (error) {
+      // THE ROW ALREADY EXISTS under the request's id: it is the task, read back as written.
+      if (opts?.createOnly && (error as { name?: string })?.name === 'ConditionalCheckFailedException') {
+        const existing = await dynamoClient.send(new GetCommand({ TableName: TASKS_TABLE, Key: { taskId, channelArn }, ConsistentRead: true }));
+        if (existing.Item) return existing.Item as Task;
+        // THE ROW THAT WON IS ALREADY GONE: nothing was written here, and none is handed back as though it had been.
+        throw error;
+      }
       console.error('Error creating task:', error);
       // Rethrown only for a caller that said a lost row is not survivable. Logged either way, so the
       // default path keeps the exact behavior it had.
-      if (opts?.throwOnWriteFailure) throw error;
+      if (opts?.throwOnWriteFailure || opts?.throwOnTaskWriteFailure) throw error;
     }
   }
 
@@ -927,6 +1079,9 @@ async function putMirrorRow(task: Task, throwOnWriteFailure = false): Promise<vo
       details: task.details ?? {},
       ...(task.openingIntent ? { openingIntent: task.openingIntent } : {}),
       ...(task.experimentArm ? { experimentArm: task.experimentArm } : {}),
+      ...(task.originConfigId ? { originConfigId: task.originConfigId } : {}),
+      ...(task.originMachineHash ? { originMachineHash: task.originMachineHash } : {}),
+      ...(task.originMachine ? { originMachine: task.originMachine } : {}),
       createdAt: task.createdAt,
       updatedAt: task.updatedAt,
       ttl: task.ttl,
@@ -960,13 +1115,14 @@ async function putMirrorRow(task: Task, throwOnWriteFailure = false): Promise<vo
 /**
  * Get a task by ID
  */
-export async function getTask(taskId: string, channelArn: string): Promise<Task | null> {
+export async function getTask(taskId: string, channelArn: string, opts: { consistent?: boolean } = {}): Promise<Task | null> {
   if (!TASKS_TABLE) return null;
 
   try {
     const result = await dynamoClient.send(new GetCommand({
       TableName: TASKS_TABLE,
       Key: { taskId, channelArn },
+      ...(opts.consistent ? { ConsistentRead: true } : {}),
     }));
     return (result.Item as Task) || null;
   } catch (error) {
@@ -1861,31 +2017,38 @@ Anyone in this conversation may ask about these. Only the holder can move one fo
  * NOTE: this is intentionally a Query on the table's PK, not a Scan.
  * `UserTasksTable.PK = principalId` so the lookup is a constant-cost index
  * read per user, not a table scan.
+ *
+ * `opts.admit` keeps the rows of each page a caller may be shown, BEFORE they count toward the limit, so
+ * rows it drops never leave a short page while more remain to read. A rejection from `admit` is the
+ * caller's answer and is thrown, never read as an empty list.
  */
 export async function getActiveTasksForUser(
   personId: string,
-  opts: { limit?: number } = {},
+  opts: { limit?: number; admit?: (rows: UserTask[]) => Promise<UserTask[]> } = {},
 ): Promise<UserTask[]> {
   if (!USER_TASKS_TABLE) return [];
 
   const limit = Math.min(Math.max(opts.limit ?? 10, 1), 25);
 
-  try {
-    // PAGINATED, because `Limit` applies BEFORE the filter and the sort key is a task id.
-    //
-    // `Limit: limit * 4` read an arbitrary 40 rows and then filtered them, and the partition holds
-    // every task this owner has had until TTL (up to 200 days) in id order - not time order. So a
-    // user whose partition happened to start with 40 finished rows got NOTHING back, and the more
-    // work someone had done the likelier that became. This read backs `/tasks/mine` and the
-    // cross-channel prompt hint, so the symptom was open work vanishing for the heaviest users.
-    //
-    // Bounded by the same reasoning as `getAssigneeChannelTasks`: the partition is TTL-bounded, so the
-    // full walk is bounded too, and a page cap stops early once enough ACTIVE rows are in hand.
-    const rows: UserTask[] = [];
-    let lastKey: Record<string, unknown> | undefined;
-    let pages = 0;
-    do {
-      const result = await dynamoClient.send(new QueryCommand({
+  // PAGINATED, because `Limit` applies BEFORE the filter and the sort key is a task id.
+  //
+  // The partition holds every task this owner has had until TTL (up to 200 days) in id order, not
+  // time order, so a single fixed-size read filtered afterwards can return NOTHING to a user whose
+  // partition starts with finished rows, and the more work someone has done the likelier that is.
+  // This read backs `/tasks/mine` and the cross-channel prompt hint, so it pages until it has its
+  // open work, and the heaviest users see theirs.
+  //
+  // Bounded by the same reasoning as `getAssigneeChannelTasks`: the partition is TTL-bounded, so the
+  // full walk is bounded too, and a page cap stops early once enough ACTIVE rows are in hand.
+  //
+  // Only the read is answered as "no rows" when it fails; what `opts.admit` throws is the caller's.
+  const rows: UserTask[] = [];
+  let lastKey: Record<string, unknown> | undefined;
+  let pages = 0;
+  do {
+    let result;
+    try {
+      result = await dynamoClient.send(new QueryCommand({
         TableName: USER_TASKS_TABLE,
         KeyConditionExpression: 'principalId = :principalId',
         FilterExpression: '#status IN (:pending, :inProgress)',
@@ -1897,20 +2060,21 @@ export async function getActiveTasksForUser(
         },
         ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
       }));
-      rows.push(...((result.Items as UserTask[] | undefined) ?? []));
-      lastKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
-      pages += 1;
-      // Enough ACTIVE rows to answer with, or a runaway partition. Either way stop: the caller wants
-      // the newest `limit`, and a further page cannot change which those are once we hold more than
-      // `limit` of them... except by recency, which is why the cap is generous rather than exact.
-    } while (lastKey && rows.length < limit * 4 && pages < 10);
+    } catch (error) {
+      console.error('Error getting cross-channel tasks for user:', error);
+      return [];
+    }
+    const page = (result.Items as UserTask[] | undefined) ?? [];
+    rows.push(...(opts.admit ? await opts.admit(page) : page));
+    lastKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+    pages += 1;
+    // Enough ACTIVE rows to answer with, or a runaway partition. Either way stop: the caller wants
+    // the newest `limit`, and a further page cannot change which those are once we hold more than
+    // `limit` of them... except by recency, which is why the cap is generous rather than exact.
+  } while (lastKey && rows.length < limit * 4 && pages < 10);
 
-    rows.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
-    return rows.slice(0, limit);
-  } catch (error) {
-    console.error('Error getting cross-channel tasks for user:', error);
-    return [];
-  }
+  rows.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+  return rows.slice(0, limit);
 }
 
 /**
@@ -2035,6 +2199,61 @@ export async function recordTaskDelivery(
 }
 
 /**
+ * A REQUEST'S TASK TAKES ITS INTENT'S RUN where no router turn opened it (ADR-067 G9 and G15; WT115, WT106): a queued
+ * request its sender accepted, or a request a task's turn opened mid-task. The request's own workflow started, and the
+ * request's task is this one: the run is recorded on it once, only while it is a `queued_request` or awaits its run, and
+ * has none, so a redelivered naming finds the run already there and writes nothing. Null when the row is not such a task.
+ */
+export async function attachRequestRun(
+  taskId: string, channelArn: string, workflowRun: WorkflowRunRef, extra: { dueBy?: string; ttlSeconds?: number } = {},
+): Promise<Task | null> {
+  if (!TASKS_TABLE || !taskId || !channelArn || !workflowRun?.runKey) return null;
+  // THE RUN'S STEP DECIDES THE TASK'S DUE TIME AND HOW LONG ITS ROW IS KEPT, as on a task the step opened itself: the row
+  // outlives the step's deadline, so its firing and the settlement find it.
+  const ttlSeconds = extra.ttlSeconds ? Math.min(Math.max(60, extra.ttlSeconds), 45 * 24 * 3600) : undefined;
+  let attached: Task | null;
+  try {
+    const out = await dynamoClient.send(new UpdateCommand({
+      TableName: TASKS_TABLE,
+      Key: { taskId, channelArn },
+      ReturnValues: 'ALL_NEW',
+      UpdateExpression: `SET workflowRun = :run, updatedAt = :now${extra.dueBy ? ', dueBy = :due' : ''}${ttlSeconds ? ', #ttl = :ttl' : ''} REMOVE awaitsIntentRun`,
+      ConditionExpression: 'attribute_exists(taskId) AND attribute_not_exists(workflowRun) AND ((taskType = :queued AND taskState = :accepted) OR awaitsIntentRun = :yes)',
+      ...(ttlSeconds ? { ExpressionAttributeNames: { '#ttl': 'ttl' } } : {}),
+      ExpressionAttributeValues: {
+        ':run': workflowRun, ':now': new Date().toISOString(), ':queued': 'queued_request', ':accepted': 'accepted', ':yes': true,
+        ...(extra.dueBy ? { ':due': extra.dueBy } : {}),
+        ...(ttlSeconds ? { ':ttl': Math.floor(Date.now() / 1000) + ttlSeconds } : {}),
+      },
+    }));
+    attached = (out.Attributes as Task | undefined) ?? null;
+  } catch (err) {
+    // A REFUSAL IS AN ANSWER (the request no longer awaits its run, or has one), and is null; a fault is raised, so the
+    // caller tries the conditional write again.
+    if ((err as { name?: string })?.name === 'ConditionalCheckFailedException') return null;
+    console.error('[task-tracking] could not record a run on a request', { taskId, message: (err as Error)?.message });
+    throw err;
+  }
+  // THE MIRROR CARRIES THE SAME DUE TIME AND LIFETIME, so the person's own list shows the task as long as its run waits on it.
+  // Set in place on the row that exists, so a state another writer moved meanwhile is never written back.
+  const owner = attached ? resolveTaskAssignee(attached) : null;
+  if (USER_TASKS_TABLE && owner && (extra.dueBy || ttlSeconds)) {
+    await dynamoClient.send(new UpdateCommand({
+      TableName: USER_TASKS_TABLE,
+      Key: { principalId: owner.id, taskId },
+      UpdateExpression: `SET ${[extra.dueBy ? 'dueBy = :due' : '', ttlSeconds ? '#ttl = :ttl' : ''].filter(Boolean).join(', ')}`,
+      ConditionExpression: 'attribute_exists(taskId)',
+      ...(ttlSeconds ? { ExpressionAttributeNames: { '#ttl': 'ttl' } } : {}),
+      ExpressionAttributeValues: {
+        ...(extra.dueBy ? { ':due': extra.dueBy } : {}),
+        ...(ttlSeconds ? { ':ttl': Math.floor(Date.now() / 1000) + ttlSeconds } : {}),
+      },
+    })).catch(() => undefined);
+  }
+  return attached;
+}
+
+/**
  * Narrow a task to private. ONE WAY: it never widens one.
  *
  * A targeted request must produce a private task and a targeted answer (DESIGN 2.4). The task is
@@ -2047,6 +2266,21 @@ export async function recordTaskDelivery(
  * less than they could have seen, which they can ask about. So this function cannot express the
  * dangerous direction.
  */
+/**
+ * A RUN AN OPERATOR CANCELLED IS RELEASED FROM A REQUEST IT MADE (WT118): the request stays its owner's work, and its ending
+ * continues no run. Only while the task still names that run.
+ */
+export async function releaseAskedBy(taskId: string, channelArn: string, runKey: string): Promise<void> {
+  if (!TASKS_TABLE || !taskId || !channelArn || !runKey) return;
+  await dynamoClient.send(new UpdateCommand({
+    TableName: TASKS_TABLE,
+    Key: { taskId, channelArn },
+    UpdateExpression: 'REMOVE askedBy SET updatedAt = :now',
+    ConditionExpression: 'askedBy.runKey = :rk',
+    ExpressionAttributeValues: { ':rk': runKey, ':now': new Date().toISOString() },
+  })).catch(() => undefined);
+}
+
 export async function markTaskPrivate(taskId: string, channelArn: string): Promise<void> {
   if (!TASKS_TABLE || !taskId || !channelArn) return;
   try {
@@ -2101,7 +2335,9 @@ export async function updateTaskStatus(
   channelArn: string,
   status: TaskStatus,
   result?: string,
-  error?: string
+  error?: string,
+  /** Why the task ended, written on its terminal history entry, for an ending that is not an error. */
+  opts: { reason?: string } = {},
 ): Promise<void> {
   if (!TASKS_TABLE) return;
 
@@ -2150,7 +2386,8 @@ export async function updateTaskStatus(
         // ending, which a machine-less task also has. Reading it as an edge is the mistake ADR-024 D3
         // avoided for ownership entries in this same log, and it is avoided the same way here.
         terminal: terminalKind,
-        reason: error !== undefined ? `task ${status}: ${error}`.slice(0, 300) : `task ${status}`,
+        reason: error !== undefined ? `task ${status}: ${error}`.slice(0, 300)
+          : opts.reason ? `task ${status}: ${opts.reason}`.slice(0, 300) : `task ${status}`,
       };
       // NO SEPARATE `resolvedAt` COLUMN, deliberately. A scalar beside the log would be a second place
       // for one fact, free to disagree with the entry describing it - and the log already holds
@@ -2422,6 +2659,50 @@ export async function cancelStoppedTasks(channelArn: string, taskIds: string[]):
     }
   }
   return cancelled;
+}
+
+/** Why a duel's tasks ended, on their history and on the message that declares it (`taskEnding`). */
+export const DUEL_ENDED_REASON = 'battle-ended';
+
+/**
+ * CLOSE THE WORK A DUEL'S SIDES OPENED, WHEN THE DUEL ENDS.
+ *
+ * Each side of a duel opens its own task for the request, and a side whose duel ended cannot resume it: left open, the
+ * task sat `in_progress` for its TTL, in the person's "waiting on you" queue and in the console as running work.
+ * `cancelled` and not `abandoned`, because on a task row `abandoned` means PAUSED and resumable (`pauseTask`); the
+ * reason on the history entry says the duel ended, and reports read it as abandoned work.
+ *
+ * Found by the conversation's index and the task's own `battleId`, so only this duel's tasks are touched; finished
+ * work is kept. Returns the tasks it closed.
+ */
+export async function endDuelTasks(channelArn: string, battleId: string): Promise<Array<{ taskId: string; assistantId?: string }>> {
+  if (!TASKS_TABLE || !channelArn || !battleId) return [];
+  const closed: Array<{ taskId: string; assistantId?: string }> = [];
+  let lastKey: Record<string, unknown> | undefined;
+  do {
+    const page = await dynamoClient.send(new QueryCommand({
+      TableName: TASKS_TABLE,
+      IndexName: 'channelArn-updatedAt-index',
+      KeyConditionExpression: 'channelArn = :c',
+      FilterExpression: 'battleId = :b',
+      ExpressionAttributeValues: { ':c': channelArn, ':b': battleId },
+      ExclusiveStartKey: lastKey,
+    }));
+    for (const item of (page.Items as Task[] | undefined) ?? []) {
+      if (!(ACTIVE_TASK_STATUSES as readonly string[]).includes(item.status)) continue;
+      try {
+        const full = (await getTask(item.taskId, channelArn)) ?? item;
+        if (!(ACTIVE_TASK_STATUSES as readonly string[]).includes(full.status)) continue;
+        await updateTaskStatus(full.taskId, channelArn, 'cancelled', undefined, undefined, { reason: DUEL_ENDED_REASON });
+        await mirrorTaskStatus(full, 'cancelled');
+        closed.push({ taskId: full.taskId, ...(full.assistantId ? { assistantId: full.assistantId } : {}) });
+      } catch (err) {
+        console.error('[endDuelTasks] could not close a side task', { taskId: item.taskId, err: (err as Error)?.message });
+      }
+    }
+    lastKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (lastKey);
+  return closed;
 }
 
 export async function cancelTasksForStop(contextId: string, itemId?: string): Promise<number> {
@@ -3640,4 +3921,65 @@ If they DO come back asking for changes, that is not a finished task being reope
 to the revising step and make the change. If they simply ask whether it is done, answer them - the
 delivery already happened, and re-producing it is not an answer.
 `;
+}
+
+
+/**
+ * THE OPEN TASKS OF ONE MACHINE IN EVERY CONVERSATION A CONVERSATION'S WORKFLOW OPENED (WT122): one query on
+ * `openedFrom-taskType-index`, every page, each row whole. Null when any page cannot be read, never a short list, so a
+ * limit counted from it is never passed on a partial count. A row past its expiry that the table has not removed yet is
+ * not open.
+ */
+export async function openTasksOpenedFrom(openedFrom: string, taskType: string, nowSeconds = Math.floor(Date.now() / 1000)): Promise<Task[] | null> {
+  if (!TASKS_TABLE || !openedFrom || !taskType) return null;
+  try {
+    const all: Task[] = [];
+    let lastKey: Record<string, unknown> | undefined;
+    do {
+      const result = await dynamoClient.send(new QueryCommand({
+        TableName: TASKS_TABLE,
+        IndexName: 'openedFrom-taskType-index',
+        KeyConditionExpression: 'openedFrom = :from AND taskType = :type',
+        FilterExpression: '#status IN (:pending, :inProgress)',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':from': openedFrom, ':type': taskType, ':pending': 'pending', ':inProgress': 'in_progress' },
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      }));
+      all.push(...((result.Items as Task[] | undefined) ?? []));
+      lastKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+    } while (lastKey);
+    return all.filter((t) => typeof t.ttl !== 'number' || t.ttl > nowSeconds);
+  } catch (err) {
+    console.warn('[task-tracking] the open tasks of the conversations an opener opened could not be read', { err: (err as Error)?.message });
+    return null;
+  }
+}
+
+/**
+ * EVERY OPEN TASK A WORKFLOW STEP OPENED IN ONE CONVERSATION (`evt-` ids), every page, each row whole: what archiving the
+ * conversation settles (ADR-017, WT122). Null when any page cannot be read.
+ */
+export async function openWorkflowTasksIn(channelArn: string): Promise<Task[] | null> {
+  if (!TASKS_TABLE || !channelArn) return null;
+  try {
+    const all: Task[] = [];
+    let lastKey: Record<string, unknown> | undefined;
+    do {
+      const result = await dynamoClient.send(new QueryCommand({
+        TableName: TASKS_TABLE,
+        IndexName: 'channelArn-updatedAt-index',
+        KeyConditionExpression: 'channelArn = :ch',
+        FilterExpression: '#status IN (:pending, :inProgress) AND attribute_exists(workflowRun)',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':ch': channelArn, ':pending': 'pending', ':inProgress': 'in_progress' },
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      }));
+      all.push(...((result.Items as Task[] | undefined) ?? []));
+      lastKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+    } while (lastKey);
+    return all.filter((t) => typeof t.taskId === 'string' && t.taskId.startsWith('evt-'));
+  } catch (err) {
+    console.warn('[task-tracking] a conversation\'s open workflow tasks could not be read', { err: (err as Error)?.message });
+    return null;
+  }
 }

@@ -60,7 +60,7 @@ describe('the New conversation picker', () => {
     setClassificationsForTest(SAMPLE_CLASSIFICATIONS);
     tier = 'premium';
     render(<NewConversationModal isOpen onClose={() => {}} />);
-    expect(offered()).toEqual(['Basic', 'Standard', 'Premium']);
+    expect(offered()).toEqual(['Public', 'Internal', 'Confidential']);
   });
 
   it('offers nothing to a person whose token names no classification', () => {

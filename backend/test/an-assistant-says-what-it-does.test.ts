@@ -24,9 +24,9 @@ import {
   MAX_ADVERTISED_IN_INTRODUCTION,
   type StoredIntentPack,
 } from '../lambda/src/lib/intent-pack';
-import { stratumIntentPack, opsIntentPack } from '../demo/intent-packs';
-import { BASIC_ONBOARDING, STANDARD_ONBOARDING, PREMIUM_ONBOARDING } from '../demo/onboarding';
-import { BASIC_BOUNDARY, STANDARD_BOUNDARY, PREMIUM_BOUNDARY } from '../demo/boundaries';
+import { stratumIntentPack, opsIntentPack } from '../../demo/stratum-company/intent-packs';
+import { BASIC_ONBOARDING, STANDARD_ONBOARDING, PREMIUM_ONBOARDING } from '../../demo/stratum-company/onboarding';
+import { BASIC_BOUNDARY, STANDARD_BOUNDARY, PREMIUM_BOUNDARY } from '../../demo/stratum-company/boundaries';
 
 const packFor = (t: 'basic' | 'standard' | 'premium') => resolveStoredPack(stratumIntentPack(t));
 

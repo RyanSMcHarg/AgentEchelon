@@ -1,8 +1,10 @@
-import React, { useState, useRef, useCallback, useMemo, useEffect } from 'react';
+import { TARGET_MISMATCH_LOG, sendTargetMismatch } from '../utils/targetIntegrity';
+import React, { useState, useRef, useCallback, useMemo, useEffect, useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useConversations } from '../providers/ConversationProvider.chime';
 import { useAuth } from '@ae/shared';
 import { classificationAudience } from '@ae/shared/config/classifications.ts';
+import { memberNameResolver, readableAddressText } from '@ae/shared/utils/addressTokens.ts';
 import { useAwsClient } from '../providers/AwsClientProvider';
 import { uploadFile } from '../services/attachmentService';
 import FileUploadPreview from './FileUploadPreview';
@@ -18,8 +20,18 @@ import {
   privatePrefixFor,
   stripPrivatePrefixFrom,
 } from '../utils/mentionParser';
+import { insideCode } from '@ae/shared/utils/addressTokens.ts';
 import { hasMarkdownPrefix, withoutMarkdownPrefix } from '../utils/markdownPrefix';
+import {
+  EMPTY_DRAFT, addressPrivatelyInDraft, draftFromEncoded, editDraft, encodeDraft, mentionInDraft, withoutShadowedMentions,
+  mentionStartsAt, pickIntoDraft, type ComposerDraft,
+} from '../utils/composerMentions';
+import {
+  cacheSession, forgetStagedFile, keepStagedFile, readDraft, restoreStagedFile, writeDraft, type StagedFileRecord,
+} from '../services/composerCache';
+import { isOnline } from '../services/outbox';
 import { taskReferenceOf, withoutTaskReference } from '../utils/taskReference';
+import { onComposerAddressRequest } from '../utils/composerRequests';
 import { useAttachmentCapability } from '../hooks/useAttachmentCapability';
 import type { ChannelMember, StickyMentionTarget } from '@ae/shared';
 import './MessageInput.css';
@@ -86,9 +98,19 @@ function resolveTaskAnswer(
   };
 }
 
-const MessageInput: React.FC = () => {
+/** `inMeetingWindow`: the composer of a meeting window's chat, a narrow column that takes a short placeholder. */
+const MessageInput: React.FC<{ inMeetingWindow?: boolean }> = ({ inMeetingWindow = false }) => {
   const { t } = useTranslation();
-  const [input, setInput] = useState('');
+  /**
+   * THE FIELD SHOWS A PICKED MEMBER BY NAME, AND THE SEND CARRIES THEIR ID (ADR-040): `input` is what the person reads
+   * (`@Name`, `.Name`), and `encoded` is the same draft with each picked member as `@<Name|id>` / `.<Name|id>`, which is
+   * what every routing decision below reads and what is sent.
+   */
+  const [draft, setDraft] = useState<ComposerDraft>(EMPTY_DRAFT);
+  const input = draft.text;
+  const setInput = useCallback((next: string | ((prev: string) => string), caret?: number) => {
+    setDraft((d) => editDraft(d, typeof next === 'function' ? next(d.text) : next, caret));
+  }, []);
   const [stagedFile, setStagedFile] = useState<File | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -111,11 +133,101 @@ const MessageInput: React.FC = () => {
   const [mentionTrigger, setMentionTrigger] = useState<'@' | '.'>('@');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const { activeConversation, sendMessage, isSending, sendError, clearSendError, channelMembers, stickyTarget, setStickyTarget, replyingToSides = [], clearReplyingToSides, openWorkItems, refreshOpenWorkItems, answeringTaskId, clearAnswering } = useConversations();
+  const mentionListId = useId();
+  const {
+    activeConversation, sendMessage, isSending, sendError, clearSendError, channelMembers, stickyTarget, setStickyTarget,
+    replyingToSides = [], clearReplyingToSides, openWorkItems, refreshOpenWorkItems, answeringTaskId, clearAnswering,
+    queuedMessages = [], retryQueuedMessage, discardQueuedMessage,
+  } = useConversations();
+  // WHAT IS SENT: each picked member as its token, except one a longer member's name now stands over in the field.
+  const sendDraft = useMemo(
+    () => withoutShadowedMentions(draft, channelMembers.map((m) => m.name ?? '')),
+    [draft, channelMembers],
+  );
+  const encoded = useMemo(() => encodeDraft(sendDraft), [sendDraft]);
   const { user } = useAuth();
   // THE SENDER IS THE ARN THE MESSAGING CLIENT ACTS AS, the person's AppInstanceUser as the credential
   // exchange returned it. Excluding anything else from the mention list leaves the sender in it.
   const { userArn: senderArn } = useAwsClient();
+
+  // ────────────────────────────────────────────────────────────────────────────────────────────
+  // THE DRAFT IS KEPT ON THIS DEVICE (`services/composerCache.ts`), per person and per conversation: its text with the
+  // picked members' ids, and the staged file. It is restored when the conversation opens, kept a moment after each
+  // change and when the conversation is left, and forgotten once sent. A file too large to keep, or a browser that
+  // keeps none, leaves its name, and the person is asked to attach it again.
+  const personId = senderArn ? senderArn.split('/').pop() || undefined : undefined;
+  const conversationId = activeConversation?.id;
+  const draftKey = personId && conversationId ? `${personId}|${conversationId}` : undefined;
+  /** Which conversation the draft in the field belongs to: set with the restored draft, so a switch never writes one
+   *  conversation's words into another's record. */
+  const [draftFor, setDraftFor] = useState<string | undefined>(undefined);
+  const [missingFile, setMissingFile] = useState<StagedFileRecord | null>(null);
+  const [fileRecord, setFileRecord] = useState<StagedFileRecord | undefined>(undefined);
+  const latest = useRef({ draft, fileRecord, draftFor });
+  latest.current = { draft, fileRecord, draftFor };
+  const sessionRef = useRef(0);
+  /**
+   * The conversation a send is under way from (its draft key), while it is: its words are in the outbox already, so they
+   * are not kept as its draft as well, and a reload never offers them to be sent a second time.
+   */
+  const sendingForRef = useRef<string | undefined>(undefined);
+  /** The conversation open now, read when a send finishes. */
+  const openArnRef = useRef<string | undefined>(undefined);
+  openArnRef.current = activeConversation?.conversationArn;
+
+  useEffect(() => {
+    if (!personId || !conversationId || !draftKey) return;
+    const session = cacheSession();
+    sessionRef.current = session;
+    const cached = readDraft(personId, conversationId);
+    setDraft(cached?.draft ?? EMPTY_DRAFT);
+    setDraftFor(draftKey);
+    setStagedFile(null);
+    setMissingFile(null);
+    setFileRecord(cached?.file);
+    let open = true;
+    const record = cached?.file;
+    if (record) {
+      void restoreStagedFile(personId, conversationId, record).then((file) => {
+        if (!open) return;
+        if (file) setStagedFile(file);
+        else setMissingFile(record);
+      });
+    }
+    return () => {
+      open = false;
+      // The conversation being left keeps what was in the field.
+      const { draft: leaving, fileRecord: leavingFile, draftFor: owner } = latest.current;
+      if (owner === draftKey && sendingForRef.current !== draftKey) {
+        writeDraft(personId, conversationId, { draft: leaving, ...(leavingFile ? { file: leavingFile } : {}) }, session);
+      }
+    };
+  }, [personId, conversationId, draftKey]);
+
+  useEffect(() => {
+    if (!personId || !conversationId || !draftKey || draftFor !== draftKey || sendingForRef.current === draftKey) return;
+    const session = sessionRef.current;
+    const timer = setTimeout(() => {
+      writeDraft(personId, conversationId, { draft, ...(fileRecord ? { file: fileRecord } : {}) }, session);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [draft, fileRecord, personId, conversationId, draftKey, draftFor]);
+
+  /** Stage a file (or none), and keep it on this device with the draft. */
+  const stageFile = useCallback((file: File | null) => {
+    setStagedFile(file);
+    setMissingFile(null);
+    if (!personId || !conversationId) return;
+    if (!file) {
+      setFileRecord(undefined);
+      void forgetStagedFile(personId, conversationId);
+      return;
+    }
+    setFileRecord({ name: file.name, size: file.size, type: file.type, kept: false });
+    void keepStagedFile(personId, conversationId, file, sessionRef.current).then((record) => {
+      setFileRecord((current) => (current && current.name === record.name && current.size === record.size ? record : current));
+    });
+  }, [personId, conversationId]);
 
   /**
    * WHO THIS MESSAGE IS PRIVATE TO, resolved from what is typed RIGHT NOW (ADR-034).
@@ -132,7 +244,7 @@ const MessageInput: React.FC = () => {
     // what the person checks before committing to privacy. Matching the raw token would fail outright
     // once it carries `Name|id`, and the chip would vanish for exactly the addresses the picker is
     // most sure about.
-    const address = privatePrefixAddress(input);
+    const address = privatePrefixAddress(encoded);
     if (!address) return null;
     const notMe = (m: { userArn?: string }) => m.userArn !== (senderArn || '');
     if (address.id) {
@@ -144,7 +256,7 @@ const MessageInput: React.FC = () => {
         && (m.name?.toLowerCase() === address.name.toLowerCase()
           || m.name?.toLowerCase() === address.raw.toLowerCase()),
     ) || null;
-  }, [input, channelMembers, senderArn]);
+  }, [encoded, channelMembers, senderArn]);
 
   /**
    * WHETHER TO OFFER THE PAPERCLIP AT ALL, answered by the deployment rather than by this client.
@@ -168,6 +280,7 @@ const MessageInput: React.FC = () => {
   const canAttach = useAttachmentCapability(activeConversation?.conversationArn);
 
   const everyoneMember: StickyMentionTarget = { userArn: 'EVERYONE', name: 'all', isBot: false, isAll: true };
+  const humansMember: StickyMentionTarget = { userArn: 'HUMANS', name: 'humans', isBot: false, isAll: true };
 
   const humanCount = channelMembers.filter((m) => !m.isBot).length;
   const isMultiUser = humanCount >= 2;
@@ -263,6 +376,7 @@ const MessageInput: React.FC = () => {
       const humanMembers = channelMembers.filter((m) => !m.isBot);
       if (humanMembers.length >= 2) {
         options.push({ userArn: 'EVERYONE', name: 'all', isBot: false, isAll: true });
+        options.push({ userArn: 'HUMANS', name: 'humans', isBot: false, isAll: true });
       }
     }
 
@@ -276,8 +390,20 @@ const MessageInput: React.FC = () => {
       : others));
 
     if (!mentionFilter) return options;
+    // WHAT IS TYPED NARROWS THE LIST, best match first: an exact name, then a name it begins, then a
+    // name it appears in. At one rank a member comes before `all` and `humans`, so `@Al` offers Alice
+    // first and `@all` still offers everyone first.
     const filter = mentionFilter.toLowerCase();
-    return options.filter((m) => m.name.toLowerCase().includes(filter));
+    const rank = (m: ChannelMember & { isAll?: boolean }) => {
+      const name = m.name.toLowerCase();
+      const match = name === filter ? 0 : name.startsWith(filter) ? 1 : 2;
+      return match * 2 + (m.isAll ? 1 : 0);
+    };
+    return options
+      .filter((m) => m.name.toLowerCase().includes(filter))
+      .map((m, i) => ({ m, i, r: rank(m) }))
+      .sort((a, b) => a.r - b.r || a.i - b.i)
+      .map(({ m }) => m);
   }, [channelMembers, senderArn, mentionFilter, mentionTrigger]);
 
   const insertMention = useCallback((member: ChannelMember & { isAll?: boolean }) => {
@@ -286,7 +412,6 @@ const MessageInput: React.FC = () => {
 
     const cursorPos = textarea.selectionStart;
     const textBefore = input.substring(0, cursorPos);
-    const textAfter = input.substring(cursorPos);
 
     // Find the token that triggered the dropdown. A `.` prefix is ANCHORED - it only means anything
     // at the start of the message - so it is found from the front; an `@` can appear anywhere, so it
@@ -302,41 +427,81 @@ const MessageInput: React.FC = () => {
     // THE PICKER WRITES THE FORM THE NAME REQUIRES, so nobody types a bracket. `privatePrefixFor`
     // delimits only when the bare token could not carry the name, which keeps an ordinary address
     // reading as `.Alice hello` in the message the recipient sees.
-    const mention = member.isAll
-      ? '@all '
+    // The field shows the member by name; the token with their id rides beside it and is what is sent.
+    const token = (member.isAll
+      ? `@${member.name}`
       : mentionTrigger === '.'
         ? privatePrefixFor(member.name, member.userArn)
         // `@` CARRIES THE ID TOO, for the same reason `.` does and through the same
         // helper shape. `@all` is deliberately excluded: it names no member, so there is no id.
-        : mentionTokenFor(member.name, member.userArn);
-    const newText = textBefore.substring(0, atIndex) + mention + textAfter;
-    setInput(newText);
+        : mentionTokenFor(member.name, member.userArn)).trimEnd();
+    const shown = member.isAll ? token : `${mentionTrigger === '.' ? '.' : '@'}${member.name}`;
+    setDraft((d) => pickIntoDraft(d, atIndex, cursorPos, shown, token));
     setShowMentionDropdown(false);
     setMentionFilter('');
     setSelectedMentionIndex(0);
 
     // Restore cursor position after React re-render
     requestAnimationFrame(() => {
-      const newPos = atIndex + mention.length;
+      const newPos = atIndex + shown.length + 1;
       textarea.setSelectionRange(newPos, newPos);
       textarea.focus();
     });
   }, [input, mentionTrigger]);
 
+  // A MEMBER ADDRESSED FROM ELSEWHERE IN THE WINDOW (the meeting's roster, `utils/composerRequests.ts`), written with the
+  // picker's own tokens: `@Name` at the caret in public, or `.Name` at the front for that member alone.
+  //
+  // THE FRONT OF THE MESSAGE MEANS SOMETHING, so neither request disturbs it: a private address goes after any `/md`
+  // command and replaces only a private address already there (a leading `.env` is the person's words), and a mention
+  // never goes in front of a leading private address, which would stop it addressing anyone.
+  const memberNames = useMemo(() => channelMembers.map((m) => m.name ?? ''), [channelMembers]);
+  const memberNamesRef = useRef(memberNames);
+  memberNamesRef.current = memberNames;
+  useEffect(() => onComposerAddressRequest(({ member, mode }) => {
+    const textarea = textareaRef.current;
+    if (!member.userArn || !member.name) return;
+    let caret = 0;
+    setDraft((d) => {
+      const placed = mode === 'private'
+        ? addressPrivatelyInDraft(d, `.${member.name}`, privatePrefixFor(member.name, member.userArn).trimEnd(), memberNamesRef.current)
+        : mentionInDraft(
+          d, textarea?.selectionStart ?? d.text.length, `@${member.name}`,
+          mentionTokenFor(member.name, member.userArn).trimEnd(), memberNamesRef.current,
+        );
+      caret = placed.caret;
+      return placed.draft;
+    });
+    requestAnimationFrame(() => {
+      if (!textarea) return;
+      textarea.focus();
+      textarea.setSelectionRange(caret, caret);
+    });
+  }), []);
+
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
-    setInput(value);
-
     const cursorPos = e.target.selectionStart;
+    const next = editDraft(draft, value, cursorPos);
+    setDraft(next);
+
     const textBefore = value.substring(0, cursorPos);
 
     // THE PRIVATE PREFIX, CHECKED FIRST AND ANCHORED TO THE START. `.` means an address only as the
     // first thing in the message (ADR-034), which is what stops a decimal, a file extension or an
     // ellipsis mid-sentence from opening a privacy picker - "call me at 5.sam" is not addressing Sam.
     // The token is still being typed here, so there is no trailing space to match yet.
-    const privateDraft = privatePrefixDraft(textBefore);
-    // An `@` can appear anywhere in a sentence, so it is matched from the cursor backwards.
-    const mentionMatch = textBefore.match(/@([\w ]*)$/);
+    // A member already picked is not completed again: text typed after `@Name ` is the person's words.
+    const draftText = privatePrefixDraft(textBefore);
+    const privateDraft = draftText !== null && mentionStartsAt(next, textBefore.indexOf('.')) ? null : draftText;
+    // An `@` can appear anywhere a word starts, so it is matched from the cursor backwards. Inside a
+    // word it is not a mention (`a@b.com`), and the typed name may hold a space, a hyphen or a dot,
+    // as display names do. A name that matches nobody leaves the picker closed and the text plain.
+    const typedMention = textBefore.match(/(?:^|[\s([{"'])@((?:[^\s@<>][^@<>\n]{0,63})?)$/);
+    // NOT INSIDE CODE: an `@` in a code span or block is the person's code, so it opens no picker and becomes no mention.
+    const mentionAt = typedMention ? cursorPos - typedMention[1].length - 1 : -1;
+    const inCode = mentionAt >= 0 && insideCode(textBefore, mentionAt);
+    const mentionMatch = typedMention && !inCode && !mentionStartsAt(next, mentionAt) ? typedMention : null;
 
     if (privateDraft !== null) {
       setMentionTrigger('.');
@@ -357,160 +522,177 @@ const MessageInput: React.FC = () => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if ((!input.trim() && !stagedFile) || !activeConversation || !user) return;
+    setUploadError(null);
+    setMentionError(null);
+    // THE SEND BELONGS TO THE CONVERSATION IT WAS WRITTEN IN: captured now, it is where the file is uploaded and the message
+    // goes, and only that conversation's draft is let go once it is sent, whichever conversation is open by then.
+    const writtenIn = { id: activeConversation.id, conversationArn: activeConversation.conversationArn };
+    const sentFromKey = draftKey;
+    const sentFromId = conversationId;
 
-    try {
-      setUploadError(null);
-      setMentionError(null);
-      let attachment;
+    // WHAT IS SENT IS DECIDED BEFORE ANYTHING LEAVES THE DEVICE. Every check that can stop the send runs first, and the
+    // staged file is uploaded only after all of them pass and is let go only once the message is sent, so a refused
+    // send keeps the draft and its file exactly as they were.
+    const fileName = stagedFile?.name;
+    let sends: Array<{ content: string; options?: { targetArn?: string; mentionBotArn?: string; mentionArns?: string[]; taskId?: string } }>;
+    let afterSent: (() => void) | undefined;
 
-      if (stagedFile) {
-        setIsUploading(true);
-        attachment = await uploadFile(stagedFile, activeConversation.id, user.id);
-        setStagedFile(null);
-        setIsUploading(false);
+    if (selectedWaiting) {
+      // A reply to a waiting duel side: the raw text TARGETED at each chosen side, so only that side's
+      // Lex receives it and the router resumes the side (ADR-029). A `Target` holds one member, so
+      // "Answer both sides" is one targeted send per side, the same words to each. No sticky prefix and
+      // no @-mention parsing.
+      const battleContent = encoded.trim() || `[Attached: ${fileName}]`;
+      sends = replyingToSides.map((side) => ({ content: battleContent, options: { targetArn: side.botArn } }));
+      afterSent = () => clearReplyingToSides?.();
+    } else {
+      // If a sticky target is set and the user didn't type their own @-mention,
+      // prepend the sticky mention so it carries over to the next send.
+      //
+      // A slash command is exempt. `/battle` is a START-OF-MESSAGE command, so a prepended
+      // mention turns it into ordinary prose addressed to one assistant: the router reads
+      // `invokesBattle: false` and answers normally, with no duel and nothing to explain why.
+      // The sticky target is also semantically wrong for a battle, which fans out to two bots
+      // rather than to the one the mention names. Once a sticky target was set - and it persists
+      // across sends - every later slash command in that conversation was silently swallowed.
+      // `/md` IS A RENDERING INSTRUCTION, NOT A ROUTING ONE, so it is lifted off before any of the
+      // decisions below and put back at the end. Every check here that asks "is this a command?"
+      // means "does this address somebody or invoke a process", and `/md` does neither - left in
+      // place it would suppress the sticky mention and disqualify the message from answering a work
+      // item, purely because of how it is spelled. It also has to stay at the START to mean
+      // anything, so the sticky prefix must land after it rather than in front of it.
+      // Re-attached in its canonical spelling rather than as the person typed it, so `/MD` and a
+      // ragged amount of leading space both come back as one known form the renderer will match.
+      const wantsMarkdown = hasMarkdownPrefix(encoded);
+      let effectiveContent = withoutMarkdownPrefix(encoded.trim()).trim();
+      // THE CHIP AND THE SEND MUST AGREE. The banner above renders `taskAnswer` BEFORE
+      // `stickyTarget`, so when both exist the person is told "Answering <work item>" - and the
+      // sticky prefix must therefore stand down: prepending it here set `mentions.targetArn` to the
+      // sticky human, which forced `answersTask` false below, and the message routed to that person
+      // with no taskId while the UI said the opposite. The work item stayed blocked. The sticky
+      // target is not cleared, only skipped: it comes back once the work item is answered or
+      // dismissed, exactly as the banner does.
+      if (stickyTarget && !taskAnswer && !effectiveContent.startsWith('@') && !effectiveContent.startsWith('/')
+        && !effectiveContent.startsWith('.')) {
+        // BY ID, as a pick writes it: two members may share a name, and the one carried forward is the one addressed.
+        // `all` and `humans` name no member, so they stay words.
+        const prefix = stickyTarget.isAll
+          ? `@${stickyTarget.name}`
+          : mentionTokenFor(stickyTarget.name, stickyTarget.userArn).trimEnd();
+        effectiveContent = effectiveContent ? `${prefix} ${effectiveContent}` : prefix;
       }
 
-      if (selectedWaiting) {
-        // A reply to a waiting duel side: the raw text TARGETED at each chosen side, so only that side's
-        // Lex receives it and the router resumes the side (ADR-029). A `Target` holds one member, so
-        // "Answer both sides" is one targeted send per side, the same words to each. No sticky prefix and
-        // no @-mention parsing.
-        const battleContent = input.trim() || `[Attached: ${attachment?.name}]`;
-        for (const side of replyingToSides) {
-          await sendMessage(battleContent, attachment, { targetArn: side.botArn });
-        }
-        clearReplyingToSides?.();
-      } else {
-        // If a sticky target is set and the user didn't type their own @-mention,
-        // prepend the sticky mention so it carries over to the next send.
-        //
-        // A slash command is exempt. `/battle` is a START-OF-MESSAGE command, so a prepended
-        // mention turns it into ordinary prose addressed to one assistant: the router reads
-        // `invokesBattle: false` and answers normally, with no duel and nothing to explain why.
-        // The sticky target is also semantically wrong for a battle, which fans out to two bots
-        // rather than to the one the mention names. Once a sticky target was set - and it persists
-        // across sends - every later slash command in that conversation was silently swallowed.
-        // `/md` IS A RENDERING INSTRUCTION, NOT A ROUTING ONE, so it is lifted off before any of the
-        // decisions below and put back at the end. Every check here that asks "is this a command?"
-        // means "does this address somebody or invoke a process", and `/md` does neither - left in
-        // place it would suppress the sticky mention and disqualify the message from answering a work
-        // item, purely because of how it is spelled. It also has to stay at the START to mean
-        // anything, so the sticky prefix must land after it rather than in front of it.
-        // Re-attached in its canonical spelling rather than as the person typed it, so `/MD` and a
-        // ragged amount of leading space both come back as one known form the renderer will match.
-        const wantsMarkdown = hasMarkdownPrefix(input);
-        let effectiveContent = withoutMarkdownPrefix(input.trim()).trim();
-        // THE CHIP AND THE SEND MUST AGREE. The banner above renders `taskAnswer` BEFORE
-        // `stickyTarget`, so when both exist the person is told "Answering <work item>" - and the
-        // sticky prefix must therefore stand down: prepending it here set `mentions.targetArn` to the
-        // sticky human, which forced `answersTask` false below, and the message routed to that person
-        // with no taskId while the UI said the opposite. The work item stayed blocked. The sticky
-        // target is not cleared, only skipped: it comes back once the work item is answered or
-        // dismissed, exactly as the banner does.
-        if (stickyTarget && !taskAnswer && !effectiveContent.startsWith('@') && !effectiveContent.startsWith('/')
-          && !effectiveContent.startsWith('.')) {
-          const prefix = stickyTarget.isAll ? '@all' : `@${stickyTarget.name}`;
-          effectiveContent = effectiveContent ? `${prefix} ${effectiveContent}` : prefix;
-        }
+      const fallbackContent = effectiveContent || `[Attached: ${fileName}]`;
+      const userArn = senderArn || '';
+      const mentions = parseMentions(fallbackContent, channelMembers, userArn);
 
-        const fallbackContent = effectiveContent || `[Attached: ${attachment?.name}]`;
-        const userArn = senderArn || '';
-        const mentions = parseMentions(fallbackContent, channelMembers, userArn);
+      // Enforce single-target-or-@all on the frontend (Chime's
+      // SendChannelMessage.Target is fixed at 1 item — see
+      // reference_chime_target_fixed_one). When the user typed multiple
+      // distinct mentions or mixed @all with explicit mentions, show
+      // the violation inline and stop here; don't silently drop the
+      // extras and send a half-targeted message.
+      if (mentions.error) {
+        setMentionError(mentionValidationMessage(mentions.error));
+        return;
+      }
 
-        // Enforce single-target-or-@all on the frontend (Chime's
-        // SendChannelMessage.Target is fixed at 1 item — see
-        // reference_chime_target_fixed_one). When the user typed multiple
-        // distinct mentions or mixed @all with explicit mentions, show
-        // the violation inline and stop here; don't silently drop the
-        // extras and send a half-targeted message.
-        if (mentions.error) {
-          setMentionError(mentionValidationMessage(mentions.error));
-          return;
-        }
+      // WHAT THE FIELD SAYS AND WHAT THE SEND DOES MUST AGREE (`targetIntegrity.ts`). The field reads as private to a
+      // member (a leading dot and their whole name), so the send carries that member as its `Target` or it is not sent:
+      // a message that looks private never goes to the room.
+      const wouldLeakTo = sendTargetMismatch(sendDraft, channelMembers, mentions.targetArn);
+      if (wouldLeakTo) {
+        console.error(`${TARGET_MISMATCH_LOG} a draft reads as private but its send carries no Target for that member; not sent`);
+        setMentionError(t('message.sendWouldNotBePrivate', { name: wouldLeakTo.name ?? '' }));
+        return;
+      }
 
-        // ANSWERING A WORK ITEM, when the person addressed nobody themselves. The assistant that asked
-        // is addressed for them and the task is named, so the message reaches the work it answers
-        // instead of reaching nobody (ADR-032).
-        //
-        // WHAT THE PERSON TYPED ALWAYS WINS. An explicit mention, `@all` and a slash command each take
-        // this branch away: a mention is the person naming who they are talking to, and ADR-030 makes
-        // that a supported path in its own right - the turn resolves the chain from the task, so no
-        // reference needs to ride the message. A `/battle` is a new instruction, not an answer.
-        //
-        // TESTED ON `mentionedArns`, NOT ON WHAT A MENTION HAPPENS TO ROUTE. The three original terms
-        // stood in for "did the person address somebody", which they did while every `@` set a
-        // `targetArn` or a `mentionBotArn`. ADR-034 removed both for a HUMAN mention - that is the
-        // whole point of it - so "@Sam can you check this?" with a work item pending set none of them
-        // and took this branch: the message went to the ASSISTANT, privately if the item was private,
-        // and Sam was never mentioned at all. The comment above was still true as written and the code
-        // under it had stopped implementing it.
-        const answersTask = taskAnswer && taskAnswer.botArn && !mentions.isAtAll && !mentions.targetArn
-          && !mentions.mentionBotArn && mentions.mentionedArns.length === 0
-          && !fallbackContent.startsWith('/');
+      // ANSWERING A WORK ITEM, when the person addressed nobody themselves. The assistant that asked
+      // is addressed for them and the task is named, so the message reaches the work it answers
+      // instead of reaching nobody (ADR-032).
+      //
+      // WHAT THE PERSON TYPED ALWAYS WINS. An explicit mention, `@all` and a slash command each take
+      // this branch away: a mention is the person naming who they are talking to, and ADR-030 makes
+      // that a supported path in its own right - the turn resolves the chain from the task, so no
+      // reference needs to ride the message. A `/battle` is a new instruction, not an answer.
+      //
+      // TESTED ON `mentionedArns`, NOT ON WHAT A MENTION HAPPENS TO ROUTE. The three original terms
+      // stood in for "did the person address somebody", which they did while every `@` set a
+      // `targetArn` or a `mentionBotArn`. ADR-034 removed both for a HUMAN mention - that is the
+      // whole point of it - so "@Sam can you check this?" with a work item pending set none of them
+      // and took this branch: the message went to the ASSISTANT, privately if the item was private,
+      // and Sam was never mentioned at all. The comment above was still true as written and the code
+      // under it had stopped implementing it.
+      const answersTask = taskAnswer && taskAnswer.botArn && !mentions.isAtAll && !mentions.isAtHumans && !mentions.targetArn
+        && !mentions.mentionBotArn && mentions.mentionedArns.length === 0
+        && !fallbackContent.startsWith('/');
 
-        // ADDRESSING IS NOT PRIVATISING, and until now this was one act. Reaching the assistant with
-        // a `targetArn` sets a Chime Target, and a Target is what makes a message unreadable to the
-        // rest of the room - so answering work the room can SEE made the exchange invisible to the
-        // people waiting on it, and the outcome changed under them with no way to know why. The
-        // convenience feature was doing the concealing, not the person.
-        //
-        // A shared item is therefore answered by MENTIONING the assistant, which is public text, with
-        // the task id riding alongside as metadata for precision. A private item keeps the target,
-        // because it is nobody else's.
-        //
-        // ABSENT VISIBILITY COUNTS AS PRIVATE. It means a row written before the server sent the
-        // field, and of the two ways to be wrong only one publishes something.
-        const answersSharedItem = answersTask && taskAnswer.visibility === 'conversation';
+      // ADDRESSING IS NOT PRIVATISING, and until now this was one act. Reaching the assistant with
+      // a `targetArn` sets a Chime Target, and a Target is what makes a message unreadable to the
+      // rest of the room - so answering work the room can SEE made the exchange invisible to the
+      // people waiting on it, and the outcome changed under them with no way to know why. The
+      // convenience feature was doing the concealing, not the person.
+      //
+      // A shared item is therefore answered by MENTIONING the assistant, which is public text, with
+      // the task id riding alongside as metadata for precision. A private item keeps the target,
+      // because it is nobody else's.
+      //
+      // ABSENT VISIBILITY COUNTS AS PRIVATE. It means a row written before the server sent the
+      // field, and of the two ways to be wrong only one publishes something.
+      const answersSharedItem = answersTask && taskAnswer.visibility === 'conversation';
 
-        const sendOptions = mentions.isAtAll
-          ? undefined
-          : answersSharedItem
-            // THE METADATA ROUTES IT, SO NOTHING ELSE MAY. The channel flow reads `task.id` off the
-            // message and dispatches the turn itself (`resolveReferenceTarget`), so a mention on the
-            // same message is a SECOND entry for one message - measured live, the second found the
-            // turn busy, queued the message behind its own answer and posted a "folding that in"
-            // notice.
-            //
-            // AND IDEMPOTENCY DOES NOT CATCH IT, which is why this has to be right here rather than
-            // being left for the dedup to absorb. The two entries derive their correlation ids
-            // differently - the flow from the inbound `MessageId`, the Lex path from a hash of the
-            // message text and a time bucket - so one message produces two ids that never collide.
-            // The claim sees two turns, not a repeat of one, and denies nothing. Idempotency covers a
-            // retry of ONE entry; it cannot see two.
-            //
-            // This used to depend on `taskAnswer.taskRef`, because only an item with a reference had
-            // something in the text for the flow to route on. Every shared item has an id.
-            ? { taskId: taskAnswer.taskId }
-            : answersTask
-              ? { targetArn: taskAnswer.botArn!, taskId: taskAnswer.taskId }
-              : (mentions.targetArn || mentions.mentionBotArn || mentions.mentionedArns.length > 0)
-                // `mentionedArns` is what makes an `@` mention of a PERSON reach them (ADR-034).
-                // Without it the send carried the bot ARN alone, so naming a colleague produced no
-                // platform mention and no push - it was plain text starting with an `@`, and the
-                // promise that `@` notifies the member it names held only for assistants.
-                //
-                // NOT ON A PRIVATE MESSAGE. The `.` branch reports the targeted member in
-                // `mentionedArns` too, and a `Target` already routes that message - to an assistant's
-                // Lex through `TargetedMessages: ALL`, and to that person's client through delivery.
-                // Adding the attribute as well would give a targeted assistant a second way in, which
-                // is the duplicate-responder shape, and it would mention a member the sender never
-                // named in the text.
-                ? {
-                  targetArn: mentions.targetArn,
-                  mentionBotArn: mentions.mentionBotArn,
-                  ...(mentions.privateToArn ? {} : { mentionArns: mentions.mentionedArns }),
-                }
-                : undefined;
+      const sendOptions = mentions.isAtAll
+        ? undefined
+        : answersSharedItem
+          // THE METADATA ROUTES IT, SO NOTHING ELSE MAY. The channel flow reads `task.id` off the
+          // message and dispatches the turn itself (`resolveReferenceTarget`), so a mention on the
+          // same message is a SECOND entry for one message - measured live, the second found the
+          // turn busy, queued the message behind its own answer and posted a "folding that in"
+          // notice.
+          //
+          // AND IDEMPOTENCY DOES NOT CATCH IT, which is why this has to be right here rather than
+          // being left for the dedup to absorb. The two entries derive their correlation ids
+          // differently - the flow from the inbound `MessageId`, the Lex path from a hash of the
+          // message text and a time bucket - so one message produces two ids that never collide.
+          // The claim sees two turns, not a repeat of one, and denies nothing. Idempotency covers a
+          // retry of ONE entry; it cannot see two.
+          //
+          // This used to depend on `taskAnswer.taskRef`, because only an item with a reference had
+          // something in the text for the flow to route on. Every shared item has an id.
+          ? { taskId: taskAnswer.taskId }
+          : answersTask
+            ? { targetArn: taskAnswer.botArn!, taskId: taskAnswer.taskId }
+            : (mentions.targetArn || mentions.mentionBotArn || mentions.mentionedArns.length > 0)
+              // `mentionedArns` is what makes an `@` mention of a PERSON reach them (ADR-034).
+              // Without it the send carried the bot ARN alone, so naming a colleague produced no
+              // platform mention and no push - it was plain text starting with an `@`, and the
+              // promise that `@` notifies the member it names held only for assistants.
+              //
+              // NOT ON A PRIVATE MESSAGE. The `.` branch reports the targeted member in
+              // `mentionedArns` too, and a `Target` already routes that message - to an assistant's
+              // Lex through `TargetedMessages: ALL`, and to that person's client through delivery.
+              // Adding the attribute as well would give a targeted assistant a second way in, which
+              // is the duplicate-responder shape, and it would mention a member the sender never
+              // named in the text.
+              ? {
+                targetArn: mentions.targetArn,
+                mentionBotArn: mentions.mentionBotArn,
+                ...(mentions.privateToArn ? {} : { mentionArns: mentions.mentionedArns }),
+              }
+              : undefined;
 
-        // The command goes back on only for the SEND. Everything above - the mention parse, the
-        // task-answer decision, the sticky prefix - reasoned about the message itself, which is what
-        // those decisions are about; the renderer is the only thing that needs the instruction.
-        await sendMessage(wantsMarkdown ? `/md ${fallbackContent}` : fallbackContent, attachment, sendOptions);
+      // The command goes back on only for the SEND. Everything above - the mention parse, the
+      // task-answer decision, the sticky prefix - reasoned about the message itself, which is what
+      // those decisions are about; the renderer is the only thing that needs the instruction.
+      sends = [{ content: wantsMarkdown ? `/md ${fallbackContent}` : fallbackContent, options: sendOptions }];
 
-        // Update sticky target from what the user just sent so the next
-        // message carries the same mention forward.
+      // Update sticky target from what the user just sent so the next
+      // message carries the same mention forward.
+      afterSent = () => {
         if (mentions.isAtAll) {
           setStickyTarget(everyoneMember);
+        } else if (mentions.isAtHumans) {
+          setStickyTarget(humansMember);
         } else if (mentions.mentionedArns.length > 0 && !mentions.privateToArn) {
           // ADDRESSING IS STICKY; PRIVACY IS NOT (ADR-034).
           //
@@ -523,20 +705,63 @@ const MessageInput: React.FC = () => {
           const targeted = channelMembers.find((m) => m.userArn === mentions.mentionedArns[0]);
           if (targeted) setStickyTarget(targeted);
         }
-      }
+      };
+    }
 
-      // Track message send for latency measurement and analytics
+    // A FILE NEEDS THE NETWORK TO GO: offline, the message and its file stay in the field (and on this device) until the
+    // person sends them again. A message alone is queued and sent once the person is back online.
+    if (stagedFile && !isOnline()) {
+      setUploadError(t('conversation.offlineFileKept'));
+      return;
+    }
+
+    /** The person is still in the conversation the message was written in. */
+    const stillHere = () => openArnRef.current === writtenIn.conversationArn;
+    try {
+      let attachment;
+      if (stagedFile) {
+        setIsUploading(true);
+        attachment = await uploadFile(stagedFile, writtenIn.id, user.id);
+        setIsUploading(false);
+      }
+      // THE WORDS LEAVE THE DRAFT AS THEY ENTER THE OUTBOX, so a reload while the send is under way restores them once, as
+      // the message waiting to send, and never again as a draft to send a second time.
+      sendingForRef.current = sentFromKey;
+      if (personId && sentFromId) writeDraft(personId, sentFromId, { draft: EMPTY_DRAFT }, cacheSession());
+      let queued = false;
+      for (const send of sends) {
+        const outcome = await sendMessage(send.content, attachment, send.options, writtenIn);
+        if (outcome && outcome.queued) queued = true;
+      }
+      sendingForRef.current = undefined;
+
+      // Track message send for latency measurement and analytics. A queued message is measured when it is sent.
       try {
-        if (activeConversation.conversationArn) {
-          markMessageSent(activeConversation.conversationArn);
+        if (writtenIn.conversationArn && !queued) {
+          markMessageSent(writtenIn.conversationArn);
         }
         trackEvent('message_sent', {
           hasAttachment: !!attachment,
-          conversationId: activeConversation.id,
+          conversationId: writtenIn.id,
+          ...(queued ? { queued: true } : {}),
         });
       } catch {
         // Tracking must never break message sending
       }
+
+      if (!stillHere()) {
+        // Sent from a conversation the person has left meanwhile: that conversation's draft and staged file are let go,
+        // and the field, which now holds another conversation's draft, is untouched.
+        if (personId && sentFromId) {
+          writeDraft(personId, sentFromId, { draft: EMPTY_DRAFT }, cacheSession());
+          void forgetStagedFile(personId, sentFromId);
+        }
+        refreshOpenWorkItems();
+        return;
+      }
+      afterSent?.();
+      // The staged file, and a file the restored draft named but this device did not keep, are forgotten once sent.
+      stageFile(null);
 
       setInput('');
       clearAnswering?.();
@@ -547,13 +772,21 @@ const MessageInput: React.FC = () => {
       refreshOpenWorkItems();
     } catch (err) {
       setIsUploading(false);
-      setUploadError(err instanceof Error ? err.message : 'Failed to send');
+      // NOT SENT: the draft is the person's again, kept as it was.
+      if (sendingForRef.current === sentFromKey) {
+        sendingForRef.current = undefined;
+        if (personId && sentFromId) writeDraft(personId, sentFromId, { draft, ...(fileRecord ? { file: fileRecord } : {}) }, cacheSession());
+      }
+      if (stillHere()) setUploadError(err instanceof Error ? err.message : t('conversation.sendFailed'));
     }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (showMentionDropdown) {
-      const options = getMentionOptions();
+    // AN INPUT METHOD COMPOSING (Japanese, Chinese, Korean) OWNS ITS KEYS: the Enter that confirms a conversion neither
+    // sends the message nor picks a member. Safari reports the composition by key code 229.
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+    const options = showMentionDropdown ? getMentionOptions() : [];
+    if (options.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         setSelectedMentionIndex((prev) => (prev + 1) % options.length);
@@ -564,7 +797,7 @@ const MessageInput: React.FC = () => {
         setSelectedMentionIndex((prev) => (prev - 1 + options.length) % options.length);
         return;
       }
-      if ((e.key === 'Enter' || e.key === 'Tab') && options.length > 0) {
+      if (e.key === 'Enter' || e.key === 'Tab') {
         e.preventDefault();
         insertMention(options[selectedMentionIndex]);
         return;
@@ -584,7 +817,7 @@ const MessageInput: React.FC = () => {
 
   const handleFileSelect = (files: FileList | null) => {
     if (files && files.length > 0) {
-      setStagedFile(files[0]);
+      stageFile(files[0]);
       setUploadError(null);
     }
   };
@@ -611,6 +844,10 @@ const MessageInput: React.FC = () => {
   const isDisabled = !activeConversation || isSending || isUploading || isArchived;
   const displayError = mentionError || uploadError || sendError;
   const mentionOptions = showMentionDropdown ? getMentionOptions() : [];
+  // The picker is open while something matches; the textarea names it as its listbox and the option
+  // the keys move through, so a screen reader follows the choice without focus leaving the text.
+  const pickerOpen = mentionOptions.length > 0;
+  const activeOptionId = pickerOpen ? `${mentionListId}-option-${selectedMentionIndex}` : undefined;
 
   return (
     <div className="message-input-container">
@@ -622,9 +859,44 @@ const MessageInput: React.FC = () => {
       {stagedFile && (
         <FileUploadPreview
           file={stagedFile}
-          onRemove={() => setStagedFile(null)}
+          onRemove={() => stageFile(null)}
           isUploading={isUploading}
         />
+      )}
+      {/* A FILE THAT WAS STAGED BUT NOT KEPT on this device (too large, or a browser that keeps none): its name stays, so
+          the person knows to attach it again before sending, or to send without it. */}
+      {missingFile && !stagedFile && (
+        <div className="message-input-attachment-notice message-input-reattach" role="status">
+          <span>{t('conversation.fileNotKept', { name: missingFile.name })}</span>
+          <button type="button" className="message-input-inline-action" onClick={() => fileInputRef.current?.click()}>
+            {t('conversation.reattachFile', { name: missingFile.name })}
+          </button>
+          <button type="button" className="message-input-inline-action" onClick={() => stageFile(null)}>
+            {t('conversation.sendWithoutFile')}
+          </button>
+        </div>
+      )}
+      {/* MESSAGES WAITING TO SEND from this device: sent once, in order, when the person is back online. One the service
+          refused says why and waits for the person to retry or discard it. */}
+      {queuedMessages.length > 0 && (
+        <ul className="message-input-queued" aria-label={t('conversation.queuedListLabel')}>
+          {queuedMessages.map((q) => (
+            <li key={q.id} className={`message-input-queued-item${q.failed ? ' message-input-queued-item--failed' : ''}`} role="status">
+              <span className="message-input-queued-text">{readableAddressText(q.content, memberNameResolver(channelMembers))}</span>
+              <span className="message-input-queued-state">
+                {q.failed ? t('conversation.queuedNotSent', { reason: q.failed }) : t(isOnline() ? 'conversation.queuedRetrying' : 'conversation.queuedOffline')}
+              </span>
+              {q.failed && (
+                <button type="button" className="message-input-inline-action" onClick={() => retryQueuedMessage?.(q.id)}>
+                  {t('conversation.queuedRetry')}
+                </button>
+              )}
+              <button type="button" className="message-input-inline-action" onClick={() => discardQueuedMessage?.(q.id)}>
+                {t('conversation.queuedDiscard')}
+              </button>
+            </li>
+          ))}
+        </ul>
       )}
       {/* SAID BEFORE THE SEND, not after it. This is the whole fix: the turn will answer from the
           caption alone and read nothing, and previously the only signal of that was a reply that
@@ -685,7 +957,7 @@ const MessageInput: React.FC = () => {
           <button
             type="button"
             className="message-input-sticky-target-clear"
-            onClick={() => setInput(stripPrivatePrefixFrom(input))}
+            onClick={() => setDraft(draftFromEncoded(stripPrivatePrefixFrom(encoded)))}
             aria-label={t('conversation.clearPrivate')}
             title={t('conversation.clearPrivate')}
           >
@@ -699,7 +971,7 @@ const MessageInput: React.FC = () => {
         <div className="message-input-sticky-target" role="status">
           <span className="message-input-sticky-target-label">{t('conversation.answering')}</span>
           <span className="message-input-sticky-target-chip message-input-sticky-target-chip--bot">
-            {taskAnswer.taskRef ? `#${taskAnswer.taskRef}: ` : ''}{taskAnswer.title}
+            {taskAnswer.taskRef ? `#${taskAnswer.taskRef}: ` : ''}{readableAddressText(taskAnswer.title, memberNameResolver(channelMembers))}
           </span>
           {taskAnswer.botArn && (
             <span className="message-input-sticky-target-hint">
@@ -752,7 +1024,11 @@ const MessageInput: React.FC = () => {
           type="file"
           ref={fileInputRef}
           className="file-input-hidden"
-          onChange={(e) => handleFileSelect(e.target.files)}
+          onChange={(e) => {
+            handleFileSelect(e.target.files);
+            // Emptied after each pick, so choosing the same file again (to attach it again) is a change the field hears.
+            e.target.value = '';
+          }}
           tabIndex={-1}
         />
         <button
@@ -768,37 +1044,56 @@ const MessageInput: React.FC = () => {
           </svg>
         </button>
         <div className="message-input-wrapper">
-          {showMentionDropdown && mentionOptions.length > 0 && (
+          {pickerOpen && (
             <div className={`mention-dropdown${mentionTrigger === '.' ? ' mention-dropdown--private' : ''}`}>
               {/* WHICH ACT THIS LIST IS COMPLETING, said in words before the names. The two grammars
                   differ in who can READ the message, which is the consequence a person cannot undo -
                   so the list that applies privacy must not look like the list that does not. */}
               {mentionTrigger === '.' && (
-                <div className="mention-dropdown-heading">
+                <div className="mention-dropdown-heading" aria-hidden="true">
                   {t('conversation.privateTo', { defaultValue: 'Send privately to' })}
                 </div>
               )}
-              {mentionOptions.map((member, index) => (
-                <button
-                  key={member.userArn}
-                  type="button"
-                  className={`mention-option ${index === selectedMentionIndex ? 'mention-option--active' : ''}`}
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    insertMention(member);
-                  }}
-                  onMouseEnter={() => setSelectedMentionIndex(index)}
-                >
-                  <span className="mention-option-name">{member.isAll ? '@' : mentionTrigger}{member.name}</span>
-                  {member.isBot && <span className="mention-option-badge">BOT</span>}
-                  {'isAll' in member && member.isAll && <span className="mention-option-badge mention-option-badge--all">ALL</span>}
-                </button>
-              ))}
+              <div
+                id={mentionListId}
+                role="listbox"
+                aria-label={mentionTrigger === '.'
+                  ? t('conversation.privateTo', { defaultValue: 'Send privately to' })
+                  : t('conversation.mentionListLabel')}
+              >
+                {mentionOptions.map((member, index) => (
+                  <div
+                    key={member.userArn}
+                    id={`${mentionListId}-option-${index}`}
+                    role="option"
+                    aria-selected={index === selectedMentionIndex}
+                    className={`mention-option ${index === selectedMentionIndex ? 'mention-option--active' : ''}`}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      insertMention(member);
+                    }}
+                    onMouseEnter={() => setSelectedMentionIndex(index)}
+                  >
+                    <span className="mention-option-name">{member.isAll ? '@' : mentionTrigger}{member.name}</span>
+                    {member.isBot && <span className="mention-option-badge">{t('conversation.mentionBadgeAssistant')}</span>}
+                    {'isAll' in member && member.isAll && (
+                      <span className="mention-option-badge mention-option-badge--all">
+                        {member.userArn === 'HUMANS' ? t('conversation.mentionBadgePeople') : t('conversation.mentionBadgeAll')}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
             </div>
           )}
           <textarea
             ref={textareaRef}
             className="message-textarea"
+            aria-autocomplete="list"
+            aria-haspopup="listbox"
+            aria-expanded={pickerOpen}
+            aria-controls={pickerOpen ? mentionListId : undefined}
+            aria-activedescendant={activeOptionId}
             placeholder={
               !activeConversation
                 ? 'Select a conversation to start messaging'
@@ -817,7 +1112,9 @@ const MessageInput: React.FC = () => {
                     // is seen by the customer.
                     : classificationAudience(activeConversation.modelTier) === 'outside'
                       ? t('conversation.placeholderOutside')
-                      : isMultiUser && assistantHere
+                      : inMeetingWindow
+                        ? t('conversation.placeholderMeeting')
+                        : isMultiUser && assistantHere
                         ? t('conversation.placeholderMultiUser')
                         : t('conversation.placeholder')
             }

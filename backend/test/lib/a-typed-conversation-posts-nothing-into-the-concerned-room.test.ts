@@ -12,6 +12,12 @@ const mockSsmSend = jest.fn();
 const mockCreate = jest.fn();
 const mockLambdaSend = jest.fn();
 
+// THE CONCERNED ROOM'S ROW, as the nesting rule reads it (`openIsNestedBy`): a top-level room, which may open a child.
+jest.mock('../../lambda/src/lib/channel-context-client', () => ({
+  ...jest.requireActual('../../lambda/src/lib/channel-context-client'),
+  readChannelContext: async (arn: string) => mockRows[arn] ?? null,
+}));
+const mockRows: Record<string, unknown> = {};
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn(() => ({ send: mockMessagingSend })),
   SendChannelMessageCommand: jest.fn().mockImplementation((input) => ({ __type: 'SendMessage', input })),
@@ -65,6 +71,7 @@ let concernedClassification = 'premium';
 beforeEach(() => {
   jest.clearAllMocks();
   concernedClassification = 'premium';
+  for (const k of Object.keys(mockRows)) delete mockRows[k];
   mockSsmSend.mockResolvedValue({ Parameter: { Value: `${APP_INSTANCE}/channel-flow/flow` } });
   mockMessagingSend.mockImplementation(async (cmd: any) => {
     if (cmd.__type === 'ListTags') return { Tags: [{ Key: 'classification', Value: concernedClassification }] };
@@ -107,5 +114,23 @@ describe('an event-opened conversation and the room the event concerned', () => 
     expect(result.error).toMatch(/classified "standard"/);
     expect(mockCreate).not.toHaveBeenCalled();
     expect(mockLambdaSend).not.toHaveBeenCalled();
+  });
+});
+
+describe('DENY: nesting stops one leaf below a child, whichever way the open was asked (DESIGN-PROCESSES O32)', () => {
+  it('a leaf opens nothing, a child opens no non-leaf, and nothing is created', async () => {
+    mockRows[CONCERNED] = { conversationType: 'customer-messaging', parentRef: '?conversation=conv-ops-1' };
+    const fromLeaf = await handler(event);
+    expect(fromLeaf.ok).toBe(false);
+    expect(fromLeaf.error).toMatch(/would nest past one leaf below a child/);
+    mockRows[CONCERNED] = { conversationType: 'ops', parentRef: '?conversation=team-ops-team-premium' };
+    expect((await handler(event)).ok).toBe(false);
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it('a top-level room opens a child', async () => {
+    mockRows[CONCERNED] = { conversationType: 'ops-team' };
+    expect((await handler(event)).ok).toBe(true);
+    expect(mockCreate).toHaveBeenCalledTimes(1);
   });
 });

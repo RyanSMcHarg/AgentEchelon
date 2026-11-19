@@ -26,7 +26,7 @@ test('Assistants → Profiles LOADS the profile list from the live manage-profil
   await page.goto('/?admin=profiles');
 
   // The Assistants section renders the Profiles tab.
-  await expect(page.locator('h3:has-text("Assistants")')).toBeVisible({ timeout: 20000 });
+  await expect(page.locator('h2:has-text("Assistants")')).toBeVisible({ timeout: 20000 });
 
   // Wait for the async load to settle.
   await expect(page.locator('.admin-tab-loading')).toHaveCount(0, { timeout: 20000 });
@@ -78,7 +78,7 @@ test('Assistants → Profiles RENAMES an assistant and applies it to the identit
 
   await signInAsAdmin(page);
   await page.goto('/?admin=profiles');
-  await expect(page.locator('h3:has-text("Assistants")')).toBeVisible({ timeout: 20000 });
+  await expect(page.locator('h2:has-text("Assistants")')).toBeVisible({ timeout: 20000 });
   await expect(page.locator('.admin-tab-loading')).toHaveCount(0, { timeout: 20000 });
 
   // Open the assistant this deployment declares for `standard`.
@@ -116,7 +116,7 @@ test('Assistants → Profiles RENAMES an assistant and applies it to the identit
   await nameField.fill(RENAMED);
   await page.getByRole('button', { name: /Save draft edits/i }).click();
   await page.getByRole('button', { name: /^Validate$/i }).click();
-  await expect(page.getByText(/Draft is valid/i)).toBeVisible({ timeout: 30000 });
+  await expect(page.getByText(/Passes Validate/)).toBeVisible({ timeout: 30000 });
 
   await page.getByRole('button', { name: /Activate draft/i }).click();
 
@@ -149,7 +149,7 @@ test('Assistants → Profiles RENAMES an assistant and applies it to the identit
   await restoreField.fill(originalName);
   await page.getByRole('button', { name: /Save draft edits/i }).click();
   await page.getByRole('button', { name: /^Validate$/i }).click();
-  await expect(page.getByText(/Draft is valid/i)).toBeVisible({ timeout: 30000 });
+  await expect(page.getByText(/Passes Validate/)).toBeVisible({ timeout: 30000 });
   await page.getByRole('button', { name: /Activate draft/i }).click();
   // Wait for the restore's activation to consume its draft (Edit is offered again) and the page to be back on the
   // active version. Until then the page may still be on the draft, whose sections hold no name row, and a check of
@@ -188,7 +188,7 @@ test('Assistants → Profiles DISCARDS a draft without activating it', async ({ 
 
   await signInAsAdmin(page);
   await page.goto('/?admin=profiles');
-  await expect(page.locator('h3:has-text("Assistants")')).toBeVisible({ timeout: 20000 });
+  await expect(page.locator('h2:has-text("Assistants")')).toBeVisible({ timeout: 20000 });
   await expect(page.locator('.admin-tab-loading')).toHaveCount(0, { timeout: 20000 });
   await page.locator('.admin-content table').first().locator('tbody tr', { hasText: profile }).first().click();
   await expect(page.locator('.admin-breadcrumb')).toBeVisible({ timeout: 10000 });

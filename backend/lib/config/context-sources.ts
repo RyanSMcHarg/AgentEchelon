@@ -12,7 +12,7 @@
  * A deployer therefore never edits a tracked file, so `git pull` cannot conflict with their
  * customization - the same posture as `deploy.config.json` and `.githooks/privacy-denylist`.
  *
- * The demo's own sources live under `backend/demo/`, never here; `demo-config-boundary.test.ts`
+ * The demo's own sources live under `demo/`, never here; `demo-config-boundary.test.ts`
  * enforces that core cannot import them.
  *
  * SECURITY: this file defines SHAPE only. Two invariants live in the stack that consumes it, because
@@ -322,11 +322,11 @@ export function publishableContextSource(entry: ContextSourceEntry): Omit<Contex
 export interface CatalogDeploymentContext {
   /** The classification this catalog is for - the isolation boundary the entries must respect. */
   classification: string;
-  /** Bucket holding `context/{classification}/*`, as an ARN - for the IAM grant. */
-  attachmentsBucketArn: string;
+  /** The company bucket, holding `context/{classification}/*`, as an ARN - for the IAM grant. */
+  companyBucketArn: string;
   /** The same bucket by NAME, for the reader. The ARN is usually a CloudFormation token (an imported
    *  value), so it cannot be sliced at synth time to recover a name. */
-  attachmentsBucketName: string;
+  companyBucketName: string;
   /** The built-in per-user profile store, as an ARN - for the IAM grant. */
   userProfileTableArn: string;
   /** The same table by NAME, for the reader - the ARN is a token, for the same reason as the bucket. */

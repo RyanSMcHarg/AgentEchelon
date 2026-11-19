@@ -16,7 +16,7 @@ describe('the shipped configuration', () => {
   it('has no contradiction: ops is a membership group that requires premium', () => {
     expect(typeGroupContradictions(defaultProfileRegistry)).toEqual([]);
     expect(() => assertTypeGroupsRequireTheirClassifications(defaultProfileRegistry)).not.toThrow();
-    expect(defaultProfileRegistry.membershipGroups()).toEqual({ ops: 'premium' });
+    expect(defaultProfileRegistry.membershipGroups()).toEqual({ ops: 'premium', 'ops-on-call': 'premium', 'ops-secondary': 'premium', 'account-management': 'premium', 'account-team-lead': 'premium' });
   });
 
   it('gives ops no clearance: it is not a clearance group, and holding it reaches nothing', () => {

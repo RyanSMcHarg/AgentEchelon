@@ -45,7 +45,7 @@ const PREMIUM = {
   classification: 'premium',
   models: { text: ['sonnet'], image: [], default: 'sonnet' },
   guardrails: [], contextSources: [], templates: [], workflows: [], packIntents: [],
-  topology: { processorTimeout: 120, memorySize: 1024 }, retrievalReach: [], contextBucket: 'ae-attachments', roles: {},
+  topology: { processorTimeout: 120, memorySize: 1024 }, retrievalReach: [], contextBucket: 'ae-company', roles: {},
   budgets: { userHourly: 750, globalHourly: 1500 },
 } as unknown as svc.ClassificationCatalog;
 
@@ -69,7 +69,7 @@ beforeEach(() => {
     classifications: { premium: PREMIUM }, fieldDecisions: DECISIONS,
   });
   vi.mocked(svc.exportProfile).mockImplementation(async (_name, version) =>
-    ({ body: version === 'draft' ? draftBody : ACTIVE }) as unknown as svc.ProfileManifest);
+    ({ body: version === 'draft' ? draftBody : ACTIVE, provenance: { exportedConfigId: version === 'draft' ? 'draft-1' : 'cfg-3' } }) as unknown as svc.ProfileManifest);
   vi.mocked(svc.editProfileDraft).mockResolvedValue({ profileName: 'advisor', draftConfigId: 'draft-2' });
   vi.mocked(listOwnership).mockResolvedValue({ assistants: [], teams: ['finance'] });
 });
@@ -88,12 +88,12 @@ async function openDraft(capabilities = ['view-profiles', 'edit-profiles', 'acti
 }
 
 describe('the tested instruction', () => {
-  it('is labeled as what an experiment tests, and says general answer style belongs in the persona', async () => {
+  it('is labeled as what an experiment tests, and says to move it into the persona to keep it', async () => {
     await open(['view-profiles']);
     const row = screen.getByTestId('field-systemPromptAddendum');
     expect(screen.getByText('Tested instruction (from an experiment)')).toBeInTheDocument();
-    expect(row.textContent).toContain('A short instruction an experiment is testing on top of the persona');
-    expect(row.textContent).toContain("How the assistant answers in general belongs in the persona's How to answer section");
+    expect(row.textContent).toContain('An instruction an experiment is testing');
+    expect(row.textContent).toContain('Move it into the persona to keep it.');
     expect(row.textContent).toContain('Keep every reply under 80 words');
     expect(row.textContent).not.toContain('three bullet points');
   });
@@ -107,7 +107,7 @@ describe('Move into the persona', () => {
     expect(vi.mocked(svc.editProfileDraft).mock.calls[0]).toEqual(['advisor', {
       persona: `${WITH_SECTION}\n- ${INSTRUCTION}`,
       systemPromptAddendum: null,
-    }]);
+    }, 'draft-1']);
   });
 
   it('adds a How to answer section at the end of a persona that has none', async () => {
@@ -127,7 +127,7 @@ describe('Move into the persona', () => {
     fireEvent.click(screen.getByTestId('move-into-persona-button'));
     const refused = await screen.findByTestId('move-into-persona-refused');
     expect(refused).toHaveAttribute('role', 'alert');
-    expect(refused.textContent).toMatch(/over the limit of 20,000/);
+    expect(refused.textContent).toMatch(/\(limit 20,000\)/);
     expect(svc.editProfileDraft).not.toHaveBeenCalled();
   });
 
@@ -135,7 +135,7 @@ describe('Move into the persona', () => {
     draftBody = { modelKey: 'sonnet', systemPromptAddendum: INSTRUCTION };
     await openDraft();
     fireEvent.click(screen.getByTestId('move-into-persona-button'));
-    expect((await screen.findByTestId('move-into-persona-refused')).textContent).toContain('no persona of its own');
+    expect((await screen.findByTestId('move-into-persona-refused')).textContent).toContain("This version uses the classification's.");
     expect(svc.editProfileDraft).not.toHaveBeenCalled();
   });
 

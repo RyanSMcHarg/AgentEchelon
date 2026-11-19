@@ -10,8 +10,8 @@
  * citations, and it is why this file exists rather than a one-off cleanup commit.
  *
  * WHAT THE 2026-08-16 SWEEP FOUND WHEN THIS WAS WRITTEN, and it is the reason the guard covers
- * `tests/` and not just `backend/` + `frontend/`: an earlier session repointed six renamed documents
- * and reported them fixed. Every one of those renames had SURVIVING references in `tests/` -
+ * `tests/` and not just `backend/` + `frontend/`: six renamed documents had been repointed and
+ * reported fixed. Every one of those renames had SURVIVING references in `tests/` -
  * `SPEC-SEPARATE-ADMIN-APP` in eight e2e specs, `SPEC-CONTEXT-SOURCE-CATALOG` in two,
  * `SPEC-PORTABLE-VERSIONED-PROFILES` in one. The fix's scope was set by where someone happened to
  * look, which is exactly the failure a fix must guard against: its scope is every instance of the

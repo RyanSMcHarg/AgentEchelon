@@ -92,12 +92,12 @@ export const RETIRED_CONTEXT_KEYS: Readonly<Record<string, string>> = {
   federatedUserPoolId:
     'federatedUserPoolId is retired. A second identity provider is an entry in the trusted-issuer registry, '
     + '"issuers" in deploy.config.json (lib/config/issuers.ts): a host app\'s Cognito pool is '
-    + '{ "kind": "cognito-pool", "pool": "<pool id>", "clearance": { "oneChannel": "<classification>", "classifications": '
-    + '["<classification>"] } }, served by the same exchange and conversation routes as everyone else. '
+    + '{ "kind": "cognito-pool", "pool": "<pool id>", "clearance": { "fixed": ["<classification>"], "classifications": '
+    + '["<classification>"] } }, served by the same exchange as everyone else. '
     + 'Remove federatedUserPoolId from your context.',
   assistantTier:
     'assistantTier is retired. The classification a host\'s context conversations are created at is the one '
-    + 'its issuer declares, clearance.oneChannel on that issuer\'s entry in "issuers" in deploy.config.json. '
+    + 'its issuer declares, contextClassification on that issuer\'s entry in "issuers" in deploy.config.json. '
     + 'Remove assistantTier from your context.',
   notifyUserPoolId:
     'notifyUserPoolId is retired. The email bridge resolves recipients in this deployment\'s own pool and the '

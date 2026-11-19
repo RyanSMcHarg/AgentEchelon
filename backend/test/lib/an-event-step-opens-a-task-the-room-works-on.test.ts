@@ -4,8 +4,9 @@
  * What it proves:
  *  - `incident_first_look` is a platform machine whose first step awaits nobody, because a task an event opens has no
  *    requester, and every machine an event may open is declared and valid;
- *  - an agent step may name one of those machines only, only where its reader is the room, and never in a step narrowed
- *    to declared values; the ops room's first look names it;
+ *  - the shipped first look opens that machine as a task step the ops assistant holds; a stored agent-step first look
+ *    names it (`AGENT_STEP_OPS_ROOM`), which the runtime runs, while `agent.workflow` is retired and refused on a draft,
+ *    and its current form is the task step that validates;
  *  - the runtime opens the task before the turn, once per step of a run, owned by the assistant and visible to the room,
  *    and hands the turn the first step's instructions and its one transition; a task that cannot be opened leaves the
  *    turn to run as a plain agent step;
@@ -16,11 +17,13 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { EVENT_TASK_MACHINES, PLATFORM_EVENT_WORKFLOWS, eventWorkflowErrors, type EventWorkflow } from '../../lambda/src/lib/event-workflow';
+import { EVENT_TASK_MACHINES, SHIPPED_EVENT_WORKFLOWS, eventWorkflowErrors, type EventWorkflow } from '../../lambda/src/lib/event-workflow';
 import { DEFAULT_TASK_STATE_MACHINES, validateTaskStateMachine } from '../../lambda/src/lib/task-state-machines';
 import { eventTaskId, openEventTask } from '../../lambda/src/lib/event-task';
 import { welcomeWorkflowErrors } from '../../lambda/src/lib/profile-lifecycle';
 import { validateIntentPackBody } from '../../lambda/src/lib/intent-pack';
+import { workflowInCurrentForm } from '../../lambda/src/lib/retired-fields';
+import { AGENT_STEP_OPS_ROOM } from '../helpers/agent-step-ops-room';
 
 const SRC = path.join(__dirname, '..', '..', 'lambda', 'src');
 const read = (f: string) => fs.readFileSync(path.join(SRC, f), 'utf8');
@@ -29,7 +32,11 @@ const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
 const APP = 'arn:aws:chime:us-east-1:111122223333:app-instance/ai';
 const CHANNEL = `${APP}/channel/ch-1`;
 const BOT = `${APP}/bot/ops-bot`;
-const OPS = PLATFORM_EVENT_WORKFLOWS['ops-room'];
+const OPS = SHIPPED_EVENT_WORKFLOWS['ops-room'];
+/** The stored shape whose agent step opens the task (`workflow:`), which the runtime runs and a draft may not declare. */
+const AGENT_OPS = AGENT_STEP_OPS_ROOM;
+const retired = (name: string, step: string) =>
+  `eventWorkflows.${name}.states.${step}.agent.workflow is retired: open the task with a task step (task: { machine, by, continue: opened })`;
 
 describe('the machines an event may open', () => {
   it('each is a declared, valid platform machine whose first step awaits nobody', () => {
@@ -46,29 +53,42 @@ describe('the machines an event may open', () => {
   it('the first look reads the deployment\'s health, then rests on its findings as the room\'s work', () => {
     const m = DEFAULT_TASK_STATE_MACHINES.incident_first_look;
     expect(m.initial).toBe('reading_health');
-    expect(m.states.reading_health).toMatchObject({ transitions: ['findings_shared'], tools: ['read_deployment_health'] });
+    expect(m.states.reading_health).toMatchObject({ transitions: ['findings_shared'], tools: ['read_deployment_health', 'publish_dashboard'], auto: 'findings_shared' });
     expect(m.states.findings_shared.transitions.sort()).toEqual(['reading_health', 'resolved']);
     expect(m.states.resolved.terminal).toBe('success');
   });
 });
 
-describe('an agent step names the task it opens', () => {
-  it('the ops room\'s first look opens incident_first_look, and validates', () => {
-    expect(OPS.states['first-look'].agent!.workflow).toBe('incident_first_look');
+describe('the shipped first look is a task step that opens it', () => {
+  it('the ops room\'s first look asks the ops assistant for incident_first_look, and validates', () => {
+    expect(OPS.states['first-look'].agent).toBeUndefined();
+    expect(OPS.states['first-look'].task).toEqual({ machine: 'incident_first_look', by: { assistantRole: 'ops' }, continue: 'opened' });
     expect(eventWorkflowErrors('ops-room', OPS)).toEqual([]);
   });
+});
 
-  it('only a machine an event may open, only for the room, and never in a narrowed step', () => {
-    const other: EventWorkflow = clone(OPS);
+describe('an agent step that names the task it opens is retired on a draft', () => {
+  it('a stored agent-step first look names incident_first_look, a draft is refused it, and its current form is the task step that validates', () => {
+    expect(AGENT_OPS.states['first-look'].agent!.workflow).toBe('incident_first_look');
+    expect(eventWorkflowErrors('ops-room', AGENT_OPS)).toEqual(expect.arrayContaining([retired('ops-room', 'first-look')]));
+    const current = workflowInCurrentForm(AGENT_OPS).workflow;
+    expect(current.states['first-look'].agent).toBeUndefined();
+    // A REQUEST TO THE OPS ASSISTANT: who sees the work is the owner's to declare (WT118).
+    expect(current.states['first-look'].task).toEqual({ machine: 'incident_first_look', by: { assistantRole: 'ops' }, continue: 'opened' });
+    expect(eventWorkflowErrors('ops-room', current)).toEqual([]);
+  });
+
+  it('refuses agent.workflow on a draft whatever machine it names and wherever the step posts', () => {
+    const other: EventWorkflow = clone(AGENT_OPS);
     other.states['first-look'].agent!.workflow = 'guided_troubleshooting';
-    expect(eventWorkflowErrors('o', other).join()).toMatch(/workflow names a task machine an event may open: incident_first_look/);
-    const private_: EventWorkflow = clone(OPS);
+    expect(eventWorkflowErrors('o', other)).toContain(retired('o', 'first-look'));
+    const private_: EventWorkflow = clone(AGENT_OPS);
     private_.states['first-look'].agent!.to = { participantRole: 'lead' };
     private_.states['first-look'].agent!.fallback.send.to = { participantRole: 'lead' };
-    expect(eventWorkflowErrors('p', private_).join()).toMatch(/opens a task the room works on, so the step posts to the room/);
-    const chase = clone(PLATFORM_EVENT_WORKFLOWS['chase-unredeemed']);
+    expect(eventWorkflowErrors('p', private_)).toContain(retired('p', 'first-look'));
+    const chase = clone(SHIPPED_EVENT_WORKFLOWS['chase-unredeemed']);
     chase.states['draft-nudge'].agent!.workflow = 'incident_first_look';
-    expect(eventWorkflowErrors('c', chase).join()).toMatch(/workflow opens a task in the room, and a step whose draft reaches a person outside it/);
+    expect(eventWorkflowErrors('c', chase)).toContain(retired('c', 'draft-nudge'));
   });
 
   it('a version that selects its task workflows offers the one its event step opens', () => {
@@ -76,6 +96,10 @@ describe('an agent step names the task it opens', () => {
     expect(welcomeWorkflowErrors({ ...body, workflows: ['guided_troubleshooting'] } as never).join()).toMatch(/opens a incident_first_look task, which this version's workflows do not include/);
     expect(welcomeWorkflowErrors({ ...body, workflows: ['incident_first_look'] } as never).join()).not.toMatch(/incident_first_look task/);
     expect(welcomeWorkflowErrors(body as never).join()).not.toMatch(/incident_first_look task/);
+    // The stored agent step that opens it is held to the same selection.
+    const stored = { modelKey: 'x', eventWorkflows: { mine: clone(AGENT_OPS) } };
+    expect(welcomeWorkflowErrors({ ...stored, workflows: ['guided_troubleshooting'] } as never).join()).toMatch(/opens a incident_first_look task, which this version's workflows do not include/);
+    expect(welcomeWorkflowErrors({ ...stored, workflows: ['incident_first_look'] } as never).join()).not.toMatch(/incident_first_look task/);
   });
 });
 

@@ -237,7 +237,7 @@ test.describe.serial('Classification context - Premium (full access)', () => {
 
   // THE INVITE-TIME HALF OF THE BOUNDARY (SPEC-CONVERSATION-SECURITY §4b). The context tests above
   // prove a member not cleared for the classification cannot READ; this proves they are refused at the DOOR - the share
-  // Lambda answers 403 TIER_FORBIDDEN rather than admitting a member Layer 1 would render inert.
+  // Lambda answers 403 RECIPIENT_NOT_ADDABLE rather than admitting a member Layer 1 would render inert.
   //
   // This assertion existed only BY ACCIDENT until 2026-08-18: task-answer.spec.ts shared a premium
   // conversation with the standard user in its SETUP, so every live run exercised the refusal - as an
@@ -260,11 +260,12 @@ test.describe.serial('Classification context - Premium (full access)', () => {
     await page.locator('#share-email').fill(standard.email);
     await page.locator('form:has(#share-email) button[type="submit"]').click();
 
-    // The refusal must be EXPLAINED to the person, naming both levels - a silent no-op teaches the
-    // sharer the button is broken, and a success would be the security failure this test exists for.
+    // The refusal must be EXPLAINED to the person - a silent no-op teaches the sharer the button is broken,
+    // and a success would be the security failure this test exists for. It names nothing about the
+    // recipient's clearance: the share answers an uncleared person exactly as it answers nobody at all.
     const refusal = page.locator('.modal-content .alert-error, .modal-content .alert-warning');
     await expect(refusal, 'the share modal explains the refusal').toContainText(
-      /does not include the premium tier this conversation requires/i,
+      /cannot be added to this conversation/i,
       { timeout: 30000 },
     );
     await expect(page.locator('.modal-content .alert-success')).toHaveCount(0);

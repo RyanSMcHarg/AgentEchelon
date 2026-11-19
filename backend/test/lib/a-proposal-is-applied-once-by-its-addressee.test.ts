@@ -11,7 +11,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { APIGatewayProxyEvent } from 'aws-lambda';
-import { PROPOSAL_OPS, agentStepIsNarrowed, eventWorkflowErrors, proposalOf, PLATFORM_EVENT_WORKFLOWS, type EventWorkflow } from '../../lambda/src/lib/event-workflow';
+import { PROPOSAL_OPS, agentStepIsNarrowed, eventWorkflowErrors, proposalOf, SHIPPED_EVENT_WORKFLOWS, type EventWorkflow } from '../../lambda/src/lib/event-workflow';
 import { PROPOSAL_TTL_SECONDS, proposalDraft, proposalDraftRefusal, proposalRecordOf, proposalRefusal } from '../../lambda/src/lib/proposals';
 import { TOKEN_KINDS, tokenKey } from '../../lambda/src/lib/tokens';
 import { NOTICE_KINDS, MUTABLE_KINDS } from '../../lambda/src/lib/notice-preferences';
@@ -24,6 +24,15 @@ import { NOT_BUILT_ROLE_SOURCES, participantRoleDeclarationErrors } from '../../
 import { CONVERSATION_TYPES } from '../../lib/config/conversation-types';
 import { runAgentStep } from '../../lambda/src/lib/event-agent-step';
 import { edgeContext } from '../helpers/edge-context';
+// The ops room with its first look as an agent step, the step a proposal is declared on.
+import { AGENT_STEP_OPS_ROOM } from '../helpers/agent-step-ops-room';
+
+// The deciders are cleared for the standard conversations here (`lib/conversation-access.ts`); an uncleared caller's
+// refusal is proven in `lib/a-person-route-reaches-only-a-conversation-its-caller-reaches.test.ts`.
+jest.mock('../../lambda/src/lib/auth', () => ({
+  ...jest.requireActual('../../lambda/src/lib/auth'),
+  callerHolderToken: () => 'standard',
+}));
 
 const SRC = path.join(__dirname, '..', '..', 'lambda', 'src');
 const read = (f: string) => fs.readFileSync(path.join(SRC, f), 'utf8');
@@ -36,11 +45,11 @@ const SAM = 'sam';
 const RILEY_ARN = `${APP}/user/${RILEY}`;
 const NOW = 1_800_000_000;
 const ID = '0b7f2a52-0000-4000-8000-000000000001';
-const CHASE = PLATFORM_EVENT_WORKFLOWS['chase-unredeemed'];
+const CHASE = SHIPPED_EVENT_WORKFLOWS['chase-unredeemed'];
 
 describe('an agent step that proposes (decision 8, rules 5 to 8)', () => {
   it('proposes one registered op, at an event that op is proposed at, to the one person who confirms it', () => {
-    expect(Object.keys(PROPOSAL_OPS)).toEqual(['send_nudge', 'open_conversation']);
+    expect(Object.keys(PROPOSAL_OPS)).toEqual(['send_nudge', 'open_conversation', 'add_to_meeting']);
     expect(proposalOf(CHASE.states['draft-nudge'].agent)).toBe('send_nudge');
     const wf = clone(CHASE) as any;
     wf.states['draft-nudge'].agent.propose = ['send_nudge', 'open_conversation'];
@@ -58,9 +67,9 @@ describe('an agent step that proposes (decision 8, rules 5 to 8)', () => {
   });
 
   it('a proposal to a participant role names a one-holder role every declared type declares', () => {
-    const ops: EventWorkflow = clone(PLATFORM_EVENT_WORKFLOWS['ops-room']);
+    const ops: EventWorkflow = clone(AGENT_STEP_OPS_ROOM);
     (ops.states['first-look'].agent as any) = {
-      prompt: 'ops-first-look', to: { participantRole: 'lead' }, deadlineMs: 20_000, propose: ['open_conversation'], opens: 'ops',
+      prompt: 'ops-first-look', to: { participantRole: 'lead' }, deadlineMs: 20_000, propose: ['open_conversation'], opens: 'customer-messaging',
       fallback: { send: { to: { participantRole: 'lead' }, template: 'ops-first-look-unavailable' } },
     };
     expect(eventWorkflowErrors('x', ops)).toEqual([]);
@@ -69,7 +78,7 @@ describe('an agent step that proposes (decision 8, rules 5 to 8)', () => {
   });
 
   it('open_conversation names a declared type the platform does not open on its own, and opens is for it alone', () => {
-    const ops: any = clone(PLATFORM_EVENT_WORKFLOWS['ops-room']);
+    const ops: any = clone(AGENT_STEP_OPS_ROOM);
     ops.states['first-look'].agent = { ...ops.states['first-look'].agent, to: { participantRole: 'lead' }, propose: ['open_conversation'], opens: 'nope', fallback: { send: { to: 'room', template: 'ops-first-look-unavailable' } } };
     expect(eventWorkflowErrors('x', ops).join()).toMatch(/opens names the declared conversation type/);
     ops.states['first-look'].agent.opens = 'ops-team';
@@ -161,9 +170,10 @@ function world(opts: { record: Record<string, unknown>; members?: string[]; hold
   };
   const messaging = {
     send: async (cmd: any) => {
-      if (cmd.constructor.name === 'DescribeChannelCommand') {
-        if (!(opts.members ?? []).includes(cmd.input.ChimeBearer)) throw Object.assign(new Error('no'), { name: 'ForbiddenException' });
-        return { Channel: { Name: 'Plan' } };
+      // A person's own membership, looked up as them.
+      if (cmd.constructor.name === 'DescribeChannelMembershipCommand') {
+        if (cmd.input.MemberArn !== cmd.input.ChimeBearer || !(opts.members ?? []).includes(cmd.input.MemberArn)) throw Object.assign(new Error('no'), { name: 'NotFoundException' });
+        return { ChannelMembership: {} };
       }
       return { Tags: [{ Key: 'classification', Value: 'standard' }] };
     },

@@ -107,7 +107,7 @@ export const DENY_TEST_INVENTORY: readonly DenyTestRow[] = [
   },
   {
     id: 'edge-authorizer',
-    claim: 'A token from an undeclared issuer, with a forged signature, for another audience, of the undeclared token type, signed with an undeclared algorithm (none and HS256 included) or outside its validity gets 401 on every person-facing route; a first-time token is refused everywhere but the exchange; a one-conversation issuer is refused everywhere but its own routes.',
+    claim: 'A token from an undeclared issuer, with a forged signature, for another audience, of the undeclared token type, signed with an undeclared algorithm (none and HS256 included) or outside its validity gets 401 on every person-facing route; a first-time token is refused everywhere but the exchange.',
     files: ['backend/scripts/deny-test-edge-authorizer.mjs'],
     configurations: 'C1 and C5',
     unit: [

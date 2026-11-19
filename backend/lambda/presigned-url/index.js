@@ -4,11 +4,37 @@ const { createPresignedPost } = require('@aws-sdk/s3-presigned-post');
 // Bundled from the TypeScript source (the stack builds this function with esbuild): who the caller is
 // comes from the one resolver every handler uses.
 const { callerPersonId } = require('../src/lib/auth');
+const { callerReachesConversation, conversationChannelArn, refusalAnswer } = require('../src/lib/conversation-access');
+const { typeAllows, capabilityRefusal } = require('../src/lib/type-capability');
+const { parseTranscriptKey } = require('../src/lib/meeting-transcript');
+const { parseRecordingKey } = require('../src/lib/meeting-recording');
+const { readChannelContext } = require('../src/lib/channel-context-client');
+const { hostedMeetingLive } = require('../src/lib/meeting-host');
+const { userArnFor } = require('../src/lib/person-arn');
+const { chimeMessagingClient } = require('../src/lib/chime/clients');
+const { loadProfileRegistry } = require('../../lib/profile-registry');
+
+/**
+ * The caller's own boundary in front of the signature: a member of the conversation, cleared for it. `keyClassification`,
+ * for a key that names one, must be the conversation's own.
+ */
+async function refusedConversation(event, conversationId, origin, keyClassification) {
+  const access = await callerReachesConversation(event, conversationId);
+  if (access.ok && keyClassification !== undefined && access.classification !== keyClassification) {
+    return respond(403, { error: 'This file is not of this conversation', code: 'FILE_KEY_NOT_OWNED' }, origin);
+  }
+  if (access.ok) return null;
+  const { statusCode, body } = refusalAnswer(access);
+  return respond(statusCode, body, origin);
+}
 const { responder, originsFrom, DEV_ORIGIN } = require('../src/lib/http-response');
 
 const s3Client = new S3Client({});
+/** The messaging client a host check asks a moderation of, created on first use. */
+let messaging;
+const moderatorReader = () => (messaging = messaging || chimeMessagingClient({}));
 const BUCKET_NAME = process.env.BUCKET_NAME;
-const EXPIRATION_SECONDS = parseInt(process.env.EXPIRATION_SECONDS || '3600');
+const EXPIRATION_SECONDS = parseInt(process.env.EXPIRATION_SECONDS || '300');
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
 
 // Tighten everything user-controlled. The Lambda must not trust body-supplied
@@ -52,6 +78,20 @@ const ALLOWED_MIME_TYPES = new Set([
 // into a peer prefix even though S3 doesn't normalise.
 const UNSAFE_FILENAME_RE = /[\x00-\x1f\\/]|^\.\.?$|^\.\.[\\/]/;
 
+/**
+ * The name a downloaded file is saved under: a meeting's transcript or recording by its meeting id, any other file by the last
+ * segment of its key. Only characters a header carries safely; nothing a person wrote decides it.
+ */
+function downloadNameOf(fileKey, meetingArtifact) {
+  const safe = (s) => String(s).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120);
+  if (meetingArtifact) {
+    const ext = fileKey.endsWith('.mp4') ? 'mp4' : 'md';
+    const part = meetingArtifact.partId ? `-${safe(meetingArtifact.partId)}` : '';
+    return `meeting-${safe(meetingArtifact.meetingId)}${part}-${ext === 'md' ? 'transcript' : 'recording'}.${ext}`;
+  }
+  return safe(fileKey.split('/').pop() || 'download');
+}
+
 const http = responder({ origin: { allow: originsFrom(ALLOWED_ORIGIN, DEV_ORIGIN) }, methods: 'POST,OPTIONS' });
 const respond = http.respond;
 
@@ -62,6 +102,9 @@ const respond = http.respond;
  */
 exports.handler = async (event) => {
   console.log('PresignedUrl:', event.httpMethod, event.path);
+  // The deployment's classifications, read at runtime from the rows its stacks publish (cached): the
+  // conversation check below reads clearance from them, and an unloaded registry refuses to be read.
+  await loadProfileRegistry();
   const origin = event.headers?.origin || event.headers?.Origin;
 
   try {
@@ -122,6 +165,15 @@ exports.handler = async (event) => {
         }, origin);
       }
 
+      const uploadRefused = await refusedConversation(event, conversationId, origin);
+      if (uploadRefused) return uploadRefused;
+      // A TYPE THAT TURNS ATTACHMENTS OFF IS REFUSED HERE (`lib/type-capability.ts`): a customer's room declares them off.
+      const uploadChannel = conversationChannelArn(conversationId, process.env.APP_INSTANCE_ARN || '');
+      const allowed = uploadChannel ? await typeAllows(uploadChannel, 'attachments') : null;
+      if (!allowed || !allowed.ok) {
+        return respond(allowed ? allowed.statusCode : 400, allowed ? capabilityRefusal(allowed) : { error: 'conversationId names no conversation of this instance', code: 'INVALID_CONVERSATION_ID' }, origin);
+      }
+
       // Server-composed key — userId is the caller's person id, NOT the
       // body. Timestamp + sanitised fileName tail.
       const key = `attachments/${conversationId}/${callerSub}/${Date.now()}-${fileName}`;
@@ -173,27 +225,33 @@ exports.handler = async (event) => {
           code: 'MISSING_FILE_KEY',
         }, origin);
       }
-      // Two download-able shapes, both scoped to the conversation the caller names:
-      //  - attachments/<conversationId>/<callerSub>/...  a file the CALLER uploaded (per-user prefix);
-      //  - generated-docs/<conversationId>/...           an assistant-GENERATED doc (report) for the
-      //    channel (generateAndUploadDocument writes generated-docs/<channelId>/...). These have no
-      //    user sub in the key (they belong to the conversation, not one uploader), so any member can
-      //    download them. The channelId is an unguessable UUID a non-member never sees, so requiring an
-      //    exact conversationId + fileKey match ties the download to the caller's own conversation.
-      //    FOLLOW-UP (defense in depth): additionally verify Chime channel membership for the
-      //    generated-docs path, so a former member who kept an old channelId cannot re-fetch.
-      //  - battle-images/<conversationId>/...            an assistant-GENERATED image (image_generation
-      //    intent / battle generation-out). Like generated docs it belongs to the conversation, not one
-      //    uploader (persistImageGenOutput writes battle-images/<channelId>/..., and channelId is the
-      //    conversation id), so any member downloads it; the unguessable conversationId + exact fileKey
-      //    match ties the download to the caller's own conversation.
+      // Three download-able shapes, each scoped to the conversation the caller names, and each signed
+      // only after the caller is proven a current member of that conversation and cleared for its
+      // classification (`refusedConversation`, below):
+      //  - attachments/<conversationId>/<callerSub>/...  a file the CALLER uploaded (per-person prefix);
+      //  - generated-docs/<conversationId>/...           a document an assistant generated for the
+      //    conversation (generateAndUploadDocument), which belongs to the conversation, not one uploader;
+      //  - battle-images/<conversationId>/...            an image an assistant generated for the
+      //    conversation (persistImageGenOutput), likewise the conversation's.
+      // A removed member and a person whose clearance no longer reaches the conversation are refused
+      // whatever key they hold.
       const ownUploadPrefix = `attachments/${conversationId}/${callerSub}/`;
       const generatedDocPrefix = `generated-docs/${conversationId}/`;
       const battleImagePrefix = `battle-images/${conversationId}/`;
+      // A MEETING'S TRANSCRIPT (`transcripts/<classification>/<conversationId>/<meetingId>.md`, `meeting-transcript.ts`):
+      // the conversation's, signed only for a member of that conversation and only where the key's classification is
+      // the one the conversation carries, checked below once the conversation is read.
+      const transcript = parseTranscriptKey(fileKey);
+      // A MEETING'S AUDIO AND VIDEO RECORDING (`recordings/<classification>/<conversationId>/<meetingId>/<part>/media/
+      // composited-video/<id>.mp4`, `meeting-recording.ts`): the conversation's, under the same rule as its transcript. Only the
+      // finished file is signed; a capture chunk is never a recording.
+      const recording = parseRecordingKey(fileKey);
+      const meetingArtifact = transcript || recording;
       if (!conversationId || !(
         fileKey.startsWith(ownUploadPrefix)
         || fileKey.startsWith(generatedDocPrefix)
         || fileKey.startsWith(battleImagePrefix)
+        || (meetingArtifact && meetingArtifact.conversationId === conversationId)
       )) {
         return respond(403, {
           error: 'fileKey must belong to the caller (own upload) or the named conversation (generated doc/image)',
@@ -201,9 +259,35 @@ exports.handler = async (event) => {
         }, origin);
       }
 
+      if (typeof conversationId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(conversationId)) {
+        return respond(400, { error: 'conversationId must match [a-zA-Z0-9_-]{1,128}', code: 'INVALID_CONVERSATION_ID' }, origin);
+      }
+      const downloadRefused = await refusedConversation(event, conversationId, origin, meetingArtifact ? meetingArtifact.classification : undefined);
+      if (downloadRefused) return downloadRefused;
+      // A MEETING'S TRANSCRIPT AND RECORDING ARE ITS HOSTS' (SPEC-ASSISTANT-MEETINGS FR28, FR70): signed only for a person the
+      // meeting's own record on its conversation's row names a host, read as written; for a record that names no host, the
+      // person who started it, else a moderator of the conversation it was started from, asked live as the caller
+      // (`hostedMeetingLive`). A row that cannot be read signs nothing.
+      if (meetingArtifact) {
+        const meetingArn = conversationChannelArn(conversationId, process.env.APP_INSTANCE_ARN || '');
+        let row;
+        try {
+          row = meetingArn ? await readChannelContext(meetingArn, { consistent: true }) : null;
+        } catch {
+          return respond(503, { error: 'The meeting could not be read just now', code: 'MEETING_UNREADABLE' }, origin);
+        }
+        const person = { personId: callerSub, personArn: userArnFor(process.env.APP_INSTANCE_ARN || '', callerSub) };
+        if (!(await hostedMeetingLive(row, meetingArn, meetingArtifact.meetingId, person, moderatorReader()))) {
+          return respond(403, { error: 'Only the meeting\'s hosts may open its transcript and recording', code: 'NOT_A_HOST' }, origin);
+        }
+      }
+
+      // A DOWNLOAD SAVES THE FILE under a name of the platform's, where the reader asks for one; otherwise the browser shows it.
+      const savedName = body.disposition === 'attachment' ? downloadNameOf(fileKey, meetingArtifact) : undefined;
       const command = new GetObjectCommand({
         Bucket: BUCKET_NAME,
         Key: fileKey,
+        ...(savedName ? { ResponseContentDisposition: `attachment; filename="${savedName}"` } : {}),
       });
 
       const presignedUrl = await getSignedUrl(s3Client, command, {

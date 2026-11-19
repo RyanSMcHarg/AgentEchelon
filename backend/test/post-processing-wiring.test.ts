@@ -21,8 +21,8 @@ const props = {
   env,
   classifications: assistantClassifications(),
   appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/11111111-2222-3333-4444-555555555555',
-  attachmentsBucketName: 'test-attachments',
-  attachmentsBucketArn: 'arn:aws:s3:::test-attachments',
+  profileBucketName: 'test-profile',
+  profileBucketArn: 'arn:aws:s3:::test-profile',
 };
 
 function synth(over: Partial<PostProcessingStackProps> = {}): Template {
@@ -180,7 +180,7 @@ describe('PostProcessingStack', () => {
     expect(bodyRead).toBeDefined();
     expect(actionsOf(ssmRead)).not.toContain('ssm:PutParameter');
     const fn = Object.values(synth().findResources('AWS::Lambda::Function'))[0] as any;
-    expect(fn.Properties.Environment.Variables.PROFILE_BODY_BUCKET).toBe('test-attachments');
+    expect(fn.Properties.Environment.Variables.PROFILE_BODY_BUCKET).toBe('test-profile');
   });
 
   /**

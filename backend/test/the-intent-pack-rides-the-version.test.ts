@@ -44,7 +44,7 @@ import { ALL_TOOL_NAMES } from '../lambda/src/lib/tool-registry';
 import { answersThroughGeneral, resolveModelForIntent } from '../lambda/src/lib/model-resolver';
 import { getModelCatalog } from '../lib/config/model-strategy';
 import { selectDeliveryOption, DeliveryOption } from '../lambda/src/lib/delivery-options';
-import { BASIC_ONBOARDING, STANDARD_ONBOARDING, PREMIUM_ONBOARDING } from '../demo/onboarding';
+import { BASIC_ONBOARDING, STANDARD_ONBOARDING, PREMIUM_ONBOARDING } from '../../demo/stratum-company/onboarding';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const SPEC = path.join(REPO_ROOT, 'docs/specs/interaction/assistants/SPEC-PORTABLE-PROFILES.md');
@@ -240,21 +240,17 @@ describe('routes and the taxonomy are reconciled', () => {
     expect(validateDefinitionBody({ ...fullBody(universal) }).join(' ')).toContain('redeclares the universal intent');
   });
 
-  it('refuses `intentPack.machines` on a version, naming the field that works', () => {
-    // Bringing the pack onto the version created a SECOND place to declare task machines. The pack's
-    // block is read on the per-deployment parameter (`taskStateMachines()` merges it over the
-    // defaults) and by nothing at all on a version - every machines consumer takes the body's
-    // top-level `machines`. Two identical-looking homes where one decides nothing is the exact shape
-    // of defect that kept the pack off the version in the first place.
+  it('refuses a platform machine in `intentPack.machines` by name (ADR-066 decision 2)', () => {
+    // A version's pack declares its intents' machines; the platform's (`place_item` among them) are every assistant's,
+    // and a version that declares one under its key is refused, naming it.
     const withMachines = { ...OWN_PACK, machines: { place_item: { initial: 'x', states: {} } } } as unknown as StoredIntentPack;
     const errs = validateDefinitionBody({ ...fullBody(withMachines) });
-    expect(errs.join(' ')).toContain('intentPack.machines is not read from a profile version');
-    expect(errs.join(' ')).toContain('top-level `machines`');
+    expect(errs.join(' ')).toContain("intentPack.machines['place_item'] is a platform machine");
   });
 
   it('the seed drops the deployment pack\'s machines rather than refusing itself', () => {
-    // The seed folds in the deployment pack, which MAY carry machines. Left in, the validator would
-    // refuse the definition the seeder just wrote.
+    // The seed folds in the deployment pack, which MAY carry machines, a platform key among them. Left in, the validator
+    // would refuse the definition the seeder just wrote; a draft is given its intents' machines when it is made instead.
     const packWithMachines = {
       ...OWN_PACK,
       machines: { place_item: { initial: 'x', states: {} } },
@@ -462,7 +458,7 @@ describe('the warm-container cache keeps every resolved field', () => {
     // The second call is a cache hit - the SSM read happened once.
     expect(ssm.send).toHaveBeenCalledTimes(1);
     expect(second).toEqual(first);
-    // And the fields this session added are actually present, so the comparison is not two empties.
+    // And the intent pack and onboarding fields are present, so the comparison is not two empties.
     expect(second.intentPack).toBeDefined();
     expect(second.onboarding).toBeDefined();
   });

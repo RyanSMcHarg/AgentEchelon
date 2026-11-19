@@ -31,7 +31,7 @@ import {
 import { connectorErrors } from '../../lib/config/connectors';
 import { holdersByRole, holdingsAtCreation, parseHoldings, rolesOfPerson } from '../../lambda/src/lib/participant-roles';
 import {
-  PLATFORM_EVENT_WORKFLOWS,
+  SHIPPED_EVENT_WORKFLOWS,
   eventWorkflowErrors,
   holderList,
   participantRoleReferences,
@@ -47,7 +47,7 @@ import { edgeContext } from '../helpers/edge-context';
 const APP = 'arn:aws:chime:us-east-1:111122223333:app-instance/test';
 const arn = (id: string) => `${APP}/user/${id}`;
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
-const OPS = PLATFORM_EVENT_WORKFLOWS['ops-room'];
+const OPS = SHIPPED_EVENT_WORKFLOWS['ops-room'];
 const read = (rel: string) => fs.readFileSync(path.join(__dirname, '../../lambda/src', rel), 'utf8');
 
 /** A type a deployment could declare: invitations redeemed by signing in, and two invitable roles. */
@@ -67,7 +67,7 @@ beforeAll(() => { (CONVERSATION_TYPES as Record<string, ConversationTypeConfig>)
 afterAll(() => { delete (CONVERSATION_TYPES as Record<string, ConversationTypeConfig>)['test-review']; });
 
 describe('the declarations (DESIGN-CONVERSATION-TYPES section 6.1)', () => {
-  const ctx = { membershipGroups: { ops: 'premium' }, outside: ['guest', 'customer'] };
+  const ctx = { membershipGroups: { ops: 'premium', 'ops-on-call': 'premium', 'ops-secondary': 'premium', 'account-management': 'premium', 'account-team-lead': 'premium' }, outside: ['guest', 'customer'] };
   const errorsOf = (types: Record<string, ConversationTypeConfig>) => participantRoleDeclarationErrors(types, ctx).join('\n');
   const withRoles = (base: string, participants: ConversationTypeConfig['participants']) => ({ [base]: { ...CONVERSATION_TYPES[base], participants } });
 
@@ -80,7 +80,7 @@ describe('the declarations (DESIGN-CONVERSATION-TYPES section 6.1)', () => {
     expect(participantRoleDeclarationErrors(CONVERSATION_TYPES, ctx)).toEqual([]);
     expect(CONVERSATION_TYPES.ops.participants?.participantRoles?.lead).toMatchObject({ from: [{ event: 'forPerson' }], holders: 'one', confers: { moderator: true } });
     expect(CONVERSATION_TYPES.ops.participants?.defaultRole).toBe('responder');
-    expect(declaredParticipantRoleNames(['ops'])).toEqual(['lead', 'responder']);
+    expect(declaredParticipantRoleNames(['ops'])).toEqual(['lead', 'on-call:ops', 'responder', 'secondary:ops']);
   });
 
   it('refuses a source no path fills yet, each with what is missing', () => {
@@ -130,7 +130,7 @@ describe('the holdings, on the context row (DESIGN-CONVERSATION-TYPES section 6.
     expect(holdingsAtCreation('ops', { forPerson: lead })).toEqual({ lead: { 'lead-1': { origin: 'event' } } });
     expect(holdingsAtCreation('general', { forPerson: lead })).toEqual({});
     expect(read('typed-conversation-from-event.ts')).toMatch(/const participantRoles = holdingsAtCreation\(typeKey, \{\s+forPerson: forUserArn, groups: roleGroups, members: \[forUserArn, \.\.\.humans\],/);
-    expect(read('lib/channel-context-client.ts')).toMatch(/'participantRoles',\n(\s+\/\/[^\n]*\n\s+'watchedAlarm',\n)?\];/);
+    expect(read('lib/channel-context-client.ts')).toMatch(/'participantRoles',\n(\s+\/\/[^\n]*\n\s+'watchedAlarm',\n(\s+\/\/[^\n]*\n\s+'watchedRefs',\n)?)?\];/);
   });
 
   it('keeps only what the type declares, and never reads a host\'s assertion', () => {
@@ -172,7 +172,7 @@ describe('the variables and the workflow (ADR-060, ADR-061 decisions 2, 3 and 6)
       return wf as unknown as EventWorkflow;
     };
     expect(eventWorkflowErrors('x', conditioned({ 'participant:role': { op: 'has', value: 'lead' } }))).toEqual([]);
-    expect(eventWorkflowErrors('x', conditioned({ 'participant:role': { op: 'has', value: 'reviewer' } })).join()).toMatch(/is a set of lead, responder/);
+    expect(eventWorkflowErrors('x', conditioned({ 'participant:role': { op: 'has', value: 'reviewer' } })).join()).toMatch(/is a set of lead, on-call:ops, responder/);
     expect(eventWorkflowErrors('x', conditioned({ 'participantRole:reviewer': { op: 'exists' } })).join()).toMatch(/not a source this classification publishes/);
     expect(eventWorkflowErrors('x', conditioned({ 'participantRole:lead': { op: 'exists' } }))).toEqual([]);
   });
@@ -180,6 +180,11 @@ describe('the variables and the workflow (ADR-060, ADR-061 decisions 2, 3 and 6)
   it('a role named in an audience or a mention must be declared by every declared type, and sayable in a room a guest reads', () => {
     const wf = clone(OPS) as unknown as Record<string, any>;
     wf.on = 'person-joined'; wf.types = ['general']; wf.initial = 'opening';
+    // The room's own path only: what opened it is said at conversation-opened, and the call it offers is an incident's.
+    wf.states.opening.onSuccess = 'greet-lead'; wf.states.opening.onFailure = 'greet-lead';
+    wf.states['first-look'].onSuccess = 'done';
+    for (const k of Object.keys(wf.states)) if (['lead-task', 'investigation', 'dashboard', 'offer-call', 'start-call', 'customer-impact', 'impact-confirm', 'messaging', 'tell-messaging', 'tell-messaging-failed', 'messaging-now', 'tell-messaging-now', 'tell-messaging-now-failed', 'resolved', 'tell-team', 'tell-messaging-resolved', 'tell-messaging-mitigating', 'investigation-complete', 'review-draft', 'review'].includes(k) || k.startsWith('runbook-')) delete wf.states[k];
+    for (const k of ['tell-absent', 'tell-unavailable']) { wf.states[k].onSuccess = 'done'; wf.states[k].onFailure = 'done'; }
     wf.states.opening.send.mention = { lead: 'participantRole:lead' };
     expect(eventWorkflowErrors('x', wf).join('\n')).toMatch(/participant role lead, which type general does not declare/);
     const visible = clone(wf);
@@ -210,6 +215,8 @@ describe('the variables and the workflow (ADR-060, ADR-061 decisions 2, 3 and 6)
         mentionName: async (p) => names[p] ?? '',
         send: async (a) => { sent.push({ template: a.template, to: a.to, values: a.values }); return true; },
         dispatchAgent: async () => true,
+        // The ops room's first look opens a task the ops assistant holds, and the run waits on it.
+        openTask: async () => 'opened',
       };
       const out = await runEventWorkflow('ops-room', wf, ctx, d);
       return { sent, out };
@@ -344,6 +351,11 @@ describe('an invitation records a participant role (DESIGN-CONVERSATION-TYPES se
         if (name === 'DescribeChannelCommand') {
           if (!members.has(i.ChimeBearer)) throw Object.assign(new Error('no'), { name: 'ForbiddenException' });
           return { Channel: { ChannelArn: CH, Name: 'Design review' } };
+        }
+        // A person's own membership, looked up as them (`lib/conversation-access.ts`).
+        if (name === 'DescribeChannelMembershipCommand') {
+          if (i.MemberArn !== i.ChimeBearer || !members.has(i.MemberArn)) throw Object.assign(new Error('no'), { name: 'NotFoundException' });
+          return { ChannelMembership: {} };
         }
         if (name === 'ListTagsForResourceCommand') return { Tags: [{ Key: 'classification', Value: 'standard' }] };
         if (name === 'DescribeChannelModeratorCommand') {

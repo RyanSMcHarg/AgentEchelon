@@ -11,7 +11,7 @@
  * sample of the most recently changed conversations, the manual run the batch documents for proving a
  * change, and reads again. The read itself still goes through the signed admin route.
  */
-import { test, expect } from './helpers/fixtures';
+import { test, expect, expectAlarm } from './helpers/fixtures';
 import { signIn, idTokenOf } from './helpers/agent-helpers';
 import { getAdminUser, getBasicUser, getPremiumUser, hasTestCredentials, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
@@ -86,6 +86,9 @@ test.describe('the de-identified copy on the deployed API', () => {
     const readAll = async () => { const out: any[] = []; for (const id of ids) out.push(await read(id)); return out; };
     let copies = await readAll();
     if (!copies.some((c) => c.derivedAt)) {
+      // THE RUN REPORTS ITSELF TO THE OPERATORS, as every run does, and a sample run ends with the rest still pending
+      // (INCOMPLETE) by construction: the notice is this spec's own doing, not a backlog.
+      expectAlarm('clean_copy_run');
       const report = runBatchOnASample();
       console.log(`--- no copy yet; the batch ran on a sample: ${JSON.stringify(report)} ---`);
       expect(report.outcome, `the batch run on a sample: ${report.failure ?? ''}`).not.toBe('failed');

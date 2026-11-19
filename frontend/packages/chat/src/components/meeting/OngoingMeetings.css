@@ -1,0 +1,39 @@
+/* MEETINGS NOW (OngoingMeetings.tsx), at the top of the dark chrome sidebar: a live mark, the meeting's name, how long it
+   has run, and Join, or Return for a meeting the person is already in from another window. Chrome tokens (`design-tokens.css`) with their values as the fallback. */
+.ae-ongoing {
+  margin: 0 0 var(--space-2, 8px);
+  padding: 8px;
+  border-radius: 8px;
+  border: 1px solid var(--chrome-text, #A1A1AA);
+  background: var(--chrome-surface, #141416);
+}
+.ae-ongoing-heading {
+  margin: 0 0 6px;
+  font-size: var(--text-xs, 11px);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--chrome-text, #A1A1AA);
+}
+.ae-ongoing-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.ae-ongoing-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ae-ongoing-live {
+  flex: none; width: 8px; height: 8px; border-radius: 50%; background: #EF4444;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.25);
+}
+.ae-ongoing-text { flex: 1; min-width: 0; display: grid; }
+.ae-ongoing-title {
+  font-size: var(--text-base, 13px); font-weight: 600; color: var(--chrome-text-bright, #FAFAFA);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ae-ongoing-meta { display: flex; gap: 6px; align-items: center; font-size: var(--text-xs, 11px); color: var(--chrome-text, #A1A1AA); }
+.ae-ongoing-badge { font-weight: 600; color: #FCA5A5; }
+.ae-ongoing-action {
+  flex: none; min-height: 28px; padding: 0 12px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--accent-400, #A78BFA); background: var(--accent-600, #6D28D9); color: #FAFAFA;
+  font-size: var(--text-sm, 12px); font-weight: 600;
+}
+.ae-ongoing-action:hover { background: var(--accent-700, #5B21B6); }
+.ae-ongoing-action:focus-visible { outline: 2px solid var(--accent-400, #A78BFA); outline-offset: 2px; }
+.ae-ongoing-in { color: var(--chrome-text-bright, #FAFAFA); font-weight: 600; }
+.ae-ongoing-elsewhere { display: block; font-size: var(--text-xs, 11px); color: var(--chrome-text, #A1A1AA); }

@@ -141,3 +141,116 @@ describe('a DynamoDB command declares only what its expressions use', () => {
     }
   });
 });
+
+/**
+ * EVERY CONDITIONAL WRITE THE CONVERSATION STORE MAKES, IN EVERY SHAPE IT TAKES (`channel-context-client.ts`).
+ *
+ * The source scan above reads literal commands; a writer that picks its condition by branch (a first claim, a claim over
+ * a recorded conversation, a reuse) builds several requests from one call site, and the scan cannot tell which names each
+ * one uses. So each writer is called here once per branch against a client that records the request, and each request is
+ * held to DynamoDB's rule. The last check reads every condition the store's source spells and requires it among the
+ * requests made here, so a conditional writer added without a shape here fails this test.
+ */
+describe('every conditional write of the conversation store declares only what it uses', () => {
+  const ROOM = 'arn:aws:chime:us-east-1:111:app-instance/i/channel/room-1';
+  const OTHER = 'arn:aws:chime:us-east-1:111:app-instance/i/channel/meet-1';
+  type Update = { UpdateExpression: string; ConditionExpression?: string; ExpressionAttributeNames?: Record<string, string>; ExpressionAttributeValues?: Record<string, unknown> };
+  const made: Update[] = [];
+
+  /** Every name and value the write declares is used by its expressions, and every one they use is declared. */
+  const unacceptable = (u: Update): string[] => {
+    const text = `${u.UpdateExpression} ${u.ConditionExpression ?? ''}`;
+    const out: string[] = [];
+    for (const n of Object.keys(u.ExpressionAttributeNames ?? {})) if (!new RegExp(`${n}\\b`).test(text)) out.push(`unused name ${n}`);
+    for (const v of Object.keys(u.ExpressionAttributeValues ?? {})) if (!new RegExp(`${v}\\b`).test(text)) out.push(`unused value ${v}`);
+    for (const n of text.match(/#[A-Za-z0-9_]+/g) ?? []) if (!(n in (u.ExpressionAttributeNames ?? {}))) out.push(`undeclared name ${n}`);
+    for (const v of text.match(/:[A-Za-z0-9_]+/g) ?? []) if (!(v in (u.ExpressionAttributeValues ?? {}))) out.push(`undeclared value ${v}`);
+    return out;
+  };
+
+  beforeAll(async () => {
+    jest.resetModules();
+    process.env.CHANNEL_CONTEXT_TABLE = 'Conversations-ChannelContext';
+    let failNext = 0;
+    let item: Record<string, unknown> | undefined;
+    jest.doMock('@aws-sdk/lib-dynamodb', () => ({
+      DynamoDBDocumentClient: { from: () => ({
+        send: async (cmd: { kind: string; input: Update }) => {
+          if (cmd.kind === 'Update') {
+            made.push(cmd.input);
+            if (failNext > 0) { failNext -= 1; throw Object.assign(new Error('held'), { name: 'ConditionalCheckFailedException' }); }
+            return {};
+          }
+          return { Item: item };
+        },
+      }) },
+      UpdateCommand: jest.fn((input) => ({ kind: 'Update', input })),
+      GetCommand: jest.fn((input) => ({ kind: 'Get', input })),
+      PutCommand: jest.fn((input) => ({ kind: 'Put', input })),
+      DeleteCommand: jest.fn((input) => ({ kind: 'Delete', input })),
+      QueryCommand: jest.fn((input) => ({ kind: 'Query', input })),
+      ScanCommand: jest.fn((input) => ({ kind: 'Scan', input })),
+    }));
+    jest.doMock('@aws-sdk/client-dynamodb', () => ({ DynamoDBClient: jest.fn() }));
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const s = require('../../lambda/src/lib/channel-context-client');
+    const intake = { subject: 'p-1', phase: 'asking', cursor: 0 } as never;
+
+    item = undefined;
+    await s.recordMemberIdentity(ROOM, { sub: 's', iss: 'i' });
+    item = { memberIdentities: [{ sub: 'x', iss: 'i' }] };
+    await s.recordMemberIdentity(ROOM, { sub: 's', iss: 'i' });
+    item = { children: [] };
+    failNext = 1;
+    await s.recordChildConversation(ROOM, { channelId: 'c', typeKey: 'thread', openedAt: 'x' });
+    await s.advanceOnboardingIntake(ROOM, { cursor: 0, phase: 'asking', subject: 'p-1' }, intake);
+    await s.startOnboardingIntake(ROOM, intake);
+    await s.claimRoomNaming(ROOM);
+    await s.releaseRoomNaming(ROOM, 1);
+    await s.markRoomNamed(ROOM);
+    item = { room: OTHER, classification: 'premium' };
+    failNext = 1;
+    await s.claimRefWatch('watch#ref#premium#ticket#7', { room: ROOM, classification: 'premium' }, async () => true);
+    await s.claimOpening('opened#ops#0#e-1');
+    await s.claimActiveMeeting(ROOM, { meetingId: 'm', meeting: {}, classification: 'premium', createdAt: 'x', createdBy: 'p' });
+    await s.releaseActiveMeeting(ROOM, 'm');
+    await s.releaseActiveMeeting(ROOM, 'm', '2026-11-12T10:30:00.000Z');
+    await s.recordMeetingJoin(ROOM, 'm', '2026-11-12T10:00:00.000Z');
+    await s.chargeTranscriptChars(OTHER, 'm', 'p-1', 120, 4000);
+    await s.claimMeetingConversation(ROOM, undefined, 'tok');
+    await s.claimMeetingConversation(ROOM, OTHER, 'tok');
+    await s.claimMeetingConversation(ROOM, OTHER, 'tok', { reuse: true });
+    await s.settleMeetingConversation(ROOM, 'tok', OTHER);
+    await s.confirmMeetingConversation(ROOM, OTHER);
+    await s.releaseMeetingConversation(ROOM, 'tok', OTHER);
+    await s.releaseMeetingConversation(ROOM, 'tok');
+    await s.recordMeetingOf(OTHER, ROOM);
+    await s.recordEndedMeetingCard(OTHER, 'm', 'msg', 'arn:bot', ROOM);
+    await s.recordMeetingInvites(OTHER, { 'p-1': { brief: 'b' } });
+    await s.claimArrivalBrief(OTHER, 'p-1');
+  });
+
+  afterAll(() => {
+    jest.dontMock('@aws-sdk/lib-dynamodb');
+    jest.dontMock('@aws-sdk/client-dynamodb');
+  });
+
+  it('every request made declares exactly the names and values its expressions use', () => {
+    expect(made.length).toBeGreaterThan(20);
+    const bad = made.flatMap((u) => unacceptable(u).map((why) => `${u.ConditionExpression ?? u.UpdateExpression}: ${why}`));
+    expect(bad).toEqual([]);
+  });
+
+  it('every condition the store spells is among the requests made here', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'lambda/src/lib/channel-context-client.ts'), 'utf8');
+    const spelled = new Set<string>();
+    for (const line of src.split('\n')) {
+      if (/\bConditionExpression:/.test(line) && !/KeyConditionExpression/.test(line)) for (const q of line.matchAll(/'([^']+)'/g)) spelled.add(q[1]);
+      // A writer that takes its condition as an argument names it where it calls itself.
+      for (const q of line.matchAll(/\bput\(\s*'([^']+)'/g)) spelled.add(q[1]);
+    }
+    const covered = new Set(made.map((u) => u.ConditionExpression).filter(Boolean));
+    expect([...spelled].filter((c) => !covered.has(c))).toEqual([]);
+    expect(spelled.size).toBeGreaterThan(15);
+  });
+});

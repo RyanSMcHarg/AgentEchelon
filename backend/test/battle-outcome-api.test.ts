@@ -23,15 +23,28 @@ jest.mock('../lambda/src/lib/battle-outcome', () => ({
   readUserBattleOutcome: (...a: unknown[]) => mockRead(...a),
 }));
 
+// THE CALLER'S OWN BOUNDARY (`lib/conversation-access.ts`: a current member, cleared for the conversation) is
+// proven for this route in `lib/a-person-route-reaches-only-a-conversation-its-caller-reaches.test.ts`. Here it
+// admits, so the route's own transport and validation contract is what is under test.
+jest.mock('../lambda/src/lib/conversation-access', () => ({
+  callerReachesConversation: async (_e: unknown, channelArn: string) => ({ ok: true, channelArn, classification: 'premium' }),
+}));
+
+// The duel ran in the channel these requests name; the refusals are `battle-outcome-is-bound-to-its-channel`.
+jest.mock('../lambda/src/lib/battle-state', () => ({
+  ...jest.requireActual('../lambda/src/lib/battle-state'),
+  readBattleRows: async () => [{
+    battleId: 'a1b2c3d4e5f60718', botArn: '__round1__', state: 'COMPLETED',
+    channelArn: 'arn:aws:chime:us-east-1:111:app-instance/i/channel/c',
+  }],
+}));
+
 import { handler } from '../lambda/src/battle-outcome-api';
 import { asPerson, edgeContext } from './helpers/edge-context';
 
 const BATTLE_ID = 'a1b2c3d4e5f60718';
 const SUB = 'user-sub-1';
-// The handler requires channelArn in the body so it can verify caller
-// membership. Tests use a placeholder ARN;
-// the membership-check itself is skipped when APP_INSTANCE_ARN env is
-// unset (which it is in this test process).
+// The handler requires channelArn in the body so it can verify the caller reaches it.
 const CHANNEL_ARN = 'arn:aws:chime:us-east-1:111:app-instance/i/channel/c';
 
 function makeEvent(opts: {

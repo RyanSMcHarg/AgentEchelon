@@ -28,14 +28,6 @@ import {
 // The first-turn summary seed. Runs HERE because the write, the Bedrock summarization, and the
 // embedding are all Aurora-side work; the non-VPC caller only supplies the exchange text.
 import { seedSummaryFromExchange, seedSummaryFromDriftTopic } from './summary-updater.js';
-// The pending-drift-suggestion task lifecycle (open/read/close) is Aurora work
-// too, so it runs HERE — not in the non-VPC handler, where a direct query() has
-// no DB access (`DB_SECRET_ARN not configured`). ADR-013 consistency.
-import {
-  savePendingSuggestion,
-  readPendingSuggestion,
-  resolvePendingSuggestion,
-} from '../lib/routing-state.js';
 // One-time analytics maintenance (placeholder->final historical reconciliation)
 // also runs here — it is Aurora work, and this is the only VPC-attached seam.
 import {
@@ -85,6 +77,8 @@ import { bindTurnRequest } from './turn-data-plane-binding.js';
 import { complianceAgreement } from './compliance-agreement.js';
 import { cleanCopyPending, cleanCopySource, cleanCopyWrite, cleanCopyRecordRun, adminCleanConversation } from './clean-copy.js';
 import { erasePersonProjection } from './person-erasure.js';
+import { ingestMeetingEvents, type MeetingEventRecord } from './meeting-events-ingest.js';
+import { readMeetingEvents, type MeetingEventsQuery } from './meeting-events-read.js';
 // The RAG sync's read of which corpus objects hold chunks (rag-coverage.ts): Aurora work, so it rides this seam.
 import { ragSourceCoverage, type RagSourceCoverageInput } from './rag-coverage.js';
 import { loadProfileRegistry } from '../../../lib/profile-registry';
@@ -101,9 +95,6 @@ export interface DataPlaneRequest {
     | 'getSummary'
     | 'seedSummary'
     | 'seedDriftTopic'
-    | 'savePendingSuggestion'
-    | 'readPendingSuggestion'
-    | 'resolvePendingSuggestion'
     | 'backfillPlaceholders'
     | 'backfillProfileAttribution'
     | 'backfillTurnEvents'
@@ -129,6 +120,9 @@ export interface DataPlaneRequest {
     | 'adminCleanConversation'
     // Offboarding's erasure of the person's own rows (person-erasure.ts), asked from outside the VPC.
     | 'erasePerson'
+    | 'ingestMeetingEvents'
+    // The meeting figures' read, one classification at a time as its reader role (meeting-events-read.ts).
+    | 'readMeetingEvents'
     // Which corpus objects under a rag/ prefix hold chunks (rag-coverage.ts), for the RAG sync.
     | 'ragSourceCoverage';
   input: unknown;
@@ -207,16 +201,6 @@ export async function handler(incoming: DataPlaneRequest): Promise<unknown> {
     case 'seedDriftTopic':
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return seedSummaryFromDriftTopic(req.input as any);
-    case 'savePendingSuggestion':
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return savePendingSuggestion(req.input as any);
-    case 'readPendingSuggestion':
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return readPendingSuggestion(req.input as any);
-    case 'resolvePendingSuggestion':
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await resolvePendingSuggestion(req.input as any);
-      return { ok: true };
     case 'backfillPlaceholders':
       return backfillPlaceholders((req.input as BackfillOptions) || {});
     // The mention-marker pairing only ever reached turns arriving after it shipped, because the hot
@@ -255,6 +239,10 @@ export async function handler(incoming: DataPlaneRequest): Promise<unknown> {
       return adminCleanConversation(req.input as Parameters<typeof adminCleanConversation>[0]);
     case 'ingestClientEvents':
       return ingestClientEvents((req.input as { records: ClientEventRecord[] }).records);
+    case 'ingestMeetingEvents':
+      return ingestMeetingEvents((req.input as { records: MeetingEventRecord[] }).records);
+    case 'readMeetingEvents':
+      return readMeetingEvents(req.input as MeetingEventsQuery);
     case 'erasePerson':
       return erasePersonProjection(req.input as { personId?: unknown });
     case 'ragSourceCoverage':

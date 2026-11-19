@@ -585,7 +585,7 @@ function rollbackVerdict(input) {
   return {
     ok: false,
     reason: `${stackName}: the live commit ${short(deployed.commit)} is not an ancestor of ${short(head)}. Deploying would remove live commits `
-      + `this checkout does not have${wasDirty}. Deploy from a checkout that contains ${short(deployed.commit)} (rebase onto private/main), `
+      + `this checkout does not have${wasDirty}. Deploy from a checkout that contains ${short(deployed.commit)} (rebase onto the branch that was deployed), `
       + 'or pass --allow-rollback if removing them is the intent.',
   };
 }

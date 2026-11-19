@@ -2,7 +2,7 @@
  * THE DEMO'S PEOPLE RECEIVE WHAT THE DEMO SAYS THEY DO.
  *
  * The demo cast (`provision-test-users.mjs --cast ops-demo`, secret `agent-interface/demo-credentials`) are the
- * people the new-assistant demo signs in as. Having an email sent to one of them is one thing; reading the email
+ * people the portable-assistants demo signs in as. Having an email sent to one of them is one thing; reading the email
  * they received and checking what it says is another, which is why their addresses are on the test inbox's
  * domain when the deployment has one (`backend/scripts/lib/demo-cast.cjs`): an SES receipt rule writes their
  * mail to S3, and this reads it back (`helpers/test-inbox.ts`).

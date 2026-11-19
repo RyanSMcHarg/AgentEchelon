@@ -66,6 +66,24 @@ describe('a refused membership read is reported as refused', () => {
     const size = await resolveChannelSize(clientThatThrows(sdkError('SomeFutureRefusal', 403)), CHANNEL, BEARER);
     expect(size.refused).toBe(true);
   });
+
+  describe('a refusal the caller expects', () => {
+    let logged: jest.SpyInstance;
+    beforeEach(() => { logged = jest.spyOn(console, 'error').mockImplementation(() => undefined); });
+    afterEach(() => logged.mockRestore());
+
+    it('stays quiet for the not-a-member refusal', async () => {
+      const size = await resolveChannelSize(clientThatThrows(sdkError('ForbiddenException', 403)), CHANNEL, BEARER, { refusalExpected: true });
+      expect(size.refused).toBe(true);
+      expect(logged).not.toHaveBeenCalled();
+    });
+
+    it('DENY: an IAM boundary refusal is logged even where a refusal was expected', async () => {
+      const size = await resolveChannelSize(clientThatThrows(sdkError('AccessDeniedException', 403)), CHANNEL, BEARER, { refusalExpected: true });
+      expect(size.refused).toBe(true);
+      expect(logged).toHaveBeenCalledTimes(1);
+    });
+  });
 });
 
 describe('an ordinary failure is NOT a refusal', () => {

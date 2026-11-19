@@ -161,18 +161,18 @@ test.describe('Admin Dashboard - Base Tabs', () => {
     await expect(page.locator('.admin-section-btn.active:has-text("Models")')).toBeVisible();
     // Model Strategy is a sub-tab within the Models section
     await page.locator('.admin-subtab-btn:has-text("Model Strategy")').click();
-    await expect(page.locator('h3:has-text("Intent Routing")')).toBeVisible();
+    await expect(page.locator('h2:has-text("Intent Routing")')).toBeVisible();
 
     // Experiments section (single sub-view → renders directly)
     await rail.locator('button:has-text("Experiments")').click();
     await expect(page.locator('.admin-section-btn.active:has-text("Experiments")')).toBeVisible();
-    await expect(page.locator('h3:has-text("A/B Experiments")')).toBeVisible();
+    await expect(page.locator('h2:has-text("A/B Experiments")')).toBeVisible();
     await expect(page.locator('button:has-text("New Experiment")')).toBeVisible();
 
     // Conversations, which is the first TAB of Oversight rather than a section of its own.
     await rail.locator('button:has-text("Oversight")').click();
     await expect(page.locator('.admin-section-btn.active:has-text("Oversight")')).toBeVisible();
-    await expect(page.locator('h3:has-text("Conversations")')).toBeVisible();
+    await expect(page.locator('h2:has-text("Conversations")')).toBeVisible();
     await expect(page.locator('.admin-filter-btn:has-text("Browser")')).toBeVisible();
     await expect(page.locator('.admin-filter-btn:has-text("Drift Detection")')).toBeVisible();
 
@@ -185,7 +185,7 @@ test.describe('Admin Dashboard - Base Tabs', () => {
     // Latency is a drill of that view, opened from it, not a tab of its own.
     await expect(page.locator('.admin-subtab-btn:has-text("Latency")')).toHaveCount(0);
     await page.getByRole('button', { name: 'Full flow and latency' }).click();
-    await expect(page.locator('h3:has-text("Response Latency")')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('h2:has-text("Response Latency")')).toBeVisible({ timeout: 15000 });
 
     // Users section → Manage Users sub-tab
     await rail.locator('button:has-text("Users")').first().click();
@@ -219,7 +219,7 @@ test.describe('Admin Dashboard - Base Tabs', () => {
     // Navigate to the Experiments section
     await page.locator('.admin-section-rail button:has-text("Experiments")').click();
     await expect(page.locator('.admin-section-btn.active:has-text("Experiments")')).toBeVisible();
-    await expect(page.locator('h3:has-text("A/B Experiments")')).toBeVisible();
+    await expect(page.locator('h2:has-text("A/B Experiments")')).toBeVisible();
 
     // Should have New Experiment and Refresh buttons
     await expect(page.locator('button:has-text("New Experiment")')).toBeVisible();
@@ -229,15 +229,15 @@ test.describe('Admin Dashboard - Base Tabs', () => {
     // "Active Experiments" deliberately (ExperimentsTab.tsx ~1226): the table lists every non-deleted
     // experiment regardless of state, and the old heading asserted otherwise on a mostly-completed
     // list. `active` survives as a status filter, not as the table's name.
-    await expect(page.locator('h4:has-text("Experiments")')).toBeVisible();
+    await expect(page.locator('h3:has-text("Experiments")')).toBeVisible();
 
     // Toggle create form
     await page.locator('button:has-text("New Experiment")').click();
-    await expect(page.locator('h4:has-text("Create Experiment")')).toBeVisible();
+    await expect(page.locator('h3:has-text("Create Experiment")')).toBeVisible();
 
     // Cancel create form
     await page.locator('button:has-text("Cancel")').click();
-    await expect(page.locator('h4:has-text("Create Experiment")')).not.toBeVisible();
+    await expect(page.locator('h3:has-text("Create Experiment")')).not.toBeVisible();
   });
 });
 
@@ -300,7 +300,7 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
 
     // L0 -> L1: click report_generation — the deterministic task-bearing intent the tasks e2e produces,
     // so a "Tasks (N)" drill is guaranteed.
-    const intentLink = page.locator('.data-table-row--clickable .admin-link-btn', { hasText: 'report_generation' }).first();
+    const intentLink = page.locator('.data-table-row--clickable .btn-link', { hasText: 'report_generation' }).first();
     await expect(intentLink).toBeVisible({ timeout: 10000 });
     await intentLink.click();
     await expect(page.locator('.admin-breadcrumb')).toBeVisible({ timeout: 10000 });
@@ -312,14 +312,14 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
     await expect(tasksDrill).toBeVisible({ timeout: 10000 });
     await tasksDrill.click();
     await expect(page.locator('.admin-breadcrumb')).toContainText(/Tasks/i, { timeout: 15000 });
-    const taskLink = page.locator('.data-table-row--clickable .admin-link-btn').first();
+    const taskLink = page.locator('.data-table-row--clickable .btn-link').first();
     await expect(taskLink).toBeVisible({ timeout: 20000 }); // wait for the L2 task list to render
 
     // L2 -> L3: the task timeline + (when the flow was scored) the multi-turn flow score fold in here.
     // The flow score depends on the evaluate phase, so accept it OR the deepened breadcrumb as proof of L3.
     await taskLink.click();
     await expect(
-      page.getByText(/Flow score/i).or(page.locator('.admin-breadcrumb .admin-link-btn').nth(2)),
+      page.getByText(/Flow score/i).or(page.locator('.admin-breadcrumb .btn-link').nth(2)),
     ).toBeVisible({ timeout: 25000 });
   });
 
@@ -327,7 +327,7 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
     await openAdmin(page);
     await openEffectiveness(page);
     await page.locator('#admin-tab-flagged').click();
-    await expect(page.locator('h3:has-text("Flagged Responses")')).toBeVisible();
+    await expect(page.locator('h2:has-text("Flagged Responses")')).toBeVisible();
 
     // Filter buttons should be visible
     await expect(page.locator('.admin-filter-btn:has-text("Pending")')).toBeVisible();
@@ -342,7 +342,7 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
     await openAdmin(page);
     await openEffectiveness(page);
     await page.locator('#admin-tab-ground_truth').click();
-    await expect(page.locator('h3:has-text("Ground Truth Calibration")')).toBeVisible();
+    await expect(page.locator('h2:has-text("Ground Truth Calibration")')).toBeVisible();
 
     // This test asserted a single heading. It passed against a dead query.
     await assertTabIsDeterminate(page, 'Ground Truth calibration');
@@ -365,7 +365,7 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
     });
     const convTab = page.locator('.admin-section-rail button:has-text("Oversight")');
     await convTab.click();
-    await expect(page.locator('h3:has-text("Conversations")')).toBeVisible();
+    await expect(page.locator('h2:has-text("Conversations")')).toBeVisible();
 
     // Shell controls.
     await expect(page.locator('.admin-filter-btn:has-text("Browser")')).toBeVisible();

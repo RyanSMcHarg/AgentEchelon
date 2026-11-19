@@ -45,6 +45,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNodeJs from 'aws-cdk-lib/aws-lambda-nodejs';
 import { grantIssuerRegistry } from '../constructs/trusted-issuers';
+import { grantLiveClearance } from '../constructs/directory-access';
 import type { RouteSource, RouteSpec } from '../constructs/http-api';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
@@ -326,13 +327,11 @@ export class BattleStack extends cdk.Stack implements RouteSource {
             // Conditioning on the declared set keeps every legitimate duel working and removes the
             // untagged channel from reach, so the boundary fails the same way here as everywhere else.
             //
-            // DescribeChannel: caller-scoped access check (is the caller a member).
             // ListTagsForResource: the classification gate reads the IMMUTABLE `classification` tag,
             // not mutable metadata, so a tampered modelTier cannot open battles.
             new iam.PolicyStatement({
               sid: 'BattleChannelActionsOnClassifiedChannels',
               actions: [
-                'chime:DescribeChannel',
                 'chime:ListTagsForResource',
                 'chime:ListChannelModerators',
               ],
@@ -363,8 +362,9 @@ export class BattleStack extends cdk.Stack implements RouteSource {
             // Amazon Chime SDK authorizes a channel action against BOTH resources: the channel, and
             // the `ChimeBearer` the call is made as. The statement above covers only the channel, so
             // without this one every action in it is denied on the bearer leg and Battle Mode cannot
-            // be turned on or off at all - `channel-battle.ts`'s first `DescribeChannel` fails. The
-            // stack deploys green and the feature is dead, which is exactly how this was missed.
+            // be turned on or off at all - `channel-battle.ts`'s moderator check (`ListChannelModerators`,
+            // bearing the caller) fails. The stack deploys green and the feature is dead, which is how a
+            // missing bearer leg goes unnoticed.
             //
             // READS ONLY. Amazon Chime SDK does not bind the `ChimeBearer` to the caller, so this role
             // could once post as any user or assistant through this leg. The ON/OFF notices now go out on
@@ -374,13 +374,13 @@ export class BattleStack extends cdk.Stack implements RouteSource {
             new iam.PolicyStatement({
               sid: 'BattleChannelReadsAsTheCaller',
               effect: iam.Effect.ALLOW,
-              actions: ['chime:DescribeChannel', 'chime:ListTagsForResource', 'chime:ListChannelModerators'],
+              actions: ['chime:ListTagsForResource', 'chime:ListChannelModerators'],
               resources: [`${props.appInstanceArn}/user/*`],
             }),
             new iam.PolicyStatement({
               sid: 'BattleChannelReadsAsTheRoomAssistant',
               effect: iam.Effect.ALLOW,
-              actions: ['chime:DescribeChannel', 'chime:ListTagsForResource', 'chime:ListChannelModerators'],
+              actions: ['chime:ListTagsForResource', 'chime:ListChannelModerators'],
               resources: [`${props.appInstanceArn}/bot/*`],
               conditions: anyClassificationTagged(),
             }),
@@ -516,6 +516,11 @@ export class BattleStack extends cdk.Stack implements RouteSource {
               actions: ['chime:DescribeChannelMembership'],
               resources: [`${props.appInstanceArn}/*`],
             }),
+            // The conversation's `classification` tag, which the picker's clearance must reach (`lib/conversation-access.ts`).
+            new iam.PolicyStatement({
+              actions: ['chime:ListTagsForResource'],
+              resources: [`${props.appInstanceArn}/channel/*`],
+            }),
           ],
         }),
         // Read-only on the channel battle config: the outcome handler resolves the pick's
@@ -558,6 +563,9 @@ export class BattleStack extends cdk.Stack implements RouteSource {
     // Who called is the edge authorizer's context, read through the registry (callerPersonId).
     grantIssuerRegistry(channelBattleFn, props.selfPoolId);
     grantIssuerRegistry(battleOutcomeFn, props.selfPoolId);
+    // The live clearance recheck of the shared conversation check (DESIGN-REVOCATION-WINDOWS R4).
+    grantLiveClearance(channelBattleFn, { appInstanceArn: props.appInstanceArn, userPoolId: props.selfPoolId });
+    grantLiveClearance(battleOutcomeFn, { appInstanceArn: props.appInstanceArn, userPoolId: props.selfPoolId });
     channelBattleFn.addEnvironment('APP_INSTANCE_ARN', props.appInstanceArn);
     battleOutcomeFn.addEnvironment('APP_INSTANCE_ARN', props.appInstanceArn);
     const battleThrottle = { rate: 10, burst: 20 };

@@ -57,6 +57,25 @@ guardConsoleErrors();
 const BOTH_ANSWERED_MS = 120_000;
 
 /**
+ * THE ROOM'S STATUS LINES, while they are still status. Both are untargeted by design and name no message, so neither
+ * is an answer to either private question:
+ *   - the queue notice (`turn-queue-notice.ts`): messages are waiting;
+ *   - the reading's interim line (`turnKind: reading`): how many requests it will take up privately with their senders.
+ * Read from the metadata the assistant stamped, not its wording. One an answer was written into leaves that phase and
+ * counts as an answer again. Whichever it is, a status line both people see must not carry either question
+ * (asserted below).
+ */
+function isRoomStatus(m: { metadata: string }): boolean {
+  try {
+    const md = JSON.parse(m.metadata || '{}');
+    return (md?.respPhase === 'notice' && md?.turnKind === 'queue_ack')
+      || (md?.respPhase === 'interim' && md?.turnKind === 'reading');
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Open a conversation by channel id through the app's deep-link handler, retrying while membership
  * propagates. Mirrors the multi-user pattern in `mentions.spec.ts` and `battle.spec.ts`: titles
  * auto-derive, so the id is the only stable handle, and copying the other browser's URL does not work
@@ -171,7 +190,10 @@ test.describe('identical private questions, sent at the same time', () => {
       // The codename rides along so the QUESTIONS are findable in a transcript that also contains the
       // answers.
       const shared = `IDENTICALASK${Date.now().toString(36).toUpperCase()}`;
-      const question = `${shared}: what is my name and my email address? Answer with both, exactly as you have them.`;
+      // A PLAIN QUESTION. A trailing "Answer with both, exactly as you have them." reads as an instruction to the model,
+      // and the deployed input guardrail's prompt-attack filter refuses it (ApplyGuardrail: INTERVENED with that
+      // sentence, NONE without it, the codename prefix either way), which would refuse both turns.
+      const question = `${shared}: what is my name and my email address?`;
 
       // What each answer must be about, and must not be about. The local part alone, because the
       // assistant may render an address, a display name or both.
@@ -199,10 +221,18 @@ test.describe('identical private questions, sent at the same time', () => {
       // snapshotted once both questions show raced a fast reply: a drift suggestion answered B in two
       // seconds, was already on B's screen when the count was taken, and the "+1" never came. A count
       // taken before the sends counted the welcome and the membership notice instead.
+      // A SETTLED REPLY: a `final` answer, or a clarifying question (`interim` that is not the reading's). Not the
+      // room's status lines, which say that something waits and answer nobody (the queue notice, `notice`; the
+      // reading's line, `interim` with `data-turn-kind="reading"`), and not a carrier with no phase yet (the reading
+      // first posts a bare "..." and stamps it after): any of those satisfied this wait before an answer existed.
       // A POSTED message, which carries its id: the thinking indicator shown while a turn runs is also an
       // `.assistant-message`, and matching it let this wait pass before either answer was posted.
+      const AFTER_QUESTION = 'xpath=following::*[@data-message-id and contains(concat(" ", normalize-space(@class), " "), " assistant-message ")';
       const answeredAfterOwnQuestion = (page: typeof pageA) => page.locator('.user-message').last()
-        .locator('xpath=following::*[@data-message-id and contains(concat(" ", normalize-space(@class), " "), " assistant-message ")]');
+        .locator(`${AFTER_QUESTION} and (@data-response-phase="final" or (@data-response-phase="interim" and not(@data-turn-kind="reading")))]`);
+      // Every assistant message after the question carries its phase: nothing is still a bare carrier.
+      const unsettledAfterOwnQuestion = (page: typeof pageA) => page.locator('.user-message').last()
+        .locator(`${AFTER_QUESTION} and not(@data-response-phase)]`);
 
       // ── WAIT ON THE WEBSOCKET, WHICH IS HOW A PERSON LEARNS THEY WERE ANSWERED ─────────────────
       //
@@ -222,6 +252,12 @@ test.describe('identical private questions, sent at the same time', () => {
         expect(answeredAfterOwnQuestion(pageB).first(), 'B must be told they were answered')
           .toBeVisible({ timeout: BOTH_ANSWERED_MS }),
       ]);
+      // SETTLED BEFORE THE BACKSTOP READS, over the same stream: a carrier read before its update would be judged as
+      // a message both people see with nothing saying what it is.
+      await Promise.all([
+        expect(unsettledAfterOwnQuestion(pageA), 'every assistant message after A\'s question settles').toHaveCount(0, { timeout: 30_000 }),
+        expect(unsettledAfterOwnQuestion(pageB), 'every assistant message after B\'s question settles').toHaveCount(0, { timeout: 30_000 }),
+      ]);
 
       // THE BACKSTOP, not the mechanism (tenet D6's second qualification). The stream said a message
       // arrived; the service is what says who may READ it, and that is the claim under test. One read
@@ -238,6 +274,7 @@ test.describe('identical private questions, sent at the same time', () => {
 
       const answersSeenBy = (arn: string) => messageRowsVisibleTo(channelArn, arn)
         .filter((m) => m.senderArn.includes('/bot/'))
+        .filter((m) => !isRoomStatus(m))
         .filter((m) => Date.parse(m.lastUpdatedAt || m.createdAt) >= askedAt);
       expect(answersSeenBy(arnA).length, 'A must have an answer the service will hand them').toBeGreaterThan(0);
       expect(answersSeenBy(arnB).length, 'B must have an answer the service will hand them').toBeGreaterThan(0);
@@ -255,9 +292,9 @@ test.describe('identical private questions, sent at the same time', () => {
       // second turn resolved the first person's message and inherited its `Target`.
       // Only messages that postdate the questions: the welcome is shared by construction and says
       // nothing about whether a private answer was delivered privately.
-      const answeredA = seenByA.filter((m) => m.senderArn.includes('/bot/')
+      const answeredA = seenByA.filter((m) => m.senderArn.includes('/bot/') && !isRoomStatus(m)
         && Date.parse(m.lastUpdatedAt || m.createdAt) >= askedAt);
-      const answeredB = seenByB.filter((m) => m.senderArn.includes('/bot/')
+      const answeredB = seenByB.filter((m) => m.senderArn.includes('/bot/') && !isRoomStatus(m)
         && Date.parse(m.lastUpdatedAt || m.createdAt) >= askedAt);
       const onlyA = answeredA.filter((m) => !idsB.has(m.messageId));
       const onlyB = answeredB.filter((m) => !idsA.has(m.messageId));
@@ -269,6 +306,15 @@ test.describe('identical private questions, sent at the same time', () => {
       expect(
         sharedAnswers.map((m) => `${m.messageId.slice(0, 8)} ${m.content.slice(0, 80)}`),
         'no answer posted after two private questions may be visible to both people',
+      ).toEqual([]);
+      // THE ROOM'S STATUS SAYS THAT SOMETHING WAITS, NEVER WHAT: none that both can see carries either question's
+      // codename or either person's full address (a local part alone can be a common word that ordinary status copy uses).
+      const sharedStatus = seenByA.filter((m) => isRoomStatus(m) && idsB.has(m.messageId));
+      expect(
+        sharedStatus
+          .filter((m) => [shared, userA.email, userB!.email].some((t) => m.content.toLowerCase().includes(t.toLowerCase())))
+          .map((m) => `${m.messageId.slice(0, 8)} ${m.content.slice(0, 120)}`),
+        'a status line both people see named a private question or its sender',
       ).toEqual([]);
       expect(onlyA.length, 'A must have a private answer of their own').toBeGreaterThan(0);
       expect(onlyB.length, 'B must have a private answer of their own').toBeGreaterThan(0);

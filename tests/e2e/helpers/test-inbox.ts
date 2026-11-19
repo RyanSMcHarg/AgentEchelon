@@ -92,6 +92,11 @@ export interface EmailQuery {
   since: number;
   /** A string the subject must contain, to tell this test's mail from anything else to the same person. */
   subjectIncludes?: string;
+  /**
+   * A string the body must contain. A person's message is emailed under the platform's subject, never one its sender
+   * wrote, so its mail is told apart by its words.
+   */
+  textIncludes?: string;
 }
 
 /** Every message matching the query that has arrived so far. */
@@ -99,7 +104,8 @@ export function emailsTo(inbox: TestInbox, q: EmailQuery): ReceivedEmail[] {
   const to = q.to.toLowerCase();
   return keysSince(inbox, q.since)
     .map((k) => read(inbox, k))
-    .filter((m) => m.to.includes(to) && (!q.subjectIncludes || m.subject.includes(q.subjectIncludes)));
+    .filter((m) => m.to.includes(to) && (!q.subjectIncludes || m.subject.includes(q.subjectIncludes))
+      && (!q.textIncludes || m.text.includes(q.textIncludes)));
 }
 
 /** The first message matching the query, waiting up to `timeoutMs` for it. Throws when none arrives. */
@@ -109,7 +115,7 @@ export async function waitForEmail(inbox: TestInbox, q: EmailQuery, timeoutMs = 
     const found = emailsTo(inbox, q)[0];
     if (found) return found;
     if (Date.now() > deadline) {
-      throw new Error(`no email to ${q.to}${q.subjectIncludes ? ` with "${q.subjectIncludes}" in the subject` : ''} `
+      throw new Error(`no email to ${q.to}${q.subjectIncludes ? ` with "${q.subjectIncludes}" in the subject` : ''}${q.textIncludes ? ` saying "${q.textIncludes}"` : ''} `
         + `reached s3://${inbox.bucket}/${inbox.prefix} within ${Math.round(timeoutMs / 1000)}s`);
     }
     await new Promise((r) => setTimeout(r, 5_000));

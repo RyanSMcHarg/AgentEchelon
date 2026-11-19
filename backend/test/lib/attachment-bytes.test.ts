@@ -49,26 +49,36 @@ describe('senderOwnsAttachmentKey (attachment-in object-level authz)', () => {
   // Chime AppInstanceUser ARN; the sub is the segment after `/user/`.
   const SENDER = 'arn:aws:chime:us-east-1:1:app-instance/app/user/sub-alice';
   const OWN_KEY = 'attachments/conv-1/sub-alice/1700000000-report.pdf';
+  const CHANNEL_1 = 'arn:aws:chime:us-east-1:1:app-instance/app/channel/conv-1';
+
+  it("rejects the sender's own upload from another conversation (a file carried across a classification)", () => {
+    expect(senderOwnsAttachmentKey('attachments/conv-premium/sub-alice/1700000000-plan.pdf', CHANNEL_1, SENDER)).toBe(false);
+  });
+
+  it('rejects every key when the conversation is unknown', () => {
+    expect(senderOwnsAttachmentKey(OWN_KEY, undefined, SENDER)).toBe(false);
+    expect(senderOwnsAttachmentKey(OWN_KEY, 'arn:aws:chime:us-east-1:1:app-instance/app/user/sub-alice', SENDER)).toBe(false);
+  });
 
   it('accepts a key under the sender own prefix', () => {
-    expect(senderOwnsAttachmentKey(OWN_KEY, SENDER)).toBe(true);
+    expect(senderOwnsAttachmentKey(OWN_KEY, CHANNEL_1, SENDER)).toBe(true);
   });
 
   it("rejects another user's file (the cross-user IDOR this guards)", () => {
     const victimKey = 'attachments/conv-9/sub-victim/1700000000-secret.pdf';
-    expect(senderOwnsAttachmentKey(victimKey, SENDER)).toBe(false);
+    expect(senderOwnsAttachmentKey(victimKey, CHANNEL_1, SENDER)).toBe(false);
   });
 
   it('rejects keys outside the attachments/ prefix', () => {
-    expect(senderOwnsAttachmentKey('context/standard/sub-alice/x.json', SENDER)).toBe(false);
-    expect(senderOwnsAttachmentKey('generated-docs/conv/sub-alice/x.md', SENDER)).toBe(false);
+    expect(senderOwnsAttachmentKey('context/standard/sub-alice/x.json', CHANNEL_1, SENDER)).toBe(false);
+    expect(senderOwnsAttachmentKey('generated-docs/conv/sub-alice/x.md', CHANNEL_1, SENDER)).toBe(false);
   });
 
   it('fails closed on a missing/malformed sender ARN or a too-short key', () => {
-    expect(senderOwnsAttachmentKey(OWN_KEY, undefined)).toBe(false);
-    expect(senderOwnsAttachmentKey(OWN_KEY, 'arn-with-no-user-segment')).toBe(false);
-    expect(senderOwnsAttachmentKey(undefined, SENDER)).toBe(false);
-    expect(senderOwnsAttachmentKey('attachments/only/two', SENDER)).toBe(false);
+    expect(senderOwnsAttachmentKey(OWN_KEY, CHANNEL_1, undefined)).toBe(false);
+    expect(senderOwnsAttachmentKey(OWN_KEY, CHANNEL_1, 'arn-with-no-user-segment')).toBe(false);
+    expect(senderOwnsAttachmentKey(undefined, CHANNEL_1, SENDER)).toBe(false);
+    expect(senderOwnsAttachmentKey('attachments/only/two', CHANNEL_1, SENDER)).toBe(false);
   });
 });
 

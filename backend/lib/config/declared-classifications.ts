@@ -15,7 +15,7 @@
  *     that names none of the declared classifications is not served here: every creator refuses a classification
  *     the registry does not declare.
  *
- * An issuer's own classifications, fixed set, mapping and oneChannel are checked by the issuer registry
+ * An issuer's own classifications, fixed set, mapping and contextClassification are checked by the issuer registry
  * (`issuerErrors`, `lib/config/issuers.ts`) against the same set.
  */
 import { CONVERSATION_TYPES, GUEST_VISITOR_TYPE, invitationPolicyOf } from './conversation-types';

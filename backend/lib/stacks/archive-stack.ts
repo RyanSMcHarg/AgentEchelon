@@ -37,7 +37,7 @@ import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { Construct } from 'constructs';
 import { ANALYTICS_PREFIX, ATHENA_WORKGROUP_NAME, ANALYTICS_DB_NAME, INSTANCE_SSM } from './agent-classification-common';
 import { MembershipAuditConstruct } from '../constructs/membership-audit';
-import { registerArchivePartitions } from '../constructs/archive-partitions';
+import { ARCHIVE_PARTITION_QUERY, registerArchivePartitions } from '../constructs/archive-partitions';
 import { utilityModelArns } from '../config/model-strategy';
 import type { IArchiveStackOutputs } from '../interfaces/archive-stack-interface';
 
@@ -62,6 +62,9 @@ export interface ArchiveStackProps extends cdk.StackProps {
 export class ArchiveStack extends cdk.Stack implements IArchiveStackOutputs {
   public readonly archiveBucketName: string;
   public readonly archiveBucketArn: string;
+  public readonly conversationArchiveBucketName: string;
+  public readonly conversationArchiveBucketArn: string;
+  public readonly archiveKeyArn: string;
   public readonly analyticsMode = 'athena' as const;
   /** The client-events route, on `PersonApi`. */
   public readonly routes: RouteSpec[] = [];
@@ -118,16 +121,25 @@ export class ArchiveStack extends cdk.Stack implements IArchiveStackOutputs {
       bucketKeyEnabled: true,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       enforceSSL: true, // deny non-TLS access (aws:SecureTransport)
+      // THE SYSTEM OF RECORD IS NEVER EXPIRED (tenet D7): `conversations/` (the event archive) and `evaluations/`
+      // (the scores the archive holds beside it) move to infrequent access at 30 days and stay. Each other family
+      // is named and expired on its own (tenet D15): failed deliveries, the browser telemetry pipeline, Athena's
+      // query results (read once), and the copies of delivered documents a grading run reads.
       lifecycleRules: [
         {
+          id: 'InfrequentAccessAfter30Days',
           transitions: [
             {
               storageClass: s3.StorageClass.INFREQUENT_ACCESS,
               transitionAfter: cdk.Duration.days(30),
             },
           ],
-          expiration: cdk.Duration.days(90),
         },
+        { id: 'ExpireDeliveryErrors', prefix: 'errors/', expiration: cdk.Duration.days(90) },
+        { id: 'ExpireClientEvents', prefix: 'client_events/', expiration: cdk.Duration.days(90) },
+        { id: 'ExpireClientEventErrors', prefix: 'client_events-errors/', expiration: cdk.Duration.days(90) },
+        { id: 'ExpireAthenaResults', prefix: 'athena-results/', expiration: cdk.Duration.days(7) },
+        { id: 'ExpireDeliveredDocuments', prefix: 'delivered-documents/', expiration: cdk.Duration.days(90) },
         {
           // The Firehose MetadataExtraction
           // partitionKey expression falls back to `unknown` when a record
@@ -145,6 +157,10 @@ export class ArchiveStack extends cdk.Stack implements IArchiveStackOutputs {
 
     this.archiveBucketName = archiveBucket.bucketName;
     this.archiveBucketArn = archiveBucket.bucketArn;
+    // In this mode the archive bucket is the system of record itself.
+    this.conversationArchiveBucketName = archiveBucket.bucketName;
+    this.conversationArchiveBucketArn = archiveBucket.bucketArn;
+    this.archiveKeyArn = archiveKey.keyArn;
 
     // ============================================================
     // Firehose Delivery Stream
@@ -212,14 +228,10 @@ export class ArchiveStack extends cdk.Stack implements IArchiveStackOutputs {
               parameters: [
                 {
                   parameterName: 'MetadataExtractionQuery',
-                  // The `user_type` partition holds the CONVERSATION'S CLASSIFICATION. Its name is
-                  // the S3 layout and the Glue projection, so it stays; its source is the turn's
-                  // `classification`. A nested `.analytics` block (an admin alert) first, else the
-                  // FLAT top-level key buildAnalyticsMetadata() emits. `unknown` when neither is
-                  // present. It reads the message and nothing else, so `classification` has to stay
-                  // in FRONTEND_METADATA_KEYS: Firehose cannot follow Aurora mode's out-of-band hop
-                  // to DynamoDB the way the archival Lambda does.
-                  parameterValue: '{user_type:(if .Payload.Metadata then (.Payload.Metadata | fromjson | .analytics.classification // .classification // "unknown") else "unknown" end)}',
+                  // The `user_type` partition: the classification the platform declared on an
+                  // assistant's record, else `unknown`. Never read from a person's Metadata, and no
+                  // Metadata routes a record out of the table (`ARCHIVE_PARTITION_QUERY`).
+                  parameterValue: ARCHIVE_PARTITION_QUERY,
                 },
                 {
                   parameterName: 'JsonParsingEngine',
@@ -408,19 +420,22 @@ export class ArchiveStack extends cdk.Stack implements IArchiveStackOutputs {
               // bucket to verify its region before writing results -
               // without this, every StartQueryExecution fails with
               // InvalidRequestException "Unable to verify/create output
-              // bucket ...". GetObject/ListBucket/PutObject cover read
-              // of source data, list of partitions, and write of both
-              // Athena results and evaluation NDJSON archives.
-              actions: [
-                's3:GetBucketLocation',
-                's3:GetObject',
-                's3:ListBucket',
-                's3:PutObject',
-              ],
+              // bucket ...". GetObject/ListBucket cover read of source
+              // data and list of partitions.
+              actions: ['s3:GetBucketLocation', 's3:GetObject', 's3:ListBucket'],
               resources: [
                 archiveBucket.bucketArn,
                 `${archiveBucket.bucketArn}/*`,
               ],
+            }),
+            // WRITES NAME THE RUNNER'S OWN FAMILIES, never the conversation record: Athena's results
+            // (the workgroup enforces `athena-results/`), the evaluation NDJSON and the per-assistant
+            // score summaries, and the copies of delivered documents it grades (SPEC-EVALUATION FR22).
+            new iam.PolicyStatement({
+              actions: ['s3:PutObject'],
+              resources: ['athena-results', 'evaluations', 'agent-scores', 'delivered-documents'].map(
+                (prefix) => `${archiveBucket.bucketArn}/${prefix}/*`,
+              ),
             }),
             // Archive bucket + Athena results are SSE-KMS on the customer CMK: reading
             // source data and writing Athena results / NDJSON both need key access.

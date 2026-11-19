@@ -110,4 +110,10 @@ describe('the entry is an invariant, not a profile setting', () => {
   it('no longer carries the probe classification, which existed only to vary the entry', () => {
     expect(defaultProfileRegistry.classificationValues()).not.toContain('probe');
   });
+
+  it('@humans starts no assistant turn at any size, and @all beside it still does', () => {
+    expect(flowOwnsTheTurn({ text: '@humans the plan changed', members: PAIR, isOneToOne: true })).toBe(false);
+    expect(flowOwnsTheTurn({ text: '@humans the plan changed', members: ROOM, isOneToOne: false })).toBe(false);
+    expect(flowOwnsTheTurn({ text: '@all @humans the plan changed', members: ROOM, isOneToOne: false })).toBe(true);
+  });
 });

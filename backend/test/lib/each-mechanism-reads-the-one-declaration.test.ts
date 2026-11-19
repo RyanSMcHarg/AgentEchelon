@@ -72,12 +72,12 @@ import {
   type CatalogDeploymentContext,
   type ContextSourceEntry,
 } from '../../lib/config/context-sources';
-import { eventWorkflowErrors, PLATFORM_EVENT_WORKFLOWS, type EventWorkflow } from '../../lambda/src/lib/event-workflow';
+import { eventWorkflowErrors, SHIPPED_EVENT_WORKFLOWS, type EventWorkflow } from '../../lambda/src/lib/event-workflow';
 
 const DEPLOYMENT: CatalogDeploymentContext = {
   classification: 'standard',
-  attachmentsBucketArn: 'arn:aws:s3:::attachments',
-  attachmentsBucketName: 'attachments',
+  companyBucketArn: 'arn:aws:s3:::attachments',
+  companyBucketName: 'attachments',
   userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/profiles',
   userProfileTableName: 'profiles',
   region: 'us-east-1',
@@ -107,10 +107,8 @@ const LEGACY = {
       priorMessage: safe(o.priorMessage, 400),
       visitSummary: safe(o.visitSummary, 400),
     };
-    const examples = (o.examples ?? []).filter((e) => typeof e === 'string' && e.trim()).slice(0, 4);
     const roleValues: Record<string, string | undefined> = {
       role: assistant.role,
-      examples: examples.length ? examples.map((e) => `- ${e.trim()}`).join('\n') : undefined,
     };
     const lines: string[] = [];
     for (const line of template.split('\n')) {
@@ -131,6 +129,7 @@ const LEGACY = {
     conversationArchived: { who: 'text', date: 'id' },
     memberJoined: { name: 'text' },
     memberWelcome: { name: 'text', recap: 'text', title: 'text', notifyPerson: 'arn', notifySubject: 'text' },
+    meetingArrivalBrief: { brief: 'longText', accounts: 'text' },
     briefingReady: { source: 'text' },
     assistantUnavailable: { name: 'text' },
     battleSideDidNotFinish: { name: 'text' },
@@ -187,7 +186,7 @@ const LEGACY = {
 // ── 1. Welcome tokens are {{field}} variables ──────────────────────────────────────────────────────
 
 const WELCOME_TEMPLATES = [
-  "Hi, I'm the {role} assistant.\nI opened this conversation because {eventSummary}\nHappy to help with {topic}.\nA few things to try:\n{examples}",
+  "Hi, I'm the {role} assistant.\nI opened this conversation because {eventSummary}\nHappy to help with {topic}.",
   "An alert opened this conversation: {eventSummary}\nI'm the {role} assistant. I can read the metrics and alarm state behind it.",
   'This conversation picks up {priorSubject} ([where it came from]({parentRef})).\nYou asked: {priorMessage}\n{visitSummary}',
   'A line naming {somethingElse} is left out.\nThis line stays.',
@@ -195,7 +194,7 @@ const WELCOME_TEMPLATES = [
   'No fields at all.',
   '',
   '   \nTrailing {role}\n\n',
-  'Two on a line: {topic} / {eventSummary}\n{examples}\nBye.',
+  'Two on a line: {topic} / {eventSummary}\nBye.',
 ];
 
 const LONG = 'x'.repeat(10_000);
@@ -516,7 +515,7 @@ describe('5. an onboarding answer is member trust, field by field, and the promp
 
 describe('6. a workflow send learns its audience, and a step condition is checked and not yet run', () => {
   it("the platform's workflows pass, their mentions included", () => {
-    for (const [name, wf] of Object.entries(PLATFORM_EVENT_WORKFLOWS)) expect([name, eventWorkflowErrors(name, wf)]).toEqual([name, []]);
+    for (const [name, wf] of Object.entries(SHIPPED_EVENT_WORKFLOWS)) expect([name, eventWorkflowErrors(name, wf)]).toEqual([name, []]);
   });
 
   const wf = (opening: Record<string, unknown>): EventWorkflow => ({

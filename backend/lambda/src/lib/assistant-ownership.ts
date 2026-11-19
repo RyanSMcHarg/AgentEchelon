@@ -85,6 +85,16 @@ export async function listAssistantIdentities(client: ChimeSDKIdentityClient, ap
   return out;
 }
 
+/**
+ * THE TEAM THAT OWNS ONE ASSISTANT, read live from its bot's `owner-team` tag (SPEC-PROCESSES P8): the same tag every other
+ * reader uses. Undefined where none is recorded or it was cleared; a read that fails throws.
+ */
+export async function ownerTeamOf(client: Pick<ChimeSDKIdentityClient, 'send'>, botArn: string): Promise<string | undefined> {
+  const tags = (await client.send(new ListTagsForResourceCommand({ ResourceARN: botArn }))).Tags || [];
+  const team = tags.find((t) => t.Key === OWNER_TEAM_TAG)?.Value;
+  return team && team !== OWNER_TEAM_CLEARED ? team : undefined;
+}
+
 /** The assistants these teams own, by the same rule as `teamsOwn`. Several bots may serve one name; it is listed once. */
 export function ownedBy(identities: AssistantIdentity[], teams: string[]): string[] {
   return [...new Set(identities.map((i) => i.assistant))].filter((a) => teamsOwn(identities, teams, a)).sort();

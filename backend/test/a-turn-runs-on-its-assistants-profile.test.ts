@@ -2,7 +2,7 @@
  * A TURN RUNS ON THE PROFILE OF THE ASSISTANT IT WAS ADDRESSED TO, NOT ITS CLASSIFICATION'S PRIMARY.
  *
  * A profile belongs to an assistant, and a classification can have several: `premium` has `advisor`
- * (its primary) and `ops-premium` (the `ops` role, keyword-classified, 120 messages an hour). Every
+ * (its primary) and `ops-premium` (the `ops` role, 120 messages an hour). Every
  * per-assistant setting the router reads for a turn - classifier mode, classifier model, rate limit,
  * onboarding intake, welcome, persona fact, the copy the assistant speaks in its own voice, the
  * attribution - comes from ONE resolution of the assistant (`turnAssistantProfile`), so a turn to `ops-premium`
@@ -42,11 +42,11 @@ const answered = (resolved: TurnAssistantProfile) => {
 };
 
 describe('the turn assistant profile', () => {
-  it('a turn addressed to ops-premium uses keyword classification and ops-premium\'s limit of 120', () => {
+  it('a turn addressed to ops-premium uses ops-premium\'s limit of 120, and the model classifier like every assistant', () => {
     const assistant = answered(resolve({ assignedAssistant: 'ops-premium' }));
     expect(assistant.source).toBe('assigned');
     expect(assistant.profile.name).toBe('ops-premium');
-    expect(assistant.profile.classifierMode).toBe('keyword');
+    expect(assistant.profile.classifierMode).toBe('llm');
     expect(assistant.profile.rateLimitPerHour).toBe(120);
   });
 
@@ -136,13 +136,13 @@ describe('the router reads every per-assistant setting from the one assistant re
     const lineReads = ROUTER.match(/turnWords\(\)/g) ?? [];
     expect(assistantVersionReads.length).toBeGreaterThanOrEqual(4);
     expect(lineReads.length).toBeGreaterThanOrEqual(7);
-    expect(ROUTER).toMatch(/async function wordsOf\(profileName: string\)[\s\S]{0,120}resolveActiveProfile\(profileName,/);
+    expect(ROUTER).toMatch(/async function wordsOf\(profileName: string, at: \{[^}]*\} = \{\}\)[\s\S]{0,200}resolveActiveProfile\(profileName,/);
   });
 
   it('a turn resolves its words once: every line of the turn reads the one set, and a failed read is not kept', () => {
     // One call resolves the version and its template set; every later line of the turn reads that same promise.
-    expect(ROUTER.match(/wordsOf\(turnProfile\.name\)/g)).toHaveLength(1);
-    expect(ROUTER).toMatch(/const turnWords = \(\): ReturnType<typeof wordsOf> => \(turnWordsRead \?\?= wordsOf\(turnProfile\.name\)\.catch\(\(err\) => \{ turnWordsRead = undefined; throw err; \}\)\);/);
+    expect(ROUTER.match(/wordsOf\(turnProfile\.name\b/g)).toHaveLength(1);
+    expect(ROUTER).toMatch(/const turnWords = \(\): ReturnType<typeof wordsOf> => \(turnWordsRead \?\?= wordsOf\(turnProfile\.name, \{ channelArn \}\)\.catch\(\(err\) => \{ turnWordsRead = undefined; throw err; \}\)\);/);
     // Declared right after the turn's assistant is known, before any line reads it.
     expect(ROUTER.indexOf('const turnWords = ')).toBeGreaterThan(ROUTER.indexOf('const turnProfile = turnAssignment.profile;'));
     expect(ROUTER.indexOf('const turnWords = ')).toBeLessThan(ROUTER.indexOf('await turnWords()'));
@@ -391,7 +391,7 @@ describe('through the handler, a turn runs on its assistant\'s profile', () => {
     }
   });
 
-  it('a turn addressed to ops-premium is keyword-classified, metered at its limit of 120, and refused in its own words', async () => {
+  it('a turn addressed to ops-premium is model-classified, metered at its limit of 120, and refused in its own words', async () => {
     // The refusal is said from the ADDRESSED assistant's own template, so ops-premium's line is said, not advisor's.
     mockResolveActiveProfile.mockImplementation(async () => ({}));
     mockOwnLines['ops-premium'] = { rateLimited: 'OPS LIMIT, back in {minutes}' };
@@ -400,8 +400,8 @@ describe('through the handler, a turn runs on its assistant\'s profile', () => {
 
     const res = await handler(answerEvent('lex-ops', 'what is the error rate on checkout?'));
 
-    expect(mockClassifyByKeyword).toHaveBeenCalled();
-    expect(mockClassifyIntent).not.toHaveBeenCalled();
+    expect(mockClassifyIntent).toHaveBeenCalled();
+    expect(mockClassifyByKeyword).not.toHaveBeenCalled();
     expect(mockEvaluateAbuseGate).toHaveBeenCalledWith(expect.objectContaining({ rateLimit: 120 }));
     expect(res.messages[0].content).toBe('OPS LIMIT, back in 5');
     for (const k of Object.keys(mockOwnLines)) delete mockOwnLines[k];
@@ -481,8 +481,8 @@ describe('through the handler, the assistant resolution decides who answers and 
 
     await handler(handedTurn(OPS_BOT, 'what is the error rate on checkout?'));
 
-    expect(mockClassifyByKeyword).toHaveBeenCalled();
-    expect(mockClassifyIntent).not.toHaveBeenCalled();
+    expect(mockClassifyIntent).toHaveBeenCalled();
+    expect(mockClassifyByKeyword).not.toHaveBeenCalled();
     expect(mockEvaluateAbuseGate).toHaveBeenCalledWith(expect.objectContaining({ rateLimit: 120 }));
     expect(securityEvents()).toEqual([]);
     // THE ATTRIBUTION, by behavior: what the turn posts says it is ops-premium, in the ops role.
@@ -564,5 +564,14 @@ describe('through the handler, the assistant resolution decides who answers and 
     expect(res.messages).toEqual([]);
     expect(mockEvaluateAbuseGate).not.toHaveBeenCalled();
     expect(securityEvents()).toEqual(['no-classification']);
+  });
+});
+
+describe('a turn whose version cannot be read opens no workflow of its own', () => {
+  // An unset selection means every workflow, so a version that could not be read must not leave it unset.
+  it('the failure path narrows the selection to the platform machines', () => {
+    const failure = ROUTER.slice(ROUTER.indexOf("profile intent-pack resolution failed"));
+    const block = failure.slice(0, failure.indexOf('markRouterStep('));
+    expect(block).toMatch(/turnWorkflowSelection = \[\.\.\.PLATFORM_TASK_MACHINE_KEYS\]/);
   });
 });

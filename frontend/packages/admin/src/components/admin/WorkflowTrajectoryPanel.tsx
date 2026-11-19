@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import DataTable from './DataTable';
 import { InfoTooltip } from './AdminHelp';
+import WorkflowEditorLink from './WorkflowEditorLink';
 import { queryAnalytics } from '../../services/analyticsService';
 import type { AnalyticsDateRange } from '@ae/shared';
 
@@ -55,7 +56,16 @@ const WorkflowTrajectoryPanel: React.FC<{
   };
 
   const columns = [
-    { key: 'task_type', label: t('admin.workflowTrajectory.column.taskType'), render: (v: unknown) => <strong>{String(v ?? '—')}</strong> },
+    {
+      // EACH TASK TYPE OPENS IN ITS ASSISTANT'S EDITOR, on the steps of the machine it ran under.
+      key: 'task_type', label: t('admin.workflowTrajectory.column.taskType'),
+      render: (v: unknown, row: Row) => (
+        <strong>
+          <WorkflowEditorLink assistant={String(row.assistant ?? '') || assistant} task={v == null ? null : String(v)}
+            testId={`workflow-trajectory-link-${String(v)}`}>{String(v ?? '—')}</WorkflowEditorLink>
+        </strong>
+      ),
+    },
     { key: 'assistant', label: t('admin.workflowTrajectory.column.assistant') },
     { key: 'conversation_classification', label: t('admin.workflowTrajectory.column.classification') },
     { key: 'tasks', label: t('admin.workflowTrajectory.column.tasks'), sortable: true },
@@ -74,10 +84,10 @@ const WorkflowTrajectoryPanel: React.FC<{
 
   return (
     <div className="admin-section" role="region" aria-label={t('admin.workflowTrajectory.title')}>
-      <h4>
+      <h3>
         {t('admin.workflowTrajectory.title')}{' '}
         <InfoTooltip label={t('admin.workflowTrajectory.title')} content={t('admin.workflowTrajectory.tip')} />
-      </h4>
+      </h3>
       <p className="admin-tab-description">{t('admin.workflowTrajectory.description')}</p>
       {error && <p className="admin-error" role="alert">{error}</p>}
       {!error && rows === null && <p className="admin-help-text">{t('admin.workflowTrajectory.loading')}</p>}

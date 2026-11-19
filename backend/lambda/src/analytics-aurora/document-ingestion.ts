@@ -2,7 +2,7 @@
  * Document Ingestion Lambda — RAG proof-point ingestor.
  *
  * Triggered by S3 PutObject events on the `rag/` prefix of the
- * attachments bucket. Reads the uploaded file, chunks it, embeds each
+ * company bucket (`CORPUS_BUCKET`). Reads the uploaded file, chunks it, embeds each
  * chunk via Titan v2 (1024-dim per ADR-002), and UPSERTs into the
  * `embeddings` table (schema migration 008) with `source_type='wiki'`
  * (or the source-type derived from the S3 prefix) + per-chunk metadata.
@@ -29,7 +29,7 @@
  * the retries are spent (DOCUMENT_INGESTION_RETRY, archive-stack-aurora.ts).
  */
 
-import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, GetObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import {
   BedrockRuntimeClient,
   InvokeModelCommand,
@@ -220,17 +220,34 @@ export async function handler(event: S3Event): Promise<{ ingested: IngestResult[
 
   for (const record of event.Records ?? []) {
     const bucket = record.s3?.bucket?.name;
+    // ONE CORPUS: a record from any bucket but the one the stack names is not the corpus, and is not ingested.
+    const corpus = process.env.CORPUS_BUCKET;
+    if (corpus && bucket !== corpus) {
+      console.warn('[document-ingestion] skipping record: not the corpus bucket', { bucket });
+      continue;
+    }
     const key = decodeURIComponent((record.s3?.object?.key ?? '').replace(/\+/g, ' '));
     const etag = (record.s3?.object?.eTag ?? '').replace(/"/g, '');
 
     // A DELETED OBJECT TAKES ITS CHUNKS WITH IT. The corpus is what an object holds;
     // an object removed from `rag/` left its embeddings retrievable, so moving or withdrawing a document
     // meant overwriting it with a stub. The S3 event is the signal (tenet D6).
+    //
+    // THE CORPUS BUCKET IS VERSIONED, so a removal event does not say the document is gone: deleting an old
+    // version leaves the current one, and deleting a delete marker restores the version beneath it. The key's
+    // current object decides: one that exists is (re)ingested as it stands, and only a key with none is purged.
     if (bucket && key.startsWith('rag/') && (record.eventName ?? '').startsWith('ObjectRemoved')) {
       try {
-        await removeObjectChunks(bucket, key);
+        const current = await currentETagOf(bucket, key);
+        if (current === null) {
+          await removeObjectChunks(bucket, key);
+        } else {
+          const result = await ingestObject(bucket, key, current, correlationId);
+          results.push(result);
+          if (result.chunksAttempted > 0 && result.chunksEmbedded === 0) failed.push(key);
+        }
       } catch (err) {
-        console.error('[document-ingestion] could not remove the chunks of a deleted object', { key, err });
+        console.error('[document-ingestion] could not settle the chunks of a removed version', { key, err });
         failed.push(key);
       }
       continue;
@@ -262,6 +279,21 @@ export async function handler(event: S3Event): Promise<{ ingested: IngestResult[
   }
 
   return { ingested: results };
+}
+
+/**
+ * The ETag of the key's current object, or null when the key has none (never written, or its current version
+ * is a delete marker, which HEAD answers 404). Any other failure throws, so the record is retried.
+ */
+export async function currentETagOf(bucket: string, key: string): Promise<string | null> {
+  try {
+    const head = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+    return (head.ETag ?? '').replace(/"/g, '');
+  } catch (err) {
+    const e = err as { name?: string; $metadata?: { httpStatusCode?: number } };
+    if (e?.name === 'NotFound' || e?.name === 'NoSuchKey' || e?.$metadata?.httpStatusCode === 404) return null;
+    throw err;
+  }
 }
 
 /** Delete the embeddings of an object removed from the bucket, as the classification writer role. */

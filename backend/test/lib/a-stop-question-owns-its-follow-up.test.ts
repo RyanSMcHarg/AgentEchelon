@@ -331,7 +331,7 @@ describe('the fold and the stop declare their targets too', () => {
     // The Lex path cannot supply one - Amazon Chime SDK sends Lex three request attributes and the
     // message id is not among them - and resolving it here would put a channel read on the one path
     // whose whole promise is immediacy.
-    const at = router.indexOf('dispatchStopEvaluationTurn({');
+    const at = router.indexOf('const evaluation: StopEvaluationDispatch = {');
     expect(at).toBeGreaterThan(-1);
     expect(router.slice(at, at + 6000)).toContain('BYPASS_MESSAGE_ID_ATTR');
   });

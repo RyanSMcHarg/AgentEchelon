@@ -4,9 +4,7 @@
  * Guest start is unauthenticated, so these are what stand between an anonymous request and a minted
  * AppInstanceUser, a conversation and a KMS `Sign`. All three run before any of those, and every one of
  * them FAILS CLOSED: a store, a parameter or a verifier that cannot answer refuses the request with
- * `unavailable`, never admits it. There is no bypass token. communication-hub's versions of the same
- * controls failed open (its IP limit and circuit breaker) and carried a bypass token; this is the
- * correction.
+ * `unavailable`, never admits it. There is no bypass token.
  *
  * ── THE PER-ADDRESS LIMIT ────────────────────────────────────────────────────────────────────────
  *

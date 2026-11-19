@@ -10,13 +10,14 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { PLATFORM_EVENT_WORKFLOWS, type EventWorkflow } from '../../lambda/src/lib/event-workflow';
+import { SHIPPED_EVENT_WORKFLOWS, type EventWorkflow } from '../../lambda/src/lib/event-workflow';
 import { previewWorkflowRun } from '../../lambda/src/lib/workflow-preview';
 import { createDraft, editDraft, previewDraftWorkflow, ProfileValidationError } from '../../lambda/src/lib/profile-lifecycle';
 import { ADMIN_CAPABILITIES } from '../../lib/config/admin-capabilities';
 import { ADMIN_CONSOLE_ROLE_NAME } from '../../lib/constructs/admin-role-grants';
 import { fakeSsmStore } from '../helpers/fake-ssm-store';
 import { adminApiTemplate, adminServicesTemplate } from '../helpers/synth';
+import { AGENT_STEP_OPS_ROOM } from '../helpers/agent-step-ops-room';
 
 const mockS3Calls: Array<{ verb: string; key: string }> = [];
 jest.mock('@aws-sdk/client-s3', () => {
@@ -33,7 +34,8 @@ jest.mock('@aws-sdk/client-s3', () => {
 });
 
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v));
-const OPS: EventWorkflow = clone(PLATFORM_EVENT_WORKFLOWS['ops-room']);
+// The ops room with its first look as an agent step, the stored shape the agent-step walks below are proven on.
+const OPS: EventWorkflow = clone(AGENT_STEP_OPS_ROOM);
 const ROOT = '/agent-echelon';
 const SRC = path.join(__dirname, '..', '..', 'lambda', 'src');
 
@@ -80,11 +82,67 @@ describe('the walk is the runtime\'s', () => {
   });
 });
 
+describe('the walk is the event\'s, as the router runs it', () => {
+  const joined: EventWorkflow = {
+    on: 'person-joined', initial: 'hi',
+    states: {
+      hi: { send: { to: 'joined', template: 'workflow-subject-welcome', mention: { name: 'event:person' } }, onSuccess: 'tell-subject' },
+      'tell-subject': { send: { to: 'subject', template: 'workflow-subject-welcome' }, onSuccess: 'done' },
+      done: { disposition: 'success' },
+    },
+  };
+
+  it('names a sample subject on assistant-joined alone: a send to the subject elsewhere reaches nobody', async () => {
+    const r = await previewWorkflowRun('greet', joined);
+    expect(r.steps.find((st) => st.step === 'tell-subject')?.outcome).toBe('skipped');
+    expect(r.acts.some((a) => a.step === 'tell-subject')).toBe(false);
+    const welcome = await previewWorkflowRun('welcome', { ...clone(joined), on: 'assistant-joined', states: { ...clone(joined).states, hi: { send: { to: 'room', template: 'workflow-opening' }, onSuccess: 'tell-subject' } } });
+    expect(welcome.acts.find((a) => a.step === 'tell-subject')).toMatchObject({ to: ['subject'] });
+  });
+
+  it('walks a person-joined workflow with the join recap the runtime adds after its own steps', async () => {
+    const r = await previewWorkflowRun('greet', joined);
+    expect(r.steps.map((st) => st.step)).toEqual(['hi', 'tell-subject', 'join-recap--done']);
+    expect(r.acts.at(-1)).toMatchObject({ step: 'join-recap--done', act: 'agent', template: 'join-recap' });
+    expect(r.ended).toBe('success');
+  });
+
+  it('an agent step another assistant takes, ended absent, runs no turn and says its absent message', async () => {
+    const r = await previewWorkflowRun('ops', OPS, { outcomes: { 'first-look': 'absent' } });
+    expect(r.steps.find((st) => st.step === 'first-look')?.outcome).toBe('no-role-assistant');
+    expect(r.acts.some((a) => a.act === 'agent')).toBe(false);
+    expect(r.acts.filter((a) => a.step === 'first-look')).toEqual([expect.objectContaining({ act: 'send', template: 'ops-assistant-absent', to: 'room', fallback: true })]);
+    expect(r.ended).toBe('success');
+  });
+
+  it('the shipped ops room opens its first look as a task, and a first look that fails says it is unavailable', async () => {
+    const shipped = clone(SHIPPED_EVENT_WORKFLOWS['ops-room']);
+    const r = await previewWorkflowRun('ops', shipped);
+    expect(r.steps.map((s) => `${s.step}:${s.outcome}`)).toEqual(['opening:posted', 'greet-lead:posted', 'first-look:opened']);
+    expect(r.acts[2]).toMatchObject({ step: 'first-look', act: 'task', template: 'incident_first_look' });
+    expect(r.acts.some((a) => a.act === 'agent')).toBe(false);
+    expect(r.ended).toBe('success');
+    const failed = await previewWorkflowRun('ops', shipped, { outcomes: { 'first-look': 'failure' } });
+    expect(failed.acts.filter((a) => a.act === 'send').map((a) => a.template)).toEqual(['ops-room-opening', 'ops-lead-welcome', 'ops-first-look-unavailable']);
+    expect(failed.ended).toBe('success');
+    // NOBODY TO DO IT: a task step that names \`by\` may end absent, which opens nothing and reads \`task:outcome\` as no-worker.
+    const absent = await previewWorkflowRun('ops', shipped, { outcomes: { 'first-look': 'absent' } });
+    expect(absent.acts.some((a) => a.act === 'task')).toBe(false);
+    expect(absent.acts.filter((a) => a.act === 'send').map((a) => a.template)).toEqual(['ops-room-opening', 'ops-lead-welcome', 'ops-assistant-absent']);
+  });
+});
+
 describe('a draft\'s preview', () => {
+  // The ops room as a draft declares it: its agent step opens no task, because `agent.workflow` is retired on a draft, and is
+  // the draft's own assistant's turn, because a step naming another assistant's role (`as`) is retired too (WT118).
+  const DRAFT_OPS: EventWorkflow = clone(OPS);
+  delete DRAFT_OPS.states['first-look'].agent!.workflow;
+  delete DRAFT_OPS.states['first-look'].agent!.as;
+  delete (DRAFT_OPS.states['first-look'].agent!.fallback as { absent?: unknown }).absent;
   const setup = async () => {
     const s = fakeSsmStore();
     await createDraft(s.client, ROOT, 'ops-premium', 'admin');
-    await editDraft(s.client, ROOT, 'ops-premium', { modelKey: 'titan', eventWorkflows: { 'ops-mine': OPS } } as never, 'admin');
+    await editDraft(s.client, ROOT, 'ops-premium', { modelKey: 'titan', eventWorkflows: { 'ops-mine': DRAFT_OPS } } as never, 'admin');
     (s.client.send as unknown as jest.Mock).mockClear();
     mockS3Calls.length = 0;
     return s;
@@ -94,7 +152,7 @@ describe('a draft\'s preview', () => {
     const { client } = await setup();
     const own = await previewDraftWorkflow(client as never, ROOT, 'ops-premium', { workflow: 'ops-mine' });
     expect(own.ended).toBe('success');
-    const unsaved = clone(OPS);
+    const unsaved = clone(DRAFT_OPS);
     delete unsaved.states['greet-lead'];
     unsaved.states.opening.onSuccess = 'first-look';
     unsaved.states.opening.onFailure = 'first-look';
@@ -109,12 +167,16 @@ describe('a draft\'s preview', () => {
 
   it('refuses by name a workflow that breaks the draft\'s rules, a missing one, and malformed samples', async () => {
     const { client } = await setup();
-    const broken = clone(OPS);
+    const broken = clone(DRAFT_OPS);
     broken.initial = 'nowhere';
     const errs = async (req: Record<string, unknown>) => ((await previewDraftWorkflow(client as never, ROOT, 'ops-premium', req as never).catch((e) => e)) as ProfileValidationError).errors;
     expect(await errs({ workflow: 'ops-mine', definition: broken })).toEqual(expect.arrayContaining([expect.stringMatching(/eventWorkflows\.ops-mine\.initial names a declared step/)]));
     expect(await errs({ workflow: 'nope' })).toEqual(["no workflow named 'nope' to preview"]);
-    expect(await errs({ workflow: 'ops-mine', outcomes: { 'first-look': 'maybe' } })).toEqual(['outcomes.first-look is success, failure or deadline']);
+    expect(await errs({ workflow: 'ops-mine', outcomes: { 'first-look': 'maybe' } })).toEqual(['outcomes.first-look is success, failure, deadline or absent']);
+    // ABSENT is the path of a step another assistant takes, so a step that names no role is refused it by name.
+    // An agent step is the run's own assistant's turn (WT118), so it is never absent.
+    expect(await errs({ workflow: 'ops-mine', outcomes: { 'first-look': 'absent' } })).toEqual(['outcomes.first-look is absent only on a task step that names by: the one whose taker may not be here']);
+    expect(await errs({ workflow: 'ops-mine', outcomes: { opening: 'absent' } })).toEqual(['outcomes.opening is absent only on a task step that names by: the one whose taker may not be here']);
     expect(await errs({ workflow: 'ops-mine', values: { 'conversation:type': { x: 1 } } })).toEqual(['values.conversation:type is a string, a number, a boolean or a list of strings']);
   });
 });

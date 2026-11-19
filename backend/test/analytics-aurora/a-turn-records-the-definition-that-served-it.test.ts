@@ -91,7 +91,9 @@ describe('the writers, the readers and the migration', () => {
   it('both exchange writers that carry the profile dimensions copy the name off the answering message', () => {
     const src = read('lambda/src/analytics-aurora/kinesis-archival.ts');
     expect(src).toMatch(/assistant_role, profile_version, profile_config_id, profile_name,\s*\n\s*battle_id, battle_round,/g);
-    expect(src.match(/assistant_role, profile_version, profile_config_id, profile_name,/g)).toHaveLength(2);
+    // The two person pairers, and the writer for a turn the platform started (migration 106), which carries them too.
+    expect(src.match(/assistant_role, profile_version, profile_config_id, profile_name,/g)).toHaveLength(3);
+    expect(src).toMatch(/p\.assistant_role, p\.profile_version, p\.profile_config_id, p\.profile_name,/);
     expect(src).toMatch(/am\.profile_config_id,\s*am\.profile_name,/);
     expect(src).toMatch(/COALESCE\(am_upd\.profile_name, am\.profile_name\)/);
     expect(src).toMatch(/'profile_config_id',\s*'profile_name',/);

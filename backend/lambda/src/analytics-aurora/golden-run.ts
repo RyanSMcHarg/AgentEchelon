@@ -19,24 +19,42 @@
  * The archive's VPC has no route to SSM, so the starter (`manage-profiles`, outside it) sends both versions' stored
  * definitions; their offloaded bodies are read here from S3 through the gateway endpoint. Each attempt is composed by
  * the composer a live turn uses (`lib/answer-prompt.ts`), under `goldenRunContext`: the entry's recorded reply
- * preferences and preceding turns, and nothing about a person. No tools: an entry whose answer used a tool is answered
- * and recorded as not exercised. No catalog context sources: they are read for a person, and a run has none.
+ * preferences and preceding turns, and nothing about a person. No live tools: a text entry whose answer used a tool is
+ * recorded as not exercised. No catalog context sources: they are read for a person, and a run has none.
+ *
+ * ── A MULTI-STEP ENTRY IS WALKED (ADR-066 decision 7) ──────────────────────────────────────────────────────────────
+ *
+ * An entry that carries its source task's exchange (`walk_exchange`, migration 096), of an intent the draft delivers as
+ * `TASK_MULTI_STEP`, is walked through each side's machine in memory (`lib/golden-walk.ts`): tools answer from the
+ * entry's recorded results (`replayExecutor`), a step awaiting the requester is answered by the utility model from the
+ * entry's own turns, and no task row is written. The run's role holds no Amazon Chime SDK action and no DynamoDB, so a
+ * walk cannot act for anybody whatever its model asks for.
  */
 
+import { runStepsNotWalked, type IntentWorkflow } from '../lib/intent-workflow.js';
+import { machinesForVersion, type VersionMachinesSource } from '../lib/version-machines.js';
 import { randomUUID } from 'crypto';
 import { withReaderRole, withWriterRole } from './classification-boundary.js';
 import { judgeRelevance } from './evaluation-runner.js';
-import { gateResult, type GateEntry, type GateResult } from '../lib/promotion-gate.js';
+import { gateResult, type GateEntry, type GateResult, type GateWalkNote } from '../lib/promotion-gate.js';
 import { composeAnswerPrompt, goldenRunContext } from '../lib/answer-prompt.js';
-import { runMessages, judgeTranscript } from '../lib/golden-entry.js';
+import { runMessages, judgeTranscript, storedWalkExchange, type WalkExchange } from '../lib/golden-entry.js';
+import {
+  walkTask, replayExecutor, personPrompt, personAnswerOf,
+  type WalkDeps, type WalkOutcome, type WalkToolExecutor,
+} from '../lib/golden-walk.js';
+import { withConfirmBrief, type TaskStateMachine } from '../lib/task-state-machines.js';
+import { routedModel } from '../lib/resolve-model-plan.js';
 import { intentDefFor, answerShapeIssues } from '../lib/intent-answer.js';
-import { parseIntentPack, type IntentPack } from '../lib/intent-pack.js';
-import { resolveFromDefinition, rememberRuntimeSeed, buildIntentStrategy, platformRoutesServedOn } from '../lib/active-profile.js';
+import { parseIntentPack, toolsForIntent, type IntentPack } from '../lib/intent-pack.js';
+import { resolveFromDefinition, rememberRuntimeSeed } from '../lib/active-profile.js';
+import { versionRouteStrategy } from '../lib/model-resolver.js';
+import type { ProfileModels } from '../lib/active-profile.js';
 import { hydrateBodies } from '../lib/profile-bodies.js';
 import { invokeBedrockWithFallback } from '../lib/bedrock-resilience.js';
 import { outputGuardrailVerdict } from '../lib/async-processor-core.js';
 import { resolveModelForIntent } from '../lib/model-resolver.js';
-import { getModelCatalog, INTENT_ROUTE_STRATEGY, UTILITY_MODEL_ID, type Classification } from '../../../lib/config/model-strategy.js';
+import { getModelCatalog, UTILITY_MODEL_ID, type Classification } from '../../../lib/config/model-strategy.js';
 import { defaultProfileRegistry } from '../../../lib/profile-registry';
 import type { ProfileDefinition } from '../lib/active-profile.js';
 import type { AssistantProfile } from '../../../lib/config/profiles.js';
@@ -44,7 +62,8 @@ import { guardrailDetector, type PiiDetector } from '../lib/pii-detector.js';
 import { GOLDEN_SET_CAPACITY, textsOf, withTexts, type UploadedEntry } from '../lib/golden-upload.js';
 import type { IntentCoverage } from '../lib/golden-gate.js';
 import { generationPrompt, requestsFromAnswer, GENERATE_MAX_INTENTS, type GenerationIntent } from '../lib/golden-generate.js';
-import { BedrockRuntimeClient, InvokeModelCommand } from '@aws-sdk/client-bedrock-runtime';
+import { BedrockRuntimeClient, InvokeModelCommand, ConverseCommand } from '@aws-sdk/client-bedrock-runtime';
+import { mapLimited } from '../lib/map-limited.js';
 
 /** Attempts per entry per side (ADR-065 decision 2). */
 export const GOLDEN_RUN_K = 3;
@@ -116,6 +135,8 @@ export interface GoldenGate {
   regressionEntries: number;
   /** Live entries of either purpose. */
   entries: number;
+  /** Live entries a run answers: those that used no tool, and those that carry an exchange to walk (ADR-066 decision 7). */
+  answeredEntries?: number;
   /** Live regression entries the latest run has no attempt for: nominated after it, so it never answered them. */
   uncoveredRegression: number;
   run: GoldenRunRecord | null;
@@ -148,6 +169,8 @@ interface EntryRow {
   used_tools: string[] | null;
   reply_preferences: Record<string, string> | null;
   preceding_turns: unknown;
+  /** The source task's de-identified exchange (migration 096); absent on a text entry. */
+  walk_exchange?: unknown;
 }
 
 /** One side, resolved as a turn would serve it. */
@@ -156,35 +179,82 @@ interface ServedSide {
   addendum?: string;
   pack: IntentPack;
   guardrailId?: string;
-  models: Parameters<typeof buildIntentStrategy>[0];
+  models: ProfileModels | undefined;
   modelKey: string;
+  /** The version's tool allowlist, which a walk's step narrows (`toolsForIntent`, `toolsForStep`). */
+  tools?: string[];
+  /** The machines the side's tasks run (`sideMachines`). */
+  machines: Record<string, TaskStateMachine>;
+  /** The version's intent workflows, whose run-level steps a walk reports as not exercised (ADR-067). */
+  intentWorkflows?: Record<string, IntentWorkflow>;
+}
+
+/**
+ * THE MACHINES A SIDE'S TASKS RUN: the version's own (`intentPack.machines`) merged over the platform's, with the version's
+ * confirmation setting applied, as a turn resolves them.
+ */
+export function sideMachines(version: VersionMachinesSource, confirmBrief?: Parameters<typeof withConfirmBrief>[1]): Record<string, TaskStateMachine> {
+  // The resolver every turn uses (`machinesForVersion`): the version's own machines over the deployment's, the
+  // platform's fixed last, so a walk runs exactly what the side would serve.
+  return withConfirmBrief(machinesForVersion(version), confirmBrief);
 }
 
 async function serve(side: GoldenRunSide, assistant: string, fallbackPersona: string, deploymentPack: IntentPack): Promise<ServedSide> {
   const resolved = resolveFromDefinition(await hydrateBodies(side.definition), assistant);
+  // A version without a pack of its own answers against the deployment's taxonomy, as a turn does.
+  const pack = resolved.intentPack ?? deploymentPack;
   return {
     persona: resolved.persona?.trim() || fallbackPersona,
     addendum: resolved.systemPromptAddendum,
-    // A version without a pack of its own answers against the deployment's taxonomy, as a turn does.
-    pack: resolved.intentPack ?? deploymentPack,
+    pack,
     guardrailId: resolved.guardrailId,
     models: resolved.models,
     modelKey: resolved.profile.modelKey,
+    tools: resolved.tools,
+    machines: sideMachines({ configId: side.configId, intentPack: resolved.intentPack }, resolved.confirmBrief),
+    ...(resolved.intentWorkflows ? { intentWorkflows: resolved.intentWorkflows as Record<string, IntentWorkflow> } : {}),
   };
+}
+
+/** Whether an entry is walked on a side: it carries an exchange, and the side delivers its intent as a multi-step task. */
+export function walkableOn(side: Pick<ServedSide, 'pack' | 'machines'>, entry: Pick<EntryRow, 'intent' | 'walk_exchange'>): WalkExchange | null {
+  const exchange = storedWalkExchange(entry.walk_exchange);
+  const intent = entry.intent || '';
+  if (!exchange || intentDefFor(intent, side.pack)?.delivery !== 'TASK_MULTI_STEP') return null;
+  return exchange;
 }
 
 /** The model the side serves this entry's intent on, by the rule a turn's route uses. */
 function modelFor(side: ServedSide, intent: string, classification: string) {
+  const { catalog, strategy, models } = routeDepsOf(side, classification);
+  return resolveModelForIntent(intent || undefined, classification as Classification, catalog, strategy, models);
+}
+
+/** The catalog, strategy and selection a side's routes resolve against, the same for a text attempt and a walk's step. */
+function routeDepsOf(side: ServedSide, classification: string) {
   const catalog = getModelCatalog(process.env.AWS_REGION || 'us-east-1', process.env.AWS_ACCOUNT_ID || '');
   const selection = defaultProfileRegistry.modelsOf(classification);
   const models = selection && (catalog as Record<string, unknown>)[side.modelKey] && selection.selected.includes(side.modelKey)
     ? { ...selection, default: side.modelKey }
     : selection;
-  const strategy = buildIntentStrategy(side.models)
-    ?? buildIntentStrategy({ byIntent: platformRoutesServedOn(side.modelKey) })
-    ?? INTENT_ROUTE_STRATEGY;
-  return resolveModelForIntent(intent || undefined, classification as Classification, catalog, strategy, models);
+  const strategy = versionRouteStrategy(side.models, side.modelKey);
+  return { catalog, strategy, models };
 }
+
+/**
+ * The model a walk's step runs on, by the processor's rule (`routedModel`, ADR-064 decision B): the step's override where
+ * the version's route declares one, the task intent's route for a delivering step, else the intent's route.
+ */
+function stepModelFor(side: ServedSide, intent: string, classification: string, step: string, produces: TaskStateMachine['states'][string]['produces']) {
+  const deps = routeDepsOf(side, classification);
+  return routedModel(
+    { classification: classification as Classification, intent: intent || undefined, task: { intent, step, produces } },
+    { ...deps, routes: side.models?.byIntent },
+  );
+}
+
+/** How a walk ended, as an attempt records it (`golden_run_attempts.walk`). */
+export type AttemptWalk = GateWalkNote & { endState: string; path: string[] };
 
 export interface AttemptRecord {
   ok: boolean;
@@ -195,6 +265,8 @@ export interface AttemptRecord {
   model: string | null;
   answer: string | null;
   error: string | null;
+  /** How the walk ended, on an attempt that walked a multi-step entry. */
+  walk?: AttemptWalk;
 }
 
 /** Answer one entry once, as one side, and judge it. Never throws: a failure is the attempt's record. */
@@ -250,17 +322,158 @@ async function attempt(side: ServedSide, entry: EntryRow, classification: string
   }
 }
 
-async function mapLimited<T>(items: T[], limit: number, worker: (item: T) => Promise<void>): Promise<void> {
-  let next = 0;
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) await worker(items[next++]);
-  }));
+// ── THE WALK OF A MULTI-STEP ENTRY (ADR-066 decision 7) ──────────────────────────────────────────────────────────────
+
+/** How long after a run starts its walks stop, leaving the function time to record how they ended. */
+export const WALK_DEADLINE_MS = 14 * 60 * 1000;
+
+/** What a walk is given besides the entry: the model call, the simulated person and the tools, each injectable. */
+export interface WalkEnvironment {
+  converse: WalkDeps['converse'];
+  person: WalkDeps['person'];
+  /** The executor for one attempt. A golden run's is always the replay of the entry's recorded results. */
+  toolsFor(exchange: WalkExchange): WalkToolExecutor;
+}
+
+/** One Converse call on the step's model, with its fallback on an error, and no tool ever executed here. */
+async function bedrockConverse(req: Parameters<WalkDeps['converse']>[0]): Promise<Awaited<ReturnType<WalkDeps['converse']>>> {
+  const call = (modelId: string) => withThrottleRetry(() => (walkClient ??= new BedrockRuntimeClient({ region: process.env.AWS_REGION || 'us-east-1' }))
+    .send(new ConverseCommand({
+      modelId,
+      system: [{ text: req.system }],
+      messages: req.messages as never,
+      toolConfig: { tools: req.tools as never },
+      inferenceConfig: { maxTokens: RUN_MAX_TOKENS },
+    })));
+  let modelUsed = req.model.primaryModelKey;
+  let res;
+  try {
+    res = await call(req.model.primaryModelId);
+  } catch (err) {
+    if (!req.model.fallbackModelId) throw err;
+    res = await call(req.model.fallbackModelId);
+    modelUsed = req.model.fallbackModelId;
+  }
+  const blocks = res.output?.message?.content ?? [];
+  return {
+    text: blocks.map((b) => b.text ?? '').join('').trim(),
+    toolUses: blocks.flatMap((b) => (b.toolUse?.name
+      ? [{ toolUseId: b.toolUse.toolUseId ?? '', name: b.toolUse.name, input: (b.toolUse.input ?? {}) as Record<string, unknown> }]
+      : [])),
+    modelUsed,
+  };
+}
+let walkClient: BedrockRuntimeClient | undefined;
+
+/** The simulated person: the utility model reading the entry's own turns as data, answering strictly as JSON. */
+async function utilityPerson(req: Parameters<WalkDeps['person']>[0]): Promise<string | null> {
+  const { system, user } = personPrompt(req);
+  const res = await withThrottleRetry(() => (generatorClient ??= new BedrockRuntimeClient({ region: process.env.AWS_REGION || 'us-east-1' }))
+    .send(new InvokeModelCommand({
+      modelId: UTILITY_MODEL_ID,
+      contentType: 'application/json',
+      accept: 'application/json',
+      body: JSON.stringify({
+        anthropic_version: 'bedrock-2023-05-31',
+        max_tokens: 600,
+        temperature: 0,
+        system,
+        messages: [{ role: 'user', content: user }],
+      }),
+    })));
+  const body = JSON.parse(new TextDecoder().decode(res.body));
+  return personAnswerOf(String(body.content?.[0]?.text ?? ''));
+}
+
+/** The environment a golden run walks in: Bedrock for the side's model and the person, the replay for every tool. */
+export const GOLDEN_WALK_ENVIRONMENT: WalkEnvironment = {
+  converse: bedrockConverse,
+  person: utilityPerson,
+  toolsFor: (exchange) => replayExecutor(exchange),
+};
+
+/** A walk's outcome as an attempt's record, judged where it delivered an answer. */
+export async function walkAttempt(
+  side: ServedSide,
+  reference: Record<string, TaskStateMachine>,
+  entry: EntryRow,
+  exchange: WalkExchange,
+  classification: string,
+  assistant: string,
+  deadlineAt: number,
+  env: WalkEnvironment = GOLDEN_WALK_ENVIRONMENT,
+): Promise<AttemptRecord> {
+  const intent = entry.intent || '';
+  const request = (exchange.turns.find((t) => t.kind === 'person') as { text: string } | undefined)?.text ?? entry.request_text;
+  const { systemPrompt } = composeAnswerPrompt({
+    persona: side.persona,
+    addendum: side.addendum,
+    hostSections: [],
+    intent,
+    pack: side.pack,
+    transcript: [{ content: request }],
+    context: goldenRunContext(entry.reply_preferences),
+  });
+  let outcome: WalkOutcome;
+  try {
+    outcome = await walkTask({
+      taskType: intent,
+      machines: side.machines,
+      reference,
+      request,
+      exchange,
+      versionTools: toolsForIntent(intent, side.tools, side.pack),
+      systemPrefix: systemPrompt,
+      modelFor: (step, def) => stepModelFor(side, intent, classification, step, def?.produces),
+      deadlineAt,
+    }, { converse: env.converse, person: env.person, tools: env.toolsFor(exchange) });
+  } catch (err) {
+    outcome = { outcome: 'failed', reason: 'error', endState: '', path: [], answer: null, model: null, error: String((err as Error)?.message ?? err) };
+  }
+  // THE RUN AROUND THE TASK IS NOT WALKED (ADR-067): its other steps are named, so a pass says what it did not cover.
+  const declaredRun = side.intentWorkflows?.[intent];
+  const runSteps = declaredRun ? runStepsNotWalked(declaredRun, intent) : [];
+  const walk: AttemptWalk = {
+    outcome: outcome.outcome,
+    ...(runSteps.length ? { runSteps } : {}),
+    ...(outcome.outcome !== 'passed' ? { reason: outcome.reason } : {}),
+    ...(outcome.outcome !== 'passed' && outcome.step ? { step: outcome.step } : {}),
+    ...(outcome.outcome !== 'passed' && outcome.tool ? { tool: outcome.tool } : {}),
+    endState: outcome.endState,
+    path: outcome.path,
+  };
+  const none = { breaches: [] as string[], score: null, answer: null, error: null };
+  if (outcome.outcome === 'not-exercised') return { ok: true, empty: false, blocked: false, ...none, model: null, walk };
+  if (outcome.outcome === 'failed') {
+    if (outcome.reason === 'error') return { ok: false, empty: true, blocked: false, ...none, model: outcome.model, error: (outcome.error ?? 'error').slice(0, 500), walk };
+    if (outcome.reason === 'empty') return { ok: true, empty: true, blocked: false, ...none, model: outcome.model, walk };
+    return { ok: true, empty: false, blocked: false, ...none, breaches: [`walk.${outcome.reason}`], model: outcome.model, answer: outcome.answer, walk };
+  }
+  // A DELIVERED ANSWER is held to what a text answer is: the guardrail's block, the intent's answer shape, the judge.
+  const verdict = await outputGuardrailVerdict(outcome.answer, side.guardrailId);
+  const breaches = answerShapeIssues(intentDefFor(intent, side.pack)?.answer, verdict.text).map((i) => `answer-shape.${i.kind}`);
+  let score: number | null = null;
+  if (verdict.text && !verdict.blocked) {
+    const judged = await judgeRelevance({
+      agentType: assistant,
+      conversationClassification: classification,
+      taskContext: '',
+      conversationContext: judgeTranscript(entry.preceding_turns),
+      userMessage: request,
+      agentResponse: verdict.text,
+    }).catch(() => null);
+    score = judged ? judged.relevanceScore : null;
+  }
+  return {
+    ok: true, empty: !verdict.blocked && !verdict.text, blocked: verdict.blocked, breaches, score,
+    model: outcome.model, answer: verdict.text, error: null, walk,
+  };
 }
 
 /** The live entries of one assistant's set, read as the classification's own reader. */
 async function liveEntries(classification: string, assistant: string): Promise<EntryRow[]> {
   const res = await withReaderRole(classification, (client) => client.query<EntryRow>(
-    `SELECT id, purpose, intent, request_text, reference_text, used_tools, reply_preferences, preceding_turns
+    `SELECT id, purpose, intent, request_text, reference_text, used_tools, reply_preferences, preceding_turns, walk_exchange
        FROM golden_set_entries
       WHERE retired_at IS NULL AND classification = $1 AND assistant = $2
       ORDER BY nominated_at`,
@@ -273,7 +486,7 @@ async function liveEntries(classification: string, assistant: string): Promise<E
  * Run a draft against its assistant's set and record every attempt. The run row is opened first, under the id the
  * starter minted and returned, so the console reads "running" from the moment the person started it.
  */
-export async function executeGoldenRun(input: StartGoldenRun): Promise<GoldenRunRecord> {
+export async function executeGoldenRun(input: StartGoldenRun, walkEnv: WalkEnvironment = GOLDEN_WALK_ENVIRONMENT): Promise<GoldenRunRecord> {
   const classification = assertOwnClassification(input.classification);
   const k = Math.max(1, Math.min(10, Math.floor(input.k ?? GOLDEN_RUN_K)));
   if (input.seed) rememberRuntimeSeed(input.seed);
@@ -291,24 +504,33 @@ export async function executeGoldenRun(input: StartGoldenRun): Promise<GoldenRun
     const deploymentPack = parseIntentPack(input.deploymentPackRaw);
     const draft = await serve(input.draft, input.assistant, input.fallbackPersona, deploymentPack);
     const active = await serve(input.active, input.assistant, input.fallbackPersona, deploymentPack);
+    // Walks stop at the run's own deadline, leaving the function time to record how they ended.
+    const walkDeadline = Date.now() + WALK_DEADLINE_MS;
     await mapLimited(entries, ENTRY_CONCURRENCY, async (entry) => {
+      // A MULTI-STEP ENTRY WITH ITS EXCHANGE IS WALKED on both sides, each through its own machines and held to the
+      // active version's required tools (ADR-066 decision 7).
+      const exchange = walkableOn(draft, entry);
       // AN ENTRY THE RUN CANNOT EXERCISE IS RECORDED, NOT ANSWERED: the gate sets its attempts aside, so answering it
       // would spend model calls and run time on nothing.
-      const notExercised = entry.used_tools?.length ? 'tools' : null;
+      const setAside = !exchange && entry.used_tools?.length ? 'tools' : null;
       // ONE ENTRY'S 2k ATTEMPTS AT ONCE. They are independent, and answering them one after another made a run's length
       // grow past the function's 15 minutes at a modest set size.
       const jobs = (['draft', 'active'] as const).flatMap((sideName) => Array.from({ length: k }, (_, n) => ({ sideName, i: n + 1 })));
       await Promise.all(jobs.map(async ({ sideName, i }) => {
-          const a: AttemptRecord = notExercised
+          const side = sideName === 'draft' ? draft : active;
+          const a: AttemptRecord = setAside
             ? { ok: true, empty: false, blocked: false, breaches: [], score: null, model: null, answer: null, error: null }
-            : await attempt(sideName === 'draft' ? draft : active, entry, classification, input.assistant);
+            : exchange
+              ? await walkAttempt(side, active.machines, entry, exchange, classification, input.assistant, walkDeadline, walkEnv)
+              : await attempt(side, entry, classification, input.assistant);
+          const notExercised = setAside ?? (a.walk?.outcome === 'not-exercised' ? a.walk.reason ?? 'step' : null);
           await withWriterRole((client) => client.query(
             `INSERT INTO golden_run_attempts
-               (run_id, classification, entry_id, side, attempt, ok, empty, blocked, breaches, score, not_exercised, model, answer_text, error)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+               (run_id, classification, entry_id, side, attempt, ok, empty, blocked, breaches, score, not_exercised, model, answer_text, error, walk)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
              ON CONFLICT (run_id, entry_id, side, attempt) DO NOTHING`,
             [input.runId, classification, entry.id, sideName, i, a.ok, a.empty, a.blocked, a.breaches, a.score,
-             notExercised, a.model, a.answer, a.error],
+             notExercised, a.model, a.answer, a.error, a.walk ? JSON.stringify({ ...a.walk, intent: entry.intent ?? '' }) : null],
           ));
       }));
       await withWriterRole((client) => client.query(
@@ -333,9 +555,9 @@ export async function executeGoldenRun(input: StartGoldenRun): Promise<GoldenRun
 async function resultOf(runId: string, classification: string): Promise<GateResult> {
   const res = await withReaderRole(classification, (client) => client.query<{
     entry_id: string; purpose: 'regression' | 'capability'; side: 'draft' | 'active'; attempt: number;
-    ok: boolean; empty: boolean; blocked: boolean; breaches: string[]; score: number | null; not_exercised: string | null;
+    ok: boolean; empty: boolean; blocked: boolean; breaches: string[]; score: number | null; not_exercised: string | null; walk: unknown;
   }>(
-    `SELECT a.entry_id, e.purpose, a.side, a.attempt, a.ok, a.empty, a.blocked, a.breaches, a.score, a.not_exercised
+    `SELECT a.entry_id, e.purpose, a.side, a.attempt, a.ok, a.empty, a.blocked, a.breaches, a.score, a.not_exercised, a.walk
        FROM golden_run_attempts a JOIN golden_set_entries e ON e.id = a.entry_id
       WHERE a.run_id = $1
       ORDER BY a.entry_id, a.side, a.attempt`,
@@ -348,6 +570,7 @@ async function resultOf(runId: string, classification: string): Promise<GateResu
 export function gateEntriesOf(rows: Array<{
   entry_id: string; purpose: 'regression' | 'capability'; side: 'draft' | 'active';
   ok: boolean; empty: boolean; blocked: boolean; breaches: string[] | null; score: number | null; not_exercised: string | null;
+  walk?: unknown;
 }>): GateEntry[] {
   const byEntry = new Map<string, GateEntry>();
   for (const r of rows) {
@@ -355,12 +578,40 @@ export function gateEntriesOf(rows: Array<{
       entryId: r.entry_id, purpose: r.purpose, candidate: [], baseline: [],
       ...(r.not_exercised === 'tools' ? { notExercised: 'tools' as const } : {}),
     };
+    const walk = walkNoteOf(r.walk);
     (r.side === 'draft' ? e.candidate : e.baseline).push({
       ok: r.ok, empty: r.empty, blocked: r.blocked, breaches: r.breaches ?? [], score: r.score,
+      ...(walk ? { walk: walk.note } : {}),
     });
+    if (walk) {
+      e.walked = { intent: walk.intent };
+      // AN ENTRY IS NOT EXERCISED WHEN ANY OF THE DRAFT'S WALKS COULD NOT GO ON: pass^k cannot be read from fewer than k.
+      if (r.side === 'draft' && walk.note.outcome === 'not-exercised' && !e.notExercised) {
+        e.notExercised = walk.note.reason === 'tool' ? 'tool' : 'step';
+        e.notExercisedAt = {
+          ...(walk.note.step ? { step: walk.note.step } : {}),
+          ...(walk.note.tool ? { tool: walk.note.tool } : {}),
+        };
+      }
+    }
     byEntry.set(r.entry_id, e);
   }
   return [...byEntry.values()];
+}
+
+/** A recorded walk (`golden_run_attempts.walk`) as the gate reads it, or null on a text attempt. */
+function walkNoteOf(value: unknown): { note: GateWalkNote; intent: string } | null {
+  let v = value;
+  if (typeof v === 'string') { try { v = JSON.parse(v); } catch { return null; } }
+  if (!v || typeof v !== 'object') return null;
+  const w = v as Record<string, unknown>;
+  if (w.outcome !== 'passed' && w.outcome !== 'failed' && w.outcome !== 'not-exercised') return null;
+  const str = (x: unknown) => (typeof x === 'string' && x ? x : undefined);
+  const note: GateWalkNote = { outcome: w.outcome };
+  if (str(w.reason)) note.reason = str(w.reason);
+  if (str(w.step)) note.step = str(w.step);
+  if (str(w.tool)) note.tool = str(w.tool);
+  return { note, intent: str(w.intent) ?? '' };
 }
 
 async function readRun(runId: string, classification: string): Promise<GoldenRunRecord | null> {
@@ -396,8 +647,9 @@ export function recordOf(r: Record<string, unknown>, now = Date.now()): GoldenRu
 export async function readGoldenGate(q: GoldenGateQuery): Promise<GoldenGate> {
   const classification = assertOwnClassification(q.classification);
   return withReaderRole(classification, async (client) => {
-    const counts = await client.query<{ entries: string; regression: string }>(
-      `SELECT COUNT(*)::text AS entries, COUNT(*) FILTER (WHERE purpose = 'regression')::text AS regression
+    const counts = await client.query<{ entries: string; regression: string; answered?: string }>(
+      `SELECT COUNT(*)::text AS entries, COUNT(*) FILTER (WHERE purpose = 'regression')::text AS regression,
+              COUNT(*) FILTER (WHERE COALESCE(cardinality(used_tools), 0) = 0 OR walk_exchange IS NOT NULL)::text AS answered
          FROM golden_set_entries
         WHERE retired_at IS NULL AND classification = $1 AND assistant = $2`,
       [classification, q.assistant],
@@ -446,6 +698,9 @@ export async function readGoldenGate(q: GoldenGateQuery): Promise<GoldenGate> {
     return {
       entries: Number(counts.rows[0]?.entries ?? 0),
       regressionEntries: Number(counts.rows[0]?.regression ?? 0),
+      // The same test `executeGoldenRun` sets an entry aside by (`used_tools`, unless the entry carries an exchange to walk),
+      // so the console counts what a run answers.
+      ...(counts.rows[0]?.answered !== undefined ? { answeredEntries: Number(counts.rows[0].answered) } : {}),
       uncoveredRegression: Number(uncovered?.rows[0]?.n ?? 0),
       run: record,
       ...(q.intents && byIntent ? coverageOf(q.intents, byIntent.rows) : {}),

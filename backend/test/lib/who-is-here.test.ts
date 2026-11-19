@@ -122,14 +122,21 @@ describe('the roster comes from the router, and only for the turn that read it',
     expect(processor).toMatch(/const whoIsHere = parseWhoIsHere\(event\.whoIsHere\);/);
     expect(processor).not.toMatch(/ListChannelMemberships/);
     expect(src('lib/who-is-here.ts')).not.toMatch(/resolveChannelSize|ListChannelMemberships/);
-    // ONE MEMBERSHIP READ, AND ONLY FOR A TURN NO PERSON ASKED FOR (`machineTurnRoster`): an event workflow's agent
-    // step and a prompt welcome, which the router hands over without a roster so the opening waits on no read. Every
-    // `resolveChannelSize` in the processor is inside that one helper, and the helper is called only from those two
-    // branches, so a person's turn reads the roster the router read for it and never one of its own.
-    const helper = processor.slice(processor.indexOf('function machineTurnRoster('));
-    const helperBody = helper.slice(0, helper.indexOf('\n}\n'));
-    expect(processor.match(/resolveChannelSize\(/g)).toHaveLength(1);
-    expect(helperBody).toMatch(/resolveChannelSize\(/);
+    // THE SECTION'S ROSTER IS READ ONLY FOR A TURN NO PERSON ASKED FOR (`machineTurnRoster`): an event workflow's agent
+    // step and a prompt welcome, which the router hands over without a roster so the opening waits on no read. The helper
+    // is called only from those two branches, so a person's turn reads the roster the router read for it. The one other
+    // read is the thread boundary (`readableRelativesOf`), which checks everyone reading is in both conversations and
+    // renders nothing into this section. Every `resolveChannelSize` in the processor is inside one of these two helpers.
+    const bodyOf = (name: string): [number, number] => {
+      const start = processor.indexOf(`function ${name}(`);
+      return [start, processor.indexOf('\n}\n', start)];
+    };
+    const [rosterStart, rosterEnd] = bodyOf('machineTurnRoster');
+    const [relativesStart, relativesEnd] = bodyOf('readableRelativesOf');
+    expect(processor.slice(rosterStart, rosterEnd)).toMatch(/resolveChannelSize\(/);
+    expect(processor.slice(relativesStart, relativesEnd)).toMatch(/resolveChannelSize\(messagingClient, arn, /);
+    const outsideTheHelpers = processor.slice(0, rosterStart) + processor.slice(rosterEnd, relativesStart) + processor.slice(relativesEnd);
+    expect(outsideTheHelpers).not.toMatch(/resolveChannelSize\(/);
     const eventStep = processor.slice(processor.indexOf('if (event.eventStep) {'), processor.indexOf('if (event.voiceSend) {'));
     const welcomePrompt = processor.slice(processor.indexOf('if (event.welcomePrompt) {'));
     const calls = processor.match(/machineTurnRoster\(event\./g) ?? [];

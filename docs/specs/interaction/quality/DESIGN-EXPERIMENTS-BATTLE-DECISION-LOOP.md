@@ -323,7 +323,7 @@ flowchart TB
 
 | Quantity | Point estimate | Interval and test | n reported |
 |---|---|---|---|
-| Score, latency, cost, tokens (Welch, guardrails, power) | the per-exchange mean; the score over scored exchanges | cluster-robust variance with the conversation as the cluster, as a design effect (`clusterDesignEffect`, `clusterAdjust`); Welch runs on conversations | conversations and exchanges per variant; scored conversations for a score-backed objective |
+| Score, latency, cost, tokens (Welch, guardrails, power) | the per-exchange mean over the exchanges that recorded the metric: the score over scored exchanges, latency over timed exchanges, tokens and token-priced cost over exchanges that recorded their tokens | cluster-robust variance with the conversation as the cluster, as a design effect (`clusterDesignEffect`, `clusterAdjust`); Welch runs on the conversations that recorded the metric | conversations and exchanges per variant; scored conversations for a score-backed objective; per arm, the exchanges with no recorded latency and with no recorded tokens |
 | User approval | the per-vote rate | votes grouped by the conversation they were cast in, Rao-Scott effective counts into Wilson, Newcombe, z or Fisher (`clusteredTwoProportionTest`) | votes and conversations |
 | Battle pick | the per-pick win rate over decisive picks | picks grouped by the battle they judged (`clusteredHumanPickTest`); a pick is per battle, never per exchange | picks and battles |
 | Classifier gate (§5.3) | McNemar over informative discordant pairs | pairs grouped by the conversation the message came from (`clusteredMcnemarTest`) | informative pairs and conversations |
@@ -343,10 +343,12 @@ flowchart LR
   SC["scored_count, traveling beside<br/>exchange_count on every variant row"] --> PWR["THE POWER DENOMINATOR for a score-backed objective:<br/>minN is the smaller of the two variants' SCORED<br/>counts, and the minimum detectable effect calculation<br/>runs against that"]
   SC --> NONE{"nothing scored on either side?"}
   NONE -->|yes| KR["no power claim to make: the state is not powered<br/>and the decision rule reports keep_running"]
-  CL["cost and latency, measured on every<br/>exchange regardless of scoring"] --> UNG["keep counting exchanges,<br/>and are not gated this way"]
+  CL["cost and latency, recorded on an exchange<br/>regardless of scoring"] --> UNG["count the exchanges that recorded them,<br/>and are not gated this way"]
 ```
 
 An unscored exchange is traffic rather than evidence, which is why the two denominators differ deliberately, and why the drill-down states how many rows carry no evaluator score rather than leaving the gap between the two counts to be inferred. In conversation units the power denominator is the smaller variant's scored conversations, and `requiredN` is in conversations.
+
+**Missing telemetry is excluded and counted, never entered as zero.** An exchange whose duration or token count was not recorded (its out-of-band analytics record was never written, or archival could not read it) is not an instant or free exchange. Latency is taken over the exchanges that recorded a duration (`timed_count`) and tokens over those that recorded both token counts (`tokened_count`), in the rollup and in the per-conversation moments alike, so the mean, the SD, the design effect and the Welch n all describe the same exchanges. A token-priced cost is taken over `tokened_count`; an image variant prices every reply by its image count. Each variant in the recommendation carries `missing_latency_count` and `missing_tokens_count`, and when either is non-zero the rationale names them per arm, so a comparison that rests on fewer exchanges than the traffic says so. A variant with no recorded latency reports `avg_total_ms` as null rather than 0.
 
 ### 4.3 The human axes
 
@@ -708,7 +710,7 @@ briefingIntent?: string;    // = experiment.intent, drives the intent-to-prompt 
 
 ### A.6 Analytics query and recommendation contract
 
-The experiment results query carries per-variant standard deviation and an explicit count alongside the aggregates, which is what makes the continuous-metric tests in §4.2-B possible, and a `units` section giving each variant's `conversation_count`, `exchange_count`, `scored_conversation_count` and `scored_count` (§4.2, the unit of analysis). The recommendation carries the computed statistics rather than a self-assessed confidence:
+The experiment results query carries per-variant standard deviation and an explicit count alongside the aggregates, which is what makes the continuous-metric tests in §4.2-B possible, and a `units` section giving each variant's `conversation_count`, `exchange_count`, `scored_conversation_count`, `scored_count`, `timed_conversation_count`, `timed_count`, `tokened_conversation_count` and `tokened_count` (§4.2, the unit of analysis). Each results row carries `timed_count` and `tokened_count`, the exchanges its latency and token figures are taken over. The recommendation carries the computed statistics rather than a self-assessed confidence:
 
 ```ts
 interface ExperimentRecommendation {
@@ -725,7 +727,8 @@ interface ExperimentRecommendation {
   recommendedVsChosen?: { recommended: string; chosen?: ExperimentDecision['outcome'] };
   minSamplePerVariant?: number;                 // conversations per variant
   unit: 'conversation';                         // every test, guardrail and the floor count conversations
-  variants: Array<{ variant_id; unit: 'conversation'; conversation_count; exchange_count; scored_conversation_count; scored_count; /* means */ }>;
+  variants: Array<{ variant_id; unit: 'conversation'; conversation_count; exchange_count; scored_conversation_count; scored_count;
+                    timed_count; tokened_count; missing_latency_count; missing_tokens_count; /* means */ }>;
 }
 ```
 

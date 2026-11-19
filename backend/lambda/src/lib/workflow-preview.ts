@@ -15,16 +15,20 @@
  * (`outcomes`), success by default, and a task's ending reads `task:state` as its first terminal state of that kind.
  */
 import {
-  continueAfter, participantRoleReferences, runEventWorkflow,
+  MEETING_NOTICE_TEMPLATE, WELCOME_EVENT, continueAfter, participantRoleReferences, runEventWorkflow, withJoinRecap,
   type EventGate, type EventRunContext, type EventRunDeps, type EventWorkflow, type StepOutcome,
 } from './event-workflow.js';
 import { buildSourceTable, versionLookup, type VariableValue, type VersionVariable } from './variables.js';
 import { TASK_STEP_OUTCOMES, machinesAStepMayOpen, taskEndedOutcome } from './task-step.js';
 import type { TaskStateMachine } from './task-state-machines.js';
 
-/** How an agent step or a task step ends in a preview. */
-export type PreviewEnding = 'success' | 'failure' | 'deadline';
-export const PREVIEW_ENDINGS: readonly PreviewEnding[] = ['success', 'failure', 'deadline'];
+/**
+ * How an agent step or a task step ends in a preview. `absent` is an agent step that names `as` finding no assistant
+ * holding its role in the room: no turn runs, its `absent` message (else its fallback) is said, and it goes on its failure edge;
+ * on a task step that names `by`, nobody named to do the work is here, so nothing opens and its failure edge reads `no-worker`.
+ */
+export type PreviewEnding = 'success' | 'failure' | 'deadline' | 'absent';
+export const PREVIEW_ENDINGS: readonly PreviewEnding[] = ['success', 'failure', 'deadline', 'absent'];
 
 export interface PreviewOptions {
   /** The version's variables, so a condition naming one reads its source. */
@@ -42,7 +46,7 @@ export interface PreviewOptions {
 /** What one step would do. `to` is `room`, or the sample people a targeted send reaches. */
 export interface PreviewAct {
   step: string;
-  act: 'send' | 'opening' | 'prompt' | 'agent' | 'intake' | 'task';
+  act: 'send' | 'opening' | 'prompt' | 'agent' | 'intake' | 'task' | 'meeting';
   template?: string;
   to?: 'room' | string[];
   values?: Record<string, string>;
@@ -84,7 +88,8 @@ function previewContext(wf: EventWorkflow, opts: PreviewOptions): EventRunContex
   return {
     event: wf.on,
     channelArn: PREVIEW_CHANNEL,
-    subject: samplePerson('subject'),
+    // THE SUBJECT IS RESOLVED WHERE THE ASSISTANT JOINS, and on no other event, as the router resolves it.
+    ...(wf.on === WELCOME_EVENT ? { subject: samplePerson('subject') } : {}),
     ...(wf.on === 'assistant-joined' || wf.on === 'alarm-state-changed' ? {} : { eventPerson: samplePerson(invitation ? 'invitee' : 'person') }),
     ...(invitation ? { invitationId: 'preview', inviter: samplePerson('inviter') } : {}),
     ...(wf.on === 'alarm-state-changed' ? { alarm: { name: 'sample-alarm', state: 'ALARM' as const, changedAt: 0 } } : {}),
@@ -107,8 +112,12 @@ function endingOutcome(wf: EventWorkflow, step: string, ending: PreviewEnding, m
   return ending === 'success' ? 'posted' : 'failed';
 }
 
-/** Walk a workflow from its initial step to its end, recording what each step would do. Never throws. */
-export async function previewWorkflowRun(name: string, wf: EventWorkflow, opts: PreviewOptions = {}): Promise<PreviewResult> {
+/**
+ * Walk a workflow from its initial step to its end, recording what each step would do. Never throws. A `person-joined`
+ * workflow is walked as the router runs it, with the join recap after its own steps (`withJoinRecap`).
+ */
+export async function previewWorkflowRun(name: string, declared: EventWorkflow, opts: PreviewOptions = {}): Promise<PreviewResult> {
+  const wf = withJoinRecap(declared);
   const ctx = previewContext(wf, opts);
   const machines = opts.machines ?? machinesAStepMayOpen();
   const claims = new Set<string>();
@@ -129,14 +138,22 @@ export async function previewWorkflowRun(name: string, wf: EventWorkflow, opts: 
       return true;
     },
     dispatchAgent: async (step, def) => {
+      // NOBODY HOLDING THE STEP'S ROLE IS IN THE ROOM, where the caller chose that ending: no turn runs.
+      if (def.as && opts.outcomes?.[step] === 'absent') return 'absent';
       acts.push({ step, act: 'agent', template: def.prompt, to: def.to === 'room' ? 'room' : [] });
       paused.push(step);
       return true;
     },
     startIntake: async (person, step) => { acts.push({ step, act: 'intake', to: [sampleLabel(person)] }); return 'started'; },
+    startMeeting: async (step, def) => { acts.push({ step, act: 'meeting', template: def.notice ?? MEETING_NOTICE_TEMPLATE, to: 'room' }); return { link: '?meeting=sample' }; },
     opening: async (step) => { acts.push({ step, act: 'opening', to: 'room' }); return true; },
     prompt: async (step, def) => { acts.push({ step, act: 'prompt', template: def.template, to: 'room' }); return true; },
-    openTask: async (step, def) => { acts.push({ step, act: 'task', template: def.machine }); paused.push(step); return 'opened'; },
+    // A TASK STEP WHOSE WORKER IS NOT HERE, where the caller chose that ending: nothing opens, and its failure edge reads
+    // `task:outcome` as `no-worker`, as the router's would (G23).
+    openTask: async (step, def) => {
+      if (def.by !== undefined && opts.outcomes?.[step] === 'absent') return 'no-worker';
+      acts.push({ step, act: 'task', template: def.machine }); paused.push(step); return 'opened';
+    },
   };
   const steps: PreviewResult['steps'] = [];
   let out = await runEventWorkflow(name, wf, ctx, deps).catch(() => ({ ran: false, steps: [] as PreviewResult['steps'], ended: undefined }));

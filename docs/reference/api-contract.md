@@ -24,13 +24,13 @@ template.
 
 | | |
 |---|---|
-| Routes | 177 |
+| Routes | 203 |
 | HTTP APIs | 2 |
-| ...authorized `AWS_IAM` by default | 138 |
-| ...authorized `CUSTOM` by default | 32 |
+| ...authorized `AWS_IAM` by default | 152 |
+| ...authorized `CUSTOM` by default | 44 |
 | ...authorized `NONE` by default | 7 |
 | ...behind the edge authorizer with no result cache | 3 |
-| Routes served in every deployment | 151 |
+| Routes served in every deployment | 177 |
 | Routes served with **no authorizer** | 7 (`GET /deployment/state`, `GET /email/preferences`, `POST /email/preferences`, `POST /guest/refresh`, `POST /guest/start`, `POST /invitations/peek`, `POST /invitations/redeem`) |
 | Payload format sent to every handler | 1.0 |
 
@@ -90,6 +90,8 @@ Declared by `AgentEchelonAdminApi`. Served in every deployment.
 | `POST` | `/admin/assistants/{assistant}/profiles/golden-set-retire-upload` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
 | `POST` | `/admin/assistants/{assistant}/profiles/import` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
 | `POST` | `/admin/assistants/{assistant}/profiles/preview-run` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
+| `POST` | `/admin/assistants/{assistant}/profiles/process-export` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
+| `POST` | `/admin/assistants/{assistant}/profiles/process-import` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
 | `POST` | `/admin/assistants/{assistant}/profiles/rollback` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
 | `POST` | `/admin/assistants/{assistant}/profiles/validate` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
 | `POST` | `/admin/assistants/{assistant}/profiles/variant-version` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
@@ -107,6 +109,12 @@ Declared by `AgentEchelonAdminApi`. Served in every deployment.
 | `GET` | `/admin/conversations/identities` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AdminConversationFunction` | every deployment |
 | `GET` | `/admin/conversations/membership-history` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AdminConversationFunction` | every deployment |
 | `GET` | `/admin/conversations` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AdminConversationFunction` | every deployment |
+| `GET` | `/admin/event-policy` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
+| `POST` | `/admin/event-policy` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
+| `POST` | `/admin/event-triggers/{typeKey}/{classification}/{ruleId}/remove` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
+| `GET` | `/admin/event-triggers/{typeKey}/{classification}` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
+| `POST` | `/admin/event-triggers/{typeKey}/{classification}` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
+| `GET` | `/admin/event-types` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
 | `POST` | `/admin/experiments/{experimentId}/promote` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `AdminExperimentsFunction` | every deployment |
 | `POST` | `/admin/experiments/{experimentId}/status` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `AdminExperimentsFunction` | every deployment |
 | `DELETE` | `/admin/experiments/{experimentId}` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `AdminExperimentsFunction` | every deployment |
@@ -115,6 +123,10 @@ Declared by `AgentEchelonAdminApi`. Served in every deployment.
 | `GET` | `/admin/experiments/challengers` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `AdminExperimentsFunction` | every deployment |
 | `GET` | `/admin/experiments` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `AdminExperimentsFunction` | every deployment |
 | `POST` | `/admin/experiments` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `AdminExperimentsFunction` | every deployment |
+| `POST` | `/admin/meetings/{meetingId}/end` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AdminMeetingsFunction` | every deployment |
+| `GET` | `/admin/meetings/{meetingId}/transcript` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AdminMeetingsFunction` | every deployment |
+| `GET` | `/admin/meetings/{meetingId}` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AdminMeetingsFunction` | every deployment |
+| `GET` | `/admin/meetings` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AdminMeetingsFunction` | every deployment |
 | `GET` | `/admin/ownership` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `AssistantOwnershipFunction` | every deployment |
 | `POST` | `/admin/ownership` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `AssistantOwnershipFunction` | every deployment |
 | `POST` | `/admin/profiles/activate-past-golden-gate` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
@@ -131,6 +143,8 @@ Declared by `AgentEchelonAdminApi`. Served in every deployment.
 | `POST` | `/admin/profiles/golden-set-retire-upload` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
 | `POST` | `/admin/profiles/import` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
 | `POST` | `/admin/profiles/preview-run` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
+| `POST` | `/admin/profiles/process-export` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
+| `POST` | `/admin/profiles/process-import` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
 | `POST` | `/admin/profiles/rollback` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
 | `POST` | `/admin/profiles/validate` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
 | `POST` | `/admin/profiles/variant-version` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `ManageProfilesFunction` | every deployment |
@@ -224,6 +238,7 @@ Declared by `AgentEchelonPersonApi`. Served in every deployment.
 | `POST` | `/conversations/leave` | edge authorizer (cached 300 s) | 50 req/s, burst 100 | `ConversationManagementFunction` | every deployment |
 | `POST` | `/conversations/remove-member` | edge authorizer (cached 300 s) | 50 req/s, burst 100 | `ConversationManagementFunction` | every deployment |
 | `POST` | `/create-conversation` | edge authorizer (cached 300 s) | 50 req/s, burst 100 | `CreateConversationFunction` | every deployment |
+| `POST` | `/dashboard-link` | edge authorizer (cached 300 s) | 10 req/s, burst 20 | `LinkFunction` | every deployment |
 | `GET` | `/deployment/state` | `NONE` | 100 req/s, burst 200 | `DeploymentSleepFn` | `sleepMode` set (Aurora mode only) |
 | `GET` | `/email/preferences/mine` | edge authorizer (cached 300 s) | 10 req/s, burst 20 | `EmailPreferencesMineFunction` | every deployment |
 | `POST` | `/email/preferences/mine` | edge authorizer (cached 300 s) | 10 req/s, burst 20 | `EmailPreferencesMineFunction` | every deployment |
@@ -242,6 +257,17 @@ Declared by `AgentEchelonPersonApi`. Served in every deployment.
 | `POST` | `/invitations` | edge authorizer (cached 300 s) | 50 req/s, burst 100 | `InvitationsFunction` | every deployment |
 | `GET` | `/me/language` | edge authorizer (cached 300 s) | 10 req/s, burst 20 | `LanguagePreferenceFunction` | every deployment |
 | `POST` | `/me/language` | edge authorizer (cached 300 s) | 10 req/s, burst 20 | `LanguagePreferenceFunction` | every deployment |
+| `POST` | `/meetings/end` | edge authorizer (cached 300 s) | 10 req/s, burst 20 | `MeetingApiFunction` | every deployment |
+| `POST` | `/meetings/events` | edge authorizer (cached 300 s) | 10 req/s, burst 20 | `MeetingApiFunction` | every deployment |
+| `POST` | `/meetings/join` | edge authorizer (cached 300 s) | 10 req/s, burst 20 | `MeetingApiFunction` | every deployment |
+| `POST` | `/meetings/mine` | edge authorizer (cached 300 s) | 5 req/s, burst 10 | `MeetingApiFunction` | every deployment |
+| `POST` | `/meetings/remove` | edge authorizer (cached 300 s) | 5 req/s, burst 10 | `MeetingApiFunction` | every deployment |
+| `POST` | `/meetings/speaking` | edge authorizer (cached 300 s) | 5 req/s, burst 10 | `MeetingApiFunction` | every deployment |
+| `POST` | `/meetings/status` | edge authorizer (cached 300 s) | 10 req/s, burst 20 | `MeetingApiFunction` | every deployment |
+| `POST` | `/meetings/transcript` | edge authorizer (cached 300 s) | 20 req/s, burst 40 | `MeetingApiFunction` | every deployment |
+| `POST` | `/meetings/transcription` | edge authorizer (cached 300 s) | 5 req/s, burst 10 | `MeetingApiFunction` | every deployment |
+| `POST` | `/meetings/unmute-request` | edge authorizer (cached 300 s) | 5 req/s, burst 10 | `MeetingApiFunction` | every deployment |
+| `POST` | `/meetings` | edge authorizer (cached 300 s) | 10 req/s, burst 20 | `MeetingApiFunction` | every deployment |
 | `POST` | `/presigned-url` | edge authorizer (cached 300 s) | 25 req/s, burst 50 | `PresignedUrlFunction` | every deployment |
 | `POST` | `/proposals/apply` | edge authorizer (cached 300 s) | 50 req/s, burst 100 | `ProposalsFunction` | every deployment |
 | `POST` | `/share-conversation` | edge authorizer (cached 300 s) | 25 req/s, burst 50 | `ShareConversationFunction` | every deployment |

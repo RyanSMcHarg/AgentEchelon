@@ -1,5 +1,6 @@
 import i18n from '@ae/shared/i18n';
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { personIdFromArn } from '@ae/shared/utils/principalArn.ts';
 import { useTranslation } from 'react-i18next';
 import './UserManagementTab.css';
 import { adminRequest } from '../../services/sigv4Fetch';
@@ -9,6 +10,7 @@ import { useCan } from '../../capabilities';
 import { classificationBadgeStyle, classificationName } from '@ae/shared/config/classifications.ts';
 import { GUEST_EXPERIENCE_SHOWN } from '../../config/guestExperience';
 import { useTeamName } from './TeamSelector';
+import { useUrlViews, viewParam } from './consoleViewUrl';
 
 /** One person, or one pool account that has not signed in yet. */
 type User = PersonEntry;
@@ -75,7 +77,7 @@ const ExternalIdpNotice: React.FC<{ provider: string }> = ({ provider }) => {
   return (
   <div className="admin-tab">
     <div className="um-external-idp">
-      <h3>{translate('admin.userManagement.usersAreManagedInYour')}</h3>
+      <h2>{translate('admin.userManagement.usersAreManagedInYour')}</h2>
       <p>
         {translate('admin.userManagement.thisDeploymentAuthenticatesEndUsers')} <strong>{provider}</strong>{translate('admin.userManagement.notTheBundledAmazonCognito')}
       </p>
@@ -111,12 +113,27 @@ const UserManagementTab: React.FC = () => {
   const [showVisitors, setShowVisitors] = useState(false);
   const can = useCan();
 
+  // THE PERSON WHOSE DETAILS ARE OPEN IS THE ADDRESS (`&user=<their id>`), by their AppInstanceUser id only, never an email: a
+  // link opens their details once the list holds them, and Back closes them. Until the list is read the address is left as is.
+  const [usersRead, setUsersRead] = useState(false);
+  const usersReadRef = useRef(false);
+  const idOfKey = (key: string | null) => personIdFromArn(key);
+  const keyOfId = (id: string | null, among: User[] = users) => (id ? entryKey(among.find((u) => idOfKey(entryKey(u)) === id) ?? ({} as User)) || null : null);
+  useUrlViews(usersRead ? { user: idOfKey(detailKey) } : {}, (v) => setDetailKey(keyOfId(v.user)));
+
   const loadUsers = useCallback(async () => {
     try {
       setIsLoading(true);
       setError(null);
       const data = await apiCall(adminUrl('user-management', '/users'));
       setUsers(data.users || []);
+      // A LINKED PERSON OPENS WITH THE FIRST LIST, in the same update, so the address is never read before they are found.
+      if (!usersReadRef.current) {
+        const linked = keyOfId(viewParam('user'), data.users || []);
+        if (linked) setDetailKey(linked);
+      }
+      usersReadRef.current = true;
+      setUsersRead(true);
       setMembershipGroups(Array.isArray(data.membershipGroups) ? data.membershipGroups : []);
       setClearanceGroups(Array.isArray(data.clearanceGroups) ? data.clearanceGroups : []);
       setTeams(Array.isArray(data.teams) ? data.teams : []);
@@ -250,9 +267,9 @@ const UserManagementTab: React.FC = () => {
 
       {/* Toolbar */}
       <div className="um-toolbar">
-        <h3>
+        <h2>
           {filter === 'all' ? 'All Users' : `${filter.charAt(0).toUpperCase() + filter.slice(1)} Users`}
-        </h3>
+        </h2>
         <div className="um-toolbar-actions">
           {GUEST_EXPERIENCE_SHOWN && <label className="um-group-toggle" title={translate('admin.userManagement.showVisitors', { count: visitors })}>
             <input type="checkbox" checked={showVisitors} onChange={(e) => setShowVisitors(e.target.checked)} aria-label={translate('admin.userManagement.showVisitors', { count: visitors })} />
@@ -285,7 +302,7 @@ const UserManagementTab: React.FC = () => {
         return (
           <section className="admin-config-group" aria-labelledby="um-detail-title" data-testid="person-detail">
             <button className="btn-link" onClick={() => setDetailKey(null)}>← {translate('admin.userManagement.backToUsers')}</button>
-            <h4 id="um-detail-title">{label}</h4>
+            <h3 id="um-detail-title">{label}</h3>
             <dl className="admin-config-list">
               {user.email && <><dt>{translate('admin.userManagement.email')}</dt><dd>{user.email}</dd></>}
               <dt>{translate('admin.userManagement.status')}</dt>

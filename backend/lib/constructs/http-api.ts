@@ -194,10 +194,12 @@ export class RouteTableApi extends Construct {
       const first = !integration;
       const n = integrations.size;
       if (!integration) {
-        // A handle that grants nothing: the one permission for this function is added below.
+        // A handle that grants nothing: the one permission for this function is added below. CDK skips an
+        // integration's per-route permission only for a handle it cannot grant on, so the handle names no
+        // environment: per-route permissions would put one statement per route on the function's resource policy,
+        // which Lambda caps at 20 KB.
         const handle = lambda.Function.fromFunctionAttributes(this, `Handler${n}`, {
           functionArn: r.handler.functionArn,
-          sameEnvironment: true,
           skipPermissions: true,
         });
         integration = new HttpLambdaIntegration(`Integration${n}`, handle, {

@@ -18,7 +18,7 @@ Wiring is in `.claude/settings.json` (checked in, so the behavior ships to every
 
 `.claude/hooks/serial-test-runs.js` runs on `PreToolUse` for `Bash` and `PowerShell` and **denies** four command shapes: a hand-written `--shard`, two test runs chained in one command, the whole backend suite in a single call, and anything test-shaped while a run already holds the lock.
 
-Four Jest shards started at once hard-lock a development machine (16 ts-jest workers, each holding a full TS program), enough to lose uncommitted work. Advice in prose does not prevent it, so the rule is a refusal.
+Jest shards started at once hard-lock a development machine (each shard runs its own worker pool, 2 ts-jest workers by default, and some suites synthesize every CDK stack inside a worker), enough to lose uncommitted work. Advice in prose does not prevent it, so the rule is a refusal.
 
 ### Run it a shard at a time, and read the record rather than the scrollback
 

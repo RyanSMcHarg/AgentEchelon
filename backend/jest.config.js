@@ -4,9 +4,10 @@ module.exports = {
   testEnvironment: 'node',
   roots: ['<rootDir>/test'],
   testMatch: ['**/*.test.ts'],
-  // The assistant session, the person resolver, email consent and account state in memory for every suite;
+  // The assistant session, the person resolver, email consent and account state in memory, and the test
+  // instance's admin session roles, for every suite;
   // see each file for why and which suites test it for real.
-  setupFiles: ['<rootDir>/test/setup/assistant-session.ts', '<rootDir>/test/setup/person-resolver.ts', '<rootDir>/test/setup/email-consent.ts', '<rootDir>/test/setup/account-state.ts'],
+  setupFiles: ['<rootDir>/test/setup/assistant-session.ts', '<rootDir>/test/setup/person-resolver.ts', '<rootDir>/test/setup/email-consent.ts', '<rootDir>/test/setup/account-state.ts', '<rootDir>/test/setup/admin-session-roles.ts'],
   // Keep the default `npm test` skip-free. The live image-gen suite hits PAID
   // external providers (OpenAI, FAL) and is opt-in via RUN_LIVE_IMAGE_GEN=1 — so
   // rather than collect-then-skip it (which reports a skip on every run), don't
@@ -16,18 +17,24 @@ module.exports = {
     '/node_modules/',
     ...(process.env.RUN_LIVE_IMAGE_GEN === '1' ? [] : ['/image-gen-live\\.test\\.ts$']),
   ],
-  // Guardrail against melting the machine. Jest defaults to (cores - 1) workers —
-  // on a 16-core box that is 15 ts-jest workers each holding a full in-memory TS
-  // program, and with `cache: false` (below) every one of them recompiles from
-  // scratch. The combined CPU + RAM spike has hard-locked dev machines. Cap the
-  // pool to a modest, fixed size so the suite stays responsive; override for CI or
-  // a beefier box with JEST_MAX_WORKERS (e.g. JEST_MAX_WORKERS=8 or =75%).
-  maxWorkers: process.env.JEST_MAX_WORKERS || 4,
-  // Restart a worker once it balloons past this after a test file finishes. The
-  // resetModules()+re-import() suites accrete transformed-module state across
-  // files; without a limit a long-lived worker's heap grows unbounded over an
-  // 80-file run. Recycling caps peak RSS at a predictable level.
-  workerIdleMemoryLimit: '768MB',
+  // Guardrail against melting the machine. Jest defaults to (cores - 1) workers, and
+  // on a 16-core box that many workers, each with its own module registry and a CDK
+  // synthesis in some suites, has hard-locked dev machines. Two workers keep one
+  // shard's peak within a 16 GB development machine beside an editor and a browser;
+  // the limit below is checked only between test files, so a worker grows past it
+  // while one runs. Override for CI or a larger box with JEST_MAX_WORKERS
+  // (e.g. JEST_MAX_WORKERS=8 or =75%).
+  maxWorkers: process.env.JEST_MAX_WORKERS || 2,
+  // EVERY TEST FILE RUNS IN A FRESH WORKER PROCESS. The limit sits below any file's
+  // heap, so a worker is replaced after each file. 1 MB, not a near-miss: transpiled
+  // one file at a time, the lightest files finish at 44 to 56 MB,
+  // and a 64 MB limit would let those keep their worker, so a later file such as
+  // `host-grounding` would inherit a process it does not expect.
+  // Jest isolates the module registry per file but not the process: `process.env`
+  // and other process-level state a file leaves behind reach the next file in the
+  // same worker, and suites written against a fresh process then fail in an order
+  // that depends on which files share a worker. It also caps peak memory.
+  workerIdleMemoryLimit: '1MB',
   // ── THE TRANSFORM CACHE IS ON, AND PINNED SOMEWHERE THAT SURVIVES BETWEEN RUNS ──────────────
   //
   // It used to be off, and the reason was real. Several suites reset the module registry per test
@@ -64,6 +71,8 @@ module.exports = {
   testTimeout: 20000,
   transform: {
     '^.+\\.tsx?$': ['ts-jest', {
+      // Transpile only (`tsconfig.jest.json`): types are checked by `npm run typecheck`.
+      tsconfig: 'tsconfig.jest.json',
       diagnostics: {
         ignoreCodes: [2307, 151002],
       },

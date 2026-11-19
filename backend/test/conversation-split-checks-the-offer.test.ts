@@ -367,6 +367,17 @@ describe('membership of a spawned conversation', () => {
     expect(created.additionalMemberArns).toBeUndefined();
   });
 
+  it('says a targeted subject is private, and its link goes to the person who asked alone', async () => {
+    const out = await handler(request(['my expenses query']));
+    expect(out.created[0].private).toBe(true);
+    const processor = require('fs').readFileSync(require('path').resolve(__dirname, '../lambda/src/assistant-async-processor.ts'), 'utf8');
+    expect(processor).toMatch(/\.\.\.\(created\.private \? \{ Target: \[\{ MemberArn: event\.senderArn! \}\] \} : \{\}\)/);
+    expect(processor).toMatch(/created\.private \? \{ targetedSender: event\.senderArn \} : \{\}/);
+    // A private subject that did not move is said to its person alone, never in the reply the room reads.
+    expect(processor).toMatch(/refusedByAudience\(outcome\.refused, pendingSplit\.topics\)/);
+    expect(processor).toMatch(/response \+= '\\n\\n' \+ refusedLine\(refused\.room\)/);
+  });
+
   it('does not ask who is in the room when nothing needs it', async () => {
     await handler(request(['my expenses query']));
 

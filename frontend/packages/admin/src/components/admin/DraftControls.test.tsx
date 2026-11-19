@@ -45,7 +45,7 @@ describe('one area inline', () => {
     render(<Holder />);
     expect(screen.queryByTestId('draft-step-identity-help-panel')).toBeNull();
     fireEvent.click(screen.getByTestId('draft-step-identity-help'));
-    expect(screen.getByTestId('draft-step-identity-help-panel')).toHaveTextContent('the persona the assistant answers with');
+    expect(screen.getByTestId('draft-step-identity-help-panel')).toHaveTextContent('The assistant\'s name and persona.');
     fireEvent.change(screen.getByTestId('draft-name'), { target: { value: 'Tax' } });
     expect(screen.getByTestId('draft-step-preview')).toHaveTextContent('Tax, with a persona of 19 characters.');
   });

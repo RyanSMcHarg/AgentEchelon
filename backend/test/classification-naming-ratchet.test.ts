@@ -38,6 +38,10 @@ const SCAN_EXTENSIONS = new Set(['.ts', '.tsx', '.mjs', '.sql']);
  */
 const EXEMPT: Array<{ pattern: RegExp; why: string }> = [
   {
+    pattern: /\bfedEx\.tier\b/,
+    why: 'The credential exchange response keeps the wire field `tier`, which the frontend reads; its value is the classification.',
+  },
+  {
     // The template text only, by the field it qualifies, so code and prose in that file are still checked.
     pattern: /\{\{classification\}\} tier\)|\{\{(classification|clearance)\}\}-tier\b/,
     why: 'The operator notices the admin channel receives (`admin-notice-templates.ts`, ADR-062 decision 6), word for '
@@ -94,7 +98,7 @@ const EXEMPT: Array<{ pattern: RegExp; why: string }> = [
   },
   {
     // The pool's attribute and the console route that sets it, by their literal names only.
-    pattern: /withCustomAttributes\('tier'\)|'approve', 'reject', 'tier'/,
+    pattern: /withCustomAttributes\('tier'\)|'approve', 'reject', 'tier'|\/users\/tier\b|custom:tier\b/,
     why: 'The Cognito user pool attribute custom:tier (a requested tier a sign-up sends) and the console '
       + 'route POST /users/tier that sets a person\'s clearance. Both are persisted or wire names the '
       + 'console and the pool already carry; renaming either is a migration, not a naming sweep.',

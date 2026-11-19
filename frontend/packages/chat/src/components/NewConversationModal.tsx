@@ -158,6 +158,7 @@ const NewConversationModal: React.FC<NewConversationModalProps> = ({
                     role="button"
                     tabIndex={0}
                     className={`ncm-class-card ${isSelected ? 'ncm-class-card--selected' : ''}`}
+                    data-classification={classification.tier}
                     onClick={() => {
                       setSelectedClassification(classification);
                       setShowContextDetail(null);

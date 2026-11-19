@@ -17,12 +17,14 @@ import { defaultProfileRegistry as profiles } from '../../../lib/profile-registr
 import { modelFits } from '../../../lib/config/model-availability.js';
 import { modelKindOf } from '../../../lib/config/model-catalog.js';
 import { IMAGE_GEN_MODELS } from './image-gen-models.js';
-import { answersThroughGeneral, needsOf, parseIntentPack, resolvePackParameterValue, taskStateMachines, UNIVERSAL_INTENT_KEYS } from './intent-pack.js';
+import { answersThroughGeneral, parseIntentPack, resolvePackParameterValue, taskStateMachines, UNIVERSAL_INTENT_KEYS } from './intent-pack.js';
+import { catalogIntentOf, type CatalogIntent, type StoredIntentPack } from './intent-pack-taxonomy.js';
 import { DEFAULT_TASK_STATE_MACHINES, PLATFORM_TASK_MACHINE_KEYS, awaitedPartyOf, type TaskStateMachine, type TerminalKind } from './task-state-machines.js';
 import { parseTemplatePointer, templatePointerPath } from './template-store.js';
-import { bodyBucket } from './profile-bodies.js';
 import { buildSourceTable, catalogEntryForVariables, intakeFactKeys, publishedVariables, type PublishedVariables, type VariableCatalogEntry } from './variables.js';
 import { parseIntakeConfig } from './onboarding-intake.js';
+import { noticeTemplateName } from './shipped-message-templates.js';
+import { parseWelcomeOrientationDetailed, type WelcomeOrientation } from './welcome-orientation.js';
 
 export interface ClassificationCatalog {
   classification: string;
@@ -30,8 +32,13 @@ export interface ClassificationCatalog {
   models: { text: string[]; image: string[]; default?: string };
   /** The guardrails a version may select (`/assistant/{c}/guardrails`). Absent when unreadable. */
   guardrails?: Array<{ key: string; guardrailId: string }>;
-  /** The context sources a version may select (`/assistant/{c}/context-sources`). Absent when unreadable. */
-  contextSources?: Array<{ key: string; description?: string }>;
+  /**
+   * The context sources a version may select (`/assistant/{c}/context-sources`). Absent when unreadable. Each carries its
+   * `type` and `prefix`, so the console reads which a role can read with the rule the turn applies (`readableByRole`).
+   */
+  contextSources?: Array<{ key: string; title?: string; description?: string; type?: string; prefix?: string }>;
+  /** The deployment declares the `notifications` capability, so a workflow can offer email. */
+  emailConfigured?: boolean;
   /** The document templates the classification holds, and the version each points at. Absent when unreadable. */
   templates?: Array<{ name: string; active: string }>;
   /**
@@ -42,11 +49,23 @@ export interface ClassificationCatalog {
   /** The intents the classification's pack declares, for a version that carries no pack of its own. */
   packIntents?: string[];
   /**
+   * Where those intents come from: the classification's own `assistant-intent-pack` parameter, or the platform's default
+   * pack, which the runtime serves to a classification that sets none (`parseIntentPack`).
+   */
+  packSource?: 'classification' | 'platform';
+  /**
    * THE SAME INTENTS WITH WHAT EACH IS FOR, read from the pack the router and the processor read: the classifier's
    * description, the line a person reads (`summary`), the answering instructions, and the task machine a multi-step
    * intent runs (its own key, when the machines hold one by that name, as `planDelivery` opens it).
    */
   intents?: CatalogIntent[];
+  /**
+   * THE CLASSIFICATION'S PACK AS IT IS STORED, when the classification sets one: what a version copies as its own pack
+   * when it first declares something of its own (a machine edited in the console), since a version's `intentPack`
+   * replaces the classification's whole. Absent when the classification serves the platform's default pack, which a
+   * version inherits with `extends: 'default'`.
+   */
+  storedPack?: StoredIntentPack;
   /**
    * THE PLATFORM INTENTS EVERY ASSISTANT ANSWERS (the universal intents and `platform_question`), each with whether it
    * answers through the `general` route when a version gives it no route of its own (`ANSWERS_THROUGH_GENERAL`, ADR-064
@@ -57,7 +76,7 @@ export interface ClassificationCatalog {
   topology?: { processorTimeout: number; memorySize: number; reservedConcurrency?: number; maxTokens?: number };
   /** The company-context prefixes the classification grants (every role's boundary). */
   retrievalReach: string[];
-  /** The bucket the company-context prefixes are keys in: the deployment's attachments bucket. Absent when unconfigured. */
+  /** The bucket the company-context prefixes are keys in: the deployment's company bucket. Absent when unconfigured. */
   contextBucket?: string;
   /** Each role's own context prefixes: narrowed below the classification, never widened past it. */
   roles: Record<string, { contextPrefixes: string[] }>;
@@ -70,6 +89,23 @@ export interface ClassificationCatalog {
   variables: PublishedVariables;
   /** The spend budgets the classification's router enforces, as deployed. Absent when unreadable. */
   budgets?: { userHourly?: number; globalHourly?: number };
+  /**
+   * THE DEPLOYMENT'S WELCOME ORIENTATION FOR THIS CLASSIFICATION (`/assistant/{c}/welcome-orientation`), as the router reads
+   * it: what the primary's opening is built from when its version sets no opening of its own. Served so the console's
+   * preview shows the text the room is actually greeted with. Absent when unset or unreadable.
+   */
+  welcomeOrientation?: WelcomeOrientation;
+  /** The classification's primary assistant: the only one the deployment's orientation applies to (`deploymentCopyAppliesTo`). */
+  primaryAssistant?: string;
+  /**
+   * THE DEPLOYMENT'S ONBOARDING INTAKE FOR THIS CLASSIFICATION (`/assistant/{c}/onboarding-intake`), as the router reads it:
+   * what the primary asks a person it has not met when its version carries no onboarding of its own
+   * (`intakeForAssistant`). Its greeting and the questions, in order, so the console shows what is asked. Absent when
+   * unset or unreadable.
+   */
+  onboardingIntake?: { greeting?: string; questions: string[] };
+  /** The deployment-wide lines a message is said from where no stored template fits, by template name (`deploymentLinesOf`). */
+  deploymentLines?: Record<string, string>;
 }
 
 /** One platform intent, as the console's Platform intents group lists it. */
@@ -83,19 +119,8 @@ export function platformIntents(): PlatformIntent[] {
   return [...UNIVERSAL_INTENT_KEYS, PLATFORM_QUESTION].map((key) => ({ key, answersThroughGeneral: answersThroughGeneral(key) }));
 }
 
-/** One intent of the classification's pack, as the assistant page shows it. */
-export interface CatalogIntent {
-  key: string;
-  description: string;
-  summary?: string;
-  instructions?: string;
-  /** True when a turn of this intent opens a task (`delivery: TASK_MULTI_STEP`). */
-  multiStep: boolean;
-  /** The machine that task runs: the intent's own key, present only when the machines declare it. */
-  machine?: string;
-  /** What a turn of this intent hands over (`needsOf`): `image` makes the card offer an image model. */
-  needs?: string;
-}
+/** One intent of the classification's pack, as the assistant page shows it (`catalogIntentOf`). */
+export type { CatalogIntent } from './intent-pack-taxonomy.js';
 
 /**
  * ONE STEP OF A TASK MACHINE, as the assistant page lists it: who it waits on, what it needs before moving on, whether it
@@ -122,6 +147,7 @@ export interface MachineStep {
   action?: string;
   prompt?: string;
 }
+
 
 /** The steps of a machine in declared order, each read through the runtime's own readers. */
 export function machineSteps(machine: TaskStateMachine): MachineStep[] {
@@ -188,11 +214,25 @@ async function templatesOf(ssm: SSMClient, ssmRoot: string, c: string): Promise<
   return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-async function budgetsOf(ssm: SSMClient, lambda: LambdaClient, ssmRoot: string, c: string): Promise<ClassificationCatalog['budgets']> {
+/** The classification's router's environment, as deployed: where its budgets and its deployment-wide lines are set. */
+async function routerEnvOf(ssm: SSMClient, lambda: LambdaClient, ssmRoot: string, c: string): Promise<Record<string, string> | undefined> {
   const routerArn = await optional(ssm, `${ssmRoot}/assistant/${c}/router-arn`);
   if (!routerArn) return undefined;
   const cfg = await lambda.send(new GetFunctionConfigurationCommand({ FunctionName: routerArn }));
-  const env = cfg?.Environment?.Variables ?? {};
+  return cfg?.Environment?.Variables ?? {};
+}
+
+/**
+ * THE DEPLOYMENT-WIDE LINES A MESSAGE IS SAID FROM, by template name, as the router reads them: the budget notice's
+ * `BUDGET_CANNED_RESPONSE` (`noticeSelection`), which wins over the shipped template where no stored one fits.
+ */
+function deploymentLinesOf(env: Record<string, string> | undefined): Record<string, string> | undefined {
+  const budget = env?.BUDGET_CANNED_RESPONSE?.trim();
+  return budget ? { [noticeTemplateName('budgetExhausted')]: budget } : undefined;
+}
+
+function budgetsOf(env: Record<string, string> | undefined): ClassificationCatalog['budgets'] {
+  if (!env) return undefined;
   const num = (v: string | undefined) => (v !== undefined && v !== '' && Number.isFinite(Number(v)) ? Number(v) : undefined);
   const userHourly = num(env.BEDROCK_USER_HOURLY_BUDGET);
   const globalHourly = num(env.BEDROCK_GLOBAL_HOURLY_BUDGET);
@@ -200,6 +240,17 @@ async function budgetsOf(ssm: SSMClient, lambda: LambdaClient, ssmRoot: string, 
 }
 
 /** One classification's catalog. Never throws: an unreadable part is left out. */
+/** The stored pack's object form: a bare array of intents is the older shape of `{ intents }`. Undefined when unreadable. */
+export function storedPackOf(raw: string | undefined): StoredIntentPack | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (Array.isArray(parsed)) return { intents: parsed as StoredIntentPack['intents'] };
+    if (parsed && typeof parsed === 'object' && Array.isArray((parsed as StoredIntentPack).intents)) return parsed as StoredIntentPack;
+  } catch { /* unreadable: no version can copy it */ }
+  return undefined;
+}
+
 export async function classificationCatalog(
   ssm: SSMClient,
   lambda: LambdaClient,
@@ -214,25 +265,44 @@ export async function classificationCatalog(
       return undefined;
     }
   };
-  const [guardrailsRaw, sourcesRaw, packValue, templates, budgets, intakeRaw] = await Promise.all([
+  const [guardrailsRaw, sourcesRaw, packValue, templates, routerEnv, intakeRaw, welcomeRaw] = await Promise.all([
     optional(ssm, `${ssmRoot}/assistant/${c}/guardrails`),
     optional(ssm, `${ssmRoot}/assistant/${c}/context-sources`),
     optional(ssm, `${ssmRoot}/assistant/${c}/assistant-intent-pack`),
     safe(() => templatesOf(ssm, ssmRoot, c)),
-    safe(() => budgetsOf(ssm, lambda, ssmRoot, c)),
+    safe(() => routerEnvOf(ssm, lambda, ssmRoot, c)),
     optional(ssm, `${ssmRoot}/assistant/${c}/onboarding-intake`),
+    optional(ssm, `${ssmRoot}/assistant/${c}/welcome-orientation`),
   ]);
+  const budgets = budgetsOf(routerEnv);
+  const deploymentLines = deploymentLinesOf(routerEnv);
+  const welcomeOrientation = welcomeRaw ? parseWelcomeOrientationDetailed(welcomeRaw).orientation ?? undefined : undefined;
+  let primaryAssistant: string | undefined;
+  try { primaryAssistant = profiles.profileFor(c)?.name; } catch { /* undeclared */ }
   const guardrails = jsonArray(guardrailsRaw)
     ?.filter((g) => typeof g.key === 'string' && typeof g.guardrailId === 'string')
     .map((g) => ({ key: g.key as string, guardrailId: g.guardrailId as string }));
   const contextSources = jsonArray(sourcesRaw)
     ?.filter((s) => typeof s.key === 'string')
-    .map((s) => ({ key: s.key as string, ...(typeof s.description === 'string' ? { description: s.description } : {}) }));
-  const pack = await safe(async () => parseIntentPack(await resolvePackParameterValue(packValue, c)));
+    .map((s) => ({
+      key: s.key as string,
+      ...(typeof s.title === 'string' ? { title: s.title } : {}),
+      ...(typeof s.description === 'string' ? { description: s.description } : {}),
+      ...(typeof s.type === 'string' ? { type: s.type } : {}),
+      ...(typeof s.prefix === 'string' ? { prefix: s.prefix } : {}),
+    }));
+  const packRaw = await safe(() => resolvePackParameterValue(packValue, c));
+  const pack = await safe(async () => parseIntentPack(packRaw));
+  const storedPack = packValue && pack ? storedPackOf(packRaw) : undefined;
   // THE SOURCE TABLE, AS VALIDATION BUILDS IT (`versionVariableErrors`): the published catalog with each entry's trust,
   // the declared classifications, and the deployment intake's fact keys.
   let facts: string[] | undefined;
-  try { facts = intakeRaw ? intakeFactKeys([parseIntakeConfig(intakeRaw)]) : undefined; } catch { /* an unreadable intake publishes no fact keys */ }
+  let onboardingIntake: ClassificationCatalog['onboardingIntake'];
+  try {
+    const intake = intakeRaw ? parseIntakeConfig(intakeRaw) : undefined;
+    facts = intake ? intakeFactKeys([intake]) : undefined;
+    if (intake?.fields.length) onboardingIntake = { ...(intake.greeting ? { greeting: intake.greeting } : {}), questions: intake.fields.map((f) => f.prompt) };
+  } catch { /* an unreadable intake publishes no fact keys */ }
   let classifications: string[] = [];
   try { classifications = profiles.classificationValues(); } catch { /* undeclared */ }
   const variables = publishedVariables(buildSourceTable({
@@ -249,19 +319,9 @@ export async function classificationCatalog(
     states: Object.keys(m.states),
     steps: machineSteps(m),
   }));
+  // THE PACK THE RUNTIME SERVES: the classification's own, or the platform's default pack when it sets none.
   // A multi-step intent opens a task of its own key (`planDelivery`), so its machine is the one by that name.
-  const intents: CatalogIntent[] | undefined = pack && packValue ? pack.intents.map((i) => {
-    const multiStep = i.delivery === 'TASK_MULTI_STEP';
-    return {
-      key: i.key,
-      description: i.description,
-      ...(i.summary ? { summary: i.summary } : {}),
-      ...(i.instructions ? { instructions: i.instructions } : {}),
-      multiStep,
-      ...(multiStep && machines[i.key] ? { machine: i.key } : {}),
-      ...(needsOf(i) ? { needs: needsOf(i) } : {}),
-    };
-  }) : undefined;
+  const intents: CatalogIntent[] | undefined = pack ? pack.intents.map((i) => catalogIntentOf(i, machines)) : undefined;
   let topology: ClassificationCatalog['topology'];
   try {
     const t = profiles.requireTopology(c);
@@ -276,19 +336,25 @@ export async function classificationCatalog(
   try { retrievalReach = profiles.contextPrefixesGranted(c); } catch { /* undeclared */ }
   return {
     classification: c,
+    ...(process.env.EMAIL_CONFIGURED === 'true' ? { emailConfigured: true } : {}),
     models: allowedModelsFor(c, catalogKeys),
     ...(guardrails ? { guardrails } : {}),
     ...(contextSources ? { contextSources } : {}),
     ...(templates ? { templates } : {}),
     workflows,
     platformIntents: platformIntents(),
-    ...(pack && packValue ? { packIntents: pack.intents.map((i) => i.key) } : {}),
+    ...(pack ? { packIntents: pack.intents.map((i) => i.key), packSource: packValue ? 'classification' as const : 'platform' as const } : {}),
     ...(intents ? { intents } : {}),
+    ...(storedPack ? { storedPack } : {}),
     ...(topology ? { topology } : {}),
     retrievalReach,
-    ...(bodyBucket() ? { contextBucket: bodyBucket() } : {}),
+    ...(process.env.CONTEXT_BUCKET ? { contextBucket: process.env.CONTEXT_BUCKET } : {}),
     roles,
     variables,
     ...(budgets ? { budgets } : {}),
+    ...(welcomeOrientation ? { welcomeOrientation } : {}),
+    ...(onboardingIntake ? { onboardingIntake } : {}),
+    ...(deploymentLines ? { deploymentLines } : {}),
+    ...(primaryAssistant ? { primaryAssistant } : {}),
   };
 }

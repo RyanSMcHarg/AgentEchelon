@@ -29,7 +29,7 @@ import {
   type StartGoldenRun, type GoldenGateQuery, type RetireGoldenUpload, type GenerateGoldenEntries, type GoldenBatchQuery,
   type ImportGoldenEntries,
 } from './golden-run.js';
-import { goldenUploadPrefix, type UploadedEntry } from '../lib/golden-upload.js';
+import { goldenUploadBucket, goldenUploadPrefix, type UploadedEntry } from '../lib/golden-upload.js';
 import { loadProfileRegistry } from '../../../lib/profile-registry';
 
 /** An upload as the function is invoked with it: where its entries are, not the entries. */
@@ -55,7 +55,7 @@ async function takeHandOver<T>(classification: string, assistant: string, key: s
   if (!key.startsWith(goldenUploadPrefix(classification, assistant))) {
     throw new Error(`[golden-run] a hand-over is under ${goldenUploadPrefix(classification, assistant)}`);
   }
-  const Bucket = process.env.PROFILE_BODY_BUCKET || '';
+  const Bucket = goldenUploadBucket() || '';
   s3 ??= new S3Client({ region: process.env.AWS_REGION || 'us-east-1' });
   try {
     const got = await s3.send(new GetObjectCommand({ Bucket, Key: key, ...(version ? { VersionId: version } : {}) }));

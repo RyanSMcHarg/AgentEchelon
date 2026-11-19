@@ -5,6 +5,7 @@ import {
   ADMIN_API_MOUNTS,
   ADMIN_ROLES,
   roleExecuteApiResources,
+  routesReachedBeyondHeld,
   type AdminApiResource,
   type AdminRole,
 } from '../config/admin-capabilities';
@@ -23,6 +24,41 @@ export const ADMIN_CONSOLE_ROLE_NAME: Record<AdminRole, string> = {
   admins: `${RES_PREFIX}-admin-console`,
   'team-members': `${RES_PREFIX}-team-console`,
 };
+
+/**
+ * THE ADMIN PLANE'S ROLE NAME. The admin credential exchange assumes it for a channel-scoped, audited vend,
+ * and every admin handler recognizes this instance's admin plane by it (`lambda/src/lib/auth.ts`), so a
+ * session minted on another instance's admin plane is never taken for this one's.
+ */
+export const ADMIN_PLANE_ROLE_NAME = `${RES_PREFIX}-admin-plane`;
+
+/**
+ * THE ROLES THIS INSTANCE MINTS AN ADMIN SESSION ON, for a handler's environment. An admin handler admits an
+ * IAM-signed console or admin-plane session only on these, by name (`trustedIamAdminPrincipal`,
+ * `lambda/src/lib/auth.ts`), so a session another instance in the same account minted is refused there.
+ */
+export function adminSessionRoleEnv(): Record<string, string> {
+  return {
+    ADMIN_CONSOLE_ROLE_NAME: ADMIN_CONSOLE_ROLE_NAME.admins,
+    TEAM_CONSOLE_ROLE_NAME: ADMIN_CONSOLE_ROLE_NAME['team-members'],
+    ADMIN_PLANE_ROLE_NAME,
+  };
+}
+
+/**
+ * THE ROUTES THE ADMIN PLANE REACHES on `AdminApi`: the message read and the task routes, each completed
+ * per vend with the one channel or owner id. Written once: the role's grant on this instance's API
+ * (`grantAdminPlaneOnApi`), its permissions boundary and the exchange's session-policy templates are all
+ * built from this list.
+ */
+export const ADMIN_PLANE_ROUTES: ReadonlyArray<{ method: RouteMethod; path: string }> = [
+  { method: 'GET', path: '/admin/conversations/{channelId}/messages' },
+  { method: 'GET', path: '/admin/tasks/channel/{channelId}' },
+  { method: 'POST', path: '/admin/tasks/channel/{channelId}/cancel' },
+  { method: 'POST', path: '/admin/tasks/channel/{channelId}/owner' },
+  { method: 'GET', path: '/admin/tasks/assignee/{assigneeId}' },
+  { method: 'GET', path: '/admin/tasks/owned-by/{ownerPersonId}' },
+];
 
 /**
  * Each catalog surface's throttle on `AdminApi`, the limit its own REST API carried as a whole: a surface
@@ -85,11 +121,32 @@ export function grantAdminRolesOnApi(
     for (const role of ADMIN_ROLES) {
       const resources = roleExecuteApiResources(role, surface).map((r) => api.arnFor(r.method, adminApiPath(surface, r.path)));
       if (!resources.length) continue;
+      // A ROUTE A PARAMETER'S WILDCARD WOULD REACH BEYOND WHAT THE ROLE HOLDS is denied by name (`routesReachedBeyondHeld`).
+      const beyond = routesReachedBeyondHeld(role, surface).map((r) => api.arnFor(r.method, adminApiPath(surface, r.path)));
       new iam.ManagedPolicy(scope, `ConsoleRoleGrant-${surface}-${role}`, {
         description: `The ${role} console role's routes on the ${surface} admin surface`,
         roles: [roles[role]],
-        statements: [new iam.PolicyStatement({ actions: ['execute-api:Invoke'], resources })],
+        statements: [
+          new iam.PolicyStatement({ actions: ['execute-api:Invoke'], resources }),
+          ...(beyond.length ? [new iam.PolicyStatement({ effect: iam.Effect.DENY, actions: ['execute-api:Invoke'], resources: beyond })] : []),
+        ],
       });
     }
   }
+}
+
+/**
+ * Grant the admin plane `execute-api:Invoke` on its routes on THIS instance's `AdminApi`, named by the API's
+ * own id, so a session vended on it reaches no other instance's admin API in the same account, whatever its
+ * session policy names. A managed policy beside the API, as the console roles' grants are.
+ */
+export function grantAdminPlaneOnApi(scope: Construct, api: RouteTableApi, role: iam.IRole): void {
+  new iam.ManagedPolicy(scope, 'AdminPlaneGrant', {
+    description: 'The admin plane role\'s routes on this instance\'s admin API',
+    roles: [role],
+    statements: [new iam.PolicyStatement({
+      actions: ['execute-api:Invoke'],
+      resources: ADMIN_PLANE_ROUTES.map((r) => api.arnFor(r.method, r.path)),
+    })],
+  });
 }

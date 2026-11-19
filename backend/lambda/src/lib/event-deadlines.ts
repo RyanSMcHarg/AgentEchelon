@@ -21,6 +21,7 @@
  * is redeemed or its people offboarded, which delete no schedule by decision: it fires, starts nothing and deletes itself.
  */
 import { createHash } from 'crypto';
+import { isMeetingId } from './meeting-lifecycle.js';
 import {
   ActionAfterCompletion, ConflictException, CreateScheduleCommand, DeleteScheduleCommand, FlexibleTimeWindowMode,
   ResourceNotFoundException, SchedulerClient,
@@ -165,6 +166,97 @@ export interface TaskDeadlineFiring {
   taskId: string;
 }
 
+/**
+ * A RUN'S WAIT, ENDING (ADR-067 decision 2, WT20): ids only, as a task's deadline is. `taskId` is the wait's id, which names
+ * the wait's record (`holdRunWait`) and the schedule; the record holds what continues the run.
+ */
+export interface RunWaitFiring {
+  kind: 'wait';
+  channelArn: string;
+  taskId: string;
+}
+
+/**
+ * A TASK STEP'S REMINDER (ADR-067 WT21): ids only. `taskId` is the task's, and `n` which reminder this is, so each has a
+ * schedule of its own name and the last one schedules no other.
+ */
+export interface TaskReminderFiring {
+  kind: 'remind';
+  channelArn: string;
+  taskId: string;
+  n: number;
+}
+
+/**
+ * A MEETING'S SUMMARY COMING DUE (the `meetings` capability): ids only. Created once, as the router posts a meeting's ended
+ * card, for the moment the meeting's last events are filed in both stores, so the card is rewritten once and nothing polls.
+ */
+export interface MeetingSummaryFiring {
+  kind: 'meeting';
+  channelArn: string;
+  meetingId: string;
+}
+
+/**
+ * HOW LONG AFTER A MEETING ENDS ITS SUMMARY IS WRITTEN: past the archive stream's 60 second buffer and an app's last report
+ * as its person leaves, so the figures are the meeting's whole record.
+ */
+export const MEETING_SUMMARY_DELAY_SECONDS = 120;
+
+/**
+ * A RUNNING MEETING'S WATCH COMING DUE (`meeting-watch.ts`): ids, the moment it was set for, which names its schedule, and
+ * since when an earlier check found the meeting unattended. Created at the meeting's start and again by each check that
+ * leaves it running.
+ */
+export interface MeetingWatchFiring {
+  kind: 'meeting-watch';
+  channelArn: string;
+  meetingId: string;
+  /** The moment the check was set for, epoch seconds. */
+  at: number;
+  /** Epoch ms since an earlier check found at most one person in it. */
+  aloneSince?: number;
+}
+
+/** A meeting watch firing, or null when the input is not one. */
+export function meetingWatchFiringOf(raw: unknown): MeetingWatchFiring | null {
+  const r = raw as Record<string, unknown> | null;
+  if (!r || typeof r !== 'object' || r.kind !== 'meeting-watch') return null;
+  if (typeof r.channelArn !== 'string' || !r.channelArn.includes('/channel/')) return null;
+  if (!isMeetingId(r.meetingId)) return null;
+  if (typeof r.at !== 'number' || !Number.isInteger(r.at) || r.at <= 0) return null;
+  const aloneSince = typeof r.aloneSince === 'number' && Number.isFinite(r.aloneSince) && r.aloneSince > 0 ? r.aloneSince : undefined;
+  return { kind: 'meeting-watch', channelArn: r.channelArn, meetingId: r.meetingId, at: r.at, ...(aloneSince !== undefined ? { aloneSince } : {}) };
+}
+
+/** A meeting summary firing, or null when the input is not one. */
+export function meetingSummaryFiringOf(raw: unknown): MeetingSummaryFiring | null {
+  const r = raw as Record<string, unknown> | null;
+  if (!r || typeof r !== 'object' || r.kind !== 'meeting') return null;
+  if (typeof r.channelArn !== 'string' || !r.channelArn.includes('/channel/')) return null;
+  if (!isMeetingId(r.meetingId)) return null;
+  return { kind: 'meeting', channelArn: r.channelArn, meetingId: r.meetingId };
+}
+
+/** A task reminder firing, or null when the input is not one. */
+export function taskReminderFiringOf(raw: unknown): TaskReminderFiring | null {
+  const r = raw as Record<string, unknown> | null;
+  if (!r || typeof r !== 'object' || r.kind !== 'remind') return null;
+  if (typeof r.channelArn !== 'string' || !r.channelArn.includes('/channel/')) return null;
+  if (typeof r.taskId !== 'string' || !/^[A-Za-z0-9_-]{1,60}$/.test(r.taskId)) return null;
+  if (typeof r.n !== 'number' || !Number.isInteger(r.n) || r.n < 1 || r.n > 5) return null;
+  return { kind: 'remind', channelArn: r.channelArn, taskId: r.taskId, n: r.n };
+}
+
+/** A run's wait firing, or null when the input is not one. */
+export function runWaitFiringOf(raw: unknown): RunWaitFiring | null {
+  const r = raw as Record<string, unknown> | null;
+  if (!r || typeof r !== 'object' || r.kind !== 'wait') return null;
+  if (typeof r.channelArn !== 'string' || !r.channelArn.includes('/channel/')) return null;
+  if (typeof r.taskId !== 'string' || !/^wait-[A-Za-z0-9_-]{1,59}$/.test(r.taskId)) return null;
+  return { kind: 'wait', channelArn: r.channelArn, taskId: r.taskId };
+}
+
 /** A task's id as a schedule carries it: the id a task step's `eventTaskId` derives. */
 const TASK_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -183,15 +275,27 @@ export function taskDeadlineFiringOf(raw: unknown): TaskDeadlineFiring | null {
   return { kind: 'task', channelArn: r.channelArn, taskId: r.taskId };
 }
 
+/** The key a schedule is named by, within its conversation. */
+function scheduleKeyOf(firing: TaskDeadlineFiring | RunWaitFiring | TaskReminderFiring | MeetingSummaryFiring | MeetingWatchFiring): string {
+  if (firing.kind === 'remind') return `${firing.taskId}-r${firing.n}`;
+  if (firing.kind === 'meeting') return `meeting-${firing.meetingId}`;
+  if (firing.kind === 'meeting-watch') return `watch-${firing.meetingId}-${firing.at}`;
+  return firing.taskId;
+}
+
 /**
  * CREATE A TASK STEP'S DEADLINE SCHEDULE, once, on the classification's own group, passing its own scheduler role, as an
  * invitation's is: ids-only input, and it deletes itself once fired. A schedule of that name already there is the same
  * deadline (a redelivered event), left as it is.
  */
-export async function createTaskDeadlineSchedule(wiring: DeadlineWiring, firing: TaskDeadlineFiring, at: Date, client?: Sender): Promise<'created' | 'exists'> {
+export async function createTaskDeadlineSchedule(
+  wiring: DeadlineWiring, firing: TaskDeadlineFiring | RunWaitFiring | TaskReminderFiring | MeetingSummaryFiring | MeetingWatchFiring, at: Date, client?: Sender,
+): Promise<'created' | 'exists'> {
   try {
     await clientOf(client).send(new CreateScheduleCommand({
-      Name: taskDeadlineScheduleName(firing.channelArn, firing.taskId),
+      // A REMINDER IS NAMED BY ITS TASK AND WHICH REMINDER IT IS, so each is a schedule of its own; a summary by its meeting;
+      // a meeting's watch by its meeting and the moment it was set for, so the check that sets the next one never meets itself.
+      Name: taskDeadlineScheduleName(firing.channelArn, scheduleKeyOf(firing)),
       GroupName: wiring.group,
       ScheduleExpression: atExpression(at),
       ScheduleExpressionTimezone: 'UTC',

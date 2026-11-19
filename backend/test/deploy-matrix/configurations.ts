@@ -62,9 +62,6 @@
  *
  * The app refuses a capability whose stacks are not built (`notBuilt` in the registry); no configuration
  * declares one, and the matrix refuses a configuration that does.
- *
- * Meetings (C4) is declared absent: its stacks and capability are owned by the meetings line of work,
- * and it joins the matrix as one entry here when that capability is in the registry.
  */
 
 import { capabilityDefinition } from '../../lib/config/capabilities';
@@ -114,7 +111,9 @@ export interface DeclaredIssuer {
  *    so declaring the capability adds those and changes nothing the stack had.
  *  - `env-only`: the same resources with the same properties, except a Lambda function's environment
  *    (the synth-time capability values and declared tools). Never a resource, a grant or an export: a
- *    capability attaches its grants to these stacks' roles from its own stack (`Battle`, `Experiments`).
+ *    capability attaches its grants to these stacks' roles from its own stack (`Battle`, `Experiments`). A bucket
+ *    has one policy, so the one statement a capability adds to a core bucket's is named in `matrix.ts`
+ *    (`CAPABILITY_BUCKET_STATEMENTS`) and holds only where that capability's stack is deployed.
  *  - `none`: identical.
  */
 export type AttachKind = 'any' | 'add-only' | 'env-and-add' | 'env-only' | 'none';
@@ -292,7 +291,7 @@ export const CUSTOM_PROFILES_PLUS_ENTERPRISE: ProfilesConfig = {
 /**
  * C7-CUSTOM'S OWN SET: C1-custom's two peers with Battle Mode on `legal`, and the shipped outside classifications
  * a guest issuer needs (`guest`, the visitor's, and `customer`, where path B's claim opens its conversation).
- * So the pair below sees what a classification adds where Battle, a guest issuer and a host's one-conversation
+ * So the pair below sees what a classification adds where Battle, a guest issuer and a host's context
  * issuer are declared: Battle's per-classification alts and grants, the guest's upgrade path, and the host's
  * context membership role.
  */
@@ -329,11 +328,11 @@ export const CUSTOM_BATTLE_PROFILES_PLUS_RESEARCH: ProfilesConfig = {
   ],
   groupClearance: { ...CUSTOM_BATTLE_PROFILES.groupClearance, [ADDED_BATTLE_CLASSIFICATION]: ADDED_BATTLE_CLASSIFICATION },
 };
-/** A host app's own pool whose people reach one context conversation at `legal` (a `oneChannel` issuer). */
+/** A host app's own pool whose context conversations are created at `legal`. */
 const HOST_CONTEXT_POOL: DeclaredIssuer = {
   id: 'host',
   kind: 'cognito-pool',
-  entry: { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', clearance: { oneChannel: 'legal', classifications: ['legal'] }, audience: 'host-client', admin: false },
+  entry: { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', clearance: { fixed: ['legal'], classifications: ['legal'] }, contextClassification: 'legal', audience: 'host-client', admin: false },
 };
 const STAFF_POOL: DeclaredIssuer = { id: 'staff-pool', kind: 'cognito-pool', admin: true };
 /** A partner's OIDC provider, federated into the deployment's pool: a generic OIDC issuer is never verified directly. */
@@ -502,6 +501,18 @@ export const CONFIGURATIONS: readonly Configuration[] = [
     greenAt: 'W14',
   },
   {
+    id: 'C4',
+    file: 'c4-meetings.test.ts',
+    summary: 'meetings, on C3: a conversation\x27s Amazon Chime SDK meeting, its routes, its run entry and its roster events',
+    capabilities: ['widget', 'chat', 'admin', 'operations', 'notifications', 'meetings'],
+    issuers: [GUEST, DEPLOYMENT_POOL, STAFF_POOL],
+    profiles: WITH_GUEST(DEFAULT_CLASSIFICATIONS),
+    classifications: WITH_GUEST(DEFAULT_CLASSIFICATIONS),
+    addedStacks: ['Widget', 'ChatApp', 'AdminServices', 'AdminApi', 'AdminApp', 'Operations', 'Notifications', 'Meetings'],
+    previous: 'C3',
+    greenAt: 'W16',
+  },
+  {
     id: 'C5',
     file: 'c5-more-issuers.test.ts',
     summary: 'a partner OIDC provider federated into the pool and a host assertion, with a classification each',
@@ -529,12 +540,12 @@ export const CONFIGURATIONS: readonly Configuration[] = [
   {
     id: 'C7',
     file: 'c7-battle-and-experiments.test.ts',
-    summary: 'battle and experiments',
-    capabilities: ['widget', 'chat', 'admin', 'operations', 'notifications', 'connectors', 'battle', 'experiments'],
+    summary: 'battle and experiments, and dashboard pages',
+    capabilities: ['widget', 'chat', 'admin', 'operations', 'notifications', 'connectors', 'battle', 'experiments', 'dashboard-pages'],
     issuers: [GUEST, DEPLOYMENT_POOL, STAFF_POOL, PARTNER_OIDC, HOST_ASSERTION],
     profiles: WITH_GUEST(DEFAULT_CLASSIFICATIONS),
     classifications: WITH_GUEST(DEFAULT_CLASSIFICATIONS),
-    addedStacks: ['Widget', 'ChatApp', 'AdminServices', 'AdminApi', 'AdminApp', 'Operations', 'Notifications', 'Connectors', 'Battle', 'Experiments'],
+    addedStacks: ['Widget', 'ChatApp', 'AdminServices', 'AdminApi', 'AdminApp', 'Operations', 'Notifications', 'Connectors', 'Battle', 'Experiments', 'DashboardPages'],
     previous: 'C6',
     greenAt: 'W16',
     connectors: [PAGERDUTY_CONNECTOR],
@@ -569,7 +580,7 @@ export const CONFIGURATIONS: readonly Configuration[] = [
   {
     id: 'C7-custom',
     file: 'c7-custom-battle.test.ts',
-    summary: 'a custom set with Battle Mode, experiments, a guest issuer and a host app\'s one-conversation issuer',
+    summary: 'a custom set with Battle Mode, experiments, a guest issuer and a host app\'s context issuer',
     capabilities: ['widget', 'chat', 'admin', 'operations', 'battle', 'experiments'],
     issuers: [GUEST, CUSTOM_DEPLOYMENT_POOL, HOST_CONTEXT_POOL],
     profiles: CUSTOM_BATTLE_PROFILES,
@@ -615,14 +626,8 @@ export function refusedCapabilities(config: Configuration): string[] {
   return config.capabilities.filter((name) => capabilityDefinition(name)?.notBuilt);
 }
 
-/** Configurations the matrix leaves out, each with the reason. */
-export const ABSENT_CONFIGURATIONS: readonly { id: string; reason: string }[] = [
-  {
-    id: 'C4',
-    reason: 'meetings: the Meetings stack and the `meetings` capability are built and owned by the meetings line of work, '
-      + 'and C4 joins the matrix as one entry here when that capability is in the registry',
-  },
-];
+/** Configurations the matrix leaves out, each with the reason. Every configuration is in the matrix. */
+export const ABSENT_CONFIGURATIONS: readonly { id: string; reason: string }[] = [];
 
 export function configuration(id: string): Configuration {
   const found = CONFIGURATIONS.find((c) => c.id === id);

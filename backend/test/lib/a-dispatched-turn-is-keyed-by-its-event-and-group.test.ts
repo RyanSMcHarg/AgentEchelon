@@ -14,7 +14,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { EVENT_DISPATCH_ID_MAX, eventDispatchId } from '../../lambda/src/lib/event-dispatch-id';
-import { conversationKey, eventNaturalKey } from '../../lambda/src/lib/event-workflow';
+import { conversationKey } from '../../lambda/src/lib/event-workflow';
+import { eventNaturalKey } from '../../lambda/src/lib/event-natural-key';
 
 const router = fs.readFileSync(path.join(__dirname, '..', '..', 'lambda', 'src', 'router-agent-handler.ts'), 'utf8');
 const APP = 'arn:aws:chime:us-east-1:1:app-instance/ai';
@@ -37,7 +38,7 @@ describe('an agent step\'s turn is keyed by its event', () => {
 
   it('the router keys the agent step\'s dispatch by the event', () => {
     const fn = router.slice(router.indexOf('async function dispatchEventAgentStep('), router.indexOf('export interface EventNaming'));
-    expect(fn).toMatch(/correlationId: eventDispatchId\('event', \[args\.event, eventNaturalKey\(/);
+    expect(fn).toMatch(/correlationId: eventDispatchId\('event', \[args\.event, runNaturalKey\(/);
   });
 });
 
@@ -54,7 +55,7 @@ describe('a voice send\'s turn is keyed by its event and its template group', ()
   });
 
   it('the router keys the voice dispatch by the event and the template', () => {
-    const fn = router.slice(router.indexOf('async function dispatchVoiceSend('), router.indexOf('async function stepTaker('));
+    const fn = router.slice(router.indexOf('async function dispatchVoiceSend('), router.indexOf('async function roleHolder('));
     expect(fn).toMatch(/correlationId: eventDispatchId\('voice', \[args\.event, [^\]]*args\.step, args\.template, botIdFromArn\(args\.botArn\)\]\)/);
   });
 });
@@ -75,5 +76,14 @@ describe('an id stays within the routing table and never merges two', () => {
 
   it('the same parts are the same id, so a redelivered dispatch collapses on the processor\'s claim', () => {
     expect(eventDispatchId('event', ['assistant-joined', 'ch-1', 'look', 'bot'])).toBe(eventDispatchId('event', ['assistant-joined', 'ch-1', 'look', 'bot']));
+  });
+});
+
+describe('a run is keyed by its identity by name', () => {
+  it('names each field, so a run\'s meeting, rule or reopen is never dropped or passed out of order', () => {
+    const { runNaturalKey } = require('../../lambda/src/lib/event-natural-key');
+    expect(runNaturalKey('invitation-sent', CHANNEL, { invitationId: ID })).toBe(eventNaturalKey('invitation-sent', CHANNEL, undefined, ID));
+    expect(runNaturalKey('task-reopened', CHANNEL, { reopened: { taskId: 't-1', n: 2 } })).toBe('reopen-t-1-2');
+    expect(runNaturalKey('event-received', CHANNEL, { ruleEvent: { rule: 'abcdef012345', window: 7 } })).toBe('rule-abcdef012345-7');
   });
 });

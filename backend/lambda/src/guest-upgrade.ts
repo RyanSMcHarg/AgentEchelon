@@ -27,7 +27,7 @@
  * ── `POST /upgrade/claim` (a signed-in person) ───────────────────────────────────────────────────
  *
  * Made by the chat app on its own once a person signs in from the link (`settlePendingUpgrade`). An
- * ordinary person: the edge and `callerPerson` refuse a guest, a one-conversation person and a host
+ * ordinary person: the edge and `callerPerson` refuse a guest and a host
  * assertion. Never answered from the authorizer cache (`UNCACHED_ROUTES`), since it consumes a single-use
  * token. The claim is found by its token's hash and nothing else, never by an email. In this order:
  *
@@ -60,6 +60,7 @@ import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
 import { claimTargetOf, GUEST_VISITOR_TYPE, typeAdmitsIssuers } from '../../lib/config/conversation-types.js';
 import { isGuestIssuer, type RegistrationApproval } from '../../lib/config/issuers.js';
 import { callerHolderToken, callerPerson, edgeCallerOf } from './lib/auth.js';
+import { callerStillCleared } from './lib/conversation-access.js';
 import { newPlatformToken, putToken, readTokenRecord, redeemToken, tokenKey, tokenRecordOf, type TokenRecord } from './lib/tokens.js';
 import {
   APPROVAL_QUEUE_ATTRIBUTE, assessVisit, openUpgradeConversation, REGISTRATIONS_AWAITING_APPROVAL, REGISTRATION_DAYS, registrationAddressOf, registrationFieldsOf, registrationKeyOf, retireVisit,
@@ -299,6 +300,10 @@ export async function claim(event: any, d: UpgradeDeps = {}): Promise<HttpResult
     console.warn('[GuestUpgrade][SecurityEvent] a claim by an account whose clearance does not reach the target; nothing consumed', { target: target.classification });
     return refuse(403, 'NOT_CLEARED_FOR_TARGET', 'this account cannot hold the conversation this claim opens');
   }
+  // A claim opens a conversation as the create route does, so it answers to the person's current clearance too.
+  const stillCleared = await callerStillCleared(target.classification, personArn);
+  if (stillCleared === 'unavailable') return refuse(503, 'UNAVAILABLE', 'your clearance could not be read just now');
+  if (stillCleared === 'not-cleared') return refuse(403, 'NOT_CLEARED_FOR_TARGET', 'this account cannot hold the conversation this claim opens');
   // 2b. AND THE TARGET TYPE ADMITS THE ISSUER THEY SIGNED IN THROUGH (T1, FR23), after the clearance check.
   if (!typeAdmitsIssuers(target.typeKey, caller.issuer ? [caller.issuer.id] : [])) {
     console.warn('[GuestUpgrade] a claim by an account of an issuer the target type does not admit; nothing consumed', { target: target.typeKey });

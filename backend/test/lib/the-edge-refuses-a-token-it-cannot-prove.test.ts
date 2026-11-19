@@ -43,7 +43,7 @@ const entraJwks = (tenant: string) => `https://login.microsoftonline.com/${tenan
 const REGISTRY = [
   { id: 'deployment', kind: 'cognito-pool', pool: 'self', clearance: { groups: true, classifications: ALL }, admin: true },
   { id: 'partner', kind: 'cognito-pool', pool: PARTNER_POOL, audience: 'partner-client', tokenUse: 'access', clearance: { fixed: ['basic'], classifications: ['basic'] } },
-  { id: 'host', kind: 'cognito-pool', pool: HOST_POOL, audience: 'host-client', clearance: { oneChannel: 'basic', classifications: ['basic'] } },
+  { id: 'host', kind: 'cognito-pool', pool: HOST_POOL, audience: 'host-client', clearance: { fixed: ['basic'], classifications: ['basic'] } },
   // A DIRECT OIDC PROVIDER, verified against its discovery document and the keys it publishes.
   { id: 'okta', kind: 'oidc', issuer: OKTA_ISS, discoveryUrl: OKTA_DISCOVERY, audience: 'okta-client', algorithm: 'ES256', clearance: { fixed: ['basic'], classifications: ['basic'] } },
   { id: 'api', kind: 'oidc', issuer: API_ISS, discoveryUrl: API_DISCOVERY, audience: 'api-client', tokenUse: 'access', clearance: { fixed: ['basic'], classifications: ['basic'] } },
@@ -122,7 +122,7 @@ describe('a good token from every issuer kind is accepted, as the entry it comes
   it.each([
     ['deployment (Cognito ID token)', () => good.deployment(), 'deployment'],
     ['partner (Cognito access token)', () => good.partner(), 'partner'],
-    ['host (one-conversation Cognito pool)', () => good.host(), 'host'],
+    ['host (Cognito pool)', () => good.host(), 'host'],
     ['okta (OIDC ID token, ES256)', () => good.okta(), 'okta'],
     ['api (OIDC access token, at+jwt)', () => good.api(), 'api'],
     ['entra (tenant on the allowlist)', () => good.entra(), 'entra'],

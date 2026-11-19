@@ -24,6 +24,8 @@ jest.mock(
     SendChannelMessageCommand: jest.fn().mockImplementation((input) => ({ _cmd: 'SendMessage', input })),
     TagResourceCommand: jest.fn().mockImplementation((input) => ({ _cmd: 'Tag', input })),
     DescribeChannelCommand: jest.fn().mockImplementation((input) => ({ _cmd: 'Describe', input })),
+    // The caller's own membership, looked up as them before archive or remove acts for them (`lib/conversation-access.ts`).
+    DescribeChannelMembershipCommand: jest.fn().mockImplementation((input) => ({ _cmd: 'DescribeMembership', input })),
     UpdateChannelCommand: jest.fn().mockImplementation((input) => ({ _cmd: 'UpdateChannel', input })),
     ListTagsForResourceCommand: jest.fn().mockImplementation((input) => ({ _cmd: 'ListTags', input })),
     ChannelMessageType: { STANDARD: 'STANDARD' },
@@ -80,6 +82,9 @@ jest.mock('../lambda/src/lib/active-profile', () => ({
 const mockPrimary = jest.fn();
 jest.mock('../lambda/src/lib/conversation-primary', () => ({
   primaryAssistantOf: (...args: unknown[]) => mockPrimary(...args),
+  // No tag memo here: every request reads the tags it asks for.
+  memoizedTagReader: (client: unknown) => client,
+  tagMemoHolds: () => false,
 }));
 const mockIdentitySend = jest.fn();
 jest.mock('@aws-sdk/client-chime-sdk-identity', () => ({

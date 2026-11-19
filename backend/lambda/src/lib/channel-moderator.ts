@@ -17,11 +17,36 @@
 
 import {
   ChimeSDKMessagingClient,
+  DescribeChannelModeratorCommand,
   ListChannelModeratorsCommand,
 } from '@aws-sdk/client-chime-sdk-messaging';
 import { sessionClient } from './assistant-session.js';
 
 const messagingClient = sessionClient(ChimeSDKMessagingClient, {});
+
+/** What asks Amazon Chime SDK messaging one command: a messaging client, or a test's. */
+export interface ModeratorReader { send(command: unknown): Promise<unknown> }
+
+/**
+ * WHETHER A PERSON MODERATES A CONVERSATION, asked of Amazon Chime SDK for that one moderator (`DescribeChannelModerator`)
+ * with the person as their own bearer, through the caller's client. The one per-person check every meeting decision and
+ * every other caller holding that action reads; any failure denies, and one that is not the service's plain "no" is logged.
+ * A function that acts as the app instance's service admin asks with that bearer (`opts.bearer`), never as the person.
+ */
+export async function personModeratesChannel(
+  messaging: ModeratorReader, channelArn: string, personArn: string, opts: { bearer?: string } = {},
+): Promise<boolean> {
+  const bearer = opts.bearer ?? personArn;
+  if (!channelArn || !personArn || !bearer) return false;
+  try {
+    await messaging.send(new DescribeChannelModeratorCommand({ ChannelArn: channelArn, ChannelModeratorArn: personArn, ChimeBearer: bearer }));
+    return true;
+  } catch (err) {
+    const name = (err as Error)?.name;
+    if (name !== 'NotFoundException' && name !== 'ForbiddenException') console.warn('[channel-moderator] a moderator read failed; it denies', { err: name });
+    return false;
+  }
+}
 
 /**
  * True iff `callerArn` is a current moderator of `channelArn`.

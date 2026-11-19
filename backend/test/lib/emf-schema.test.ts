@@ -33,6 +33,7 @@ import {
 import { recordNoTransitionTurn, TASK_STALL_TURNS, type Task } from '../../lambda/src/lib/task-tracking';
 import { recordWelcomeConfigDefect, recordWelcomePromptOutcome } from '../../lambda/src/lib/welcome-metrics';
 import { recordClassificationBoundaryRefusal } from '../../lambda/src/lib/access-denial';
+import { recordGuardrailUnavailable } from '../../lambda/src/lib/guardrail-unavailable';
 import { recordUnauditableChannel } from '../../lambda/src/membership-audit';
 import { emitArchivalHealth } from '../../lambda/src/analytics-aurora/archival-health';
 import * as queueMetrics from '../../lambda/src/lib/turn-queue-metrics';
@@ -49,7 +50,9 @@ import { guestMetric } from '../../lambda/src/guest-session';
 import { countAssertionRefused } from '../../lambda/src/lib/host-assertion-metric';
 import { invitationMetric } from '../../lambda/src/lib/invitations';
 import { scheduleInvitationDeadline } from '../../lambda/src/router-agent-handler';
-import { PLATFORM_EVENT_WORKFLOWS } from '../../lambda/src/lib/event-workflow';
+import { SHIPPED_EVENT_WORKFLOWS } from '../../lambda/src/lib/event-workflow';
+import { recordCheck } from '../../lambda/src/lib/conversation-access';
+import { recordClientFailures, recordsFromReport } from '../../lambda/src/lib/meeting-client-events';
 
 interface EmfDoc {
   _aws: {
@@ -232,7 +235,7 @@ const CALLERS: Array<{ module: string; label: string; emit: () => Promise<EmfDoc
         await scheduleInvitationDeadline({
           channelArn: `${app}/channel/ch-1`, invitationId: '0b7f2a52-0000-4000-8000-000000000001', conversationType: 'general',
           expiresAt: 1_800_000_000 + 7 * 86_400,
-        } as never, { chase: PLATFORM_EVENT_WORKFLOWS['chase-unredeemed'] }, {
+        } as never, { chase: SHIPPED_EVENT_WORKFLOWS['chase-unredeemed'] }, {
           wiring: { group: 'ae-standard-event-deadlines', roleArn: 'arn:aws:iam::111122223333:role/d', routerArn: 'arn:aws:lambda:us-east-1:111122223333:function:r' },
           create: async () => { throw Object.assign(new Error('no'), { name: 'AccessDeniedException' }); },
           now: () => 1_800_000_000_000,
@@ -253,6 +256,20 @@ const CALLERS: Array<{ module: string; label: string; emit: () => Promise<EmfDoc
       try {
         recordUnauditableChannel('arn:chan', 'arn:member', 'member');
         recordUnauditableChannel('arn:chan', 'arn:bot', 'assistant');
+      } finally { err.mockRestore(); }
+    }),
+  },
+  {
+    // A guardrail that could not be applied, so the turn was withheld. The alarm watches the
+    // Classification set, so Classification must be present on every call, including the one where the
+    // processor has no CLASSIFICATION set.
+    module: 'lambda/src/lib/guardrail-unavailable.ts',
+    label: 'recordGuardrailUnavailable (input and output, named and unnamed classification)',
+    emit: async () => capture(() => {
+      const err = jest.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        recordGuardrailUnavailable({ source: 'INPUT', classification: 'premium', guardrailId: 'gr', error: Object.assign(new Error('x'), { name: 'AccessDeniedException' }) });
+        recordGuardrailUnavailable({ source: 'OUTPUT', classification: '', guardrailId: 'gr', error: new Error('x') });
       } finally { err.mockRestore(); }
     }),
   },
@@ -505,6 +522,34 @@ const CALLERS: Array<{ module: string; label: string; emit: () => Promise<EmfDoc
       recordNotificationOutcome({ emailed: 2, skipped: 1, failed: 1 });
       // A fan-out that reached everybody publishes one document, not three empty ones.
       recordNotificationOutcome({ emailed: 1, skipped: 0, failed: 0 });
+    }),
+  },
+  {
+    // A person-route check, by use, outcome and tag source. `Instance` is named only where the function
+    // carries one, so both shapes must parse.
+    module: 'lambda/src/lib/conversation-access.ts',
+    label: 'recordCheck (with and without an instance)',
+    emit: async () => capture(() => {
+      const prior = process.env.ALERT_INSTANCE;
+      try {
+        process.env.ALERT_INSTANCE = 'dev';
+        recordCheck(Date.now(), 'ALLOWED', 'read', 'check');
+        delete process.env.ALERT_INSTANCE;
+        recordCheck(Date.now(), 'NOT_CLEARED', 'remembered', 'list');
+      } finally {
+        if (prior === undefined) delete process.env.ALERT_INSTANCE; else process.env.ALERT_INSTANCE = prior;
+      }
+    }),
+  },
+  {
+    // A meeting report's client failures, dimensionless: the series the Meetings alarm fires on.
+    module: 'lambda/src/lib/meeting-client-events.ts',
+    label: 'recordClientFailures',
+    emit: async () => capture(() => {
+      const report = recordsFromReport([{ name: 'audioInputFailed', at: Date.now() }, { name: 'meetingFailed', at: Date.now() }], {
+        meetingId: 'm-1', channelArn: 'arn:c', classification: 'standard', personId: 'p-1', attendeeId: 'a-1', now: Date.now(),
+      });
+      recordClientFailures('records' in report ? report.records : [], 'ns/Meetings');
     }),
   },
 ];

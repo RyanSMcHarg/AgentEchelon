@@ -34,18 +34,19 @@ import {
   resolveDriftRival,
   recordDriftFire,
   recordDriftOutcome,
-  savePendingSuggestion,
-  readPendingSuggestion,
-  resolvePendingSuggestion,
   adoptOfferedTopic,
   seedDriftTopicSummary,
 } from './data-plane-client.js';
 import type { Intent as DriftIntent } from '../analytics-aurora/drift-detection.js';
 import { resolveScopedChannelArns } from './scoped-channels.js';
 import { findInboundMessage, type InboundMessage } from './inbound-message.js';
-import { withTurnDeclaration } from './turn-declaration.js';
-import { classifyConfirmDeclineReply } from './routing-state.js';
+import { withTurnDeclarationLine } from './turn-declaration.js';
+import { readDriftOfferAnswer } from './drift-offer-answer.js';
 import { createConversationFromDrift } from './channel-creation.js';
+import { stripAtAll, stripMentionOf } from './flow-bypass.js';
+import { stripPrivatePrefix } from './private-prefix.js';
+import { decodeContent } from './chime/history.js';
+import { resolveChannelSize } from './channel-size.js';
 import { resolveServiceAdminBearer } from './service-admin-bearer.js';
 import { getChannelContext } from './channel-context-client.js';
 import { resolveActiveBattle, readBattleRows, duelIsLive } from './battle-state.js';
@@ -151,6 +152,11 @@ export interface LiveDriftFlowInput {
    * assistant, which answers it before anything else the reply asks.
    */
   onHeldQuestion?: (held: HeldQuestion) => void;
+  /**
+   * The profile's classifier model, which reads the reply to an open offer (`readDriftOfferAnswer`), so the
+   * profile's choice governs that reading as it governs the intent. Omitted, the deployment default.
+   */
+  classifierModelId?: string;
   /** The classified intent (IntentType value). Uppercased for detectDrift. */
   intent: string;
   /**
@@ -177,6 +183,56 @@ export interface LiveDriftFlowInput {
    * within the deployment's recently-ended window. Never read to make a decision here or downstream.
    */
   taskSignal?: 'live' | 'recently_ended';
+  /**
+   * RAISE `subject-changed` (WT88): what happens when a person's message changes the subject is a workflow, the version's
+   * for the room's type else the platform's `drift`, which makes the offer itself. Its answer says what the run did; `none`, or
+   * no such function, makes no offer and the turn is answered as any other.
+   */
+  raiseSubjectChanged?: (change: SubjectChange) => Promise<SubjectChangeRaised>;
+  /**
+   * MOVE THE SENDER'S OPEN OFFER (WT89) to what their reply said, carrying the reply's message id; the run goes on from
+   * there. Its answer says what became of the offer.
+   */
+  answerOffer?: (answer: 'move' | 'keep', answeringMessageId: string) => Promise<OfferAnswered>;
+  /**
+   * THE PERSON'S OPEN OFFER IN THIS CONVERSATION, the one record of it (WT89): the task the `subject-changed` run opened for
+   * them, which the router reads with the person's own work, read only by a turn the flow's gates let through. Absent, or
+   * resolving to nothing, no offer is open.
+   */
+  openOffer?: () => Promise<SubjectOffer | undefined>;
+}
+
+/** What a subject change carries to its workflow's run: the message, and what detection found. */
+export interface SubjectChange {
+  messageId: string;
+  kind: 'confirm' | 'redirect';
+  rivalConversationArn?: string;
+  driftEventId?: string;
+  /** The fire's correlation, which names the embedding a declined offer's subject is adopted from. */
+  correlationId?: string;
+  /** The room's conversation type, which selects the version's workflow for it. */
+  conversationType?: string;
+}
+
+/**
+ * What a raised change did, read from its run's own steps: an offer the person can answer, the subject moved unasked, or
+ * nothing the person was told of, in which case the turn is answered as any other.
+ */
+export type SubjectChangeRaised = 'offered' | 'moved' | 'none';
+
+/** What answering an offer did: the run moved the subject, kept it, moved nothing it was asked to, or held no offer. */
+export type OfferAnswered = 'moved' | 'kept' | 'not-moved' | 'gone';
+
+/** An open offer, as its task records it: the message that changed the subject, when it was offered, and what detection found. */
+export interface SubjectOffer {
+  taskId: string;
+  originatingMessageId: string;
+  createdAt?: string;
+  kind: 'confirm' | 'redirect';
+  driftEventId?: string;
+  correlationId?: string;
+  /** Made on a private message, so only a private reply answers it. */
+  privateMessage?: boolean;
 }
 
 /** A short-circuit response from the drift flow: the caller returns these messages as the turn's reply
@@ -351,11 +407,14 @@ export async function readOriginatingMessageText(args: {
     }));
     const raw = res.ChannelMessage?.Content || '';
     if (!raw) return undefined;
-    try {
-      return decodeURIComponent(raw);
-    } catch {
-      return raw;
-    }
+    const text = decodeContent(raw);
+    // THE PERSON'S WORDS, WITHOUT THEIR ADDRESS TO THE ASSISTANT: the `.<Name|id>` or `@<Name|id>` the picker wrote says who
+    // the message was for, and what is named and quoted from here is what it said.
+    // Typed by hand the address carries a name and no id, so a message that opens with one reads the assistant's name from the room.
+    const typedAddress = /^\s*[.@]/.test(text);
+    const name = typedAddress ? (await resolveChannelSize(messagingClient, args.channelArn, args.botArn).catch(() => null))?.members?.find((m) => m.arn === args.botArn)?.name ?? '' : '';
+    const assistant = { arn: args.botArn, name, isBot: true };
+    return stripAtAll(stripMentionOf(stripPrivatePrefix(text, assistant), assistant)) || undefined;
   } catch (err) {
     console.warn('[Drift] could not read the originating message back; using the generic label', {
       name: (err as Error)?.name,
@@ -384,6 +443,19 @@ export interface TurnSubjectDecision {
 export interface HeldQuestion {
   messageId: string;
   text: string;
+}
+
+/**
+ * THE REPLY THAT MOVES A SUBJECT SAYS SO: which message's subject moved, and which yes it answers. Every reader
+ * that builds the model's context here leaves the moved exchange out on the strength of it (`lib/moved-subject.ts`),
+ * so the subject continues where it moved to and not in this conversation as well.
+ */
+export function declareTheMove(content: string, movedMessageId: string | undefined, answeringMessageId: string): string {
+  return withTurnDeclarationLine(content, {
+    kind: 'drift',
+    ...(movedMessageId ? { moves: movedMessageId } : {}),
+    ...(answeringMessageId ? { answers: answeringMessageId } : {}),
+  });
 }
 
 export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveDriftResponse | null> {
@@ -485,16 +557,11 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
 
   const driftIntent = intent.toUpperCase() as DriftIntent;
 
-  // THE OPEN OFFER, READ FROM THE ONE PLACE IT LIVES, ON EVERY DRIFT TURN.
-  //
-  // It used to be read from the Amazon Lex session first, with Aurora consulted only when the session
-  // was empty AND the reply looked like a yes or a no. A turn the channel flow answers has no Lex
-  // session, so there the offer was invisible to every ordinary message: an answer that was not a bare
-  // yes/no ran detection again and could fire a second offer beside the first. The durable row is the
-  // record of the offer, so it is the thing that is read. One data-plane read per drift turn, which is
-  // the price of a "yes" never being lost to how the turn arrived.
+  // THE OPEN OFFER IS ONE RECORD, THE RUN'S TASK (WT89), handed over by the router from the person's own work, which it reads
+  // on the turn. Nothing here reads it again, and no second record of it is kept: the task is what the person sees, what
+  // their answer moves, and what the run waits on, so the three cannot disagree.
   driftMark('battle');
-  const pending = await readPendingSuggestion({ personId, channelArn });
+  const pending = (await input.openOffer?.()) ?? null;
   driftMark('pending');
 
   // AN OFFER IS ANSWERED ONLY BY A MESSAGE SENT AFTER IT (code review, 2026-09-12).
@@ -507,10 +574,12 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
   // So this message is compared with the offer: the same message, or one sent no later than the offer
   // was opened, leaves the offer open and the turn is answered normally. Detection does not run either:
   // an offer is already open, and the duplicate-offer claim below would refuse a second one anyway.
+  /** The message answering the open offer, which the acting reply declares it answers. */
+  let answeringMessageId = '';
   if (pending) {
     const declaredId = event.requestAttributes?.['AE.message.id'] || '';
-    const inbound = declaredId
-      ? { messageId: declaredId }
+    const inbound: InboundMessage = declaredId
+      ? { messageId: declaredId, ...(event.requestAttributes?.['AE.turn.targeted'] === '1' ? { targeted: true } : {}) }
       : input.resolveInbound
         ? await input.resolveInbound()
         : await resolveOriginatingMessage({
@@ -520,6 +589,12 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
           botArn,
           userMessage,
         });
+    answeringMessageId = inbound.messageId || '';
+    // A PRIVATE MESSAGE'S OFFER IS ANSWERED PRIVATELY: a public reply would have this turn answer the private question in the room.
+    if (pending.privateMessage && inbound.targeted !== true) {
+      console.log('[Drift] a public message cannot answer a private offer; leaving it open', { channelArn });
+      return null;
+    }
     const isTheOfferingMessage = Boolean(pending.originatingMessageId)
       && inbound.messageId === pending.originatingMessageId;
     const inboundAt = 'createdAt' in inbound && inbound.createdAt ? Date.parse(inbound.createdAt) : NaN;
@@ -537,7 +612,18 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
   // Branch (a): an offer is open, and this message answers it.
   let justDeclined = false;
   if (pending) {
-    const reply = classifyConfirmDeclineReply(userMessage);
+    // THE REPLY IS JUDGED, NOT MATCHED (tenet D11). The classifier model reads it against the offer and
+    // records `move` or `keep`; no word list decides it, so it holds in every language. No reading at
+    // all (the model call failed or answered outside the set) neither accepts nor declines: the offer
+    // stays open until its deadline and the message is answered here, so a reply nobody understood moves nobody.
+    const answer = await readDriftOfferAnswer({
+      kind: pending.kind, message: userMessage, modelId: input.classifierModelId,
+    });
+    if (!answer) {
+      console.warn('[Drift] the reply to the open offer could not be read; the offer stays open and the message is answered', { channelArn });
+      return null;
+    }
+    const reply = answer === 'move' ? 'affirmative' : 'keep';
 
     // A suggestion can outlive the condition it was made under: Battle Mode may be enabled between the
     // offer and the answer. Accepting it now would create the new conversation and walk the user out of
@@ -554,110 +640,21 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
       };
     }
 
+    // A YES MOVES THE OFFER (WT90): the person's answer is relayed to their task, and the run that made it goes on, in this
+    // turn, to its move step, which moves the subject and tells the person where. A move that did not happen is said, so a
+    // yes is never met with silence; an offer that is no longer open leaves the message to be answered.
     if (reply === 'affirmative') {
-      try {
-        if (pending.kind === 'confirm') {
-          const senderArn = event.requestAttributes?.['CHIME.sender.arn'] || '';
-          const channelFlowArn = CHANNEL_FLOW_ARN_PARAM
-            ? await getSsmValue(CHANNEL_FLOW_ARN_PARAM)
-            : undefined;
-          // The person's own words, read back by reference now that they are needed (see
-          // readOriginatingMessageText). Nothing about the offer stored them.
-          const originatingMessageText = await readOriginatingMessageText({
-            channelArn,
-            messageId: pending.originatingMessageId,
-            botArn,
-          });
-          const created = await createConversationFromDrift({
-            // As above: the admin creates, every assistant is added after the flow association.
-            creatorBearerArn: await resolveServiceAdminBearer(),
-            appInstanceArn: APP_INSTANCE_ARN,
-            botArn,
-            userArn: senderArn,
-            // The spawned channel carries THE PARENT CONVERSATION'S classification, the one this turn
-            // is running at. It used to be read off the parent's type entry, which only worked while
-            // types were named after classifications - a conversation whose type named none produced
-            // no classification at all. IAM Layer-1 gates the new channel on this tag, so it must be
-            // the parent's own.
-            modelTier: classification,
-            modelId: '',
-            modelName: '',
-            // The topic derives from what the person actually said, not a fixed string.
-            topicLabel: driftTopicLabel(originatingMessageText),
-            channelFlowArn: channelFlowArn || undefined,
-            parentChannelArn: channelArn,
-            originatingMessageId: pending.originatingMessageId,
-            // Their own words, quoted back in the new conversation's welcome.
-            originatingMessageText,
-          });
-          // THE NEW CONVERSATION KNOWS ITS TOPIC BEFORE ITS FIRST MESSAGE, and this is where that is
-          // written down. The person was asked whether to move this subject somewhere else and said
-          // yes, so the subject is settled and in their own words.
-          //
-          // Without it the new conversation's first summary is the ordinary turn-one seed, built from
-          // its own opening exchange - which `detectDrift` treats as no topic at all and refuses to
-          // compare against. A conversation created BECAUSE of a topic would then be the one place
-          // drift stayed blind longest, which is backwards.
-          //
-          // NOTHING HERE MAY COST THE PERSON THEIR NEW CONVERSATION. It is already created and they
-          // are already being sent to it, so a failure to write the anchor must be invisible to them;
-          // losing it costs the new conversation its early drift anchor and nothing else.
-          //
-          // try/catch rather than `.catch()`, because `.catch()` only covers a REJECTED promise. A
-          // synchronous throw - the client absent, the op unrecognized - would escape it and land on
-          // the outer error path, which answers the person with a failure for a conversation that was
-          // successfully created. A test caught exactly that.
-          try {
-            await seedDriftTopicSummary({
-              channelArn: created.channelArn,
-              topicLabel: driftTopicLabel(originatingMessageText),
-              originatingMessageText,
-            });
-          } catch (err) {
-            console.warn('[drift] drift-topic seed failed (non-fatal):', err);
-          }
-
-          if (pending.driftEventId) {
-            await recordDriftOutcome({
-              eventId: pending.driftEventId,
-              outcome: 'accepted',
-              newChannelArn: created.channelArn,
-            }).catch(() => undefined);
-          }
-          await resolvePendingSuggestion({ taskId: pending.taskId, outcome: 'confirmed' }).catch(() => undefined);
-          return {
-            messages: [{
-              contentType: 'PlainText',
-              content: `${templateLine('drift-created', input.words)} NAVIGATE_CHANNEL:${created.channelArn}|${templateLine('drift-created', input.words, { section: 'label.link' })}`,
-            }],
-          };
-        }
-
-        if (pending.kind === 'redirect' && pending.rivalConversationArn) {
-          if (pending.driftEventId) {
-            await recordDriftOutcome({
-              eventId: pending.driftEventId,
-              outcome: 'accepted',
-              newChannelArn: pending.rivalConversationArn,
-            }).catch(() => undefined);
-          }
-          await resolvePendingSuggestion({ taskId: pending.taskId, outcome: 'confirmed' }).catch(() => undefined);
-          return {
-            messages: [{
-              contentType: 'PlainText',
-              content: `${templateLine('drift-redirected', input.words)} NAVIGATE_CHANNEL:${pending.rivalConversationArn}|${templateLine('drift-redirected', input.words, { section: 'label.link' })}`,
-            }],
-          };
-        }
-      } catch (err) {
-        console.error('[Drift] Failed to act on confirmation:', err);
+      const answered = input.answerOffer ? await input.answerOffer('move', answeringMessageId).catch(() => 'not-moved' as const) : 'gone';
+      if (answered === 'moved') return { messages: [] };
+      if (answered === 'not-moved') {
+        console.warn('[Drift] the person said move and the subject did not move; they are told', { channelArn });
+        if (pending.driftEventId) await recordDriftOutcome({ eventId: pending.driftEventId, outcome: 'move_failed' }).catch(() => undefined);
+        return { messages: [{ contentType: 'PlainText', content: templateLine('drift-move-failed', input.words) }] };
       }
-      // The yes could not be acted on. The offer stays open and the message is answered normally, rather
-      // than being re-read as a new subject.
       return null;
     }
 
-    // ANYTHING BUT A YES KEEPS THE SUBJECT HERE, AND THAT IS A DECLINE.
+    // ANYTHING BUT A MOVE KEEPS THE SUBJECT HERE, AND THAT IS A DECLINE.
     //
     // The offer itself says so: "Reply 'yes' to create one, or anything else to keep going here." So a
     // "no" and a message that simply carries on are the same answer, and the code now agrees with the
@@ -669,18 +666,16 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
     // So the offer's embedding is adopted as a topic, for the life of the conversation, and the detector
     // compares later messages with it (SPEC-DRIFT-CONVERGENCE step 6). This replaces suppression by
     // distance, which matched a number rather than a subject and was kept in a session that forgot it.
-    if (pending.driftEventId) {
-      await recordDriftOutcome({ eventId: pending.driftEventId, outcome: 'declined' }).catch(() => undefined);
-    }
-    await resolvePendingSuggestion({ taskId: pending.taskId, outcome: 'declined' }).catch(() => undefined);
     // THE HELD QUESTION IS ANSWERED ON DECLINE. The offer was that turn's whole reply,
-    // so declining it must not leave the question unanswered. Read alongside the adoption, which this
-    // turn already waits on, so the read adds no time.
+    // so declining it must not leave the question unanswered. Everything a decline does is independent,
+    // so the turn waits on the slowest of them.
     const [{ adopted }, heldText] = await Promise.all([
-      adoptOfferedTopic({ channelArn, correlationId: pending.correlationId }),
+      pending.correlationId ? adoptOfferedTopic({ channelArn, correlationId: pending.correlationId }) : Promise.resolve({ adopted: false }),
       pending.originatingMessageId
         ? readOriginatingMessageText({ channelArn, messageId: pending.originatingMessageId, botArn })
         : Promise.resolve(undefined),
+      pending.driftEventId ? recordDriftOutcome({ eventId: pending.driftEventId, outcome: 'declined' }).catch(() => undefined) : undefined,
+      input.answerOffer?.('keep', answeringMessageId).catch(() => 'gone' as const),
     ]);
     if (heldText && pending.originatingMessageId) {
       try { input.onHeldQuestion?.({ messageId: pending.originatingMessageId, text: heldText }); } catch { /* an observer never affects the turn */ }
@@ -813,13 +808,10 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
       // the dedup claim - so a lookup is not paid twice and the three cannot disagree about which
       // message started this.
       //
-      // The drift row previously took `CHIME.message.id` directly, which this module's own comment
-      // (see resolveOriginatingMessageId) records that Chime never sends. Every live row therefore
-      // stored an empty originating_message_id, and the evaluation pass selects offers with
-      // `JOIN messages m ON m.message_id = d.originating_message_id` - a join an empty id can never
-      // satisfy. No live offer was ever judged, so evaluated_count stayed 0 and the admin Accuracy
-      // tile read "Not measured" permanently, looking like an unimplemented feature rather than a
-      // broken write.
+      // The drift row carries the resolved id, never `CHIME.message.id`, which Amazon Chime SDK does not send (see
+      // resolveOriginatingMessageId). The evaluation pass selects offers with
+      // `JOIN messages m ON m.message_id = d.originating_message_id`, so a row's originating id is what lets its offer be
+      // judged and the console's Accuracy tile be measured.
       // The caller's memo where there is one, so this turn resolves once however many callers want it.
       const originatingMessageId = input.resolveInbound
         ? (await input.resolveInbound()).messageId
@@ -895,72 +887,140 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
         console.warn('[Drift] recordDriftFire failed:', err);
       }
 
-      try {
-        await savePendingSuggestion({
-          channelArn,
-          personId,
-          kind: driftResult.suggestedAction === 'redirect' ? 'redirect' : 'confirm',
-          rivalConversationArn: driftResult.rivalConversationArn,
-          originatingMessageId,
-          cosineDistance: Number.isFinite(driftResult.driftScore) ? driftResult.driftScore : undefined,
-          correlationId: driftResult.correlationId,
-          // Carried on the durable row, which is the only record of the offer (migration 044).
+      // THE OFFER IS THE WORKFLOW'S (WT88, WT89): the change is raised, and the run says it, to the room or to the person
+      // alone where their message was private. A change no run took makes no offer, and the turn is answered.
+      const raised = originatingMessageId && input.raiseSubjectChanged
+        ? await input.raiseSubjectChanged({
+          messageId: originatingMessageId,
+          kind: driftResult.suggestedAction === 'redirect' && driftResult.rivalConversationArn ? 'redirect' : 'confirm',
+          ...(driftResult.suggestedAction === 'redirect' && driftResult.rivalConversationArn ? { rivalConversationArn: driftResult.rivalConversationArn } : {}),
           ...(driftEventId ? { driftEventId } : {}),
-        });
-      } catch (err) {
-        console.warn('[Drift] savePendingSuggestion failed:', err);
+          ...(driftResult.correlationId ? { correlationId: driftResult.correlationId } : {}),
+          conversationType: typeKey,
+        }).catch((err) => { console.warn('[Drift] subject-changed could not be raised', { message: (err as Error)?.message }); return 'none' as const; })
+        : 'none';
+      if (raised === 'none') {
+        // NOT AN OFFER: nobody was shown one, so it is recorded as such and counts in no acceptance rate.
+        if (driftEventId) await recordDriftOutcome({ eventId: driftEventId, outcome: 'not_offered' }).catch(() => undefined);
+        console.warn('[Drift] no run took the subject change; no offer is made', { channelArn, driftEventId });
+        return null;
       }
-
-      // A fired suggestion SHORT-CIRCUITS the turn: the agent flow never runs, so the turn is
-      // answered without the conversation history and without the model. That is by design, but it
-      // was invisible - this path logged nothing on success, while the router logs its delivery
-      // decision only AFTER the drift check returns. A turn interrupted here therefore left a log
-      // trace identical to a turn that failed to dispatch, and a "the assistant forgot the previous
-      // turn" report could not be told apart from "drift answered instead". Log the interception.
-      console.log('[Drift] suggestion fired, short-circuiting the turn', {
+      // A fired change SHORT-CIRCUITS the turn: the run makes the offer, and this turn posts nothing. Logged, so a turn
+      // drift answered is told apart from one that failed to dispatch.
+      console.log('[Drift] subject change raised, short-circuiting the turn', {
         intent: driftIntent,
         suggestedAction: driftResult.suggestedAction,
         driftScore: Number.isFinite(driftResult.driftScore) ? driftResult.driftScore : undefined,
         driftEventId,
       });
-
-      return {
-        messages: [{
-          contentType: 'PlainText',
-          // ── IT SAYS WHAT IT RESPONDS TO, AND THAT IT IS NOT AN ANSWER ──────
-          //
-          // "Drift suggestions are a response to a message... Drift can be excluded from normal
-          // responses, but should still be tracked in analytics and filterable / separately viewable
-          // like readings." So it declares BOTH facts rather than one.
-          //
-          // THE TARGET COSTS NOTHING. `originatingMessageId` was resolved above for the drift row
-          // and the dedup claim, and was in scope here and unused.
-          //
-          // THE KIND IS WHY IT MUST NOT BE INFERRED FROM AN ABSENCE. This suggestion is excluded
-          // from the exchange population today only by accident: it posts directly rather than as a
-          // placeholder-then-update, so it carries no correlation marker, and the pairing rule
-          // happened to require one. That is the same coincidence that wrongly excludes a broadcast
-          // answer, which IS a real reply - so the absence could never be read as intent. Saying
-          // which it is makes the two separable.
-          //
-          // AND THE EXCLUSION IS THE POINT, not a technicality: a suggestion answers fast and
-          // deliberately does not do the work. Counted as an answer it drags every latency average
-          // down while representing a turn that answered nothing.
-          //
-          // No `phase`, deliberately. A phase closes a response in the ledger, and this message
-          // opens none - it carries no correlation marker, so it archives as a message the assistant
-          // volunteered rather than as a response of its own.
-          // The offer the detection decided: a redirect to the conversation it found, else a new one. Read from its
-          // action, so a data plane on another build cannot hand the router a name it does not say.
-          content: withTurnDeclaration(templateLine(driftResult.suggestedAction === 'redirect' ? 'drift-redirect-offer' : 'drift-offer', input.words), {
-            ...(originatingMessageId ? { answers: originatingMessageId } : {}),
-            kind: 'drift',
-          }),
-        }],
-      };
+      return { messages: [] };
     }
   }
 
   // Branch (c): no drift action - continue normal flow.
+  return null;
+}
+
+/**
+ * MOVE A SUBJECT A PERSON'S MESSAGE CHANGED (WT90): a new conversation for it, at the room's classification, linked from
+ * the room with the moved exchange declared so the room leaves it out of its context (FR26); or, where detection found a
+ * conversation already about it, that one. The reply sends the person there. Null when neither applies. Called by the
+ * answer to an offer and by a workflow's move step alike, so the two move the same way.
+ */
+export async function moveSubject(m: {
+  kind: 'confirm' | 'redirect'; channelArn: string; classification: string; botArn: string; senderArn: string;
+  originatingMessageId: string; answeringMessageId: string; driftEventId?: string; rivalConversationArn?: string;
+  words?: LiveDriftFlowInput['words']; typeKey?: string; memberArns?: string[];
+  /** Runs work on a route that names the new conversation. */
+  inNewConversation?: <T>(channelArn: string, work: () => Promise<T>) => Promise<T>;
+  /** No offer was made: the workflow moved it unasked, which is recorded so (`moved_unasked`), never as an acceptance. */
+  unasked?: boolean;
+  /** The message was private: the parent room is told nothing, and the link goes to the sender alone (WT92). */
+  privateMessage?: boolean;
+}): Promise<{ channelArn: string; reply: string } | null> {
+  if (m.kind === 'confirm') {
+    const channelFlowArn = CHANNEL_FLOW_ARN_PARAM
+      ? await getSsmValue(CHANNEL_FLOW_ARN_PARAM)
+      : undefined;
+    // The person's own words, read back by reference now that they are needed (see
+    // readOriginatingMessageText). Nothing about the offer stored them.
+    const originatingMessageText = await readOriginatingMessageText({
+      channelArn: m.channelArn,
+      messageId: m.originatingMessageId,
+      botArn: m.botArn,
+    });
+    const created = await createConversationFromDrift({
+      // As above: the admin creates, every assistant is added after the flow association.
+      creatorBearerArn: await resolveServiceAdminBearer(),
+      appInstanceArn: APP_INSTANCE_ARN,
+      botArn: m.botArn,
+      userArn: m.senderArn,
+      // The spawned channel carries THE PARENT CONVERSATION'S classification, the one this turn
+      // is running at, never one read off the parent's type entry: a type need not name a
+      // classification, and a conversation whose type names none still has one. IAM Layer-1 gates
+      // the new channel on this tag, so it must be the parent's own.
+      modelTier: m.classification,
+      modelId: '',
+      modelName: '',
+      // The topic derives from what the person actually said, not a fixed string.
+      topicLabel: driftTopicLabel(originatingMessageText),
+      channelFlowArn: channelFlowArn || undefined,
+      parentChannelArn: m.channelArn,
+      originatingMessageId: m.originatingMessageId,
+      // Their own words, quoted back in the new conversation's welcome.
+      originatingMessageText,
+      ...(m.typeKey ? { typeKey: m.typeKey } : {}),
+      ...(m.memberArns?.length ? { additionalMemberArns: m.memberArns } : {}),
+      // A PRIVATE MESSAGE'S SUBJECT IS NOT ANNOUNCED TO THE ROOM: the parent-side link would title it from the private text.
+      ...(m.privateMessage ? { postParentLink: false } : {}),
+    });
+    // THE NEW CONVERSATION KNOWS ITS TOPIC BEFORE ITS FIRST MESSAGE, and this is where that is
+    // written down. The person was asked whether to move this subject somewhere else and said
+    // yes, so the subject is settled and in their own words.
+    //
+    // Without it the new conversation's first summary is the ordinary turn-one seed, built from
+    // its own opening exchange - which `detectDrift` treats as no topic at all and refuses to
+    // compare against. A conversation created BECAUSE of a topic would then be the one place
+    // drift stayed blind longest, which is backwards.
+    //
+    // NOTHING HERE MAY COST THE PERSON THEIR NEW CONVERSATION. It is already created and they
+    // are already being sent to it, so a failure to write the anchor must be invisible to them;
+    // losing it costs the new conversation its early drift anchor and nothing else.
+    //
+    // try/catch rather than `.catch()`, because `.catch()` only covers a REJECTED promise. A
+    // synchronous throw - the client absent, the op unrecognized - would escape it and land on
+    // the outer error path, which answers the person with a failure for a conversation that was
+    // successfully created. A test caught exactly that.
+    try {
+      const seed = () => seedDriftTopicSummary({
+        channelArn: created.channelArn,
+        topicLabel: driftTopicLabel(originatingMessageText),
+        originatingMessageText,
+      });
+      await (m.inNewConversation ? m.inNewConversation(created.channelArn, seed) : seed());
+    } catch (err) {
+      console.warn('[drift] drift-topic seed failed (non-fatal):', err);
+    }
+
+    if (m.driftEventId) {
+      await recordDriftOutcome({
+        eventId: m.driftEventId,
+        outcome: m.unasked ? 'moved_unasked' : 'accepted',
+        newChannelArn: created.channelArn,
+      }).catch(() => undefined);
+    }
+    return { channelArn: created.channelArn, reply: declareTheMove(`${templateLine('drift-created', m.words)} NAVIGATE_CHANNEL:${created.channelArn}|${templateLine('drift-created', m.words, { section: 'label.link' })}`, m.originatingMessageId, m.answeringMessageId) };
+  }
+
+  if (m.kind === 'redirect' && m.rivalConversationArn) {
+    if (m.driftEventId) {
+      await recordDriftOutcome({
+        eventId: m.driftEventId,
+        outcome: m.unasked ? 'moved_unasked' : 'accepted',
+        newChannelArn: m.rivalConversationArn,
+      }).catch(() => undefined);
+    }
+    return { channelArn: m.rivalConversationArn, reply: declareTheMove(`${templateLine('drift-redirected', m.words)} NAVIGATE_CHANNEL:${m.rivalConversationArn}|${templateLine('drift-redirected', m.words, { section: 'label.link' })}`, m.originatingMessageId, m.answeringMessageId) };
+  }
   return null;
 }

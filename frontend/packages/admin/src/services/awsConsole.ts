@@ -15,6 +15,8 @@
  *   - IAM role `iam/home#/roles/details/NAME`: by name, not ARN, whatever the role's path.
  *   - IAM policy `iam/home#/policies/details/ENCODED_ARN`: the current IAM console's policy page.
  *   - Amazon Lex V2 bot `lexv2/home?region=R#bot/BOT_ID`.
+ *   - CloudWatch alarm `cloudwatch/home?region=R#alarmsV2:alarm/NAME`: the console's alarm detail route.
+ *   - EventBridge rule `events/home?region=R#/eventbus/BUS/rules/NAME`: a rule on the default bus unless named.
  *   - Systems Manager parameter `systems-manager/parameters/NAME/description?region=R&tab=Table`, the name
  *     without its leading slash.
  *   - S3 prefix `s3/buckets/BUCKET?region=R&prefix=P&showversions=false`.
@@ -107,6 +109,34 @@ export function iamPolicyUrl(policyArn: string): string {
 /** One Amazon Lex V2 bot. */
 export function lexBotUrl(botId: string, region = awsRegion()): string {
   return `${base(region)}/lexv2/home?region=${region}#bot/${encodeURIComponent(botId)}`;
+}
+
+/** One CloudWatch alarm, by name. */
+export function cloudwatchAlarmUrl(alarmName: string, region = awsRegion()): string {
+  return `${base(region)}/cloudwatch/home?region=${region}#alarmsV2:alarm/${encodeURIComponent(alarmName)}`;
+}
+
+/** One EventBridge rule, by name, on its bus (the default bus unless named). */
+export function eventBridgeRuleUrl(ruleName: string, region = awsRegion(), bus = 'default'): string {
+  return `${base(region)}/events/home?region=${region}#/eventbus/${encodeURIComponent(bus)}/rules/${encodeURIComponent(ruleName)}`;
+}
+
+/**
+ * The console page of a resource named by its ARN, in the ARN's own region, for the kinds this console links:
+ * a CloudWatch alarm, an EventBridge rule and a Lambda function. Any other ARN has none here, and undefined is returned.
+ */
+export function consoleUrlForArn(arn: string): string | undefined {
+  const m = /^arn:aws[a-z-]*:([a-z0-9-]+):([a-z0-9-]*):\d*:(.+)$/.exec(arn);
+  if (!m) return undefined;
+  const [, service, region, resource] = m;
+  if (!region) return undefined;
+  if (service === 'cloudwatch' && resource.startsWith('alarm:')) return cloudwatchAlarmUrl(resource.slice('alarm:'.length), region);
+  if (service === 'events' && resource.startsWith('rule/')) {
+    const parts = resource.slice('rule/'.length).split('/');
+    return parts.length === 2 ? eventBridgeRuleUrl(parts[1], region, parts[0]) : eventBridgeRuleUrl(parts[0], region);
+  }
+  if (service === 'lambda' && resource.startsWith('function:')) return lambdaFunctionUrl(resource.slice('function:'.length).split(':')[0], region);
+  return undefined;
 }
 
 /** One Systems Manager parameter. */

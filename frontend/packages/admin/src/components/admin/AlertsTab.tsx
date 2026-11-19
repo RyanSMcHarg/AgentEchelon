@@ -8,7 +8,7 @@ import type { AnalyticsResult } from '@ae/shared';
 
 /**
  * Alerts — the consolidated "what is wrong right now" view (SPEC-ADMIN-CONSOLE "Alerts"). It scans the
- * results the dashboard already loads (effectiveness, latency, model effectiveness, flagged, error rate)
+ * results the dashboard already loads (effectiveness, latency, model effectiveness, error rate)
  * for anything in `bad`/`warn` status against `metricTargets.ts`, plus literal error rows, and lists each
  * with a link to its drill. No new backend query — this is assembly over data already in memory.
  */
@@ -16,7 +16,6 @@ interface AlertsTabProps {
   intentEffectiveness: AnalyticsResult | null;
   latency: AnalyticsResult | null;
   modelEffectiveness: AnalyticsResult | null;
-  flagged: AnalyticsResult | null;
   errorRate: AnalyticsResult | null;
   isLoading: boolean;
   /**
@@ -77,7 +76,7 @@ const AlertRow: React.FC<{ alert: Alert; onNavigate: (tab: string) => void }> = 
 };
 
 const AlertsTab: React.FC<AlertsTabProps> = ({
-  intentEffectiveness, latency, modelEffectiveness, flagged, errorRate, filters, isLoading, onNavigate,
+  intentEffectiveness, latency, modelEffectiveness, errorRate, filters, isLoading, onNavigate,
 }) => {
   const { t } = useTranslation();
   const alerts = useMemo(() => {
@@ -85,12 +84,11 @@ const AlertsTab: React.FC<AlertsTabProps> = ({
       intentEffectiveness: (intentEffectiveness?.data ?? []) as Array<Record<string, unknown>>,
       latency: (latency?.data ?? []) as Array<Record<string, unknown>>,
       modelEffectiveness: (modelEffectiveness?.data ?? []) as Array<Record<string, unknown>>,
-      flagged: (flagged?.data ?? []) as Array<Record<string, unknown>>,
       errorRate: (errorRate?.data ?? []) as Array<Record<string, unknown>>,
       filters,
     };
     return computeAlerts(sources);
-  }, [intentEffectiveness, latency, modelEffectiveness, flagged, errorRate, filters]);
+  }, [intentEffectiveness, latency, modelEffectiveness, errorRate, filters]);
 
   const errors = alerts.filter((a) => a.severity === 'error');
   const warnings = alerts.filter((a) => a.severity === 'warn');
@@ -100,13 +98,13 @@ const AlertsTab: React.FC<AlertsTabProps> = ({
   return (
     <div className="admin-tab">
       <div className="admin-tab-header">
-        <h3>
+        <h2>
           Alerts{' '}
           <InfoTooltip
             label={t('admin.alerts.aboutAlerts')}
             content={t('admin.alerts.everythingCurrentlyInBadOr')}
           />
-        </h3>
+        </h2>
       </div>
 
       <p className="admin-tab-description">
@@ -123,13 +121,13 @@ const AlertsTab: React.FC<AlertsTabProps> = ({
         <>
           {errors.length > 0 && (
             <div style={{ marginBottom: 'var(--space-4)' }}>
-              <h4 style={{ margin: '0 0 var(--space-2)', color: STATUS_VAR.bad }}>Errors ({errors.length})</h4>
+              <h3 style={{ margin: '0 0 var(--space-2)', color: STATUS_VAR.bad }}>Errors ({errors.length})</h3>
               {errors.map((a) => <AlertRow key={a.id} alert={a} onNavigate={onNavigate} />)}
             </div>
           )}
           {warnings.length > 0 && (
             <div>
-              <h4 style={{ margin: '0 0 var(--space-2)', color: STATUS_VAR.warn }}>Warnings ({warnings.length})</h4>
+              <h3 style={{ margin: '0 0 var(--space-2)', color: STATUS_VAR.warn }}>Warnings ({warnings.length})</h3>
               {warnings.map((a) => <AlertRow key={a.id} alert={a} onNavigate={onNavigate} />)}
             </div>
           )}

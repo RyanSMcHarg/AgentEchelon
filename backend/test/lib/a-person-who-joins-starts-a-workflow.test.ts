@@ -13,7 +13,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import {
   EVENT_WORKFLOW_EVENTS,
-  eventNaturalKey,
   eventRunKey,
   eventWorkflowErrors,
   personJoinedWorkflowOf,
@@ -27,6 +26,7 @@ import {
   type EventRunDeps,
   type EventWorkflow,
 } from '../../lambda/src/lib/event-workflow';
+import { eventNaturalKey } from '../../lambda/src/lib/event-natural-key';
 import { welcomeWorkflowErrors } from '../../lambda/src/lib/profile-lifecycle';
 import { welcomeIntoOpenedConversation } from '../../lambda/src/lib/typed-conversation-notice';
 import { EVENT_FIELDS } from '../../lambda/src/lib/variables';
@@ -84,7 +84,7 @@ describe('validation (ADR-061 decisions 1 and 3)', () => {
     const errs = eventWorkflowErrors('joined', atWelcome);
     expect(errs).toEqual(expect.arrayContaining([
       expect.stringMatching(/greet\.send\.to is joined, which only person-joined carries/),
-      expect.stringMatching(/greet\.send\.mention\.name binds event:person, which only conversation-opened, person-joined, invitation-sent, invitation-unredeemed carry/),
+      expect.stringMatching(/greet\.send\.mention\.name binds event:person, which only conversation-opened, person-joined, invitation-sent, invitation-unredeemed, task-reopened, subject-changed carry/),
     ]));
   });
 
@@ -179,9 +179,12 @@ describe('the welcome a run replaces is replaced whole (ADR-061 decisions 3 and 
     const router = read('router-agent-handler.ts');
     const send = router.slice(router.indexOf('async function sayWorkflowSend('), router.indexOf('async function sendLanguages('));
     // A task step's send names its own kind (ADR-063 decision C2); every other send's kind is the event's rule.
-    expect(send).toMatch(/const kind = args\.emailKind && args\.to\.length \? args\.emailKind : workflowSendEmailKind\(args\.event, args\.to\);/);
+    expect(send).toMatch(/const kind = args\.emailKind && \(args\.to\.length \|\| args\.emailRoom\) \? args\.emailKind : workflowSendEmailKind\(args\.event, args\.to\);/);
     expect(send).toMatch(/rendered\.sections\['email\.subject'\]/);
-    expect(send).toMatch(/notifyDirective\(\{ \.\.\.\(subject \? \{ subject \} : \{\}\), targets: args\.to, kind, conversationId: conversationKey\(args\.channelArn\) \}\)/);
+    // One person is a target; a message to several or to the room carries no target list, and its mentions address the email.
+    expect(send).toMatch(/notifyDirective\(\{ \.\.\.\(subject \? \{ subject \} : \{\}\), \.\.\.\(args\.emailRoom \|\| args\.to\.length > 1 \? \{\} : \{ targets: args\.to, kind \}\), conversationId: conversationKey\(args\.channelArn\),/);
+    // A meeting's email carries its own link and the template's `email.body`, never the chat line's relative link.
+    expect(send).toMatch(/\.\.\.\(args\.emailLink \? \{ link: args\.emailLink, \.\.\.\(rendered\.ok && rendered\.sections\['email\.body'\]/);
   });
 
   it('a creation sends no separate welcome to a person whose run welcomed them, and still welcomes the rest', async () => {
@@ -198,9 +201,9 @@ describe('the welcome a run replaces is replaced whole (ADR-061 decisions 3 and 
 describe('where it is named, and verified (ADR-061 decision 1)', () => {
   const router = read('router-agent-handler.ts');
 
-  it('person-joined is verified before anything runs: the classification, the primary, the declared workflow, then the live roster', () => {
+  it('person-joined is verified before anything runs: the classification, the owning assistant, its declared workflow, then the live roster', () => {
     const fn = router.slice(router.indexOf('export async function handlePersonJoined('), router.indexOf('export async function handleConversationOpened('));
-    const order = ['resolveChannelClassificationTag(channelArn)', 'primaryAssistantOf(', 'servedWelcomeVersion(', 'personJoinedWorkflowOf(', 'resolveChannelSize(', 'verifiedJoiners(', 'runWorkflowFor('].map((t) => fn.indexOf(t));
+    const order = ['resolveChannelClassificationTag(channelArn)', 'eventWorkflowOwner(', 'servedWelcomeVersion(', 'personJoinedWorkflowOf(', 'resolveChannelSize(', 'verifiedJoiners(', 'runWorkflowFor('].map((t) => fn.indexOf(t));
     expect(order.every((i) => i > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     // The people a run owns are the verified members, never the people the payload named.
@@ -211,12 +214,12 @@ describe('where it is named, and verified (ADR-061 decision 1)', () => {
 
   it('a hand-back after a person-joined agent step recomputes its run key with the person', () => {
     const fn = router.slice(router.indexOf('export async function handleEventContinuation('), router.indexOf('async function sayWorkflowSend('));
-    expect(fn).toMatch(/const naturalKey = eventNaturalKey\(wf\.on, channelArn, person\(req\.eventPerson\), str\(req\.invitationId\), alarm\);/);
+    expect(fn).toMatch(/const naturalKey = runNaturalKey\(wf\.on, channelArn, \{\s*eventPerson: person\(req\.eventPerson\), invitationId: str\(req\.invitationId\), alarm,/);
     expect(fn).toMatch(/const runKey = eventRunKey\(wf\.on, naturalKey, assistant\.profile\.name\);/);
   });
 
   it('two people\'s agent steps are two turns: the dispatch is correlated by the natural key', () => {
-    expect(router).toMatch(/correlationId: eventDispatchId\('event', \[args\.event, eventNaturalKey\(args\.event, channelArn, args\.eventPerson, args\.invitationId, args\.alarm\) \?\? conversationKey\(channelArn\), args\.step, botIdFromArn\(botArn\)\]\)/);
+    expect(router).toContain("correlationId: eventDispatchId('event', [args.event, runNaturalKey(args.event, channelArn, { ...args, subjectMessageId: args.values?.message, meetingId: args.meeting?.meetingId }) ?? conversationKey(channelArn), args.step, botIdFromArn(botArn)])");
   });
 
   it('the share, the add-member path and the creator each name it once the membership exists, and welcome only the people no run owns', () => {

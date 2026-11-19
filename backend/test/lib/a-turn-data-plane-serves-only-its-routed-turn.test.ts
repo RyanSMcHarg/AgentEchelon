@@ -18,7 +18,7 @@ const OTHER = 'arn:aws:chime:us-east-1:1:app-instance/i/channel/c2';
 const env = { DATA_PLANE_CLASSIFICATION: 'standard', TURN_ROUTING_TABLE: 'ae-turn-routing-standard' } as NodeJS.ProcessEnv;
 
 /** A routing table holding at most one record, as GetItem returns it. */
-function table(record?: { classification: string; channelArn?: string; expiresAt?: number }) {
+function table(record?: { classification: string; channelArn?: string; threadRelatives?: string[]; expiresAt?: number }) {
   return {
     send: jest.fn(async () => ({
       Item: record ? {
@@ -26,6 +26,7 @@ function table(record?: { classification: string; channelArn?: string; expiresAt
         botArn: { S: 'arn:aws:chime:us-east-1:1:app-instance/i/bot/b' },
         classification: { S: record.classification },
         ...(record.channelArn ? { channelArn: { S: record.channelArn } } : {}),
+        ...(record.threadRelatives?.length ? { threadRelatives: { SS: record.threadRelatives } } : {}),
         expiresAt: { N: String(record.expiresAt ?? Math.floor(Date.now() / 1000) + 3600) },
       } : undefined,
     })),
@@ -90,5 +91,67 @@ describe('a classification\'s turn data plane', () => {
   it('serves the conversation the turn was routed in', async () => {
     const bound = await bindTurnRequest({ op: 'getSummary', input: { channelArn: CHANNEL }, routeId: 'route-1' }, { env, ddb: table({ classification: 'standard', channelArn: CHANNEL }) });
     expect((bound.input as { channelArn: string }).channelArn).toBe(CHANNEL);
+  });
+});
+
+describe('a drift outcome is recorded only on a drift event of the routed conversation', () => {
+  const routed = table({ classification: 'standard', channelArn: CHANNEL });
+  const events = new Map<string, string>([['evt-here', CHANNEL], ['evt-there', OTHER]]);
+  const driftEventChannel = jest.fn(async (eventId: string) => events.get(eventId) ?? null);
+  const outcome = (input: Record<string, unknown>, record = routed) =>
+    bindTurnRequest({ op: 'recordDriftOutcome', input, routeId: 'route-1' }, { env, ddb: record, driftEventChannel });
+
+  it('records an outcome on an event of the conversation the turn was routed in', async () => {
+    const bound = await outcome({ eventId: 'evt-here', outcome: 'declined' });
+    expect((bound.input as { eventId: string }).eventId).toBe('evt-here');
+    expect(driftEventChannel).toHaveBeenCalledWith('evt-here');
+  });
+
+  it('DENY: an event of another conversation is refused', async () => {
+    await expect(outcome({ eventId: 'evt-there', outcome: 'accepted' })).rejects.toThrow('drift event is not one of the conversation');
+  });
+
+  it('DENY: an event that does not exist is refused', async () => {
+    await expect(outcome({ eventId: 'evt-missing', outcome: 'declined' })).rejects.toBeInstanceOf(TurnBindingRefused);
+  });
+
+  it('DENY: a call naming no event is refused', async () => {
+    await expect(outcome({ outcome: 'declined' })).rejects.toThrow('no drift event named');
+  });
+
+  it('DENY: a turn routed in no conversation is refused', async () => {
+    await expect(outcome({ eventId: 'evt-here', outcome: 'declined' }, table({ classification: 'standard' }))).rejects.toBeInstanceOf(TurnBindingRefused);
+  });
+
+  it('DENY: a failed event read refuses rather than records', async () => {
+    await expect(bindTurnRequest(
+      { op: 'recordDriftOutcome', input: { eventId: 'evt-here', outcome: 'declined' }, routeId: 'route-1' },
+      { env, ddb: routed, driftEventChannel: async () => { throw new Error('database unavailable'); } },
+    )).rejects.toThrow('database unavailable');
+  });
+});
+
+describe('a thread relative is read across conversations by its summary alone', () => {
+  const routed = { classification: 'standard', channelArn: CHANNEL, threadRelatives: [OTHER] };
+  const NOT_NAMED = 'arn:aws:chime:us-east-1:1:app-instance/i/channel/c3';
+
+  it('admits a relative\'s getSummary when the routing record names that relative', async () => {
+    const bound = await bindTurnRequest({ op: 'getSummary', input: { channelArn: OTHER }, routeId: 'route-1' }, { env, ddb: table(routed) });
+    expect((bound.input as { channelArn: string }).channelArn).toBe(OTHER);
+  });
+
+  it('DENY: a getSummary for a conversation the record does not name is refused', async () => {
+    await expect(bindTurnRequest({ op: 'getSummary', input: { channelArn: NOT_NAMED }, routeId: 'route-1' }, { env, ddb: table(routed) }))
+      .rejects.toThrow('not the one the turn was routed in');
+  });
+
+  it('DENY: a getSummary naming a relative is refused when the record names no relatives', async () => {
+    await expect(bindTurnRequest({ op: 'getSummary', input: { channelArn: OTHER }, routeId: 'route-1' }, { env, ddb: table({ classification: 'standard', channelArn: CHANNEL }) }))
+      .rejects.toThrow('not the one the turn was routed in');
+  });
+
+  it.each([...TURN_OPS].filter((op) => op !== 'getSummary'))('DENY: %s naming a relative is refused', async (op) => {
+    await expect(bindTurnRequest({ op, input: { channelArn: OTHER }, routeId: 'route-1' }, { env, ddb: table(routed) }))
+      .rejects.toThrow('not the one the turn was routed in');
   });
 });

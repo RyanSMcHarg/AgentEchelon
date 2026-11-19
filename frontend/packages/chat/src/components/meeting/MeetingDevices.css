@@ -1,0 +1,43 @@
+/* The device check before joining, and the device menu in the meeting's controls (`MeetingDevices.tsx`). */
+.ae-meeting-devices { width: min(720px, 100%); display: grid; gap: 12px; }
+.ae-meeting-devices-layout { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.ae-meeting-preview {
+  aspect-ratio: 16 / 9; border-radius: 12px; overflow: hidden; display: grid; place-items: center;
+  background: var(--surface-200, #E4E4E7);
+}
+.ae-meeting-preview video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+.ae-meeting-preview-off { color: var(--text-secondary, #71717A); font-size: 14px; margin: 0; }
+.ae-meeting-device-settings { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; min-width: 0; }
+/* A LONG DEVICE NAME NEVER WIDENS ITS ROW: the select fills the row and truncates. */
+.ae-meeting-device-row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; min-width: 0; }
+.ae-meeting-device-row label { font-size: 13px; font-weight: 600; color: var(--text-primary, #09090B); }
+.ae-meeting-device-row select {
+  min-height: 36px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--control-border-strong, #71717A);
+  background: var(--surface-100, #F4F4F5); color: var(--text-primary, #09090B); font-size: 14px; width: 100%; max-width: 100%;
+  min-width: 0; text-overflow: ellipsis;
+}
+.ae-meeting-level { height: 6px; border-radius: 999px; overflow: hidden; background: var(--surface-200, #E4E4E7); }
+.ae-meeting-level-fill { display: block; height: 100%; background: var(--btn-primary-bg, #0F766E); transition: width 80ms linear; }
+.ae-meeting-option { display: flex; gap: 8px; align-items: center; font-size: 14px; color: var(--text-primary, #09090B); cursor: pointer; }
+.ae-meeting-permission {
+  border-radius: 10px; padding: 10px 14px; font-size: 14px;
+  background: var(--warning-bg, #FEF3C7); border: 1px solid var(--warning-border, #FCD34D); color: var(--text-primary, #09090B);
+}
+.ae-meeting-permission p { margin: 4px 0 0; }
+.ae-meeting-device-menu { position: relative; }
+.ae-meeting-device-popover {
+  /* OPENS TOWARD THE WINDOW: the gear sits at the lower right, so the popover is anchored at its right edge. */
+  position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 10; width: min(280px, calc(100vw - 32px)); box-sizing: border-box;
+  display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 12px;
+  border-radius: 12px; border: 1px solid var(--control-border-strong, #71717A); background: var(--surface-50, #FFFFFF);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+}
+
+@media (max-width: 720px) {
+  .ae-meeting-devices-layout { grid-template-columns: 1fr; }
+  .ae-meeting-device-popover { width: min(280px, calc(100vw - 32px)); }
+}
+@media (max-width: 640px), (max-height: 480px) and (orientation: landscape) {
+  .ae-meeting-device-row select { min-height: 44px; }
+  .ae-meeting-option { min-height: 44px; }
+}

@@ -30,6 +30,12 @@ export const GOLDEN_SET_CAPACITY = 100;
  */
 export const goldenUploadPrefix = (classification: string, assistant: string): string => `golden-uploads/${classification}/${assistant}/`;
 
+/**
+ * The bucket a hand-over is written in: the profile bucket, under `golden-uploads/`, beside the assistant it evaluates,
+ * where uploaded data waits before it is de-identified and expires within a day. Absent ⇒ not wired here.
+ */
+export const goldenUploadBucket = (): string | undefined => process.env.GOLDEN_UPLOAD_BUCKET || undefined;
+
 /** One upload's bounds: no more entries than the set holds, and what one request carries. */
 export const GOLDEN_UPLOAD_MAX_LINES = GOLDEN_SET_CAPACITY;
 export const GOLDEN_UPLOAD_MAX_BYTES = 1_000_000;

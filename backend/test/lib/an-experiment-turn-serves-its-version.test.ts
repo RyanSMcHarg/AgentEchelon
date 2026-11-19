@@ -62,9 +62,9 @@ describe('a served version answers through its routes', () => {
 
 describe('an image model hosted outside AWS answers exactly where its classification selects it', () => {
   it('is served in a classification that selects it, with no profile switch, and withheld in one that does not', () => {
-    const base = { intent: 'image_generation', classification: 'premium', profileImageModelKey: 'openai_gpt_image_1' };
-    expect(defaultProfileRegistry.selectsModel('premium', 'openai_gpt_image_1')).toBe(true);
-    expect(resolveTurnImageGenModelId(base)).toBe('gpt-image-1');
+    const base = { intent: 'image_generation', classification: 'premium', profileImageModelKey: 'openai_gpt_image_2' };
+    expect(defaultProfileRegistry.selectsModel('premium', 'openai_gpt_image_2')).toBe(true);
+    expect(resolveTurnImageGenModelId(base)).toBe('gpt-image-2');
     expect(resolveTurnImageGenModelId({ ...base, classification: 'standard' })).toBeUndefined();
     // An AWS-hosted image model follows the same selection.
     expect(resolveTurnImageGenModelId({ ...base, profileImageModelKey: 'nova_canvas' })).toBeTruthy();

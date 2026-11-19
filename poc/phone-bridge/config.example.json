@@ -1,0 +1,10 @@
+{
+  "awsProfile": "your-aws-profile",
+  "region": "us-east-1",
+  "twilioSecretId": "REPLACE_WITH_SECRET_NAME",
+  "twilioNumber": "+15555550100",
+  "localPort": 8787,
+  "publicPort": 8788,
+  "chromePath": "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  "cloudflaredPath": "cloudflared"
+}

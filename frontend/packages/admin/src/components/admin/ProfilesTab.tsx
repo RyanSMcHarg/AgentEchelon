@@ -29,8 +29,9 @@ import {
   type IdentityRenameOutcome,
 } from '../../services/profileService';
 import { listTeamRoster } from '../../services/rosterService';
+import { draftConflictOf } from '../../services/draftConflict';
 import { listOwnership } from '../../services/ownershipService';
-import { VersionProvenance, CandidateNotActivatable, canActivateVersion } from './ProfileVersionProvenance';
+import { VersionProvenance, CandidateNotActivatable, RetiredWelcomeNotActivatable, canActivateVersion } from './ProfileVersionProvenance';
 import type { PastGateOutcome } from './GoldenRunPanel';
 
 /** The server's refusals of an activation past the gate, which the golden panel words; anything else is an error. */
@@ -40,9 +41,10 @@ import ImportVersion from './ImportVersion';
 import { LimitsGroup } from './AssistantConfigFields';
 import { type AreaContext, type DraftValidation } from './DraftControls';
 import AssistantPage from './AssistantPage';
-import { unsavedAreas, type Unsaved } from './unsavedAreas';
+import { rebaseOnto, unsavedAreas, type Unsaved } from './unsavedAreas';
 import type { DraftArea } from './draftAreas';
-import type { AssistantLink } from './assistantLinks';
+import { type AssistantLink, type WorkflowEditorLink } from './assistantLinks';
+import { setViewParams, useUrlViews } from './consoleViewUrl';
 import type { ClassificationCatalog, FieldDecision, ProfileDraftPatch } from '../../services/profileService';
 
 /**
@@ -67,9 +69,27 @@ interface ProfilesTabProps {
    * assistant rather than the list. The tab is unmounted while another tab shows, which is why it is handed back.
    */
   initialAssistant?: string | null;
+  /** The workflow a link opens the assistant's page on (`WorkflowEditorLink`): its Workflows section, on that workflow. */
+  linkedWorkflow?: WorkflowEditorLink | null;
 }
 
-const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, initialAssistant }) => {
+/**
+ * THE TASKS AN ASSISTANT'S ROLE IS GIVEN (ADR-067 WT78): every task step another assistant of the same classification
+ * gives to this assistant's role, read from the names each active version's listing carries (`activeRoleTasks`), never
+ * from another assistant's definition.
+ */
+export function roleTasksFor(
+  profiles: readonly ProfileListing[],
+  selected: Pick<ProfileListing, 'profileName' | 'role' | 'classification'>,
+): Array<{ assistant: string; workflow: string; step: string; machine: string }> {
+  if (!selected.role) return [];
+  return profiles
+    .filter((p) => p.profileName !== selected.profileName && p.classification === selected.classification)
+    .flatMap((p) => (p.activeRoleTasks ?? []).filter((r) => r.role === selected.role)
+      .map((r) => ({ assistant: p.displayName || p.profileName, workflow: r.workflow, step: r.step, machine: r.machine })));
+}
+
+const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, initialAssistant, linkedWorkflow }) => {
   const { t: translate } = useTranslation();
   // Each control renders only for a role holding its capability (SPEC-ADMIN-CONSOLE FR0f, FR36).
   const can = useCan();
@@ -104,6 +124,16 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [selectedName, setSelectedName] = useState<string | null>(initialAssistant ?? null);
+  // THE OPEN ASSISTANT IS THE ADDRESS (`?admin=profiles&assistant=`): a link opens it, and Back and Forward step between the
+  // list and each assistant. Leaving for the list takes the page's section with it. An unsaved edit is asked about first.
+  useUrlViews(selectedName ? { assistant: selectedName } : { assistant: null, section: null }, (v) => {
+    if ((v.assistant ?? null) === selectedNameRef.current) return;
+    if (mayLeaveRef.current()) setSelectedName(v.assistant ?? null);
+    else setViewParams({ assistant: selectedNameRef.current });
+  });
+  const selectedNameRef = useRef(selectedName);
+  selectedNameRef.current = selectedName;
+  const mayLeaveRef = useRef<() => boolean>(() => true);
   const [validation, setValidation] = useState<DraftValidation | null>(null);
   // The active version's resolved config VALUES (read from its manifest body), for the read-only view.
   const [config, setConfig] = useState<ProfileDefinitionBody | null>(null);
@@ -114,8 +144,16 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
   // The configId of the draft those values came from. The draft controls are keyed on it, so they re-seed when the
   // saved draft has LOADED, not when the listing first names its new id while the old values are still in hand.
   const [draftLoadedId, setDraftLoadedId] = useState<string | null>(null);
+  /**
+   * THE DRAFT A SAVE MADE, until the page has loaded it. A save is built from the values on the page, so the next one
+   * waits for the draft the last one made: built from the older values and sent as based on the newer draft, it would
+   * put back what the last save changed. Every save names the draft whose values it was built from (`draftLoadedId`).
+   */
+  const [awaitingDraft, setAwaitingDraft] = useState<string | null>(null);
+  const working = busy || (awaitingDraft !== null && awaitingDraft !== draftLoadedId);
   /** Where the draft's workflow steps sit on the builder's canvas (ADR-061 decision 7), read with the draft. */
   const [draftLayout, setDraftLayout] = useState<ProfileManifestTyped['layout']>(undefined);
+  const [draftKept, setDraftKept] = useState<ProfileManifestTyped['keptWelcomeWorkflow']>(undefined);
   const [downloading, setDownloading] = useState(false);
   // WHICH VERSION THE PAGE SHOWS: the active one, or the draft, edited in place. Switching to the active version keeps the draft.
   const [mode, setMode] = useState<'active' | 'draft'>('active');
@@ -140,6 +178,14 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
   const patchUnsaved = (area: DraftArea, patch: ProfileDraftPatch) => setUnsaved((u) => ({ ...u, [area]: { ...(u[area] ?? {}), ...patch } }));
   const dropUnsaved = (areas: readonly DraftArea[]) => setUnsaved((u) => Object.fromEntries(Object.entries(u).filter(([a]) => !areas.includes(a as DraftArea))));
   const held = unsavedAreas(unsaved);
+  // The latest unsaved edits, for the rebase a reload after a save conflict runs (`rebaseOnto`).
+  const unsavedNow = useRef<Unsaved>(unsaved);
+  unsavedNow.current = unsaved;
+  /**
+   * A SAVE REFUSED BECAUSE THE DRAFT WAS SAVED ELSEWHERE: the draft the refused edits were made over, until the newer one
+   * has loaded. Its edits are then carried onto the newer draft, and any field both changed is named.
+   */
+  const conflictBase = useRef<{ before: ProfileDefinitionBody; fromId: string | null } | null>(null);
 
   const selected = profiles.find((p) => p.profileName === selectedName) ?? null;
   const ownedKey = ownedAssistants.join(',');
@@ -224,6 +270,7 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
   const mayLeave = () => !held.length || window.confirm(translate('admin.assistantPage.unsaved.leave', {
     areas: held.map((a) => translate(`admin.draftCards.area.${a}`)).join(', '),
   }));
+  mayLeaveRef.current = mayLeave;
 
   // Let global/browser Back close the assistant first, asking before it drops an unsaved edit.
   useEffect(() => {
@@ -231,6 +278,16 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
     return () => registerBack?.(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedName, registerBack, held.join(',')]);
+
+  // A WORKFLOW LINK OPENS ITS ASSISTANT ONCE: leaving that assistant spends the link, so reopening the assistant opens it
+  // as any other, and takes the workflow out of the URL; the assistant open now stays there.
+  const [spentLink, setSpentLink] = useState<WorkflowEditorLink | null>(null);
+  const liveLink = linkedWorkflow && linkedWorkflow !== spentLink ? linkedWorkflow : null;
+  useEffect(() => {
+    if (!linkedWorkflow || selectedName === linkedWorkflow.assistant) return;
+    setSpentLink(linkedWorkflow);
+    setViewParams({ workflow: null, task: null, step: null }, { replace: true });
+  }, [selectedName, linkedWorkflow]);
 
   // A reload or a closed tab with an unsaved edit gets the browser's own leave prompt.
   useEffect(() => {
@@ -242,7 +299,7 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
 
   // RESETTING THE OPEN AREA BELONGS TO SELECTION, NOT TO EVERY REFRESH. Another assistant starts with no unsaved edit.
   useEffect(() => {
-    setMode('active'); setIdentityRename(null); setDiscardOutcome(null); setUnsaved({});
+    setMode('active'); setIdentityRename(null); setDiscardOutcome(null); setUnsaved({}); conflictBase.current = null;
     setSetupFor((cur) => (cur === selectedName ? cur : null));
   }, [selectedName]);
 
@@ -265,17 +322,35 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
 
   // The draft's values, for the editor, whenever the assistant has a draft.
   useEffect(() => {
-    if (!selectedName || !selected?.hasDraft) { setDraftConfig(null); setDraftLoadedId(null); return; }
+    // A conflict's base belongs to the draft it was refused on; with no draft left there is nothing to rebase onto.
+    if (!selectedName || !selected?.hasDraft) { setDraftConfig(null); setDraftLoadedId(null); setAwaitingDraft(null); conflictBase.current = null; return; }
     let live = true;
     exportProfile(selectedName, 'draft')
       .then((m) => {
         if (!live) return;
         const typed = m as unknown as ProfileManifestTyped;
+        const loadedId = typed.provenance?.exportedConfigId ?? null;
         setDraftConfig(typed.body ?? null);
         setDraftLayout(typed.layout);
-        setDraftLoadedId(typed.provenance?.exportedConfigId ?? null);
+        setDraftKept(typed.keptWelcomeWorkflow);
+        setDraftLoadedId(loadedId);
+        setAwaitingDraft(null);
+        const conflict = conflictBase.current;
+        if (conflict && typed.body && loadedId !== conflict.fromId) {
+          conflictBase.current = null;
+          const rebased = rebaseOnto(unsavedNow.current, conflict.before, typed.body);
+          setUnsaved(rebased.unsaved);
+          const lines = [translate('admin.draftCards.conflict.edit')];
+          if (unsavedNow.current.events && rebased.unsaved.events) lines.push(translate('admin.draftCards.conflict.eventsRebased'));
+          if (rebased.overlaps.length) {
+            lines.push(translate('admin.draftCards.conflict.overlap', {
+              fields: rebased.overlaps.map((o) => `${translate(`admin.draftCards.area.${o.area}`)} (${o.fields.join(', ')})`).join('; '),
+            }));
+          }
+          setError(lines.join(' '));
+        }
       })
-      .catch(() => { if (live) { setDraftConfig(null); setDraftLoadedId(null); } });
+      .catch(() => { if (live) { setDraftConfig(null); setDraftLoadedId(null); setAwaitingDraft(null); } });
     return () => { live = false; };
   }, [selectedName, configNonce, selected?.hasDraft, selected?.draftConfigId]);
 
@@ -293,35 +368,86 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
     }
   }
 
-  /** Save one area's edit to the draft. A saved change is a new draft, so an earlier Validate no longer speaks for it. */
+  /**
+   * Save one area's edit to the draft the page is showing, named by its configId. A saved change is a new draft, so an
+   * earlier Validate no longer speaks for it, and the next save names the draft this one made. A draft saved elsewhere
+   * since is refused by the server: the reason is shown, the page reloads to the newer draft, and the edit stays unsaved.
+   */
   async function saveDraft(name: string, patch: ProfileDraftPatch): Promise<boolean> {
     let saved = false;
+    let refused = false;
     await run('edit-draft', async () => {
-      await editProfileDraft(name, patch);
+      try {
+        const r = await editProfileDraft(name, patch, draftLoadedId);
+        if (r?.draftConfigId) setAwaitingDraft(r.draftConfigId);
+      } catch (e) {
+        if (draftConflictOf(e)) {
+          refused = true;
+          if (draftConfig) conflictBase.current = { before: draftConfig, fromId: draftLoadedId };
+          return;
+        }
+        throw e;
+      }
       saved = true;
       setValidation(null);
     });
+    // Said once the reload has finished, so the reload does not clear it.
+    if (refused) setError(translate('admin.draftCards.conflict.edit'));
     return saved;
   }
 
-  /** Activate the draft; a refusal is shown beside the button that asked, each reason on its own line. */
-  async function onActivate(name: string) {
+  /** Start a new version. A draft started elsewhere since this page loaded is kept, said so, and shown. */
+  async function onStartDraft(name: string) {
+    let refused = false;
+    await run('create-version', async () => {
+      try {
+        await createProfileVersion(name);
+      } catch (e) {
+        if (draftConflictOf(e)) {
+          refused = true;
+          return;
+        }
+        throw e;
+      }
+    });
+    setMode('draft');
+    if (refused) setError(translate('admin.draftCards.conflict.newVersion'));
+  }
+
+  /**
+   * Activate the draft the page is showing, named by the configId it was reviewed as; a refusal is shown beside the button
+   * that asked, each reason on its own line. A draft saved elsewhere since is refused and the page reloads to it.
+   */
+  async function onActivate(name: string, configId: string | null) {
     let activated = false;
+    let conflicted: string | null = null;
     await run('activate', async () => {
       let r: Awaited<ReturnType<typeof activateProfileDraft>>;
       try {
-        r = await activateProfileDraft(name);
+        r = await activateProfileDraft(name, configId ?? '');
       } catch (e) {
-        const errs = (e as { body?: { errors?: unknown } }).body?.errors;
-        if (Array.isArray(errs) && errs.some((x) => typeof x === 'string')) {
-          setValidation({ valid: false, errors: errs.filter((x): x is string => typeof x === 'string') });
+        // A REFUSAL ACTIVATE GAVE IS SHOWN BESIDE THE BUTTON AS ACTIVATE'S (`source: 'activate'`) and never holds the
+        // button back: the server reads every check again on the next click.
+        const conflict = draftConflictOf(e);
+        if (conflict) {
+          // The reload that follows shows the newer draft, so the reason is said outside it (below), where it outlives it.
+          conflicted = translate(conflict === 'NO_DRAFT' ? 'admin.draftCards.conflict.activateGone' : 'admin.draftCards.conflict.activate');
+          setValidation(null);
           return;
         }
-        // THE GOLDEN SET'S REFUSAL (ADR-065): the reason, then each failed entry and attempt, beside the button.
+        const errs = (e as { body?: { errors?: unknown } }).body?.errors;
+        if (Array.isArray(errs) && errs.some((x) => typeof x === 'string')) {
+          setValidation({ valid: false, source: 'activate', errors: errs.filter((x): x is string => typeof x === 'string') });
+          return;
+        }
+        // THE GOLDEN SET'S REFUSAL (ADR-065): the reason, then each failed entry and attempt, beside the button, until the
+        // golden panel reads the gate as passing.
         const golden = (e as { body?: { code?: string; params?: Record<string, string | number>; failures?: GoldenFailure[] } }).body;
         if (golden?.code?.startsWith('GOLDEN_')) {
           setValidation({
             valid: false,
+            source: 'activate',
+            golden: true,
             errors: [translate(`admin.assistantPage.golden.refusal.${golden.code}`, golden.params ?? {}), ...(golden.failures ?? []).map((f) => translate('admin.assistantPage.golden.failure', {
               entry: f.entryId.slice(0, 8), attempt: f.attempt,
               reason: translate(`admin.assistantPage.golden.reason.${f.reason}`, { rules: (f.rules ?? []).join(', ') }),
@@ -334,6 +460,7 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
       activated = true;
       showActivated(r);
     });
+    if (conflicted) setError(conflicted);
     // The wizard ends at activation; the assistant's page shows what is now serving.
     if (activated) setSetupFor(null);
   }
@@ -405,7 +532,7 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
     setError(null);
     try {
       const r = await validateProfileDraft(name);
-      setValidation({ valid: r.valid, errors: r.errors, ...(r.warnings?.length ? { warnings: r.warnings } : {}), ...(r.errorDetails?.length ? { errorDetails: r.errorDetails } : {}) });
+      setValidation({ valid: r.valid, source: 'validate', errors: r.errors, ...(r.warnings?.length ? { warnings: r.warnings } : {}), ...(r.errorDetails?.length ? { errorDetails: r.errorDetails } : {}) });
     } catch (e) {
       setError(`validate: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -432,13 +559,20 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
     }
   }
 
-  // AN IMPORT REPLACES THE DRAFT, so the editors seeded for the old one are cleared and re-seed from what
-  // the reload returns, the same as opening the assistant again.
-  async function onImported() {
+  // AN IMPORT REPLACES THE WHOLE DRAFT, so the editors seeded for the old one are cleared and re-seed from what the reload
+  // returns, the same as opening the assistant again. The unsaved edits went with the draft they were made over (the
+  // preview named them): saved afterwards, they would write over the imported draft. A refused import keeps them.
+  async function onImported(landed: boolean) {
     setValidation(null);
+    if (landed) setUnsaved({});
     await load();
     setConfigNonce((n) => n + 1);
   }
+
+  /** A refusal Activate gave from the golden gate stands until the golden panel reads the gate as passing. */
+  const onGoldenOutcome = (proceed: boolean) => {
+    if (proceed) setValidation((v) => (v?.golden ? null : v));
+  };
 
   // The teams an owner field offers: every team for an admin, the person's own for a team member.
   const ownerChoices = isTeam
@@ -453,12 +587,20 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
     // WHAT THIS ASSISTANT'S CLASSIFICATION OFFERS: the draft's model selects offer only its models.
     const catalog = selected.classification ? catalogs[selected.classification] : undefined;
     const areaContext: AreaContext = {
-      profileName: selected.profileName, role: selected.role, catalog, tools, decisions,
+      profileName: selected.profileName, provisionedName: selected.provisionedDisplayName, role: selected.role, catalog, tools, decisions,
       canActivate: can('activate-profiles'), canEdit: can('edit-profiles'),
-      layout: draftLayout, validationErrors: validation?.errors,
+      layout: draftLayout, keptWelcome: draftKept, validationErrors: validation?.errors,
+      draftConfigId: draftLoadedId ?? selected.draftConfigId, onProcessImported: onImported,
     };
     const back = () => { if (!mayLeave()) return; setSelectedName(null); setValidation(null); };
     const inSetup = setupFor === selected.profileName && !!selected.hasDraft && !!draftConfig;
+    /**
+     * A ROLLBACK LEAVES THE DRAFT AS IT IS, so with one open it asks first, naming where the draft was started: activating
+     * it later replaces the version rolled back to with what the draft holds.
+     */
+    const mayRollBack = (version: number) => !selected.hasDraft || window.confirm(selected.draftBasedOnVersion !== undefined
+      ? translate('admin.assistantPage.versions.rollBackOverDraft', { version, base: selected.draftBasedOnVersion })
+      : translate('admin.assistantPage.versions.rollBackOverDraftUnrecorded', { version }));
     const exportButton = (
       <button className="btn-secondary" disabled={downloading} onClick={() => onExport(selected.profileName)}>
         {translate(downloading ? 'admin.profiles.downloading' : 'admin.profiles.exportManifest')}
@@ -508,9 +650,10 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
               // reaches the live assistant.
               render: (_v, row) => (row.derivedFrom && can('activate-profiles')
                 ? <CandidateNotActivatable experimentId={String((row.derivedFrom as { experimentId: string }).experimentId)} />
+                : row.retiredWelcome && !row.active && can('activate-profiles') ? <RetiredWelcomeNotActivatable />
                 : !canActivateVersion(row as unknown as ProfileVersionSummary) || !can('activate-profiles') ? '' : (
-                  <button className="btn-secondary" disabled={busy}
-                    onClick={() => run('rollback', () => rollbackProfile(selected.profileName, Number(row.version)))}>
+                  <button className="btn-secondary" disabled={working}
+                    onClick={() => { if (mayRollBack(Number(row.version))) void run('rollback', () => rollbackProfile(selected.profileName, Number(row.version))); }}>
                     {translate('admin.assistantPage.versions.rollBack', { version: row.version })}
                   </button>
                 )),
@@ -521,7 +664,8 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
             names it as the target, whatever assistant the chosen manifest was exported from. */}
         {can('edit-profiles') ? (
           <ImportVersion assistant={selected.profileName} assistantLabel={name} hasDraft={!!selected.hasDraft}
-            disabled={busy} onImported={onImported}
+            draftConfigId={selected.draftConfigId}
+            disabled={working} onImported={onImported} unsaved={held.map((a) => translate(`admin.draftCards.area.${a}`))}
             beside={exportButton} />
         ) : <div>{exportButton}</div>}
       </>
@@ -530,6 +674,7 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
     return (
       <AssistantPage
         selected={selected}
+        roleTasks={roleTasksFor(profiles, selected)}
         config={config}
         configLoading={configLoading}
         draft={draftConfig}
@@ -538,12 +683,12 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
         tools={tools}
         decisions={decisions}
         ctx={areaContext}
-        busy={busy}
+        busy={working}
         validation={validation}
         // UNTIL ITS FIRST ACTIVATION THE PAGE SHOWS THE DRAFT: nothing is serving.
         mode={selected.activeVersion === null ? 'draft' : mode}
         onModeChange={setMode}
-        onStartDraft={() => { void run('create-version', () => createProfileVersion(selected.profileName)).then(() => setMode('draft')); }}
+        onStartDraft={() => { void onStartDraft(selected.profileName); }}
         onSave={(patch) => saveDraft(selected.profileName, patch)}
         unsaved={unsaved}
         onUnsavedPatch={patchUnsaved}
@@ -551,11 +696,13 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
         // THE WIZARD CONTINUES HERE once the build has made the draft: the same page, its sections as steps.
         wizard={inSetup ? { onFinishLater: () => setSetupFor(null) } : undefined}
         onValidate={() => onValidate(selected.profileName)}
-        onActivate={() => onActivate(selected.profileName)}
+        onActivate={() => onActivate(selected.profileName, draftLoadedId)}
         onActivatePastGate={(confirm) => onActivatePastGate(selected.profileName, confirm)}
+        onGoldenOutcome={onGoldenOutcome}
         onDiscard={() => { void onDiscard(selected.profileName, draftLoadedId ?? selected.draftConfigId); }}
         onBack={back}
         onOpenLink={onOpenLink}
+        linkedWorkflow={liveLink?.assistant === selected.profileName ? liveLink : null}
         canEdit={can('edit-profiles')}
         canValidate={can('view-profiles')}
         notices={notices}
@@ -589,14 +736,14 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
   return (
     <div className="admin-tab">
       <div className="admin-tab-header">
-        <h3>{translate('admin.assistants.title')} <InfoTooltip label={translate('admin.profiles.aboutProfiles')} content={translate('admin.profiles.eachAssistantProfileIsA')} /></h3>
+        <h2>{translate('admin.assistants.title')} <InfoTooltip label={translate('admin.profiles.aboutProfiles')} content={translate('admin.profiles.eachAssistantProfileIsA')} /></h2>
         <div className="admin-assistants-toolbar-group">
           {can('manage-assistants') && !creating && (
             <button className="btn-primary" onClick={() => { setCreating(true); setJustCreated(null); }} data-testid="create-assistant-open">
               {translate('admin.create.open')}
             </button>
           )}
-          <button className="btn-secondary" onClick={() => load()} disabled={busy}>{translate('admin.assistants.refresh')}</button>
+          <button className="btn-secondary" onClick={() => load()} disabled={working}>{translate('admin.assistants.refresh')}</button>
         </div>
       </div>
       <p className="admin-tab-description">{translate('admin.assistants.description')}</p>

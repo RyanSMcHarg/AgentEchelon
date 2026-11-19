@@ -62,7 +62,7 @@ describe('a role reads only its own context', () => {
     const stack = fs.readFileSync(path.join(__dirname, '../../lib/stacks/assistant-profile-stack.ts'), 'utf8');
     const start = stack.indexOf('ContextS3Read: new iam.PolicyDocument({');
     expect(start).toBeGreaterThan(-1);
-    const shared = stack.slice(start, stack.indexOf('}),\n', stack.indexOf("`${props.attachmentsBucketArn}/profiles/*`", start)));
+    const shared = stack.slice(start, stack.indexOf('}),\n', stack.indexOf("`${props.profileBucketArn}/profiles/*`", start)));
     expect(shared).not.toContain('contextPrefixesAllowedFor');
     expect(shared).toContain('platformGrantedPrefixes');
   });
@@ -72,7 +72,7 @@ describe('a role reads only its own context', () => {
     // a public overview, and neither the role nor the vended session reaches `platform-knowledge/*` wholesale.
     const stack = fs.readFileSync(path.join(__dirname, '../../lib/stacks/assistant-profile-stack.ts'), 'utf8');
     expect(stack).toContain('const platformGrantedPrefixes = defaultProfileRegistry.grantsFor(classification).map((c) => `platform-knowledge/${c}/`)');
-    expect(stack).not.toContain('`${props.attachmentsBucketArn}/platform-knowledge/*`');
+    expect(stack).not.toContain('`${props.companyBucketArn}/platform-knowledge/*`');
     const common = fs.readFileSync(path.join(__dirname, '../../lib/stacks/agent-classification-common.ts'), 'utf8');
     expect(common).toContain('PLATFORM_PREFIXES = profiles.grantsFor(opts.classification)');
     expect(common).toContain("actions: ['s3:GetObject'], resources: PLATFORM_OBJECT_ARNS");
@@ -87,5 +87,8 @@ describe('a role reads only its own context', () => {
     const processor = fs.readFileSync(path.join(__dirname, '../../lambda/src/assistant-async-processor.ts'), 'utf8');
     expect(processor).toContain('companyContextScope(CLASSIFICATION)');
     expect(processor).toMatch(/isCompanyContext\(entry\) \? roleContextRead\(entry\) : sharedRead\(entry\)/);
+    // A selected source the role does not read is dropped by the rule the console and Validate read, and counted.
+    expect(processor).toMatch(/readableByRole\(e, scope\.prefixes\)/);
+    expect(processor).toContain("outcome: 'not-readable-by-role'");
   });
 });

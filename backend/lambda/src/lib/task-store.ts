@@ -53,9 +53,9 @@ import type { DeliveryOption } from './delivery-options.js';
 export { hasTaskService };
 
 /** One task, by id. Null when it does not exist, or when the boundary refused it. */
-export async function getTask(taskId: string, channelArn: string): Promise<Task | null> {
-  if (!hasTaskService()) return direct.getTask(taskId, channelArn);
-  return service.getTask({ taskId, channelArn });
+export async function getTask(taskId: string, channelArn: string, opts: { consistent?: boolean } = {}): Promise<Task | null> {
+  if (!hasTaskService()) return direct.getTask(taskId, channelArn, opts);
+  return service.getTask({ taskId, channelArn, ...opts });
 }
 
 /**
@@ -247,6 +247,12 @@ export async function cancelStoppedTasks(
   return res?.cancelled ?? 0;
 }
 
+/** Close the work an ended duel's sides opened (`endDuelTasks`). */
+export async function endDuelTasks(channelArn: string, battleId: string): Promise<Array<{ taskId: string; assistantId?: string }>> {
+  if (!hasTaskService()) return direct.endDuelTasks(channelArn, battleId);
+  return (await service.endDuelTasks({ channelArn, battleId })).closed;
+}
+
 export async function markTaskPrivate(taskId: string, channelArn: string): Promise<void> {
   if (!hasTaskService()) return direct.markTaskPrivate(taskId, channelArn);
   return service.markTaskPrivate({ taskId, channelArn });
@@ -361,12 +367,57 @@ export async function openWorkflowTask(input: Record<string, unknown>): Promise<
 export async function cancelForDeadline(input: { taskId: string; channelArn: string }): Promise<{ cancelled: boolean }> {
   return hasTaskService() ? service.cancelForDeadline(input) : { cancelled: false };
 }
+/** A request whose task no router turn opened takes its intent's run (WT115, WT106). Null without the service: only the service writes it. */
+export async function attachRequestRun(input: { taskId: string; channelArn: string; workflowRun: Record<string, unknown>; dueBy?: string; ttlSeconds?: number }): Promise<Task | null | undefined> {
+  return hasTaskService() ? service.attachRequestRun(input) : null;
+}
+
+/** A person's choice on their task, relayed (`advanceAsAssignee`). Refused without the service. */
+export async function advanceAsAssignee(input: Parameters<typeof service.advanceAsAssignee>[0]): Promise<{ ok: boolean; to?: string; error?: string }> {
+  return hasTaskService() ? service.advanceAsAssignee(input) : { ok: false, error: 'REFUSED' };
+}
+
+/** The task a requester may move while another person holds it (WT114). Null without the service. */
+export async function requesterMovableTask(input: { channelArn: string; personId: string; machines?: Record<string, unknown> }): Promise<{ task: Task; moves: string[] } | null> {
+  return hasTaskService() ? service.requesterMovableTask(input) : null;
+}
+
+export async function holdRunWait(input: { waitId: string; channelArn: string; continuation: Record<string, unknown> }): Promise<{ claimed: boolean; reason?: string }> {
+  return hasTaskService() ? service.holdRunWait(input) : { claimed: false };
+}
+export async function readRunWait(input: { waitId: string; channelArn: string }): Promise<Record<string, unknown> | null> {
+  return hasTaskService() ? service.readRunWait(input) : null;
+}
+export async function recordRunEnded(input: Record<string, unknown>): Promise<{ recorded: boolean }> {
+  return hasTaskService() ? service.recordRunEnded(input) : { recorded: false };
+}
 export async function readyTasks(input: { channelArn: string; assistantId: string }): Promise<Task[]> {
   return hasTaskService() ? service.readyTasks(input) : [];
 }
 export async function claimPickup(input: { taskId: string; channelArn: string; state: string }): Promise<ActionClaim> {
   return hasTaskService() ? service.claimPickup(input) : { claimed: false, key: `pickup:${input.state}#?`, reason: 'failed' };
 }
+/** The open tasks of one machine in every conversation a conversation's workflow opened, or null when they cannot be read (WT122). Through the service only. */
+export async function openTasksOpenedFrom(openedFrom: string, taskType: string): Promise<Task[] | null> {
+  return hasTaskService() ? service.openTasksOpenedFrom({ openedFrom, taskType }) : null;
+}
+/** An archived conversation's open workflow tasks, settled (ADR-017): the ids settled, or null. Through the service only. */
+export async function settleArchivedTasks(channelArn: string): Promise<string[] | null> {
+  return hasTaskService() ? service.settleArchivedTasks({ channelArn }) : null;
+}
+/** A run a settlement ended mid-way cancels its open work (`endsRun`): the ids cancelled, or null. Through the service only. */
+export async function endRunTasks(channelArn: string, runKey: string, opts: { keepAlongside?: boolean } = {}): Promise<string[] | null> {
+  return hasTaskService() ? service.endRunTasks({ channelArn, runKey, ...(opts.keepAlongside ? { keepAlongside: true } : {}) }) : null;
+}
+/** Which of a run's step claims are held, with their outcomes, or null when they cannot be read. Through the service only. */
+export async function readEventSteps(input: { runKey: string; channelArn: string; steps: string[] }): Promise<Record<string, string> | null> {
+  return hasTaskService() ? service.readEventSteps(input) : null;
+}
+
 export async function workflowTaskIds(channelArn: string): Promise<string[]> {
   return hasTaskService() ? service.workflowTaskIds({ channelArn }) : [];
+}
+/** The open item an id names, when its sender may answer it (ADR-035). Null without the service: only the service answers it. */
+export async function answerableTaskById(input: { channelArn: string; taskId: string; senderSub: string }): Promise<{ taskId: string; assistantId?: string; private?: true } | null> {
+  return hasTaskService() ? service.answerableTaskById(input) : null;
 }

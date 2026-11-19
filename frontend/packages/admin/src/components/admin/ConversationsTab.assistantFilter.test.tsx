@@ -30,7 +30,7 @@ beforeEach(() => {
 describe('the conversation list, narrowed to an assistant', () => {
   it('asks for the conversations the assistant was in, says so, and offers every conversation again', async () => {
     const clear = vi.fn();
-    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} assistantFilter="advisor" onClearAssistantFilter={clear} />);
+    render(<ConversationsTab driftData={null} isLoading={false} assistantFilter="advisor" onClearAssistantFilter={clear} />);
     await waitFor(() => expect(svc.listAdminConversations).toHaveBeenCalled());
     expect(vi.mocked(svc.listAdminConversations).mock.calls[0][3]).toBe('advisor');
     const banner = await screen.findByTestId('conversations-assistant-filter');
@@ -40,7 +40,7 @@ describe('the conversation list, narrowed to an assistant', () => {
   });
 
   it('asks for every conversation without the filter (non-vacuity)', async () => {
-    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} />);
+    render(<ConversationsTab driftData={null} isLoading={false} />);
     await waitFor(() => expect(svc.listAdminConversations).toHaveBeenCalled());
     expect(vi.mocked(svc.listAdminConversations).mock.calls[0][3]).toBeNull();
     expect(screen.queryByTestId('conversations-assistant-filter')).toBeNull();

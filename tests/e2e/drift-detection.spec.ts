@@ -35,6 +35,7 @@ import {
   assistantResponseCount,
   channelMetadata,
   channelContext,
+  channelMessagesAsStored,
   driftChannelForParent,
   driftRedirectMessage,
   firstBotMessage,
@@ -304,6 +305,23 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
     const link = pushed ?? await driftRedirectMessage(originArn);
     expect(link, 'the parent has no message carrying a driftRedirect link to the child').not.toBeNull();
     expect(link!.childChannelArn, 'the parent link points at the child that was created').toBe(child);
+
+    // THE SUBJECT LEAVES THE PARENT'S CONTEXT. The moved messages stay in the parent as the record, and the
+    // turn that acted on the yes and the link both declare which message's subject moved, so the parent's next
+    // turn and its summary are built without the moved exchange (`lib/moved-subject.ts`). Asserted on the
+    // parent's own stored messages as the assistant reads them: the acting reply is targeted at the person, and
+    // the assistant's own history is what the moved exchange leaves.
+    const assistantInParent = (await channelMessagesAsStored(originArn)).find((m) => m.fromAssistant)?.senderArn;
+    expect(assistantInParent, 'the assistant has spoken in the parent').toBeTruthy();
+    const parentMessages = await channelMessagesAsStored(originArn, assistantInParent);
+    const moved = parentMessages.find((m) => !m.fromAssistant && m.content.trim() === DRIFT_TRIGGER.trim());
+    expect(moved, 'the message that drifted is still in the parent, as the record').toBeTruthy();
+    const declaresTheMove = (m: { fromAssistant: boolean; content: string }) =>
+      m.fromAssistant && (m.content.match(/<!--turn:[^>]*-->/g) || [])
+        .some((d) => d.slice('<!--turn:'.length, -'-->'.length).split(';').includes(`moves=${moved!.id}`));
+    const declaring = parentMessages.filter(declaresTheMove);
+    expect(declaring.some((m) => m.content.includes('NAVIGATE_CHANNEL:')), 'the reply that acted on the yes declares the move').toBe(true);
+    expect(declaring.some((m) => (m.metadata || '').includes('driftRedirect')), 'the link in the parent declares the move').toBe(true);
 
     // Step 4 (welcome content), read from the channel rather than the DOM so it is the assistant's actual
     // output and not whatever the browser happened to be showing.

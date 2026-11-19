@@ -20,7 +20,7 @@ const OPS_INCIDENT_OPENED = 'Incident opened';
  * incident concerns (the operations team's standing room), which must be at the classification the `ops`
  * type is created at.
  */
-function opsEventEntry({ instance, forPerson, topicLabel, summary, concernedChannelArn, alarmName, service, eventBusName = 'default' }) {
+function opsEventEntry({ instance, forPerson, topicLabel, summary, concernedChannelArn, alarmName, service, incidentId, eventBusName = 'default' }) {
   if (!instance) throw new Error('an ops event names the instance it is for');
   if (!forPerson) throw new Error('an ops event names the person it opens a room for');
   if (!concernedChannelArn) throw new Error('an ops event names the conversation it concerns');
@@ -34,6 +34,8 @@ function opsEventEntry({ instance, forPerson, topicLabel, summary, concernedChan
     ...(alarmName ? { alarmName } : {}),
     // The system the incident is about, read for the room's name alone.
     ...(service ? { service } : {}),
+    // The incident's own id, which the room watches, so a later update for it reaches the room (DESIGN-EVENT-TARGETS).
+    ...(incidentId ? { incidentId } : {}),
   };
   return {
     EventBusName: eventBusName,
@@ -43,4 +45,14 @@ function opsEventEntry({ instance, forPerson, topicLabel, summary, concernedChan
   };
 }
 
-module.exports = { OPS_EVENT_SOURCE, OPS_INCIDENT_OPENED, opsEventEntry };
+/** The detail type of an update to an incident a room already watches (DESIGN-EVENT-TARGETS). */
+const OPS_INCIDENT_UPDATED = 'Incident updated';
+
+/** An update to an incident, naming it by the id its room watches. It names no room: the room is the one that watches the id. */
+function opsUpdateEntry({ instance, incidentId, eventBusName = 'default' }) {
+  if (!instance) throw new Error('an ops event names the instance it is for');
+  if (!incidentId) throw new Error('an incident update names the incident it is for');
+  return { EventBusName: eventBusName, Source: OPS_EVENT_SOURCE, DetailType: OPS_INCIDENT_UPDATED, Resources: [], Detail: JSON.stringify({ instance, incidentId }) };
+}
+
+module.exports = { OPS_EVENT_SOURCE, OPS_INCIDENT_OPENED, OPS_INCIDENT_UPDATED, opsEventEntry, opsUpdateEntry };

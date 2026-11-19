@@ -1,6 +1,6 @@
 # DESIGN-ASSISTANT: Meetings assistant
 
-**Status:** NOT BUILT, under consideration. Draft / planning - the design is not finalized and none of the meeting itself is built; the invitation chase (FR32) is built for any conversation. The Phase 1 WebRTC meeting is **NOT BUILT** in this codebase, and [SPEC-ASSISTANT-MEETINGS.md](./SPEC-ASSISTANT-MEETINGS.md), "Phase 1 scope", states what it covers. **BLOCKED** on sub-agent identity, then the moderator role; the chain and its order are in [SPEC-ASSISTANT-MEETINGS.md](./SPEC-ASSISTANT-MEETINGS.md), "What Blocks This, In Order". Every occasion on which this assistant acts unprompted is an event of [ADR-061](../../../design/decisions/061-a-welcome-is-a-workflow-an-event-starts.md), the platform's one event model, and its reasoning steps are that ADR's `agent` steps, which are built (ADR-061); the meeting events in B.6 are **NOT BUILT**.
+**Status:** PARTLY BUILT. The Phase 1 WebRTC meeting is built, and [SPEC-ASSISTANT-MEETINGS.md](./SPEC-ASSISTANT-MEETINGS.md), "Phase 1 scope", states what it covers and the status of each requirement; the invitation chase (FR32) is built for any conversation. The assistant as a meeting participant is **BLOCKED** on sub-agent identity, then the moderator role; the chain and its order are in [SPEC-ASSISTANT-MEETINGS.md](./SPEC-ASSISTANT-MEETINGS.md), "What Blocks This, In Order". Every occasion on which this assistant acts unprompted is an event of [ADR-061](../../../design/decisions/061-a-welcome-is-a-workflow-an-event-starts.md), the platform's one event model, and its reasoning steps are that ADR's `agent` steps, which are built (ADR-061); the meeting events in B.6 are **NOT BUILT**.
 
 **The phone leg (C.2) is an optional adapter and the platform ships none**, because Amazon Chime SDK PSTN Audio is in maintenance mode and closed to new accounts from 2026-10-29.
 
@@ -49,7 +49,7 @@ flowchart TB
 |---|---|---|
 | **Profile and model** | `AssistantProfile` (`backend/lib/config/profiles.ts`) | A `meetings` profile: `modelKey: sonnet`, `classifierMode: 'llm'`, `timeoutSeconds: 60`, `contextScope: 'granted'`. Assigned to a conversation as that conversation's own assistant, and it runs at that conversation's classification, so a customer meeting's assistant reaches no internal content |
 | **Persona** | `ASSISTANT_SYSTEM_PROMPT` in SSM, hydrated at cold start, stable prefix cached via `cachePoint` | `persona-meetings.txt`: a concise meeting facilitator - proposes, does not decide; confirms before consequential actions; never chairs |
-| **Guardrail** | `applyInputGuardrail` and `applyOutputGuardrail`, out of band, failing open | The platform default: prompt-attack screening on input, PII and marker filtering on output. No meeting-specific rules |
+| **Guardrail** | `applyInputGuardrail` and `applyOutputGuardrail`, out of band, withholding the turn when the guardrail cannot be applied | The platform default: prompt-attack screening on input, PII and marker filtering on output. No meeting-specific rules |
 | **Context scope** | `load_company_context` and `load_platform_info` over a classification-scoped S3 prefix, IAM-bounded | The company-context tool is off. This assistant's context is the meeting record rather than a document corpus; `load_platform_info` may stay on for "what can you do?" turns |
 | **Classification** | The immutable channel `classification` tag, read live | It serves the classification of the meeting conversation. An unreadable tag is not a value, and a caller that needs one refuses rather than substituting a floor. An attendee whose classification does not reach the conversation is refused the conversation rather than capped inside it |
 | **Identity** | Its own app-instance-bot, provisioned the way every assistant identity is; bearer-pinned; privileged actions through credential-exchange | The meetings bot owns and moderates the meeting conversation. It holds no standing calendar-write or membership grant - those live on the apply endpoints |
@@ -403,10 +403,21 @@ flowchart TB
   REC --> ATT["CreateAttendee:<br/>ExternalUserId = AppInstanceUser id"]
 ```
 
-- **One meeting, one channel.** The meeting belongs to the conversation it was started in, or to its own meeting conversation when scheduled. The relation is the server-side `activeMeeting` record keyed by the channel ARN, claimed with a conditional write so two starts produce one meeting, and never member-writable channel Metadata. `ExternalMeetingId` is the channel id, so a lifecycle event names its conversation with no lookup, and the meeting carries the channel's classification as a tag.
+- **One meeting, one channel.** The meeting belongs to the conversation it was started in, or to its own meeting conversation when scheduled; C.7 moves every meeting into a meeting conversation of its own (**NOT BUILT**). The relation is the server-side `activeMeeting` record keyed by the channel ARN, claimed with a conditional write so two starts produce one meeting, and never member-writable channel Metadata. `ExternalMeetingId` is the channel id, so a lifecycle event names its conversation with no lookup, and the meeting carries the channel's classification as a tag.
 - **The meeting is never chosen by the caller.** A request names a channel, never a meeting id, and the meeting is read from that channel's record, so a meeting id from another conversation admits no one.
 - **Membership is checked as the caller.** The membership read bears the caller's own AppInstanceUser, so a non-member's check fails inside Amazon Chime SDK rather than being adjudicated by the handler. The Amazon Chime SDK Meetings actions are not ARN-scopable, so these handler checks, not a policy underneath, are the isolation, and they are what the deny-tests drive.
 - **The attendee is the AppInstanceUser.** `ExternalUserId` is the caller's AppInstanceUser id, whichever identity provider signed them in, so the roster and every transcript segment resolve to one person.
+
+**Who may start, join and end a meeting: its hosts.** The host is a role, not a person (SPEC-ASSISTANT-MEETINGS FR50). The room's type names the participant roles that host its meetings (`participants.meetingHost`), and every person holding one of them hosts: an `ops` room's lead, its on-call (`on-call:ops`, from the `ops-on-call` group) and its secondary on-call (`secondary:ops`, from `ops-secondary`). Where none is named or held, whoever starts the meeting hosts it; a meeting a workflow starts takes the room's host roles. The hosts are recorded on the meeting at its start (`activeMeeting.hosts`, `backend/lambda/src/lib/meeting-host.ts`).
+
+| Action | Who | Where it is enforced |
+|---|---|---|
+| Start, and start again after it ended | a host, where a host role is held; anyone in a room with none | `startInHome` in `meeting-api.ts`, before any conversation is opened (`NOT_HOST`) |
+| Join | any member of the room or the meeting's conversation, while the service says it runs | the join route reads the record and confirms it with `GetMeeting` |
+| End for everyone, without joining | a host, or a moderator of the room or of the meeting's conversation (read live) | `mayEndMeeting` in `meeting-api.ts`; the console's end (FR49) uses the same `endMeeting` |
+| End on its own | nobody: nobody else joined within five minutes, one person left alone at two checks five minutes apart, or the deployment's limit (`meetingMaxMinutes`, 90 minutes unless set) | the router's watch (`handleMeetingWatchFired`, `meeting-watch.ts`), one-shot schedules from the meeting's start, ending through the same `endMeeting` after telling the room why |
+
+The client shows only what the server allows: the status, join and start answers carry `isHost`, `hostIds`, `mayEnd` and `mayStart`, and the room's banner offers End to those who may end it. A host's Leave asks whether to leave or end it for everyone. A meeting nobody is connected to also ends after five continuous minutes by Amazon Chime SDK's own rule, and its `MeetingEnded` event releases the conversation's record. The watch is what bounds a meeting one person forgot in: the service alone would let it run 24 hours.
 
 **NOT BUILT**: the route uses a Cognito user-pool authorizer, and the caller ARN, `ExternalUserId` and `createdBy` are the token's `sub` claim rather than the caller's AppInstanceUser id (`callerPersonId`), and a caller from another issuer cannot reach the route (see SPEC-ASSISTANT-MEETINGS, "Phase 1 scope"). The channel check, the caller-as-bearer membership read and the per-channel record are on that branch as described.
 
@@ -434,7 +445,7 @@ The implementations, and the design endorses none:
 | **A telephony connector (Twilio first), phone-only.** The connector places the call once a member starts it and their membership is checked; Real-Time Transcription posts signed events to the connector ingress, and segments are appended to the conversation's archive by call leg. No Amazon Chime SDK is involved | anybody with the vendor account, through [SPEC-CONNECTORS.md](../../communication/SPEC-CONNECTORS.md) |
 | **A media bridge, for a phone leg into a WebRTC meeting.** The connector streams the call (Twilio `<Connect><Stream>`, bidirectional: the caller's inbound track as mulaw at 8000 Hz, and meeting audio sent back in the same format) to a container that joins the meeting as one WebRTC attendee per caller, taking the leg's AppInstanceUser id as `ExternalUserId`. Meeting transcription then transcribes the caller like any attendee. The bridge attendee can neither post nor read. **OPEN:** how a server process joins an Amazon Chime SDK meeting as an attendee, a headless browser or a supported native SDK | anybody, at the cost of running the container |
 | Amazon Chime SDK PSTN Audio, a Voice Connector plus a SIP media application | an account that already holds one, or has an approved exception. **OPEN:** whether Amazon Chime SDK Voice Connector is affected. The notice scopes the change to the PSTN Audio service and does not name Voice Connector; unconfirmed with AWS |
-| Amazon Connect | anybody, and it is where AWS is putting telephony investment. Whether it can bridge into an Amazon Chime SDK meeting is not known (**unverified**) |
+| Amazon Connect | anybody, and it is where AWS is putting telephony investment. **OPEN:** whether it can bridge into an Amazon Chime SDK meeting |
 
 **What a deployment with no adapter loses, stated so a regression is visible:** dial-in and dial-out. Nothing else. WebRTC meetings, the roster, every tool in Part B, the notes, the follow-ups and all of B.5's context sources are unaffected. **The roster's transport attribute (FR25) degenerates to one value rather than breaking**, which is the correct shape for an absent optional leg.
 
@@ -519,11 +530,207 @@ So a roster row reads as a small timeline. On a deployment with no telephony ada
 
 **What it is for, in order.** Live, it is what lets this assistant know who it is still waiting for, which is the input to chasing an absence. After the meeting, it is the denominator for every statistic in the roadmap below, and the record of who presented. Those are two different reads of one projection and neither needs a second store.
 
-**Where it lives.** It is derived from the archive, which owns the event sequence and outlives the channel. Aurora projects it for querying across meetings. **NOT BUILT:** in the Phase 1 design the lifecycle consumer writes events to Aurora through the data plane only, so a deployment in Athena mode records no roster, and its person key is the Cognito `sub` the attendee was created with. Nothing maintains a roster as mutable state, which is the mistake FR22 exists to prevent: a counter incremented on arrival and decremented on departure is wrong the first time an event is redelivered or lost, and it is wrong silently.
+**Where it lives.** It is derived from the archive, which owns the event sequence and outlives the channel. Aurora projects it for querying across meetings. Each event is filed in the archive first, under `meeting_events/` through the Meetings stack's own delivery stream, and then projected into Aurora where the deployment keeps it, so a deployment in Athena mode keeps every event. The stream and its Glue table belong to the Meetings stack, so a deployment that does not declare `meetings` has neither. Nothing maintains a roster as mutable state, which is the mistake FR22 exists to prevent: a counter incremented on arrival and decremented on departure is wrong the first time an event is redelivered or lost, and it is wrong silently.
 
 ### C.6 How Parts A and B sit on this
 
 `create_meeting` provisions the meeting and its conversation; `onboard_attendees` greets people as they join a live meeting; `take_notes` and `follow_up` write and summarize the meeting the timeline cards surface. That layering is why the chat-facing halves depend on nothing here.
+
+### C.7 Every meeting is its own conversation (FR27, FR41 to FR43)
+
+**PARTLY BUILT, not deployed:** C.7.1 and C.7.2 (the meeting conversation, cards in the room, joining from the room, `parentMembersJoin`). C.7.3, C.7.4, the parent type's `meetings` entry, the start's narrowing, and C.7.7 are **NOT BUILT**. Every meeting, started from a conversation or scheduled, is held in a **meeting conversation** of its own. The meeting's chat, cards, transcript and summary live there. Who may join is who is a member of it. The meeting's settings decide whether people can be added and who, and being added to a meeting never gives anyone the parent conversation.
+
+#### C.7.1 The meeting conversation
+
+- **Started from a conversation, a meeting opens a child conversation.** The parent classification's typed creator (`typed-conversation-from-event.ts`, `aeMeeting: 'open'`, asked by the meetings function) opens it as the `meeting` conversation type through the canonical creator ([ADR-053](../../../design/decisions/053-a-conversation-records-its-type-rather-than-being-pinned-to-it.md)), at the parent's classification, read from the parent's immutable tag and never from the request. The child's server-side row names the parent (`meetingOf`), and the parent's names its newest meeting conversation (`meetingConversation`), claimed so two starts at once open one. The child is not listed among the parent's threads, so the parent's turns never read the meeting's chat. Only a meeting opens one: an event or a workflow step that names the type is refused. A scheduled meeting is the same conversation, opened when it is scheduled (FR30).
+- **The meeting belongs to the child.** The `activeMeeting` record is the child's, the meeting's `ExternalMeetingId` is the child's channel id, and the meeting carries the child's classification as a tag. C.1's join checks apply unchanged, to the child: membership is read with the caller as bearer, so Amazon Chime SDK refuses a non-member of the meeting conversation whatever their standing in the parent.
+- **Its first members** are the person or workflow that started it, the people the start called (C.7.3), the parent's primary assistant, which owns and moderates it, and every other assistant of the classification that is a member of the parent when the meeting starts. The meeting carries on part of the parent's subject, so the assistants working that subject are in it: an incident's call has the ops assistant to ask, while the primary still owns the meeting's cards and workflows. The creator reads each live assistant's membership of the parent as the service admin, and a read that fails opens no meeting conversation rather than one missing an assistant its room has. No assistant is welcomed there, because the meeting conversation is the meeting's chat. Each person is checked for the classification as an invitation checks its inviter (`invitations.ts` step 3), and a person whose clearance does not reach it is refused by name. Clearance is never raised to fit.
+- **It holds none of the parent's history.** Its join recap is built from the child alone. What the meeting needs from the parent, it is told in the child's opening: an incident room's meeting names its incident there (`meeting-started-incident`).
+- **The parent gets the cards, and a link.** The started card in the parent says a meeting is running and links to it; the ended card and its summary are posted in the parent too, because the parent's members are who the meeting was about. The transcript and the meeting's own chat stay in the child.
+- **The child stays when the meeting ends.** It is the meeting's durable home, follows the `meeting` type's retention, and a later meeting started from the same parent opens a new child.
+
+#### C.7.2 A member of the parent joins from the parent
+
+Every member of the parent may join the parent's meeting unless the start called only some people and closed it to the rest (C.7.3). Joining is one request, `POST /meetings/join`, naming the parent:
+
+1. The caller is a member of the parent, read with the caller as bearer, and the parent is not archived.
+2. The parent's row names the child, and the child's settings let parent members join.
+3. The meetings function asks the classification's creator to admit the caller (`aeMeeting: 'admit'`), which adds them to the child as the service admin, only where the child's row says it is a meeting's; it then answers the child's join information, naming the child (`conversationId`). A join may name the child itself, from a card's link, and is admitted the same way.
+
+The parent's membership is what admits the caller, so a person removed from the parent can no longer join from it. Being in the child grants nothing back in the parent: the two memberships are separate Amazon Chime SDK channels, checked separately.
+
+#### C.7.3 Calling some people (FR41)
+
+- **The start names whom to call.** `POST /meetings` takes an optional `call: [<AppInstanceUser id>, ...]`, each a member of the parent, read with the caller as bearer; a non-member refuses the start with `NOT_A_MEMBER`. A workflow's `start_meeting` names participant roles instead (`call: ['on-call:ops']`), resolved to their holders when the step runs, as a `meeting_offer` task resolves them today (FR40).
+- **Called people are added to the child at the start**, hear its ring (the ring is the child's, so it reaches only them), and are emailed (`targets` on the notify directive).
+- **The rest of the parent may still join (C.7.2), or not.** The start's **Others in this conversation can join** switch decides, within what the meeting's settings allow (C.7.5). Off, the parent's started card says a meeting is running without a join link, and joining from the parent is refused.
+- **The parent's card says whom the meeting is for**, in `meeting-started-call` (or `meeting-started-incident-call`), editable like every meeting card. Whether it names the people is the team's choice, made in the template.
+
+#### C.7.4 Adding people to a meeting (FR42)
+
+Anyone added to a meeting becomes a member of the meeting conversation only. They see the meeting, its chat and what is said in it from then on, never the parent. A person is given the parent only by the parent's own rules, as anyone is: sharing, an invitation into the parent, or the parent's group.
+
+- **A member of the parent** is added to the child directly. The picker lists the parent's members.
+- **A person who has an account but is not in the parent** is added to the child by sharing the child (`backend/lambda/share-conversation/`), under the child's checks: their clearance reaches the classification, and the meeting's settings allow people from outside.
+- **A person with no account** is invited into the child (`POST /invitations`, `invitations.ts`): an invitee AppInstanceUser is minted, added to the child, and emailed a link that lands them in the meeting window after they redeem it (template `invitation-meeting`). The address is the route for that one email and is never stored or used to find anyone. This is the "invitations into meetings" SPEC-CREDENTIAL-EXCHANGE lists as not built.
+- **During the meeting**, the meeting window's **Add people** opens the same picker. A person added while the meeting runs hears a ring if they have the app open.
+
+Because the child is never group-sourced, a group-sourced parent (the ops team room, an incident room opened from it) needs no special case: its membership stays equal to its group, and a vendor or another team's engineer is added to the incident's meeting conversation alone.
+
+#### C.7.5 The meeting's settings (FR43)
+
+What a meeting allows is decided in three layers, each of which can only narrow the one above it:
+
+| Layer | Where it is declared | What it sets |
+|---|---|---|
+| The `meeting` conversation type | the conversation-type registry | The most any meeting allows: who may add people (`organizer`, `attendees` or nobody), whether people from outside the parent may be added (`outsiders`), and how (`sharing`, `invitations` with their modes, as any type declares `invitations` today) |
+| The parent's conversation type | its `meetings` entry in the registry | Narrower settings for meetings started from that kind of conversation: a customer's room may allow no outsiders, an incident room may let any attendee add people |
+| The start | `POST /meetings`, or the `start_meeting` step | Narrower still, for this one meeting: **Others in this conversation can join**, and whether people can be added at all |
+
+The meeting conversation's server-side row records the settings the start resolved, and every add reads them from there, never from the request or channel Metadata. Each add is checked twice: the meetings function checks the settings and the adder's role, and Amazon Chime SDK checks the membership write under the identity that makes it.
+
+#### C.7.6 What a person sees
+
+```mermaid
+flowchart TB
+  START["Meeting control in a conversation"] --> OPEN["A meeting conversation opens,<br/>child of this one"]
+  OPEN --> CALLED["The called people are added,<br/>and their apps ring"]
+  OPEN --> CARD["The parent gets a card:<br/>a meeting is running"]
+  CARD -->|"others may join"| JOIN["A parent member clicks Join:<br/>added to the meeting conversation"]
+  CALLED --> ADD{"Add people<br/>(if the settings allow)"}
+  ADD -->|"a parent member"| CHILD["Added to the meeting<br/>conversation"]
+  ADD -->|"an account outside"| SHARE["Shared the meeting<br/>conversation only"]
+  ADD -->|"no account"| INVITE["Invited into the meeting<br/>conversation only"]
+```
+
+- **The meeting control** starts a meeting for everyone with one click, and **Call some people** opens the picker: the parent's members with check boxes, a search for someone else in the deployment, an email field for someone new, and the **Others in this conversation can join** switch. Choices the settings refuse are not offered.
+- **The meeting window** shows the meeting conversation's chat in its right column, and **Add people** where the settings let this person add.
+- **The parent** shows the meeting's cards, and its "meeting in progress" line opens the meeting.
+- Every word in these is a template or a localized string (tenets P5 and D11).
+
+#### C.7.7 Events and workflows
+
+- The meeting conversation's `meeting-started` and `meeting-ended` run the workflows of its own primary assistant, the parent's.
+- `meeting-started` gains a platform-computed field, `meetingCalled`, the people the start named.
+- A new event, `meeting-person-added`, names the meeting conversation, the person and who added them, so a team's workflow can brief the newcomer (what `onboard_attendees` does in Part B, without the sub-agent fan-out).
+
+#### C.7.8 What changes in what is built
+
+| Built today | Changes to |
+|---|---|
+| The meeting is the started-in conversation's (`activeMeeting` on it; `meeting-api.ts`, `meeting-run.ts`) | The start opens the child and records the meeting on it; the parent's row names the child |
+| The ring and the email reach the conversation's members | They reach the child's members |
+| The started and ended cards and the summary are posted in the conversation | Posted in the parent, linking to the child |
+| The meeting window shows the conversation's chat (`MeetingProvider`, `MeetingRoom`) | It shows the child's chat |
+| `POST /meetings/join` checks membership of the named conversation | Checks the parent, the child's settings, then adds to the child (C.7.2) |
+| The meetings and incident triage e2e specs assert the room's meeting | They assert the child, and a person who is in the child and not the parent being refused the parent |
+
+New: the `meeting` conversation type and its settings, the parent type's `meetings` entry, `call` on the start, sharing and inviting from the meeting window, the templates `meeting-started-call`, `meeting-started-incident-call` and `invitation-meeting`, and the events in C.7.7.
+
+**Open questions.** Whether a meeting conversation is archived some time after its last meeting, rather than at its type's retention. Whether one parent may have two meetings running at once, which a child per meeting allows and the parent's single started card does not yet describe.
+
+### C.9 Transcription, the ended card, and the archive on end (FR28, FR55 to FR57)
+
+**Proven on a sibling deployment, and built here with hosts as roles, people as AppInstanceUser identities, and the classification on every piece.**
+
+| Piece | Built in |
+|---|---|
+| Starting live transcription, its settings | `lib/meeting-transcription.ts` `setTranscription`, from `meeting-api.ts` at the meeting's creation where `meetingTranscription` is set |
+| Who turns it on or off | `POST /meetings/transcription`, the meeting's recorded hosts only (FR50), the control shown to a host only |
+| Telling every client the state | the service's own `TranscriptionStarted` and `TranscriptionStopped` events, handed to the router as lifecycle events and posted in the meeting's chat; each client reads the service's transcription status on the data channel |
+| The indicator | `MeetingRoom.tsx` `ae-meeting-transcribing`, for everyone in the meeting while on |
+| The spoken notice | `services/meetingTranscription.ts` `announce`, in the reader's language from `meeting.transcription.*` |
+| Two modes: live captions (nothing kept) and recording (captions, the stored transcript and the summary), recording the default | `nextTranscriptionMode` in `lib/meeting-transcription.ts`: recording turns captions on, captions cannot be turned off while it records; `meetingRecording` sets the start's mode; the host's app says the mode on the data channel, and the meetings function publishes a change the service raises no event for |
+| Live captions | `MeetingRoom.tsx` `ae-meeting-captions`, every speaker's newest lines, partial lines included |
+| Consent | none beyond the notice |
+| Capturing what was said | each app sends its own person's final lines as it goes (`POST /meetings/transcript`), kept per line under `transcripts/<classification>/<conversationId>/<meetingId>/segments/` |
+
+**Each line is its speaker's own app's.** An app sends only the final lines the service attributes to its own attendee, and the server keeps a line only from an attendee the service confirms is the caller's (`GetAttendee`, its `ExternalUserId`). So a line is attributed to the AppInstanceUser who spoke it and no member can attribute words to another; what remains a client's word is the text of its own lines. Capturing the service's transcription messages server side, through a media capture pipeline, would keep a line whose app never sent it; it is not built.
+
+**The transcript is written once the meeting has ended**, when its summary is due (`MEETING_SUMMARY_DELAY_SECONDS`, so the last reports are in): the run entry reads the segments, names each speaker as the room shows them (their AppInstanceUser name), and writes `transcripts/<classification>/<conversationId>/<meetingId>.md`. Only a meeting that was transcribed at some point is written.
+
+**The ended card** (FR55) is then rewritten in place with the transcript's link, which the chat app opens through the attachment download path: signed only for a member of the meeting's conversation, cleared for it, and only where the key's classification is the conversation's.
+
+**The meeting's conversation is archived** (FR56) after the card, through the conversation management function's one archive sequence, which checks the conversation's own row first.
+
+**The room reads it** (FR57): a meeting's conversation is the room's `thread` child, so a room turn reads its summary and its newest transcript under the membership rule every thread child is read under.
+
+### C.10 The meeting's summary, and its action items as tasks (FR66, FR67)
+
+**The summary's sections and rules were proven on a sibling deployment; its action items are Agent Echelon tasks** (owner, 2026-11-12).
+
+| Piece | Built in |
+|---|---|
+| When it runs | the router's `handleMeetingSummaryFired`, once the transcript is written (C.9) and the card rewritten with its figures, only where the meeting was recorded (a transcript was written) |
+| The prompt | `lib/meeting-summary-turn.ts` `MEETING_SUMMARY_INSTRUCTIONS`: the sections Summary, Key Discussion Points, Action Items and Next Steps, and their rules (nothing fabricated, only what was said, a plain statement for no meaningful dialogue, an assignee only where the transcript makes it clear, no model name), answered as one JSON object (`summary`, `keyPoints`, `actionItems` of `{ text, assignee, due }`, `nextSteps`) rather than Markdown parsed back (tenet D11) |
+| The meeting's context | the date, the duration, and the participants as references `P1`, `P2`, ... with the names the room shows them under; the transcript, each line by its speaker's reference, inside a `<meeting-data>` block the instructions call data |
+| Topics | `topicsOf`: the opening clause of each discussion point |
+| The model call | one turn of the room's owning assistant, on its own vended session, through the processor's model path (`invokeBedrockWithFallback`, the assistant's own model and fallback), metered against the global budget as machine-written work |
+| Where it is kept | the meeting conversation's server-side row, `lastMeeting.summary` (tenet D13, no new store) |
+| Where it is shown | the ended card in the room, rewritten in place (`meeting-summary` with `summary`, `key_points` and `action_items`); the room's assistants read it there as the room's own history, beside the meeting's transcript (FR57) |
+| Action items | one task each, on the platform machine `meeting_action_item` (FR67) |
+
+**The turn.** The router dispatches it to the room's owning assistant (`eventWorkflowOwner`: the role the room's type names, such as `ops` in an ops room, else the primary) with ids and its own reads only: the meeting, its people as the meeting conversation's membership lists them, and the card. The processor reads the meeting's segments under its classification's transcript family, asks the model, records the turn on the card's message as a `meeting_summary` turn (model, tokens, latency; `trigger` and `turnKind` `meeting_summary`, an interaction kind that answers no message), and hands the summary back to the router (`aeMeetingSummary`). A turn the meter refuses, that times out, whose reply a guardrail touched or that is not the object, hands nothing back, and the card keeps its figures and links.
+
+**The router writes it.** On the hand-back it reads the meeting conversation's row again (its last meeting, its ended card, no summary yet), checks both conversations are its own classification and the room is not archived, and checks the turn's assistant is still the room's owning assistant. It then opens the action items' tasks, stores the summary with each item's task id on the meeting conversation's row, and rewrites the card.
+
+**The assignee rule.** The model names a participant only by a reference the platform gave it, and the platform maps the reference back to the AppInstanceUser id it was given for; no name in the model's text is ever matched to a person. An item is assigned to that person only where they are a member of both the meeting's conversation and the room, read live; that is also what keeps an item from crossing a classification, since the task is opened on the room, which the task service refuses for any classification but its own. Any other item (no assignee named, a reference it was not given, or a person outside the room) is held by a host: the meeting's first recorded host who is a member of the room, else the person who started it. A held item is that host's task, assigned to them and shown as held on the card. The task model has no unassigned person task: a task's worker is a person or an assistant, and an assistant worker would be taken up by the assistant itself (ADR-063 decision 5). Where the room has no host to hold it, the item is listed on the card and in the stored summary and opens no task.
+
+**Each task** opens through the one workflow-task seam (`openWorkflowTaskStep`, ADR-063, ADR-067): on the room, the meeting's run (`meeting-summary#<meetingId>`, its meeting on `workflowRun.meeting`) and one step per item, so a redelivered hand-back opens each task once; its worker the person by `{ people: 'event:person' }`; its creator the owning assistant; its due date, where one was stated, a `due` deadline at the end of that day. The holder is told privately with the task's card and emailed (`workflow-task-assigned`), and marks it done on the card. Its settlement continues no run.
+
+**Roadmap (owner, 2026-11-12): the Advisor follows up on open action items. Not built.** It hooks in as an event, never a poll (tenet D6): an action item with a stated due date already carries a `due` deadline. The follow-up adds a reminder schedule on that deadline (the `remind` kind a task step takes, WT21), whose firing names the task to the room's router as any task deadline does. The router runs the Advisor's declared workflow on that event, and an `agent` step drafts the follow-up to the holder, privately. An item with no due date is followed up on a deployment default from the meeting's end, set when its task opens. Nothing reads open tasks on a timer.
+
+### C.11 Audio and video recording (FR70)
+
+Owner decision 2026-11-12 (the spec's "Owner decisions"). Recording mode is one switch: where `meetingMediaRecording` is set, the moment recording turns on or off (`setTranscription`, `lib/meeting-transcription.ts`) calls `syncMediaCapture` (`lib/meeting-media-capture.ts`).
+
+| Step | What runs | Where it is written |
+|---|---|---|
+| Recording on | `CreateMediaCapturePipeline` on the meeting, the guide's composited view (`GridView`, 1080p, `ActiveSpeakerOnly` while content is shared, audio muxed in); the part recorded as `capturing` | `recordings/<c>/<conv>/<meeting>/<part>/capture/` |
+| Recording off, or a host or the watch ends the meeting | `DeleteMediaCapturePipeline`, then `CreateMediaConcatenationPipeline` on it; the part moved to `processing` by a conditional write, so it is concatenated once | `.../<part>/media/` |
+| The service stops the capture itself (everyone left) or it fails | The `Chime Media Pipeline State Change` event (`chime:MediaPipelineDeleted`, `chime:MediaPipelinePermanentFailure`) concatenates a part still `capturing` (`meeting-recording-events.ts`) | as above |
+| The file is written | The store's `Object Created` event for `.../media/composited-video/<id>.mp4` (or the concatenation's own deleted event, where the file is there) moves the part to `ready` with its key, deletes its `capture/` chunks, files `recordingReady` and publishes `recording-ready` | the part's `key` |
+| The concatenation fails | Its permanent failure event, or a refused create, moves the part to `failed`, files `recordingFailed` and publishes `recording-failed` | |
+| The card | The router's `recording-ready` and `recording-failed` lifecycle events call `rewriteEndedCard`, which renders the card again from the row (`endedCardValues`, `recordingCardValues`) as the assistant that posted it | the ended card |
+
+The conversation is found from the event, never guessed: a pipeline event's `externalMeetingId` is the meeting conversation's id (`meeting-api.ts` sets it), else the pipeline's sink names the family's conversation and meeting, and the row must hold that pipeline as one of the meeting's parts; an object's key names the part the row must hold. Who acts: the meetings functions start and stop a capture; the recording's event function, with a delete grant on `recordings/*/capture/*` alone, finishes it. The media pipelines service writes the family by the conversation store's bucket policy (`lib/constructs/meeting-recordings.ts`), attached by the store's own stack where `meetings` is declared. The service checks the sink's policy with the caller's `s3:GetBucketPolicy`, which the callers hold on the store alone.
+
+**Not verified on a deployed stack:** whether a concatenation pipeline's events carry the meeting's ids (the guide shows them for a capture), which is why the written file's object event also finishes a part; and whether the service lists the store under the family's prefix alone, as the policy's listing condition requires.
+
+### C.8 The console's Meetings tab (FR45 to FR49)
+
+**Every number on it is the server's.** The admin meetings function (`admin-meetings.ts`) folds the window's recorded events once (`meeting-figures.ts`) and answers the figures, each with its population, and each meeting's summary; one meeting's answer adds its roster, its events in time order and each attendee record's connectivity. The console lays these out and computes no figure of its own, so the tab, the room's ended card and the alarms agree (FR22, tenet D7). People are shown by their AppInstanceUser id, as the record keys them; the tab looks up no names.
+
+**The overview** (`MeetingsOverview.tsx`):
+
+| Part | Drawn from | Form |
+|---|---|---|
+| Headline figures | `figures` | A tile per figure, the population under it, and the dash rule in the tooltip of a figure that can be a dash |
+| By day | `figures.byDay`: meetings, people, drops and app failures per UTC day | Four small column charts on one row, one axis each, every day of the window drawn (a day the answer omits held no meeting), and a table of the same numbers |
+| How people fared | `figures.quality`, each person once per meeting | One segmented bar in the status colors, each part named with a glyph |
+| Status and how meetings started | `figures.byStatus`, `figures.startedVia` | Segmented bars |
+| Incidents | `figures.incidents`: each kind's count and newest 50 (`incidentKindOf`: a drop, a join failure, a microphone, camera or audio failure, a lost connection) | A list per kind with the time, the person, the event and its error, each opening its meeting |
+| Devices and failure types | `failuresByType`, `browsers`, `operatingSystems`, `sdkVersions` | Ranked horizontal bars |
+| Meetings | `meetings`, each with `live` | A table, live meetings first, with a Live now filter |
+
+**The drill-down** (`MeetingTimeline.tsx`, `meetingLanes.ts`) puts the meeting on one time axis: a lane for the meeting and one per person on the roster, in the order they joined, then anyone the events name who is not on it. A person's lane carries three thin tracks, connected, camera and sharing, drawn from the roster row's `spans`, the same intervals its seconds are summed from, so the drawing and the figures cannot disagree. Every event but the periodic connectivity reading is a marker, by category (the meeting, join and leave, camera, sharing and mute, devices, connection, failures, ring, other), each with its own color and shape so a category never rests on color alone. A new event type the console has no words for still appears, under `other`, by its recorded name. The category filter scopes the markers and the list beneath alike, a lane's person narrows the list to them, and a marker or a row opens every recorded field of its event. The quality charts (`MeetingQualityCharts.tsx`) draw each measure from `connectivity` (FR44) over time, one line per attendee on the timeline's time axis with the thresholds as reference lines, and say the connection was not recorded where there are no readings; the experience issues (`MeetingExperience.tsx`, FR74) lead the meeting's view.
+
+**Live is read from the source, not the record of events** (`meeting-liveness.ts`). A meeting whose events hold its end is ended. Any other is live only while its conversation's context row holds it as `activeMeeting` and Amazon Chime SDK still runs it (`meetingRunsNow`, the router's own check). A conversation can keep `activeMeeting` for a meeting the service has already ended until the next start or join releases it, so the record alone never reads as live. The newest 40 unended meetings of an answer are asked, eight at a time; any further one, and one whose read failed, answers `null`, which the tab shows as not known. How an ended meeting ended is read from its events: `everyoneLeft` when the last person left at least 30 seconds before the service's end, `withPeopleIn` otherwise, `nobodyJoined` for an empty roster.
+
+**The meeting dashboard (FR68).** Beside everything above, the tab carries the healthy-meetings figure, per-person quality detail and the timeline's filters, a dashboard shape proven on a sibling deployment. It shows no phone-network figures (this platform has no phone leg), and meeting requests arrive with scheduling. What each part is drawn from:
+
+| Part | Drawn from |
+|---|---|
+| Healthy meetings and the tile colors | `figures.healthyMeetings` (meetings in which no app reported a failure, over meetings); the console's `--status-*` tokens, each with a glyph and a word |
+| Conversation and host columns | the meeting's `channelArn`, named through `find-conversation` where the operator holds it, and `hosts` else `createdBy` |
+| Where it was held | `conversation` on the detail: the meeting conversation's type and `meetingOf` with the room's type, read from their records; `createdBy`, `hosts` and `mediaRegion` from `meetingCreated` |
+| Quality and each person | the roster: `quality`, `failureEvents` (each with its error text), `device.name`, `presenceReceivedMs`, the join and leave times, and the person's own events |
+| Timeline filter, source and error | the timeline's events; Only shows one category, Show all clears, and the chip still hides one |
+| Transcript and summary | `GET /admin/meetings/{meetingId}/transcript`, below |
+
+**A meeting's transcript and summary are conversation content** (`view-events`), so they are their own route, `GET /admin/meetings/{meetingId}/transcript`, granted under `view-events` and never under `view-meeting-analytics`. The detail says only whether each was written (`transcribed` from the service's `TranscriptionStarted`, `conversation.summarized` from the record). On the operator's request the console asks for a reason (the one the meeting's conversation was opened for, where it was), and the handler takes the meeting's conversation and classification from its events, refuses a classification the caller's scope does not reach, writes the access log (`meeting_transcript_read`) before reading and refuses the read if the record cannot be written, then reads the transcript from its key (`transcripts/<classification>/<conversation>/<meeting>.md`) and the summary from the meeting conversation's `lastMeeting.summary`. The summary's action items are tasks on the room, each shown with its assignee or the host holding it by id and opening the room in the conversation viewer. The function reads only the transcript family (`s3:GetObject` on its `.md` keys, `s3:ListBucket` under its prefix).
+
+**Ending a meeting for everyone** (`end-meetings`, FR49) is its own capability on its own resource, `POST /admin/meetings/{meetingId}/end`, so reading the figures never carries it. The console asks for a reason through the change dialog every console change uses. The handler takes the conversation from the request and everything else from the source: the meeting must be the one that conversation holds now, its classification is the record's, the caller's signed role must reach that classification (`classificationAllowed`), and the service must still run it. It then writes the access log (`meeting_ended_for_all`: the person, the conversation, the meeting, the classification, the scope and the reason) and refuses the end if the record cannot be written. The end goes through the run entry of the meeting's recorded classification (`runHandler` with `op: 'end'`, named from `MEETING_RUN_FUNCTION_PATTERN`) to the same `endMeeting` a host or moderator uses: the service deletes the meeting, the conversation's record is released, and the service's own end event reaches the room's router, which posts the ended card. The admin function holds a read of the context table, `chime:GetMeeting` on meetings, the access log's `PutItem` and the invoke of every classification's run entry (an admin spans every classification), and no meeting write of its own.
 
 ## Phases
 
@@ -539,7 +746,7 @@ A phase ends somewhere a person could use. **The blocking chain in the spec is n
 
 ```mermaid
 flowchart LR
-  P1["1<br/>WebRTC meeting"] --> P2["2<br/>Transcription, embedding,<br/>chat in the parent"]
+  P1["1<br/>WebRTC meeting"] --> P2["2<br/>Transcription and embedding<br/>in the meeting conversation"]
   P2 --> P3["3<br/>Email on start and join"]
   P3 --> P4["4<br/>Meetings assistant<br/>and the swarm"]
   P4 -.->|"nothing is built on top of it"| P5["5<br/>Telephony adapter:<br/>phone failover"]
@@ -560,22 +767,20 @@ flowchart LR
 
 **Builds toward Phase 2** by giving the transcript somewhere to land: the roster names who spoke, and the conversation is already the meeting's home.
 
-### Phase 2 - transcription and embedding, with the meeting's chat in the parent conversation
+### Phase 2 - transcription and embedding, in the meeting conversation
 
 **The non-goal that gated this is largely answered by where a transcript lives.** It called transcription automatic, which it is not: **recording is a host-controlled toggle in the meeting client**, captions are visible to everyone while it runs, and that is the industry norm. The host decides, attendees are told and may leave, and no mainstream product gives an attendee a veto, so this design does not invent one.
 
-**A transcript is an ATTACHMENT on a message in the conversation**, which answers the two questions the non-goal raised rather than leaving them open:
+**Built (FR28, owner decision 2026-11-12), as C.9 describes.** A transcript is an artifact of the meeting's conversation, in the conversation store's own platform-written family, so the two questions the non-goal raised are answered by the conversation:
 
-| What the non-goal asked | Why it is already answered |
+| What the non-goal asked | How it is answered |
 |---|---|
-| How long a transcript is kept | It is conversation content, so it lives under that conversation's retention. Expiration is declared per conversation type, and the transcript goes when the conversation does |
-| What classification it carries | The conversation's, by the same route every other attachment takes. There is no second boundary to design |
-
-**Every segment is attributed to an AppInstanceUser, and the archive is fed by the service, not by a client.** Amazon Chime SDK live transcription attributes each transcript item to an attendee (`attendeeId`, `externalUserId`), so a segment resolves through its attendee to the AppInstanceUser who spoke; a speaker label such as "Speaker 2" is never the attribution. Results are archived from the media capture pipeline's transcription-message artifacts and appended to the conversation's archive, with Aurora projecting them. No client relays segments, because a client could relay anything. Live transcription transcribes the top two active talkers at any moment, so overlapping speech beyond two people is not captured. The pipeline is per meeting and carries its own cost beside the transcription stream; **OPEN:** that cost per meeting-hour, to be priced against the provider's pricing page and recorded beside the transcription prices in [DESIGN-MEETING-ONBOARDING-AND-INCIDENT-SUBAGENTS.md](./DESIGN-MEETING-ONBOARDING-AND-INCIDENT-SUBAGENTS.md), section 5.3. **Only the host starts transcription**, and every attendee is told it is running.
+| How long a transcript is kept | As long as its conversation: the family expires the platform's longest conversation lifetime after it is written, which is when the meeting's conversation expires. No setting of its own |
+| What classification it carries | The conversation's, in its key, so a reader's grant comes from the conversation's classification. There is no second boundary to design |
 
 So Phase 2 is far less gated than the non-goal implies. **Two things remain, and neither is a question about transcripts.**
 
-**Notice in the room**, which is an obligation rather than an open question: a visible indicator while recording runs, so somebody who objects can say so or leave. Matching the bar, not exceeding it.
+**Notice in the room** is built (C.9): the indicator while transcription runs, and a spoken notice on joining and on each start and stop, so somebody who objects can say so or leave.
 
 **The derived copy outlives its source, and that is the real residual.** The transcript expires with the conversation; the SUMMARY embedded into the retrieval corpus does not. [ADR-008](../../../design/decisions/008-embedding-cost-and-ttl-policy.md) decided **no TTL on embeddings**, deliberately, because the cost is negligible until index size affects retrieval latency. So a conversation can expire while its meeting summary stays answerable in the corpus indefinitely. That is an accepted state rather than an oversight, **but the monitoring ADR-008 named as its own trigger for revisiting was never built**, so the gate it set for itself cannot fire. Phase 2 is where that stops being hypothetical, because it is the first feature to write conversation-derived content into a corpus with no expiry.
 

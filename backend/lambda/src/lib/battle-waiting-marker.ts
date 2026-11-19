@@ -45,12 +45,36 @@ const BATTLE_WAITING_MARKER = /<!--battlewaiting:[^>]*-->/g;
  * Returns whether a marker was actually removed, so a caller can report honestly. `false` covers both
  * "never carried one" and "already cleared", which are the same thing to a caller.
  */
+/**
+ * A DUEL SIDE'S MESSAGE DECLARES THAT ITS TASK ENDED WITH THE DUEL. The task the message carries (`activeTask`) is
+ * stated `cancelled` with the ending `battle-ended`, which the archive records as the task's ending
+ * (`task_terminal`) and the evaluation reads as abandoned work. Only a task this end actually closed is declared;
+ * metadata that cannot be read, or that would outgrow the Amazon Chime SDK cap, is left as it was.
+ */
+export function declareDuelEnded(current: string | undefined, closedTaskIds: ReadonlySet<string>): string | undefined {
+  if (!current) return current;
+  try {
+    const meta = JSON.parse(current) as Record<string, any>;
+    const holder = meta?.analytics && typeof meta.analytics === 'object' ? meta.analytics : meta;
+    const taskId = holder?.activeTask?.taskId;
+    if (typeof taskId !== 'string' || !closedTaskIds.has(taskId)) return current;
+    holder.activeTask = { ...holder.activeTask, status: 'cancelled' };
+    holder.taskEnding = 'battle-ended';
+    const next = JSON.stringify(meta);
+    return next.length <= 1024 ? next : current;
+  } catch {
+    return current;
+  }
+}
+
 export async function clearBattleWaitingMarker(
   channelArn: string,
   messageId: string,
   botArn: string,
   /** The assistant's own client, when the caller speaks for it on a session of its own (DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION, Phase 1b). */
   client: Pick<ChimeSDKMessagingClient, 'send'> = messagingClient,
+  /** What the edit writes as the message's Metadata, given what it holds now. Default: unchanged. */
+  metadataFor: (current: string | undefined) => string | undefined = (current) => current,
 ): Promise<boolean> {
   try {
     const current = await client.send(new GetChannelMessageCommand({
@@ -73,7 +97,7 @@ export async function clearBattleWaitingMarker(
       MessageId: messageId,
       Content: encodeURIComponent(cleared),
       ChimeBearer: botArn,
-      Metadata: current.ChannelMessage?.Metadata,
+      Metadata: metadataFor(current.ChannelMessage?.Metadata),
     }));
     return true;
   } catch (err) {

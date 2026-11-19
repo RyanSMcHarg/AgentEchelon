@@ -16,8 +16,8 @@ import { loadContextSourceCatalog, type ContextSourceEntry } from '../../lib/con
 
 const CTX = {
   classification: 'standard',
-  attachmentsBucketArn: 'arn:aws:s3:::b',
-  attachmentsBucketName: 'b',
+  companyBucketArn: 'arn:aws:s3:::b',
+  companyBucketName: 'b',
   userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/UserProfile',
   userProfileTableName: 'UserProfile',
   region: 'us-east-1',

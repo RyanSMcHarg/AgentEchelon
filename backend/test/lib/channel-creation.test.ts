@@ -43,6 +43,7 @@ jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
 jest.mock('../../lambda/src/lib/channel-context-client', () => ({
   putChannelContext: (...args: unknown[]) => mockPutChannelContext(...args),
   getChannelContext: (...args: unknown[]) => mockGetChannelContext(...args),
+  recordChildConversation: () => Promise.resolve(),
 }));
 
 import {
@@ -360,7 +361,7 @@ describe('the drift child inherits the member identity hint', () => {
   // The partner's pool, declared in the trusted-issuer registry beside this deployment's own.
   beforeAll(() => {
     process.env.TRUSTED_ISSUERS = JSON.stringify([
-      { id: 'partner', kind: 'cognito-pool', pool: 'us-east-1_partner', iss: FED_ISS, subject: ['sub'], clearance: { oneChannel: 'basic', classifications: ['basic'] }, admin: false, groupsClaim: 'cognito:groups' },
+      { id: 'partner', kind: 'cognito-pool', pool: 'us-east-1_partner', iss: FED_ISS, subject: ['sub'], clearance: { fixed: ['basic'], classifications: ['basic'] }, admin: false, groupsClaim: 'cognito:groups' },
     ]);
   });
   afterAll(() => { delete process.env.TRUSTED_ISSUERS; });
@@ -771,6 +772,16 @@ describe('a conversation records the membership source its type enforces', () =>
     const meta = JSON.parse(commandOf('CreateChannel').input.Metadata);
     expect(meta.membershipSource).toBe('group:ops');
     expect(meta.conversationType).toBeUndefined();
+  });
+
+  it('a meeting\'s conversation names its room in Metadata, as the conversation list\'s display hint', async () => {
+    await createConversationFromEvent({ ...EVENT, typeKey: 'meeting', parentChannelArn: `${APP_INSTANCE}/channel/conv-ops-room` } as any);
+    expect(JSON.parse(commandOf('CreateChannel').input.Metadata).meetingOf).toBe('conv-ops-room');
+  });
+
+  it('a room an event opens from a parent names no meeting', async () => {
+    await createConversationFromEvent({ ...EVENT, parentChannelArn: `${APP_INSTANCE}/channel/conv-team` } as any);
+    expect(JSON.parse(commandOf('CreateChannel').input.Metadata).meetingOf).toBeUndefined();
   });
 
   it('stamps nothing for an ordinary conversation, whose membership is manual', async () => {

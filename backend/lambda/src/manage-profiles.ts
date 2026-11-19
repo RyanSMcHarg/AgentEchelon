@@ -4,8 +4,9 @@
  * capability (§7 / plan item A14). Routes on the existing admin API — NO new gateway (§3).
  *
  *   GET  /profiles                 — list every profile: versions, active pointer, draft state
- *   POST /profiles/version         — {profileName} clone the active version into a fresh draft
- *   POST /profiles/draft           — {profileName, patch} edit the draft's runtime-editable fields
+ *   POST /profiles/version         — {profileName, replaceConfigId?} clone the active version into a fresh draft; a draft
+ *                                    that exists is replaced only when replaceConfigId names it (409 DRAFT_EXISTS)
+ *   POST /profiles/draft           — {profileName, patch, configId} edit the draft named by configId (409 DRAFT_CHANGED)
  *   POST /profiles/validate        — {profileName} validate the draft (schema + §7 model-ARN boundary)
  *   POST /profiles/golden-run      - {profileName} run the draft against its golden set, beside the active version (ADR-065)
  *   POST /profiles/golden-gate     - {profileName} the set's size and the draft's latest run, as Activate reads them
@@ -14,15 +15,24 @@
  *   POST /profiles/golden-set-retire-generation - {profileName, uploadId} retire the capability entries of one generation
  *   POST /profiles/golden-set-batch - {profileName, batchId} how an upload or a generation ended
  *   POST /profiles/golden-set-generate - {profileName, intents?, perIntent?} entries written from the draft's intent pack (decision 8)
- *   POST /profiles/activate        — {profileName} promote the draft to a new active version, refused by the golden gate
+ *   POST /profiles/activate        — {profileName, configId} promote the draft the activator reviewed, refused by the golden gate
  *   POST /profiles/rollback        — {profileName, version} move `active` onto an existing version
  *   POST /profiles/discard         - {profileName, configId} delete the draft, only if it is still that configId
  *   POST /profiles/export          — {profileName, version?} serialize an instance-agnostic manifest
- *   POST /profiles/import          — {manifest, targetProfileName} validate + land as the target's draft (never active)
+ *   POST /profiles/import          — {manifest, targetProfileName, replaceConfigId?} validate + land as the target's draft
+ *                                    (never active); a draft that exists is replaced only when replaceConfigId names it
+ *   POST /profiles/process-export  - {profileName, processName, draft?} one process of the active (or draft) version, as
+ *                                    its own manifest with what it requires of a deployment (SPEC-PROCESSES P13)
+ *   POST /profiles/process-import  - {manifest, profileName?, replaceConfigId?} check what the process requires against this
+ *                                    deployment and land it in the owner's draft (never active), or refuse with codes
  *
  * The mutations are the write path; the async-processor role is read-only on /assistant/* (§7). Every
  * mutation is audited with the server-verified caller sub. The management API is the ONLY sanctioned
  * write path to the profile SSM namespace.
+ *
+ * A TEAM ROUTE (`/admin/assistants/{assistant}/profiles/...`) writes on its team writer session, tagged with the path's
+ * assistant, so IAM holds each of its writes to that assistant's versions, draft, advertisement, bodies and golden-set
+ * hand-overs behind the ownership check here (`team-scoped-writer.ts`).
  */
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
@@ -32,6 +42,7 @@ import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
 import { createInfraResolver, type InfraPlacement } from './lib/profile-infra.js';
 import { bodyBucket } from './lib/profile-bodies.js';
+import { directOpRefused, invokedAliasOf } from './lib/profile-direct-callers.js';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { IAMClient } from '@aws-sdk/client-iam';
 import { LexModelsV2Client } from '@aws-sdk/client-lex-models-v2';
@@ -86,21 +97,31 @@ import {
   servedIntentKeys,
   deploymentPackRaw,
   audit,
+  DraftConflictError,
+  assertDraftReplaceable,
+  requestConfigId,
+  withDeclaredWorkflows,
   type FirstDraftResult,
 } from './lib/profile-lifecycle.js';
 import { goldenGateOutcome, pastGateDecision, effectiveMinimum, type GoldenGateRead } from './lib/golden-gate.js';
-import { readGoldenUpload, uploadIdFor, goldenUploadPrefix, GOLDEN_SET_CAPACITY } from './lib/golden-upload.js';
+import { readGoldenUpload, uploadIdFor, goldenUploadPrefix, goldenUploadBucket, GOLDEN_SET_CAPACITY } from './lib/golden-upload.js';
 import {
   generationIntentOf, GENERATE_MAX_INTENTS, GENERATE_PER_INTENT_DEFAULT, GENERATE_PER_INTENT_MAX,
 } from './lib/golden-generate.js';
 import { randomUUID } from 'crypto';
 import { exportManifest, importManifest, ProfileManifestError, type TargetContextSource } from './lib/profile-manifest.js';
+import {
+  buildProcessManifest, mergeRequirements, processRequirementErrors, processRequirementsOf, processTargetOf, readProcessManifest,
+  versionProcessRefusals,
+} from './lib/process-manifest.js';
+import { versionProcessesErrors } from './lib/event-workflow.js';
 import { startingPointErrors, startingPointOf, withStartingChoices, type StartingPoint, type StartingChoices } from './lib/starting-point.js';
 // The canonical tool registry, SERVED rather than mirrored. See the GET handler for why.
 import { TOOL_REGISTRY } from './lib/tool-registry.js';
 import { classificationCatalog, type ClassificationCatalog } from './lib/classification-catalog.js';
 import { fieldDecisions } from './lib/profile-field-decisions.js';
-import { requireOwnedAssistant, isRefusal } from './lib/assistant-scope.js';
+import { requireOwnedAssistant, isRefusal, scopedAssistant, refuseTeamSessionOnAdminRoute } from './lib/assistant-scope.js';
+import { onTeamRoute, withTeamWriterAlt, writesAsTeam, TeamWriterRefused } from './lib/team-scoped-writer.js';
 import { DUEL_ROLE, challengerOf } from './lib/alt-assignment.js';
 import { loadProfileRegistry } from '../../lib/profile-registry';
 import { rosterTargets } from './lib/roster-targets.js';
@@ -108,7 +129,9 @@ import { displayNameHolder } from './lib/display-names-in-use.js';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
-const ssm = new SSMClient({ region: AWS_REGION });
+// A TEAM ROUTE'S WRITES GO OUT ON ITS TEAM WRITER SESSION, whose grants name the path's assistant alone
+// (`team-scoped-writer.ts`); reads, and every write on an administrator's route, go out on this function's own role.
+const ssm = writesAsTeam(new SSMClient({ region: AWS_REGION }), 'ssm', (credentials) => new SSMClient({ region: AWS_REGION, credentials }));
 
 /**
  * A RUNTIME ASSISTANT IS KNOWN HERE ONLY WHILE THE DIRECTORY SAYS IT IS ACTIVE (ADR-048).
@@ -124,7 +147,7 @@ async function learnRuntimeAssistant(name: string): Promise<boolean> {
     forgetRuntimeAssistant(name);
     return false;
   }
-  rememberRuntimeAssistant(name, found.entry.classification);
+  rememberRuntimeAssistant(name, found.entry.classification, found.entry.role);
   rememberRuntimeSeed(found.seed);
   runtimeEntries.set(name, found.entry);
   return true;
@@ -247,6 +270,8 @@ function describeAssistant<T extends { profileName: string; activeDisplayName?: 
   // configuration, read by the router), so it is shown the way the deployed channel flow is.
   const deployedTurnLimit = consoleCreated ? entry?.descriptor?.rateLimitPerHour : declared?.rateLimitPerHour;
   const displayName = listing.activeDisplayName || declared?.displayName || entry?.displayName;
+  // WHAT "INHERIT" RESTORES: the applier puts the directory entry's name back, or the assistant id when it holds none.
+  const provisionedDisplayName = entry ? (entry.displayName || n) : (declared?.displayName || n);
   // HOW TURNS ARE CLASSIFIED, read where the router reads it: the directory's descriptor for a console-created
   // assistant, the deployment's profile for a declared one. Not part of a version.
   const classifierMode = consoleCreated ? entry?.descriptor?.classifierMode : declared?.classifierMode;
@@ -261,6 +286,7 @@ function describeAssistant<T extends { profileName: string; activeDisplayName?: 
     // One owner when every bot agrees; null when none owns it or they disagree. Omitted when unread.
     ...(identities ? { ownerTeam: owners.length === 1 ? owners[0] : null } : {}),
     ...(displayName ? { displayName } : {}),
+    provisionedDisplayName,
     ...(typeof deployedTurnLimit === 'number' ? { deployedTurnLimit } : {}),
   };
 }
@@ -281,6 +307,20 @@ async function nameTakenRefusal(profileName: string, displayName: string): Promi
 }
 
 /** Whether an assistant has an active version. */
+/**
+ * A DRAFT WHOSE PROCESSES NEED WHAT THIS DEPLOYMENT NO LONGER HAS IS NOT ACTIVATED (SPEC-PROCESSES P13): each process's
+ * requirements are computed from the draft itself and checked as an import checks them, so a role withdrawn or an
+ * assistant's intent dropped since the process was imported is refused with the same codes. Null where it may activate.
+ */
+async function processActivationRefusal(profileName: string, draft: ProfileDefinition): Promise<{ status: number; body: Record<string, unknown> } | null> {
+  const version = bodyFrom(draft);
+  if (!version.processes || !Object.keys(version.processes).length) return null;
+  const checked = await versionProcessRefusals(ssm, SSM_ROOT, profileName, version);
+  if ('error' in checked) return { status: 503, body: { error: checked.error, code: 'PROCESS_TARGET_UNREADABLE' } };
+  if (!checked.refusals.length) return null;
+  return { status: 409, body: { error: 'This deployment no longer has what the draft\'s processes need', code: 'PROCESS_REQUIREMENTS_UNMET', refusals: checked.refusals } };
+}
+
 async function hasActiveVersion(name: string): Promise<boolean> {
   try {
     await ssm.send(new GetParameterCommand({ Name: `${definitionParamName(SSM_ROOT, name)}:active` }));
@@ -449,7 +489,12 @@ async function generationIntents(profileName: string): Promise<IntentDef[]> {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 let uploadS3Client: S3Client | undefined;
-const uploadS3 = (): S3Client => (uploadS3Client ??= new S3Client({ region: process.env.AWS_REGION || 'us-east-1' }));
+// A team route hands an upload over on its team writer session, which writes `golden-uploads/*/<its assistant>/*` alone.
+const uploadS3 = (): S3Client => (uploadS3Client ??= writesAsTeam(
+  new S3Client({ region: process.env.AWS_REGION || 'us-east-1' }),
+  's3',
+  (credentials) => new S3Client({ region: process.env.AWS_REGION || 'us-east-1', credentials }),
+));
 
 /** The API's own sentence for each upload refusal, for a caller with no console; the console words the code. */
 const UPLOAD_REFUSAL_TEXT: Record<string, string> = {
@@ -499,8 +544,8 @@ async function startGoldenRun(profileName: string, actor: string): Promise<{ sta
   const seed = isRuntimeAssistant(profileName) ? (await readRuntimeAssistant(ssm, SSM_ROOT, profileName))?.seed : undefined;
   // THE RUN'S INPUT TRAVELS AS AN OBJECT, NOT IN THE EVENT: an async invocation's request is repeated in the record its
   // destination sends to EventBridge, which has a size limit and every rule on the bus reads. The event names the key.
-  const bucket = bodyBucket();
-  if (!bucket) return { status: 503, body: { error: 'This deployment has no body bucket to hand a run over in', code: 'GOLDEN_RUN_UNAVAILABLE' } };
+  const bucket = goldenUploadBucket();
+  if (!bucket) return { status: 503, body: { error: 'This deployment has no bucket to hand a run over in', code: 'GOLDEN_RUN_UNAVAILABLE' } };
   const inputKey = `${goldenUploadPrefix(classification, profileName)}runs/${runId}.json`;
   const put = await uploadS3().send(new PutObjectCommand({
     Bucket: bucket, Key: inputKey, ContentType: 'application/json',
@@ -643,6 +688,9 @@ async function contextSourceCatalogFor(
       ...(s.trust === 'platform' || s.trust === 'operator' || s.trust === 'member' ? { trust: s.trust } : {}),
       ...(typeof s.describesPerson === 'boolean' ? { describesPerson: s.describesPerson } : {}),
       ...(s.availability === 'always' || s.availability === 'identity-settled' || s.availability === 'conversation-settled' ? { availability: s.availability } : {}),
+      // What decides which roles can read it, for Validate's warning on a source the assistant's role cannot read.
+      ...(typeof s.type === 'string' ? { type: s.type } : {}),
+      ...(typeof s.prefix === 'string' ? { prefix: s.prefix } : {}),
     }));
 }
 
@@ -809,6 +857,11 @@ export interface DeriveExperimentVersionsEvent {
     experiment: Record<string, unknown>;
     /** The person arming it, for the audit line. */
     actor: string;
+    /**
+     * The assistant a team route's path names, when the experiment is armed on one. The derivation then writes as that
+     * assistant's team writer (`team-scoped-writer.ts`) and derives for that assistant alone.
+     */
+    teamAssistant?: string;
   };
 }
 
@@ -953,6 +1006,10 @@ export async function deriveExperimentVersions(
   const assignment = roleForCandidate(exp, '');
   const baseProfile = assignment ? profiles.roleAssistantName(assignment.classification, assignment.role) : undefined;
   if (!assignment || !baseProfile) return fail(400, 'The experiment names no assistant role this deployment declares', 'NO_ALT_FOR_ROLE');
+  // ARMED ON A TEAM ROUTE, THE EXPERIMENT IS THAT ASSISTANT'S: its candidate is derived for no other.
+  if (req?.teamAssistant !== undefined && baseProfile !== req.teamAssistant) {
+    return fail(403, 'This route derives only for the assistant it names', 'ASSISTANT_MISMATCH');
+  }
   if (assignment.classification !== runsIn[0]) {
     return fail(400, `The experiment's assistant serves ${assignment.classification}, not ${runsIn[0]}`, 'VARIANT_PROFILE_REF_CLASSIFICATION');
   }
@@ -1001,10 +1058,11 @@ export async function deriveExperimentVersions(
   if (imageRefusal) return fail(409, imageRefusal, 'BATTLE_SIDE_HAS_NO_IMAGE_MODEL');
   const prior = treatment.altPin as Partial<SidePin> | undefined;
   const existingVersion = prior?.profileName === altProfile && Number.isInteger(prior.version) ? prior.version : undefined;
-  const r = await publishVariantVersion(
+  // The candidate lands in the alt of the base's own role; a team writer is bound to that alt for this write alone.
+  const r = await withTeamWriterAlt(altProfile, () => publishVariantVersion(
     ssm, SSM_ROOT, { baseProfile, targetProfile: altProfile }, patch, catalog(), actor,
     { experimentId, variantId }, existingVersion, contextSourceCatalogFor, guardrailCatalogFor,
-  );
+  ));
   return { ok: true, controlPin, altPin: { profileName: r.profileName, version: r.version, configId: r.configId } };
 }
 
@@ -1018,6 +1076,8 @@ export interface PromoteCandidateEvent {
     experiment: Record<string, unknown>;
     /** The person promoting, for the audit line. */
     actor: string;
+    /** The assistant a team route's path names, when promoted on one: the promotion writes as its team writer, into it alone. */
+    teamAssistant?: string;
   };
 }
 
@@ -1054,6 +1114,9 @@ export async function promoteExperimentCandidate(req: PromoteCandidateEvent['aeP
   if (!live || controlPin.profileName !== live) {
     return fail(409, "The control is not the live assistant's version, so the experiment records a decision and promotes nothing", 'PROMOTION_CONTROL_NOT_LIVE');
   }
+  if (req?.teamAssistant !== undefined && live !== req.teamAssistant) {
+    return fail(403, 'This route promotes only into the assistant it names', 'ASSISTANT_MISMATCH');
+  }
   try {
     const r = await promoteCandidate(ssm, SSM_ROOT, {
       liveProfile: live,
@@ -1075,7 +1138,36 @@ export async function promoteExperimentCandidate(req: PromoteCandidateEvent['aeP
   }
 }
 
-export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
+/**
+ * The assistant a request writes as, when it is a team's: the `{assistant}` of a team route's path, or the assistant an
+ * experiment armed or promoted on a team route names (the experiments handler sends its own route's path assistant).
+ */
+function teamAssistantOf(event: APIGatewayProxyEvent): string | null {
+  if (event.httpMethod) return scopedAssistant(event);
+  const direct = event as unknown as Partial<DeriveExperimentVersionsEvent & DeriveBattleSidesEvent & PromoteCandidateEvent>;
+  const team = (direct.aeDeriveExperimentVersions ?? direct.aeDeriveBattleSides ?? direct.aePromoteCandidate)?.teamAssistant;
+  return typeof team === 'string' ? team : null;
+}
+
+/**
+ * A TEAM'S REQUEST WRITES AS ITS ASSISTANT'S TEAM WRITER (`team-scoped-writer.ts`): every write below goes out on a
+ * session whose grants name that assistant, behind the ownership check the request makes. An administrator's request
+ * writes on this function's own role.
+ */
+export const handler = async (event: APIGatewayProxyEvent, context?: { invokedFunctionArn?: string }): Promise<APIGatewayProxyResult> =>
+  onTeamRoute(teamAssistantOf(event), () => handleProfiles(event, context));
+
+const handleProfiles = async (event: APIGatewayProxyEvent, context?: { invokedFunctionArn?: string }): Promise<APIGatewayProxyResult> => {
+  // EACH DIRECT OPERATION IS SERVED ONLY THROUGH ITS CALLER'S ALIAS (`profile-direct-callers.ts`): IAM grants each
+  // caller its own alias, and Lambda names the alias it was invoked through, so a caller asks for its own
+  // operations and no other's.
+  const refusedOp = event.httpMethod ? undefined : directOpRefused(event, context?.invokedFunctionArn);
+  if (refusedOp) {
+    console.warn('[manage-profiles] a direct operation came through an alias that does not serve it', {
+      op: refusedOp, alias: invokedAliasOf(context?.invokedFunctionArn) || '(unqualified)',
+    });
+    return { ok: false, status: 403, error: `${refusedOp} is not served through this alias`, code: 'DIRECT_OP_REFUSED' } as unknown as APIGatewayProxyResult;
+  }
   // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
   await loadProfileRegistry();
   // THE EXPERIMENTS HANDLER'S DIRECT INVOKES, never an API Gateway request (which always carries a method).
@@ -1158,6 +1250,10 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
     console.warn('[manage-profiles] caller lacks manage-profiles capability', { sub });
     return respond(403, { error: 'manage-profiles capability required' });
   }
+  // A TEAM SESSION READS AND WRITES ONLY ON ITS TEAM ROUTES, never on the administrator's, where a body names
+  // any assistant.
+  const offRoute = refuseTeamSessionOnAdminRoute(event, origin);
+  if (offRoute) return offRoute;
 
   // A TEAM MEMBER'S ROUTE NAMES ONE ASSISTANT (SPEC-ADMIN-CONSOLE FR48). Every read and write below is
   // bound to it: the listing is that assistant alone, and a body naming another is refused rather
@@ -1308,8 +1404,50 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
       // The target was required above; scoped, it is the assistant the route names, whatever the manifest says.
       if (path.endsWith('/import')) {
+        await assertDraftReplaceable(ssm, SSM_ROOT, importTarget, requestConfigId(body.replaceConfigId));
         const draft = await importManifest(ssm, SSM_ROOT, body.manifest, importOptions(sub, { targetProfileName: importTarget }));
         return respond(200, { imported: draft.profileName, configId: draft.configId, landedAs: 'draft' });
+      }
+
+      // ── A PROCESS LANDS IN ITS OWNER'S DRAFT ONLY WHERE THIS DEPLOYMENT HAS WHAT IT NEEDS (SPEC-PROCESSES P13) ──────────
+      //
+      // The owner is the assistant the request names (a team route's own), else the manifest's. What the process requires is
+      // the manifest's word joined with what the draft's own linked workflows require, checked against this deployment
+      // before anything is written; every refusal comes back as a code with the missing names, and nothing is written.
+      if (path.endsWith('/process-import')) {
+        const read = readProcessManifest(body.manifest);
+        if ('refusals' in read) return respond(422, { error: 'The process manifest is refused', code: 'PROCESS_MANIFEST_REFUSED', refusals: read.refusals });
+        const m = read.manifest;
+        const owner = profileName || m.ownerProfileName;
+        await learnRuntimeAssistant(owner);
+        if (!isKnownProfile(owner) || profiles.roleOfAlt(owner)) {
+          return respond(422, { error: 'The process names no assistant this deployment holds', code: 'PROCESS_MANIFEST_REFUSED', refusals: [{ code: 'PROCESS_OWNER_UNKNOWN', assistant: owner }] });
+        }
+        const existing = await getDraft(ssm, SSM_ROOT, owner);
+        if (existing) await assertDraftReplaceable(ssm, SSM_ROOT, owner, requestConfigId(body.replaceConfigId));
+        // A DRAFT CLONED FROM THE ACTIVE VERSION DECLARES EVERY MULTI-STEP INTENT'S WORKFLOW (`createDraft`), so a process that links a
+        // request-started workflow is checked against the workflows the draft it lands in will hold.
+        const base = existing ? bodyFrom(existing) : await withDeclaredWorkflows(bodyFrom(await hydrateBodies(await storedActiveDefinition(ssm, SSM_ROOT, owner))), ssm, SSM_ROOT, owner);
+        const landed = { ...base, processes: { ...(base.processes ?? {}), [m.processName]: m.process } };
+        const requires = mergeRequirements(m.requires, processRequirementsOf(m.process, landed.eventWorkflows, landed.intentWorkflows));
+        const target = await processTargetOf(ssm, SSM_ROOT, owner, landed, requires);
+        if ('error' in target) return respond(503, { error: target.error, code: 'PROCESS_TARGET_UNREADABLE' });
+        const refusals = processRequirementErrors(requires, target);
+        const errors = refusals.some((r) => r.code === 'PROCESS_REQ_WORKFLOW') ? [] : versionProcessesErrors(landed.processes, landed.eventWorkflows, landed.intentWorkflows);
+        if (refusals.length || errors.length) {
+          return respond(422, { error: 'This deployment does not have what the process needs', code: 'PROCESS_REQUIREMENTS_UNMET', refusals, errors });
+        }
+        // WRITTEN ONLY NOW: into the draft that exists, or a draft cloned from the active version, which is discarded again
+        // if the edit is refused, so a refused import leaves no draft behind.
+        const created = existing ? null : await createDraft(ssm, SSM_ROOT, owner, sub);
+        try {
+          const draft = await editDraft(ssm, SSM_ROOT, owner, { processes: landed.processes }, sub, { configId: (existing ?? created)!.configId });
+          audit('process-import', sub, owner, { process: m.processName, contentHash: m.contentHash, from: m.provenance });
+          return respond(200, { imported: m.processName, profileName: owner, configId: draft.configId, landedAs: 'draft' });
+        } catch (err) {
+          if (created) await discardDraft(ssm, SSM_ROOT, owner, created.configId, sub).catch(() => undefined);
+          throw err;
+        }
       }
 
       // A battle's candidate names its role through the experiment's challenger, so `/variant-version` may
@@ -1321,6 +1459,8 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       }
 
       if (path.endsWith('/version')) {
+        // A NEW VERSION REPLACES A DRAFT ONLY BY NAME: the draft that exists is someone's work in progress.
+        await assertDraftReplaceable(ssm, SSM_ROOT, profileName, requestConfigId(body.replaceConfigId));
         // A RUNTIME ASSISTANT THAT HAS NEVER BEEN ACTIVATED starts again from its classification's defaults
         // (`seedFirstDraft`): there is no active version to clone, and a draft cloned from its record's seed
         // alone would carry no intents.
@@ -1337,13 +1477,17 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
           const taken = await nameTakenRefusal(profileName, patch.displayName);
           if (taken) return respond(409, taken);
         }
-        const draft = await editDraft(ssm, SSM_ROOT, profileName, patch, sub);
+        // Held to the draft the editor was showing: a draft saved since is refused, never merged over.
+        // A guardrail key is stored as the id it names, read against the catalog import reads (`guardrailCatalogFor`).
+        const draft = await editDraft(ssm, SSM_ROOT, profileName, patch, sub, { configId: requestConfigId(body.configId) }, guardrailCatalogFor);
         return respond(200, { profileName, draftConfigId: draft.configId });
       }
       if (path.endsWith('/validate')) {
         // The same catalog reader import uses, so a key that would be rejected on the way IN to
         // another instance is also rejected on the way in here.
-        const { errors, configId, warnings, errorDetails } = await validateDraft(ssm, SSM_ROOT, profileName, catalog(), contextSourceCatalogFor, guardrailCatalogFor);
+        // The name check is Activate's own (`nameTakenRefusal`), so Validate refuses a name Activate would.
+        const { errors, configId, warnings, errorDetails } = await validateDraft(ssm, SSM_ROOT, profileName, catalog(), contextSourceCatalogFor, guardrailCatalogFor,
+          async (displayName) => (await nameTakenRefusal(profileName, displayName))?.error ?? null);
         return respond(200, { profileName, valid: errors.length === 0, errors, configId, ...(warnings?.length ? { warnings } : {}), ...(errorDetails?.length ? { errorDetails } : {}) });
       }
       if (path.endsWith('/preview-run')) {
@@ -1436,8 +1580,8 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
         // THE ENTRIES TRAVEL AS AN OBJECT, NOT IN THE EVENT: an async invocation's request is repeated in the record its
         // destination sends to EventBridge, and an upload's text has not been de-identified yet. The run function reads the
         // object and removes that version of it; a lifecycle rule removes anything left within a day.
-        const bucket = bodyBucket();
-        if (!bucket) return respond(503, { error: 'This deployment has no body bucket to hand an upload over in', code: 'GOLDEN_RUN_UNAVAILABLE' });
+        const bucket = goldenUploadBucket();
+        if (!bucket) return respond(503, { error: 'This deployment has no bucket to hand an upload over in', code: 'GOLDEN_RUN_UNAVAILABLE' });
         const entriesKey = `${goldenUploadPrefix(classification, profileName)}${uploadId}.json`;
         const put = await uploadS3().send(new PutObjectCommand({
           Bucket: bucket, Key: entriesKey, Body: JSON.stringify(read.entries), ContentType: 'application/json',
@@ -1454,22 +1598,38 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
         return respond(202, { profileName, batchId: uploadId, kind: 'upload', status: 'running', entries: read.entries.length, startedAfter });
       }
       if (path.endsWith('/activate')) {
+        // ACTIVATION PROMOTES THE DRAFT THE ACTIVATOR REVIEWED, named by its configId. A draft replaced since (an edit, an
+        // import, a new version) is refused with the configId that is there now, and nothing serving changes.
+        const reviewed = requestConfigId(body.configId);
+        if (!reviewed) {
+          return respond(409, { error: 'An activation names the configId of the draft it promotes', code: 'CONFIG_ID_REQUIRED' });
+        }
+        const pendingDraft = await getDraft(ssm, SSM_ROOT, profileName);
+        if (!pendingDraft) return respond(404, { error: `'${profileName}' has no draft to activate`, code: 'NO_DRAFT' });
+        if (pendingDraft.configId !== reviewed) {
+          return respond(409, {
+            error: 'The draft was saved again since it was reviewed; review the newer draft before activating',
+            code: 'DRAFT_CHANGED',
+            configId: pendingDraft.configId,
+          });
+        }
         // CHECKED AGAIN AT ACTIVATION: another assistant may have taken the name since the draft was edited,
         // and an import lands a name without passing the edit.
-        const pendingDraft = await getDraft(ssm, SSM_ROOT, profileName);
-        const pending = pendingDraft?.displayName;
+        const pending = pendingDraft.displayName;
         if (pending) {
           const taken = await nameTakenRefusal(profileName, pending);
           if (taken) return respond(409, taken);
         }
+        // WHAT THE DRAFT'S PROCESSES NEED IS CHECKED AGAIN (SPEC-PROCESSES P13): an assistant, a role or a template may have
+        // gone since the process was imported or written.
+        const processRefusal = await processActivationRefusal(profileName, pendingDraft);
+        if (processRefusal) return respond(processRefusal.status, processRefusal.body);
         // THE GOLDEN SET'S GATE (ADR-065): a draft that fails a regression entry, or was not run against a set that has
         // one, is refused here, whatever the console showed. Activation is the gate; a caller can skip the console.
-        if (pendingDraft) {
-          const outcome = goldenGateOutcome(await readGoldenGate(profileName, pendingDraft), pendingDraft.configId);
-          if (!outcome.proceed) return respond(409, { error: outcome.error, code: outcome.code, params: outcome.params, ...(outcome.failures ? { failures: outcome.failures } : {}) });
-        }
-        // The configId the gate checked: a draft saved since is refused, not activated unrun.
-        const r = await activateDraft(ssm, SSM_ROOT, profileName, catalog(), sub, contextSourceCatalogFor, guardrailCatalogFor, pendingDraft?.configId);
+        const outcome = goldenGateOutcome(await readGoldenGate(profileName, pendingDraft), pendingDraft.configId);
+        if (!outcome.proceed) return respond(409, { error: outcome.error, code: outcome.code, params: outcome.params, ...(outcome.failures ? { failures: outcome.failures } : {}) });
+        // The configId reviewed and gated: a draft saved since is refused, not activated unrun.
+        const r = await activateDraft(ssm, SSM_ROOT, profileName, catalog(), sub, contextSourceCatalogFor, guardrailCatalogFor, reviewed);
         // The identity carries the name a person reads in the room; the version carries the one the
         // console reads. Activating has to move both or the two disagree until someone notices.
         const identity = await applyNameToIdentity(profileName, r.displayName);
@@ -1492,6 +1652,9 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
           const taken = await nameTakenRefusal(profileName, pendingDraft.displayName);
           if (taken) return respond(409, taken);
         }
+        // Past the golden gate only: what the draft's processes need is still checked.
+        const processRefusal = await processActivationRefusal(profileName, pendingDraft);
+        if (processRefusal) return respond(processRefusal.status, processRefusal.body);
         const gate = await readGoldenGate(profileName, pendingDraft);
         const decision = pastGateDecision(gate, pendingDraft.configId, body);
         if (!decision.allow) {
@@ -1623,7 +1786,8 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
         }
         const refusal = candidateRefusal(exp, variantId, assignment.classification, patch);
         if (refusal) return respond(refusal.status, { error: refusal.error, code: refusal.code });
-        const r = await publishVariantVersion(
+        // On a team route the candidate is written as the team writer bound to this alt, the alt of the path assistant's role.
+        const r = await withTeamWriterAlt(targetProfile, () => publishVariantVersion(
           ssm, SSM_ROOT, { baseProfile, targetProfile },
           patch,
           catalog(), sub,
@@ -1632,7 +1796,7 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
           // The SAME catalog readers `/validate` and `/activate` pass, so a selection this deployment
           // cannot resolve is refused here exactly as it is on the editor's own path.
           contextSourceCatalogFor, guardrailCatalogFor,
-        );
+        ));
         // NO `applyNameToIdentity` HERE, and that is the difference from `/activate`. The identity
         // wears the name of what is SERVING; a candidate serves nobody, so renaming the assistant
         // after one would put a duel side's name on the live assistant.
@@ -1645,12 +1809,32 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
         const manifest = await exportManifest(ssm, SSM_ROOT, profileName, version, guardrailCatalogFor, contextSourceCatalogFor);
         return respond(200, { manifest });
       }
+      if (path.endsWith('/process-export')) {
+        // ONE PROCESS OF THE ACTIVE (OR DRAFT) VERSION, read as an export reads it, with what it requires computed from that
+        // version's linked workflows (SPEC-PROCESSES P13).
+        const processName = typeof body.processName === 'string' ? body.processName : '';
+        const read = await exportManifest(ssm, SSM_ROOT, profileName, body.draft === true ? 'draft' : undefined);
+        const manifest = buildProcessManifest({ ownerProfileName: profileName, processName, body: read.body, provenance: read.provenance });
+        if (!manifest) return respond(404, { error: `'${profileName}' declares no process '${processName}'`, code: 'PROCESS_NOT_FOUND', refusals: [{ code: 'PROCESS_NOT_FOUND', process: processName }] });
+        return respond(200, { manifest });
+      }
     }
 
     return respond(404, { error: 'Not found' });
   } catch (err) {
+    if (err instanceof DraftConflictError) {
+      return respond(409, { error: err.message, code: err.code, configId: err.configId });
+    }
     if (err instanceof ProfileValidationError || err instanceof ProfileManifestError) {
       return respond(422, { error: err.message, errors: (err as ProfileValidationError).errors });
+    }
+    // SSM REFUSED A WRITE THAT LANDED SECONDS AFTER ANOTHER ON THE SAME PARAMETER, so nothing was written and the caller saves again.
+    if ((err as { name?: string })?.name === 'TooManyUpdates') {
+      return respond(503, { error: 'Another save of this profile is landing; try again in a few seconds', code: 'PROFILE_WRITE_BUSY' });
+    }
+    if (err instanceof TeamWriterRefused) {
+      console.error('[manage-profiles] the team writer session could not be opened', { reason: err.reason });
+      return respond(503, { error: 'The team\'s write session could not be opened; nothing was written', code: 'TEAM_WRITER_UNAVAILABLE' });
     }
     console.error('[manage-profiles] error:', err);
     return respond(500, { error: 'Internal error' });

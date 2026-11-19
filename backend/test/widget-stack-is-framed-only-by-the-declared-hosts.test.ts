@@ -19,7 +19,7 @@ const ALL = ['basic', 'standard', 'premium', 'admin'];
 const ISSUERS = [
   { id: 'deployment', kind: 'cognito-pool', pool: 'self', clearance: { groups: true, classifications: ALL }, admin: true },
   { id: 'guest', kind: 'guest', clearance: { fixed: ['guest'], classifications: ['guest'] }, allowedOrigins: [SITE] },
-  { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', audience: 'host-client', allowedOrigins: [ORG, SITE], clearance: { oneChannel: 'basic', classifications: ['basic'] } },
+  { id: 'host', kind: 'cognito-pool', pool: 'us-east-1_HostApp', audience: 'host-client', allowedOrigins: [ORG, SITE], clearance: { fixed: ['basic'], classifications: ['basic'] } },
 ];
 
 function policyOf(template: Template): { csp: string; config: Record<string, any> } {

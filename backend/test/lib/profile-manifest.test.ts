@@ -89,12 +89,10 @@ describe('profile manifest P3', () => {
     expect(r.version).toBe(1);
   });
 
-  it('a manifest cannot carry task graphs onto a version, and the OLD wait spelling still resolves', async () => {
-    // THIS TEST CHANGED SHAPE WITH THE DECISION IT GUARDS. It used to prove that a version's own
-    // `machines` survived export, import and activation - the round trip that kept a deployment's
-    // legacy machine working. Task graphs are global workflows now: a version
-    // neither defines nor carries them, so the round trip it protected no longer exists, and IMPORT is
-    // the other door into per-assistant graphs that had to be closed alongside the edit path.
+  it('a manifest\'s legacy top-level machines are dropped, and the OLD wait spelling still resolves', async () => {
+    // The top-level `machines` field is legacy. A version's own machines ride its pack (`intentPack.machines`,
+    // ADR-066) and travel through export and import with it (an-intents-workflow-rides-the-version.test.ts); the
+    // top-level field is dropped on import, as `bodyFrom` drops it everywhere.
     //
     // What survives is the half that still matters: a machine whose wait is spelled the OLD way must
     // still resolve to the same reference the declared form does (SPEC-TASK-STATE-TRANSITIONS 12.6),

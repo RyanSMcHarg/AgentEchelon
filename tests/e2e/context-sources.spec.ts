@@ -38,6 +38,7 @@ import {
 } from './helpers/context-source-metrics';
 import { SSM_ROOT } from './helpers/stack-prefix';
 import { ADMIN_API_URL, adminUrl, profileActionUrl } from './helpers/api-urls';
+import { replacingDraft, draftIdOf } from './helpers/profile-draft';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
 guardConsoleErrors();
@@ -103,9 +104,9 @@ test.describe.serial('context sources reach a live turn', () => {
         signedAnalyticsPost(profileActionUrl(action), idToken, body);
 
       originalActiveVersion = activeStandardVersion();
-      await post('/version', { profileName: PROFILE_NAME });
-      await post('/draft', { profileName: PROFILE_NAME, patch: { contextSources: [SOURCE_KEY] } });
-      const activated = await post('/activate', { profileName: PROFILE_NAME });
+      const started = await replacingDraft((b) => post('/version', b), { profileName: PROFILE_NAME });
+      const edited = await post('/draft', { profileName: PROFILE_NAME, patch: { contextSources: [SOURCE_KEY] }, configId: draftIdOf(started) });
+      const activated = await post('/activate', { profileName: PROFILE_NAME, configId: draftIdOf(edited) });
       expect(
         activated?.version,
         `could not select '${SOURCE_KEY}' on the ${PROFILE_NAME} profile: ${JSON.stringify(activated)}`,

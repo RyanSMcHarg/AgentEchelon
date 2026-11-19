@@ -1,7 +1,7 @@
 import i18n from '@ae/shared/i18n';
 import type { TFunction } from 'i18next';
 import React, { useEffect, useMemo, useState } from 'react';
-import { useTranslation } from 'react-i18next';
+import { Trans, useTranslation } from 'react-i18next';
 import DataTable from './DataTable';
 import UnsupportedAnalyticsBanner from './UnsupportedAnalyticsBanner';
 import { InfoTooltip, GuideLinks, guide } from './AdminHelp';
@@ -56,6 +56,16 @@ import type {
   ExperimentResultRow,
   ExperimentUnitsRow,
 } from '@ae/shared';
+import { useUrlViews, viewParam } from './consoleViewUrl';
+
+/** The drill an address opens on this experiment (`expDrill=<axis>:<variant>`), or null. */
+const DRILL_AXES: readonly DrillAxis[] = ['metrics', 'battle', 'approval', 'picks'];
+function experimentDrillFromUrl(experimentId: string): DrillTarget | null {
+  if (viewParam('exp') !== experimentId) return null;
+  const [axis, ...rest] = (viewParam('expDrill') ?? '').split(':');
+  const variantId = rest.join(':');
+  return (DRILL_AXES as readonly string[]).includes(axis) && variantId ? { experimentId, axis: axis as DrillAxis, variantId } : null;
+}
 
 // ── Local contract mirrors (DESIGN-EXPERIMENTS-BATTLE §1.2 / §3.2.1) ──────────
 // Kept local (not imported) so this file compiles independently of the shared-type
@@ -201,7 +211,7 @@ const MODEL_OPTIONS = MODEL_STRATEGY_MODELS.map((m) => ({ value: m.key, label: m
 // them ("not used in 30 days → upgrade to an active model"), so offering
 // them would let an operator bind a model that fails on first use.
 const IMAGE_GEN_MODEL_OPTIONS = [
-  { value: 'openai_gpt_image_1', label: 'OpenAI gpt-image-1 (key)' },
+  { value: 'openai_gpt_image_2', label: 'OpenAI gpt-image-2 (key)' },
   { value: 'fal_flux_pro_1_1', label: 'FLUX 1.1 Pro via FAL (key)' },
   { value: 'stability_image_core', label: 'Stability Image Core (Bedrock · us-west-2)' },
   { value: 'stability_image_ultra', label: 'Stability Image Ultra (Bedrock · us-west-2)' },
@@ -292,9 +302,12 @@ function syncExperimentToUrl(id: string | null): void {
   if ((url.searchParams.get('exp') || null) === id) return;
   if (id) {
     url.searchParams.set('exp', id);
+    url.searchParams.delete('expDrill');
     window.history.pushState({}, '', url);
   } else {
     url.searchParams.delete('exp');
+    // The experiment's drill goes with it.
+    url.searchParams.delete('expDrill');
     window.history.replaceState({}, '', url);
   }
 }
@@ -404,21 +417,26 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
   // BATTLE ON/OFF, PER CLASSIFICATION. Loaded beside the experiments because this is where an
   // operator arms the comparison a duel runs on, so turning battle on and arming it are one visit.
   const [battleSettings, setBattleSettings] = useState<BattleSetting[]>([]);
+  // Whether the settings were read: until they are, where a battle can run is not known, and nothing says it is nowhere.
+  const [battleRead, setBattleRead] = useState(false);
   const [battleSaving, setBattleSaving] = useState<string | null>(null);
 
   async function loadBattleSettings() {
     // Battle is set for a whole classification, so a team's console has no route for it and does not ask.
     if (teamAssistant()) {
       setBattleSettings([]);
+      setBattleRead(false);
       return;
     }
     try {
       setBattleSettings(await listBattleSettings());
+      setBattleRead(true);
     } catch {
       // BEST EFFORT, AND SILENT. This panel is one control among many on a tab whose main job is
       // experiments; a deployment whose API predates the route would otherwise show an error banner
       // over working content. The panel simply does not render.
       setBattleSettings([]);
+      setBattleRead(false);
     }
   }
 
@@ -899,10 +917,10 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
             <span>{name}</span>
           </nav>
         </div>
-        <h3 className="experiment-page-title">
+        <h2 className="experiment-page-title">
           {name}
           {selectedExperiment && <> <span className="status-badge">{selectedExperiment.status}</span></>}
-        </h3>
+        </h2>
         {selectedExperiment && <ExperimentGoal experiment={selectedExperiment} />}
         {unsupported ? (
           <UnsupportedAnalyticsBanner result={resultsData!} />
@@ -968,7 +986,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
         {/* The tab opened straight onto controls with nothing saying what a reader is deciding.
             One line does that; the decision loop itself - guardrails, power, how a recommendation is
             reached - is a document, not a page header. */}
-        <h3>
+        <h2>
           {translate('admin.experiments.aBExperiments')}
           <InfoTooltip
             label={translate('admin.experiments.whatAnExperimentOnThis')}
@@ -976,7 +994,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
               translate('admin.experiments.aboutText')
             }
           />
-        </h3>
+        </h2>
         <div className="admin-filter-group">
           <button className="btn-secondary" onClick={() => setShowCreate(!showCreate)}>
             {showCreate ? translate('admin.experiments.cancel') : translate('admin.experiments.newExperiment')}
@@ -1004,7 +1022,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
           classification and offers three confirmed ways to free it, then auto-retries. */}
       {conflicts && conflicts.length > 0 && (
         <div className="admin-section experiment-conflict-panel" data-testid="experiment-conflict">
-          <h4>{translate('admin.experiments.classificationAlreadyInUse')}</h4>
+          <h3>{translate('admin.experiments.classificationAlreadyInUse')}</h3>
           <p className="admin-tab-description">
             {pendingCreate ? `"${pendingCreate.experimentId}" can't start` : "This test can't start"} —{' '}
             {conflicts.length === 1 ? translate('admin.experiments.anotherExperimentIs') : translate('admin.experiments.experimentsAre', { conflicts: conflicts.length })} active on{' '}
@@ -1079,9 +1097,9 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
             className="admin-modal experiment-confirm admin-section"
             style={{ maxWidth: '520px', width: '100%', margin: 0 }}
           >
-            <h4>
+            <h3>
               {confirm.kind === 'end' ? translate('admin.experiments.endExperiment') : confirm.kind === 'pause' ? translate('admin.experiments.pauseExperiment') : translate('admin.experiments.deleteExperiment')}
-            </h4>
+            </h3>
             <p>{confirmCopy(confirm.kind, confirm.exp.experimentId)}</p>
             {confirm.kind === 'end' && confirm.ran && (
               <div className="experiment-decision-picker">
@@ -1129,11 +1147,11 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
       )}
 
       {showCreate && (
-        <div className="admin-section admin-conversation-panel">
-          <h4>{translate('admin.experiments.createExperiment')}</h4>
+        <div className="admin-section admin-conversation-panel experiment-create-form">
+          <h3>{translate('admin.experiments.createExperiment')}</h3>
           <div className="admin-form-grid">
             <label>
-              {translate('admin.experiments.experimentId')}
+              <span className="admin-field-label">{translate('admin.experiments.experimentId')}</span>
               <input className="input"
                 type="text"
                 value={newExperiment.experimentId}
@@ -1142,16 +1160,17 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
               />
             </label>
             <label>
-              Type
-              <InfoTooltip
-                label={translate('admin.experiments.aboutExperimentType')}
-                // The Classification wording no longer claims to measure labeling. It does not: the
-                // `accuracy` objective maps to the same evaluator score that backs `quality`, so a
-                // classification experiment is scored on the ANSWER, a downstream proxy for the
-                // routing change. Saying otherwise told an operator they were measuring something the
-                // platform does not measure. See DESIGN §5 for the shadow gate that would.
-                content={translate('admin.experiments.intentTestsWhichModelBest')}
-              />
+              {/* The caption and its tip share one line, so every control in the grid starts on the same
+                  baseline. The Classification wording names what is measured: the `accuracy` objective
+                  maps to the evaluator score that backs `quality`, so a classification experiment is
+                  scored on the answer under the new routing (DESIGN §5 has the shadow gate). */}
+              <span className="admin-field-label">
+                {translate('admin.experiments.form.type')}
+                <InfoTooltip
+                  label={translate('admin.experiments.aboutExperimentType')}
+                  content={translate('admin.experiments.intentTestsWhichModelBest')}
+                />
+              </span>
               <select className="select"
                 value={newExperiment.experimentType}
                 onChange={(e) => setNewExperiment((p) => {
@@ -1172,7 +1191,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
             </label>
             {newExperiment.experimentType === 'intent' && (
               <label>
-                Intent
+                <span className="admin-field-label">{translate('admin.experiments.form.intent')}</span>
                 <select className="select"
                   value={newExperiment.intent}
                   onChange={(e) => setNewExperiment((p) => ({ ...p, intent: e.target.value }))}
@@ -1191,9 +1210,9 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                   return (
                     <>
                       <label>
-                        {translate('admin.experiments.controlProfile')}
+                        <span className="admin-field-label">{translate('admin.experiments.controlProfile')}</span>
                         <select className="select" value={newExperiment.controlProfile} onChange={(e) => setNewExperiment((p) => ({ ...p, controlProfile: e.target.value, controlProfileVersion: '' }))}>
-                          <option value="">{translate('admin.experiments.selectAProfile')}</option>
+                          <option value="" className="select-placeholder" disabled hidden>{translate('admin.experiments.selectAProfile')}</option>
                           {profileOptions.map((p) => <option key={p.profileName} value={p.profileName}>{p.profileName}</option>)}
                         </select>
                         <select className="select" value={newExperiment.controlProfileVersion} onChange={(e) => setNewExperiment((p) => ({ ...p, controlProfileVersion: e.target.value }))} style={{ marginTop: 'var(--space-1)' }}>
@@ -1202,9 +1221,9 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                         </select>
                       </label>
                       <label>
-                        {translate('admin.experiments.treatmentProfile')}
+                        <span className="admin-field-label">{translate('admin.experiments.treatmentProfile')}</span>
                         <select className="select" value={newExperiment.treatmentProfile} onChange={(e) => setNewExperiment((p) => ({ ...p, treatmentProfile: e.target.value, treatmentProfileVersion: '' }))}>
-                          <option value="">{translate('admin.experiments.selectAProfile')}</option>
+                          <option value="" className="select-placeholder" disabled hidden>{translate('admin.experiments.selectAProfile')}</option>
                           {profileOptions.map((p) => <option key={p.profileName} value={p.profileName}>{p.profileName}</option>)}
                         </select>
                         <select className="select" value={newExperiment.treatmentProfileVersion} onChange={(e) => setNewExperiment((p) => ({ ...p, treatmentProfileVersion: e.target.value }))} style={{ marginTop: 'var(--space-1)' }}>
@@ -1219,10 +1238,12 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
             ) : (
               <>
                 <label>
-                  Control {showImageGenModels ? 'Image Model' : 'Model'}
+                  <span className="admin-field-label">
+                    {translate(showImageGenModels ? 'admin.experiments.form.controlImageModel' : 'admin.experiments.form.controlModel')}
+                  </span>
                   {showImageGenModels ? (
                     <select className="select" value={newExperiment.controlImageGenModelKey} onChange={(e) => setNewExperiment((p) => ({ ...p, controlImageGenModelKey: e.target.value }))}>
-                      <option value="">{translate('admin.experiments.selectAnImageModel')}</option>
+                      <option value="" className="select-placeholder" disabled hidden>{translate('admin.experiments.selectAnImageModel')}</option>
                       {IMAGE_GEN_MODEL_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
                     </select>
                   ) : controlIsLiveVersion(newExperiment.experimentType) ? (
@@ -1236,10 +1257,12 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                   )}
                 </label>
                 <label>
-                  Treatment {showImageGenModels ? 'Image Model' : 'Model'}
+                  <span className="admin-field-label">
+                    {translate(showImageGenModels ? 'admin.experiments.form.treatmentImageModel' : 'admin.experiments.form.treatmentModel')}
+                  </span>
                   {showImageGenModels ? (
                     <select className="select" value={newExperiment.treatmentImageGenModelKey} onChange={(e) => setNewExperiment((p) => ({ ...p, treatmentImageGenModelKey: e.target.value }))}>
-                      <option value="">{translate('admin.experiments.selectAnImageModel')}</option>
+                      <option value="" className="select-placeholder" disabled hidden>{translate('admin.experiments.selectAnImageModel')}</option>
                       {IMAGE_GEN_MODEL_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
                     </select>
                   ) : (
@@ -1256,7 +1279,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
               </>
             )}
             <label>
-              {translate('admin.experiments.trafficSplitControl')}
+              <span className="admin-field-label">{translate('admin.experiments.trafficSplitControl')}</span>
               <input
                 type="range"
                 min="10"
@@ -1268,7 +1291,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
               <span>{newExperiment.controlWeight}% / {100 - newExperiment.controlWeight}%</span>
             </label>
             <div>
-              <span>{translate('admin.experiments.tiers')}</span>
+              <span className="admin-field-label">{translate('admin.experiments.tiers')}</span>
               <div className="admin-filter-group">
                 {tierOptions().map((tier) => (
                   <button
@@ -1282,7 +1305,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
               </div>
             </div>
             <label>
-              End Date
+              <span className="admin-field-label">{translate('admin.experiments.form.endDate')}</span>
               <input className="input"
                 type="date"
                 value={newExperiment.endDate}
@@ -1295,16 +1318,16 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
           {/* Objective block (§1.4): the written decision this test informs is REQUIRED; the
               metric+target is the primary quantitative criterion; guardrails pre-register the
               ship rule. The objective is advisory — it frames the decision, never auto-acts. */}
-          <fieldset className="admin-section experiment-objective-block" style={{ marginTop: '12px' }}>
-            <legend>
-              Objective
+          <fieldset className="admin-section experiment-objective-block">
+            <legend className="admin-field-label">
+              {translate('admin.experiments.form.objective')}
               <InfoTooltip
                 label={translate('admin.experiments.aboutTheObjective')}
                 content={translate('admin.experiments.stateTheDecisionThisTest')}
               />
             </legend>
-            <label style={{ display: 'block' }}>
-              What decision will this test inform? <span aria-hidden="true">*</span>
+            <label className="experiment-objective-statement">
+              <span className="admin-field-label">{translate('admin.experiments.form.decision')} <span aria-hidden="true">*</span></span>
               <textarea
                 className="textarea input"
                 value={newExperiment.objectiveStatement}
@@ -1318,7 +1341,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
             </label>
             <div className="admin-form-grid">
               <label>
-                {translate('admin.experiments.primaryMetric')}
+                <span className="admin-field-label">{translate('admin.experiments.primaryMetric')}</span>
                 <select className="select"
                   value={newExperiment.objectiveMetric}
                   onChange={(e) => setNewExperiment((p) => ({ ...p, objectiveMetric: e.target.value as ObjectiveMetric }))}
@@ -1331,7 +1354,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                 </select>
               </label>
               <label>
-                Target (%)
+                <span className="admin-field-label">{translate('admin.experiments.form.target')}</span>
                 <input className="input"
                   type="number"
                   min="0"
@@ -1363,14 +1386,14 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                       ],
                     }))}
                   >
-                    + Add guardrail
+                    {translate('admin.experiments.form.addGuardrail')}
                   </button>
                 )}
               </div>
               {newExperiment.guardrails.map((gr, i) => (
                 <div className="experiment-guardrail-row admin-form-grid" key={i}>
                   <label>
-                    Metric
+                    <span className="admin-field-label">{translate('admin.experiments.form.metric')}</span>
                     <select className="select"
                       value={gr.metric}
                       onChange={(e) => setNewExperiment((p) => {
@@ -1379,7 +1402,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                         return { ...p, guardrails };
                       })}
                     >
-                      <option value="">{translate('admin.experiments.select')}</option>
+                      <option value="" className="select-placeholder" disabled hidden>{translate('admin.experiments.select')}</option>
                       <option value="cost">{translate('admin.experiments.cost')}</option>
                       <option value="latency">{translate('admin.experiments.latency')}</option>
                       <option value="quality">{translate('admin.experiments.quality')}</option>
@@ -1387,7 +1410,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                     </select>
                   </label>
                   <label>
-                    Rule
+                    <span className="admin-field-label">{translate('admin.experiments.form.rule')}</span>
                     <select className="select"
                       value={gr.direction}
                       onChange={(e) => setNewExperiment((p) => {
@@ -1401,7 +1424,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                     </select>
                   </label>
                   <label>
-                    Bound (%)
+                    <span className="admin-field-label">{translate('admin.experiments.form.bound')}</span>
                     <input className="input"
                       type="number"
                       min="0"
@@ -1418,10 +1441,9 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                   <button
                     type="button"
                     className="btn-danger"
-                    style={{ alignSelf: 'end' }}
                     onClick={() => setNewExperiment((p) => ({ ...p, guardrails: p.guardrails.filter((_, j) => j !== i) }))}
                   >
-                    Remove
+                    {translate('admin.experiments.form.removeGuardrail')}
                   </button>
                 </div>
               ))}
@@ -1441,9 +1463,13 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                 onChange={(e) => setNewExperiment((p) => ({ ...p, battleEnabled: e.target.checked }))}
               />
               <span className="experiment-battle-toggle-label">
-                Enable for <strong>/battle</strong>
+                <Trans i18nKey="admin.experiments.form.enableForBattle" components={{ b: <strong /> }} />
               </span>
-              <span className="status-badge">premium-only</span>
+              {battleRead && (
+                <span className="status-badge" data-testid="battle-availability">
+                  {battleAvailabilityLine(battleSettings, translate)}
+                </span>
+              )}
             </label>
             <p className="experiment-battle-toggle-help">
               {translate('admin.experiments.battleOptionHelp')}
@@ -1512,7 +1538,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
               )}
 
               <div className="experiment-battle-challenger">
-                <label className="label" htmlFor="battle-challenger-select">{translate('admin.experiments.battleChallenger')}</label>
+                <label className="admin-field-label" htmlFor="battle-challenger-select">{translate('admin.experiments.battleChallenger')}</label>
                 <select
                   id="battle-challenger-select"
                   className="select input"
@@ -1536,8 +1562,8 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
             </div>
           )}
 
-          <button className="btn-secondary" onClick={handleCreate} style={{ marginTop: '12px' }}>
-            Create & Activate
+          <button className="btn-secondary" onClick={handleCreate}>
+            {translate('admin.experiments.form.createAndActivate')}
           </button>
         </div>
       )}
@@ -1546,7 +1572,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
         {/* "Experiments", not "Active Experiments": this table lists every non-deleted experiment
             regardless of state, and the old heading asserted otherwise on a list that is mostly
             completed rows. The ACTIVE count now says the live number, and it is a filter. */}
-        <h4>{translate('admin.experiments.experiments')}</h4>
+        <h3>{translate('admin.experiments.experiments')}</h3>
         <div className="admin-filter-group experiments-status-filter">
           {(['all', 'active', 'paused', 'draft', 'completed'] as const).map((s) => {
             const n = s === 'all' ? visibleExperiments.length : visibleExperiments.filter((e) => e.status === s).length;
@@ -1580,6 +1606,9 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                     <button
                       type="button"
                       className="btn-link experiment-name-link"
+                      // The row's name is its description when it has one, so the id is carried here for anything
+                      // that has to find one experiment's row (the e2e, an operator's own tooling).
+                      data-experiment-id={exp.experimentId}
                       title={translate('admin.experiments.openThisExperimentSResults')}
                       onClick={() => setSelectedExperimentId(exp.experimentId)}
                     >
@@ -1685,7 +1714,8 @@ const MIN_SAMPLE_FALLBACK = 30;
 
 interface VariantAgg {
   variant_id: string;
-  model_name: string;
+  /** Every model that answered this variant's turns, most exchanges first (ties by name). */
+  model_names: string[];
   exchange_count: number;
   /** Exchanges an evaluator scored. Shown beside the sample because avg_score counts an unscored
    *  exchange as zero, so the two numbers together say how much of the mean is quality and how much
@@ -1710,15 +1740,26 @@ interface VariantAgg {
 
 interface ExperimentGroup {
   experimentId: string;
-  intent: string;
-  tier: string;
+  /** Every intent the figures below were summed over, each once, in name order. */
+  intents: string[];
+  /** Every classification of the conversations the figures below were summed over, each once, in name order. */
+  classifications: string[];
   control?: VariantAgg;
   treatment?: VariantAgg;
   others: VariantAgg[];
 }
 
+/** Each model of the rows once, ordered by the exchanges it answered, then by name. */
+function modelsByExchanges(rows: ExperimentResultRow[]): string[] {
+  const byModel = new Map<string, number>();
+  for (const r of rows) byModel.set(r.model_name, (byModel.get(r.model_name) ?? 0) + (Number(r.exchange_count) || 0));
+  return Array.from(byModel.entries())
+    .sort(([a, n], [b, m]) => m - n || a.localeCompare(b))
+    .map(([model]) => model);
+}
+
 /** Weighted aggregate of a variant's rows (by exchange_count), null-aware. */
-function aggregateVariant(rows: ExperimentResultRow[]): VariantAgg {
+export function aggregateVariant(rows: ExperimentResultRow[]): VariantAgg {
   let wScore = 0, wLat = 0, wCost = 0, wComp = 0, wFb = 0, wTask = 0;
   let exch = 0, scored = 0, taskCount = 0;
   let scoreN = 0, latN = 0, costN = 0, compN = 0, fbN = 0, taskN = 0;
@@ -1734,11 +1775,15 @@ function aggregateVariant(rows: ExperimentResultRow[]): VariantAgg {
     thumbsUp += Number(r.thumbs_up) || 0;
     fbCount += Number(r.feedback_count) || 0;
     battleWins += Number(r.battle_wins) || 0;
-    const acc = (val: number | null, sum: number, wn: number): [number, number] =>
-      val == null ? [sum, wn] : [sum + val * n, wn + n];
+    // Each mean is weighted by the turns it was taken over: latency by the turns that recorded one, cost by
+    // the turns that could be priced, so a row with missing telemetry does not count for more than it measured.
+    const acc = (val: number | null, sum: number, wn: number, w = n): [number, number] =>
+      val == null || w === 0 ? [sum, wn] : [sum + val * w, wn + w];
+    const timed = r.timed_count == null ? n : Number(r.timed_count) || 0;
+    const priced = r.priced_count == null ? n : Number(r.priced_count) || 0;
     [wScore, scoreN] = acc(r.avg_score, wScore, scoreN);
-    [wLat, latN] = acc(r.avg_total_ms, wLat, latN);
-    [wCost, costN] = acc(r.avg_cost_usd, wCost, costN);
+    [wLat, latN] = acc(r.avg_total_ms, wLat, latN, timed);
+    [wCost, costN] = acc(r.avg_cost_usd, wCost, costN, priced);
     [wComp, compN] = acc(r.compliance_rate, wComp, compN);
     [wFb, fbN] = acc(r.fallback_rate, wFb, fbN);
     [wTask, taskN] = acc(r.task_completion_rate, wTask, taskN);
@@ -1747,7 +1792,7 @@ function aggregateVariant(rows: ExperimentResultRow[]): VariantAgg {
     wn === 0 ? null : Math.round((sum / wn) * 10 ** dp) / 10 ** dp;
   return {
     variant_id: rows[0]?.variant_id ?? 'unknown',
-    model_name: rows[0]?.model_name ?? 'unknown',
+    model_names: modelsByExchanges(rows),
     exchange_count: exch,
     scored_count: scored,
     task_count: taskCount,
@@ -1795,13 +1840,79 @@ function groupExperiments(rows: ExperimentResultRow[]): ExperimentGroup[] {
     const aggs = Array.from(byVariant.values()).map(aggregateVariant);
     return {
       experimentId,
-      intent: expRows[0]?.intent ?? 'unknown',
-      tier: expRows[0]?.assistant ?? '',
+      intents: Array.from(new Set(expRows.map((r) => r.intent))).sort(),
+      classifications: Array.from(new Set(expRows.flatMap((r) => r.classifications ?? []))).sort(),
       control: aggs.find((a) => a.variant_id === 'control'),
       treatment: aggs.find((a) => a.variant_id === 'treatment'),
       others: aggs.filter((a) => a.variant_id !== 'control' && a.variant_id !== 'treatment'),
     };
   });
+}
+
+/**
+ * THE INTENTS AN EXPERIMENT TESTS, read from its definition, and the intents its figures came from.
+ *
+ * `targets` is what the experiment's definition selects: an `intent` experiment (the type an experiment
+ * without one has) tests its one intent, and every other type (`base_model`, `classification`, `profile`)
+ * spans the intents (DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP §3.5, "What an experiment counts"). It is
+ * `null` when no definition is in hand or an `intent` experiment names none, and then only the figures
+ * describe the scope. `covered` is every intent of the rows the figures sum, so the header and the
+ * figures describe the same population.
+ */
+export interface IntentScope {
+  targets: string[] | 'all' | null;
+  covered: string[];
+}
+
+export function intentScopeOf(
+  experiment: Pick<Experiment, 'experimentType' | 'intent'> | undefined,
+  covered: string[],
+): IntentScope {
+  if (!experiment) return { targets: null, covered };
+  if ((experiment.experimentType ?? 'intent') !== 'intent') return { targets: 'all', covered };
+  return { targets: experiment.intent ? [experiment.intent] : null, covered };
+}
+
+/**
+ * The scope as one short line: the intents the experiment tests, then the intents the figures cover
+ * whenever those are not exactly the tested set (an all-intents experiment's traffic, or an experiment on
+ * `general` whose figures include intents answered through the `general` route).
+ */
+export function intentScopeLine({ targets, covered }: IntentScope, t: TFunction): string {
+  return scopeLine(targets === 'all' ? t('admin.experiments.scope.allIntents') : targets, covered, (i) => i, t);
+}
+
+/**
+ * Where a battle can run, read from the deployment's battle settings: the classifications this
+ * deployment builds Battle Mode for (`capable`), by display name. Availability is a per-classification
+ * fact, so the line lists exactly those classifications and says so when there are none.
+ */
+export function battleAvailabilityLine(settings: readonly BattleSetting[], t: TFunction): string {
+  const names = settings.filter((s) => s.capable).map((s) => classificationName(s.classification));
+  return names.length
+    ? t('admin.experiments.form.battleAvailableIn', { names: names.join(', ') })
+    : t('admin.experiments.form.battleAvailableNowhere');
+}
+
+/**
+ * The classifications an experiment targets, from its definition (`tiers`), then the classifications of
+ * the conversations its figures came from whenever those are not exactly the targeted set.
+ */
+export function classificationScopeLine(
+  experiment: Pick<Experiment, 'tiers'> | undefined,
+  covered: string[],
+  t: TFunction,
+): string {
+  const targets = experiment?.tiers?.length ? experiment.tiers : null;
+  return scopeLine(targets, covered, classificationName, t);
+}
+
+/** What is tested (a label, or names), then "figures from" the covered names when they differ from the tested names. */
+function scopeLine(tested: string | string[] | null, covered: string[], name: (id: string) => string, t: TFunction): string {
+  const list = (ids: string[]) => ids.map(name).join(', ');
+  const same = Array.isArray(tested) && tested.length === covered.length && tested.every((i) => covered.includes(i));
+  const figures = covered.length > 0 && !same ? t('admin.experiments.scope.figuresFrom', { names: list(covered) }) : '';
+  return [typeof tested === 'string' ? tested : tested ? list(tested) : '', figures].filter(Boolean).join(' · ');
 }
 
 type MetricKey = keyof Pick<
@@ -2030,7 +2141,7 @@ function ExperimentGoal({ experiment }: { experiment: Experiment }) {
   const label = objective ? objectiveLabelOf(objective) : null;
   return (
     <section className="admin-section" data-testid="experiment-goal" aria-labelledby="experiment-goal-title">
-      <h4 id="experiment-goal-title">{t('admin.experiments.goal.title')}</h4>
+      <h3 id="experiment-goal-title">{t('admin.experiments.goal.title')}</h3>
       <p>{objective?.statement?.trim() || t('admin.experiments.goal.none')}</p>
       <dl className="admin-config-list">
         <dt>{t('admin.experiments.goal.decidesOn')}</dt>
@@ -2049,7 +2160,7 @@ function ExperimentGoal({ experiment }: { experiment: Experiment }) {
         <dt>{t('admin.experiments.goal.compares')}</dt>
         <dd>{comparisonLine(experiment, t)}</dd>
         <dt>{t('admin.experiments.goal.scope')}</dt>
-        <dd>{[experiment.intent, ...(experiment.tiers ?? []).map(classificationName)].filter(Boolean).join(' · ')}</dd>
+        <dd>{[intentScopeLine(intentScopeOf(experiment, []), t), ...(experiment.tiers ?? []).map(classificationName)].filter(Boolean).join(' · ')}</dd>
       </dl>
     </section>
   );
@@ -2146,7 +2257,7 @@ function ExperimentResults({
     <section className="admin-section exp-results" data-testid="experiment-results" aria-labelledby="experiment-results-title">
       <div className="exp-results-head">
         <div>
-          <h4 id="experiment-results-title">{translate('admin.experiments.resultsTitle', { name: title })}</h4>
+          <h3 id="experiment-results-title">{translate('admin.experiments.resultsTitle', { name: title })}</h3>
           <p className="admin-tab-description">{translate('admin.experiments.resultsHelp')}</p>
         </div>
         {actions}
@@ -2390,7 +2501,11 @@ function ExperimentComparison({
   // ONE open drill at a time, holding the axis AND the variant. Both are needed: the aggregate a
   // drill-down checks itself against is a per-variant number, so an axis alone has nothing on screen
   // to reconcile with.
-  const [drill, setDrill] = useState<DrillTarget | null>(null);
+  const [drill, setDrill] = useState<DrillTarget | null>(() => experimentDrillFromUrl(group.experimentId));
+  // THE OPEN DRILL IS THE ADDRESS (`&expDrill=<axis>:<variant>`, beside the experiment's `exp`): a link opens it.
+  // Several comparisons may be on screen: only the one with a drill open, or the one the address names, writes the key.
+  const ownsDrillKey = !!drill || viewParam('exp') === group.experimentId;
+  useUrlViews(ownsDrillKey ? { expDrill: drill ? `${drill.axis}:${drill.variantId}` : null } : {}, () => setDrill(experimentDrillFromUrl(group.experimentId)));
   const openDrill = (axis: DrillAxis, variantId: string) =>
     setDrill((d) =>
       d && d.axis === axis && d.variantId === variantId
@@ -2434,8 +2549,15 @@ function ExperimentComparison({
         <div className="exp-compare-title">
           <span className="exp-compare-id">{experiment ? versusLine(experiment, translate) : group.experimentId}</span>
           <span className="exp-compare-meta">
-            {group.intent}{group.tier ? ` · ${group.tier}` : ''} ·{' '}
-            {hasUnits ? <SampleMeta variants={[controlUnits, treatmentUnits]} /> : `${totalN.toLocaleString()} exchanges`}
+            {[
+              ['experiment-intent-scope', intentScopeLine(intentScopeOf(experiment, group.intents), translate)],
+              ['experiment-classification-scope', classificationScopeLine(experiment, group.classifications, translate)],
+            ].filter(([, line]) => line).map(([testId, line]) => (
+              <React.Fragment key={testId}><span data-testid={testId}>{line}</span>{' · '}</React.Fragment>
+            ))}
+            {hasUnits
+              ? <SampleMeta variants={[controlUnits, treatmentUnits]} />
+              : translate('admin.experiments.evidence.exchanges', { count: totalN, total: totalN.toLocaleString() })}
           </span>
         </div>
         <button className="btn-secondary" onClick={onRecommend} disabled={reco?.loading}>
@@ -2554,7 +2676,7 @@ function VariantHeader({ variant, side }: { variant: VariantAgg; side: 'A' | 'B'
   return (
     <div className="exp-variant-head">
       <span className="exp-variant-side">{side} · {variant.variant_id}</span>
-      <span className="exp-variant-model">{modelDisplayName(variant.model_name)}</span>
+      <span className="exp-variant-model">{variant.model_names.map(modelDisplayName).join(', ')}</span>
     </div>
   );
 }

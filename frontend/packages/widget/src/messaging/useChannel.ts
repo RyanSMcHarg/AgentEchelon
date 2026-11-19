@@ -56,7 +56,7 @@ function toMessage(
     fromAssistant: isAssistantArn(raw.senderArn),
     senderName: raw.senderName,
     createdAt: raw.createdAt,
-    text: displayText(raw.content),
+    text: displayText(raw.content, isAssistantArn(raw.senderArn)),
   };
 }
 

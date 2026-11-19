@@ -248,28 +248,25 @@ describe('an @ token names one member, and the flow routes it', () => {
     expect(warn.mock.calls.some(([m]) => String(m).includes('named nobody'))).toBe(false);
   });
 
-  it('claims a 1:1 @all with no space in front of it, now that nothing else is invoked', async () => {
-    // THE TWO-RESPONDER DEFECT THIS ONCE PINNED, kept because the reason matters. `matchesAtAll` has
-    // no leading boundary; the roster-read prefilter requires one. So "hey@all" is an `@all` to the
-    // branch below and not a mention to the gate above it - the roster was never read, `isOneToOne`
-    // defaulted to false, and the flow dispatched in a two-member channel where AUTO invoked the
-    // handler for every message regardless. Two placeholders, one stranded forever.
+  it('claims a 1:1 @all with punctuation in front of it, now that nothing else is invoked', async () => {
+    // THE MATCH SURFACES DIFFER, AND THE FLOW CLAIMS THE TURN. `matchesAtAll` takes punctuation before the
+    // token; the roster-read prefilter requires a space. So "(@all)" is an `@all` to the branch below and
+    // not a mention to the gate above it: the roster is not read and `isOneToOne` defaults to false.
     //
-    // THE HAZARD IS GONE BECAUSE THE SECOND RESPONDER IS GONE. `turnEntry` now defaults to `'flow'`,
-    // so the assistant carries `StandardMessages: NONE` and Amazon Chime SDK invokes Amazon Lex for
-    // no untargeted message at any size. Standing aside here would answer NOBODY, which is the worse
-    // of the two failures. The match-surface gap is still real and still worth its own guard; what
-    // changed is which side of it is safe.
+    // THERE IS ONE RESPONDER. `turnEntry` defaults to `'flow'`, so the assistant carries
+    // `StandardMessages: NONE` and Amazon Chime SDK invokes Amazon Lex for no untargeted message at any
+    // size. Standing aside here would answer NOBODY, so the flow claims the turn. The match-surface gap
+    // is worth its own guard; with a single responder, claiming is the safe side of it.
     withRoster(ONE_TO_ONE);
 
-    await handler(flowEvent('hey@all what is the billing policy?'));
+    await handler(flowEvent('(@all) what is the billing policy?'));
 
     expect(dispatched()).toBe(true);
     expect(allowed()).toBe(true);
   });
 
   it('still answers that same @all in a GROUP, so the fix did not silence it', async () => {
-    await handler(flowEvent('hey@all what is the billing policy?'));
+    await handler(flowEvent('(@all) what is the billing policy?'));
 
     expect(dispatched()).toBe(true);
   });

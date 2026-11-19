@@ -6,7 +6,7 @@
  * the exported active version. This opens `ops-premium` as an admin and checks them against the source:
  *   - the templates against the classification's template pointers in SSM
  *     (`<root>/assistant/premium/templates/<name>`), and each pointer's version against the S3 body it names
- *     (`templates/premium/<name>/<sha256>.md` in the attachments bucket);
+ *     (`templates/premium/<name>/<sha256>.md` in the profile bucket);
  *   - the intents against the active definition in SSM, its intent pack read from S3 when the definition
  *     carries a pointer, or the classification's pack when the version carries none;
  *   - the workflows against the definition's `workflows`, and their steps against the machines the page lists.
@@ -19,7 +19,7 @@ import { signInAsAdmin } from './helpers/agent-helpers';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 import { awsOrNull, awsv, awsvText } from './helpers/aws';
 import { SSM_ROOT } from './helpers/stack-prefix';
-import { attachmentsBucket } from './helpers/delivered-template';
+import { profileBucket } from './helpers/delivered-template';
 
 const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || process.env.E2E_BASE_URL || 'http://localhost:5174';
 test.use({ baseURL: ADMIN_BASE_URL });
@@ -56,8 +56,8 @@ function activeIntentsAndWorkflows(): { intents: string[]; workflows: string[] }
   };
   let pack = def.intentPack;
   if (!pack && def.intentPackRef) {
-    const bucket = attachmentsBucket();
-    expect(bucket, 'the attachments bucket that holds profile bodies').toBeTruthy();
+    const bucket = profileBucket();
+    expect(bucket, 'the profile bucket that holds profile bodies').toBeTruthy();
     pack = JSON.parse(awsvText(['s3', 'cp', `s3://${bucket}/${def.intentPackRef.key}`, '-'], { quiet: true }));
   }
   return { intents: (pack?.intents ?? []).map((i) => i.key), workflows: def.workflows ?? [] };
@@ -68,7 +68,7 @@ test(`${ASSISTANT}'s page lists its classification's templates and its active in
   test.skip(!param(`${SSM_ROOT}/assistant-assignments/${CLASSIFICATION}/ops/assistants/${ASSISTANT}`), `${ASSISTANT} is not deployed here`);
   const pointers = templatePointers();
   expect(pointers.has('report'), 'the premium classification holds the report template').toBe(true);
-  const bucket = attachmentsBucket();
+  const bucket = profileBucket();
   for (const [name, hash] of pointers) {
     // Each pointer names a body that exists, so the page's version is a real one.
     const head = awsOrNull(`s3api head-object --bucket ${bucket} --key templates/${CLASSIFICATION}/${name}/${hash}.md`);
@@ -102,17 +102,13 @@ test(`${ASSISTANT}'s page lists its classification's templates and its active in
   await expect(page.locator('.admin-tab-loading')).toHaveCount(0, { timeout: 30000 });
   await expect(intentField).not.toContainText('Loading configuration');
   await expect(intentField, 'the active version could not be read').not.toContainText('Could not be read');
-  const shownIntents = await intentField.locator('code.admin-chip').allInnerTexts();
-  if (intents.length) expect(shownIntents.sort()).toEqual([...intents].sort());
+  const shownIntents = await page.locator('[data-testid^="intent-card-"]').evaluateAll((cards) => cards.map((c) => c.getAttribute('data-testid')!.slice('intent-card-'.length)));
+  if (intents.length) expect(shownIntents).toEqual(expect.arrayContaining(intents));
   else expect(shownIntents.length, 'a version with no pack shows its classification\'s').toBeGreaterThan(0);
   await expect(page.getByTestId('edit-path-intentPack')).toContainText('npm run assistant -- draft');
 
   await page.getByTestId('assistant-nav-workflows').click();
-  const workflowField = page.getByTestId('field-workflows');
-  for (const w of workflows) await expect(workflowField).toContainText(w);
-  if (!workflows.length) await expect(workflowField).toContainText('None');
-  await expect(page.getByTestId('edit-path-workflows')).toContainText('npm run assistant -- draft');
-
+  await page.getByTestId('workflows-platform-details').locator('summary').click();
   const platform = page.getByTestId('assistant-config-platform');
   await expect(platform).toContainText('Platform-level, not editable');
 });

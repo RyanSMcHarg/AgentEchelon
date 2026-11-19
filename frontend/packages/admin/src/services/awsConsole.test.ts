@@ -16,8 +16,7 @@ import {
   lambdaFunctionUrl,
   lexBotUrl,
   s3PrefixUrl,
-  ssmParameterUrl,
-} from './awsConsole';
+  ssmParameterUrl, cloudwatchAlarmUrl, eventBridgeRuleUrl, consoleUrlForArn } from './awsConsole';
 
 const R = 'eu-west-2';
 
@@ -78,5 +77,28 @@ describe('AWS console links', () => {
       .toBe(`aws chime-sdk-messaging describe-channel-flow --channel-flow-arn ${app}/channel-flow/flow-1 --region eu-west-2`);
     expect(describeCommand(`${app}/bot/bot-1`, R))
       .toBe(`aws chime-sdk-identity describe-app-instance-bot --app-instance-bot-arn ${app}/bot/bot-1 --region eu-west-2`);
+  });
+});
+
+describe('a resource named by its ARN links to its console page, in its own region', () => {
+  it('a CloudWatch alarm', () => {
+    expect(cloudwatchAlarmUrl('my alarm', 'eu-west-2')).toBe('https://eu-west-2.console.aws.amazon.com/cloudwatch/home?region=eu-west-2#alarmsV2:alarm/my%20alarm');
+    expect(consoleUrlForArn('arn:aws:cloudwatch:eu-west-2:111122223333:alarm:my-alarm')).toBe(cloudwatchAlarmUrl('my-alarm', 'eu-west-2'));
+  });
+
+  it('an EventBridge rule, on the default bus or the bus its ARN names', () => {
+    expect(eventBridgeRuleUrl('r1', 'eu-west-2')).toBe('https://eu-west-2.console.aws.amazon.com/events/home?region=eu-west-2#/eventbus/default/rules/r1');
+    expect(consoleUrlForArn('arn:aws:events:eu-west-2:111122223333:rule/r1')).toBe(eventBridgeRuleUrl('r1', 'eu-west-2'));
+    expect(consoleUrlForArn('arn:aws:events:eu-west-2:111122223333:rule/bus-a/r1')).toBe(eventBridgeRuleUrl('r1', 'eu-west-2', 'bus-a'));
+  });
+
+  it('a Lambda function, without its qualifier', () => {
+    expect(consoleUrlForArn('arn:aws:lambda:eu-west-2:111122223333:function:fn:live')).toBe('https://eu-west-2.console.aws.amazon.com/lambda/home?region=eu-west-2#/functions/fn');
+  });
+
+  it('no link for a kind it does not know, or an ARN with no region', () => {
+    expect(consoleUrlForArn('arn:aws:sqs:eu-west-2:111122223333:q')).toBeUndefined();
+    expect(consoleUrlForArn('arn:aws:iam::111122223333:role/r')).toBeUndefined();
+    expect(consoleUrlForArn('not an arn')).toBeUndefined();
   });
 });

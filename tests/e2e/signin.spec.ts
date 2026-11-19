@@ -120,9 +120,9 @@ test.describe.serial('Sign In Flow', () => {
     await signIn(page, user.email, user.password);
     await expect(page.locator('.app-header')).toBeVisible({ timeout: 30000 });
 
-    // Click sign out
-    const signOutButton = page.locator('button:has-text("Sign out"), button:has-text("Logout"), .sign-out-btn');
-    await signOutButton.click();
+    // Sign out is in the account menu: open it, then choose the item by its id rather than its wording.
+    await page.locator('.account-menu-trigger').click();
+    await page.getByTestId('account-menu-sign-out').click();
 
     // Should return to login form
     await expect(page.locator('input[type="email"]')).toBeVisible({ timeout: 10000 });

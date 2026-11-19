@@ -41,7 +41,7 @@ const { savePendingSplit, clearPendingSplit, claimTurn, readTurnState } =
   require('../../lambda/src/lib/turn-lock') as typeof import('../../lambda/src/lib/turn-lock');
 
 const CHANNEL = 'arn:aws:chime:us-east-1:123456789012:app-instance/i/channel/c1';
-const BOT = 'ed31ac66-21f5-41d0-9fdf-faf1da43869c';
+const BOT = '00000000-0000-4000-8000-0000000000b1';
 const ALICE = 'alice-sub';
 const BOB = 'bob-sub';
 

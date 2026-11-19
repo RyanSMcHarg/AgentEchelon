@@ -16,16 +16,11 @@ related:
   - "../../../backend/lambda/src/lib/bot-coordination.ts"
   - "../../../backend/lambda/src/lib/interaction-kinds.ts"
 tracking: |
-  Proposed. The single-active-battle guard is the one entry point where this is built, and it is built
-  the way this ADR argues for: a conversation-level fact, a soft lock that falls through when the work
-  behind it is provably over, and an explained no-op to the sender. Tasks have a partial guard with a
-  known sub-turn window. Ordinary exchanges, @all and the direct-invoke entries have nothing.
-
-  Built. The lock store and its table sit behind TURN_QUEUE_ENABLED (default OFF, off everywhere);
-  triage into tasks, the pause, task visibility, the client affordance and the admin metrics all
-  exist. What remains is the TRIGGER: triage runs when a turn ends rather than when a message
-  arrives, which makes the in-flight question retrospective. Moving it is gated on the lock question
-  in DESIGN-TASK-ACCESS-AND-QUEUE-PROCESSING section 9.
+  Built. The lock store and its table sit behind TURN_QUEUE_ENABLED, which a deployment turns on with
+  `turnQueue` in deploy.config.json (default off; the dev deployment runs with it on). Triage into
+  tasks runs on message arrival (`lib/triage-on-arrival.ts`); the pause, task visibility, the client
+  affordance and the admin metrics all exist. The end-to-end phase `turn-queue` passed on dev,
+  2026-11-05 (12/12); see "What proves it works".
 
   Three earlier drafts were wrong and are corrected in place, because the reasoning that produced
   them is the reusable part: releasing the lock and draining the queue atomically; answering the
@@ -54,7 +49,7 @@ tracking: |
 | The claim, in the router | **BUILT + DEPLOYED**, inert while the switch is off |
 | Triage into tasks, prioritisation, the pause for direction | **BUILT**, and it now runs on message ARRIVAL (`lib/triage-on-arrival.ts`) rather than at turn completion, so the in-flight question is asked about work that is genuinely still in flight |
 | A task `priority` field | **BUILT** |
-| Follow-ups rolled into the answer before it is sent: history bounded at the turn's message, follow-ups kept across reading passes, an answer parked until the reading resumes it | **BUILT + DEPLOYED** to dev on 2026-10-27, where `turnQueue` is on; **NOT VERIFIED** on a deployment. See "Follow-ups are rolled into the answer before it is sent" |
+| Follow-ups rolled into the answer before it is sent: history bounded at the turn's message, follow-ups kept across reading passes, an answer parked until the reading resumes it | **BUILT + DEPLOYED** to dev, where `turnQueue` is on. `Verified by:` `backend/test/lib/an-answer-waits-for-the-reading.test.ts` and `a-queue-behind-a-turn-is-not-its-history.test.ts`. See "Follow-ups are rolled into the answer before it is sent" |
 | Task VISIBILITY (a targeted request makes a private task) | **BUILT + DEPLOYED**, and the conversation read passes a viewer so a person still sees their own |
 | `/stop` reaching the turn already running | **BUILT + DEPLOYED**, and live independently of the queue switch |
 | A canceled turn as its own ledger phase | **BUILT** |
@@ -240,7 +235,7 @@ So the proposal names the in-progress task explicitly and asks whether to finish
 
 ### Waiting for that answer is not an interrupt
 
-The pause is a task awaiting the person, which is a state this platform already has and already handles correctly: while a task awaits them, their message is the awaited input rather than an interruption, and the busy check must not treat it as one. The per-entry table above already says this for both surfaces that have such a state, and the pause created here is the same state arriving by a new route. A message whose intent opens a different kind of task is not the awaited input: it opens its own task, and the waiting task stays where it was (`opensOtherWorkThan`, `backend/lambda/src/lib/task-continuity.ts`). A message that names the waiting item, an answer to one of the platform's own machines, and a duel side's exchange remain the awaited input.
+The pause is a task awaiting the person, which is a state this platform already has and already handles correctly: while a task awaits them, their message is the awaited input rather than an interruption, and the busy check must not treat it as one. The per-entry table above already says this for both surfaces that have such a state, and the pause created here is the same state arriving by a new route. Whether a message is the awaited input is decided from its content read with the task state ([ADR-064](064-a-turn-takes-its-model-from-the-intent-and-the-step-it-runs.md) decision B, amended 2026-11-12): the classifier is offered the waiting task and decides whether the message continues it or is a request of its own (`classifierPlacement`, `backend/lambda/src/lib/task-continuity.ts`). A message it reads as its own request is not the awaited input: it is routed on its own intent, opening its own task where that intent runs one, and the waiting task stays where it was. Where no model decided (a fast-path greeting or acknowledgment, a keyword-mode profile) a message whose intent opens a different kind of task is the one set aside (`opensOtherWorkThan`). A message that names the waiting item, an answer to one of the platform's own machines, and a duel side's exchange remain the awaited input.
 
 **Which is why the pause needs no mechanism of its own.** A triaged request runs on a state machine whose INITIAL state awaits the requester:
 
@@ -585,7 +580,7 @@ Every reading closes the question. A failed reading leaves it standing and route
 
 **The confirmation carries the visibility of what it canceled.** Stopping a targeted request is confirmed to the sender alone: a public "stopped, discarded the report" announces both that a private request existed and that it was abandoned, which is more disclosure than the request itself would have made. Where the canceled work was visible to the room, so is the confirmation, because the room watched it start.
 
-**As built (amendment, owner 2026-09-15): a private `/stop` in a room is refused, and a stop is confirmed to the room.** A stop halts the assistant for everybody in the conversation, so a stop sent privately in a group stops nothing: the router replies with the configured `stopMustBePublic` copy, delivered only to the sender because the Lex reply inherits the message's `Target` (`router-agent-handler.ts`; the Lex entry answers a targeted command through `lexEntryAnswersCommand` and the flow's dispatched turn stands down through `inboundWasTargeted`, both in `lib/private-command.ts`). A stop in a 1:1, or in a room whose size cannot be read, proceeds. A stop that is carried out was therefore sent to the room, and its acknowledgment is posted to the room; it names no task, only how many were cancelled. The paragraph above records the decision this replaced. Verified by `backend/test/lib/a-private-command-is-answered-by-the-lex-entry.test.ts` and `backend/test/lib/a-stop-cancels-work-in-progress-and-asks.test.ts`, both of which run in the ordinary suite. `tests/e2e/private-stop.spec.ts` covers the same rule end to end but is **opt-in and has not been run**: it skips unless `PRIVATE_STOP_E2E=1` is set, so a plain `npx playwright test` proves nothing about it, and the repository records no passing run. It is run as `node backend/scripts/validate.mjs --only=private-stop`. Until that happens the end-to-end claim rests on the two unit tests.
+**As built (amendment, owner 2026-09-15): a private `/stop` in a room is refused, and a stop is confirmed to the room.** A stop halts the assistant for everybody in the conversation, so a stop sent privately in a group stops nothing: the router replies with the configured `stopMustBePublic` copy, delivered only to the sender because the Lex reply inherits the message's `Target` (`router-agent-handler.ts`; the Lex entry answers a targeted command through `lexEntryAnswersCommand` and the flow's dispatched turn stands down through `inboundWasTargeted`, both in `lib/private-command.ts`). A stop in a 1:1, or in a room whose size cannot be read, proceeds. A stop that is carried out was therefore sent to the room, and its acknowledgment is posted to the room; it names no task, only how many were cancelled. The paragraph above records the decision this replaced. Verified by `backend/test/lib/a-private-command-is-answered-by-the-lex-entry.test.ts` and `backend/test/lib/a-stop-cancels-work-in-progress-and-asks.test.ts`, both of which run in the ordinary suite. The end-to-end spec `tests/e2e/private-stop.spec.ts` (opt-in, `node backend/scripts/validate.mjs --only=private-stop`) passed on dev, 2026-11-05: a private `/stop` in a room is refused before anything stops, only the sender sees the refusal, and the work finishes.
 
 **A duel is canceled by its initiator only**, consistent with ADR-029 and with the existing rule that only the person who started a duel may end it.
 
@@ -734,7 +729,7 @@ An implementation is judged on these, in this order. The first is the one that d
 | A triage turn holds NO tools | The reading cannot execute itself | Through the tool surface it would arrive before the reply exists, where parsing the reply catches nothing |
 | Several messages draw ONE notice, updated in place | The acknowledgment does not itself become noise | Three "still working on it" lines leave the conversation worse than saying nothing |
 
-**Where the whole is asserted, not the parts.** Every row above has unit coverage, and unit coverage cannot show that the pieces are wired to each other: the property spans five Lambdas and a client hook, each green in isolation. `tests/e2e/turn-queue.spec.ts` (validate phase `turn-queue`) covers the deferral, the depth, `/stop`, and per-responder busy against a live deployment; `frontend/packages/chat/src/hooks/useTurnState.test.ts` covers the several-assistant union, which needs two assistants answering to be visible in the DOM and so cannot be observed end to end here.
+**Where the whole is asserted, not the parts.** Every row above has unit coverage, and unit coverage cannot show that the pieces are wired to each other: the property spans five Lambdas and a client hook, each green in isolation. `tests/e2e/turn-queue.spec.ts` (validate phase `turn-queue`, opt-in) asserts the deferral, the depth, `/stop`, and per-responder busy against a live deployment, and passed on dev, 2026-11-05 (12/12), so the wired whole is proven on a deployment; `frontend/packages/chat/src/hooks/useTurnState.test.ts` covers the several-assistant union, which needs two assistants answering to be visible in the DOM and so cannot be observed end to end here.
 
 **The metric that reports on it in production is `LockTakeover`.** A test suite shows the release paths work on the cases it thought of; that counter shows whether they hold on the ones it did not.
 

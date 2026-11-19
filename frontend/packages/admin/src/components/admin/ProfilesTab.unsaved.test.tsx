@@ -95,8 +95,8 @@ describe('an unsaved edit', () => {
   it('is kept when another area is saved and the draft reloads, and that save sends only its own area', async () => {
     await editPersona();
     nav('workflows');
-    fireEvent.change(await screen.findByTestId('draft-welcome-template'), { target: { value: 'I help with taxes.' } });
-    fireEvent.click(within(screen.getByTestId('draft-step-welcome')).getByTestId('draft-step-save'));
+    fireEvent.change(await welcomeOpening(), { target: { value: 'I help with taxes.' } });
+    fireEvent.click(within(screen.getByTestId('draft-step-events')).getByTestId('draft-step-save'));
     await waitFor(() => expect(svc.editProfileDraft).toHaveBeenCalledTimes(1));
     const [, patch] = vi.mocked(svc.editProfileDraft).mock.calls[0];
     expect(Object.keys(patch)).toEqual(['eventWorkflows']);
@@ -104,7 +104,7 @@ describe('an unsaved edit', () => {
     await waitFor(() => expect(svc.exportProfile).toHaveBeenCalledWith('advisor', 'draft'));
     await waitFor(() => expect(screen.queryByTestId('assistant-nav-workflows-unsaved')).toBeNull());
     // The reload keeps the section that was open.
-    expect(screen.getByTestId('draft-step-welcome')).toBeTruthy();
+    expect(screen.getByTestId('draft-step-events')).toBeTruthy();
     nav('behavioral');
     expect(await persona()).toBe('You advise briefly.');
   });
@@ -112,13 +112,26 @@ describe('an unsaved edit', () => {
   it('is dropped by Reset, for that area only', async () => {
     await editPersona();
     nav('workflows');
-    fireEvent.change(await screen.findByTestId('draft-welcome-template'), { target: { value: 'Hello.' } });
-    fireEvent.click(within(screen.getByTestId('draft-step-welcome')).getByTestId('draft-step-cancel'));
+    fireEvent.change(await welcomeOpening(), { target: { value: 'Hello.' } });
+    fireEvent.click(within(screen.getByTestId('draft-step-events')).getByTestId('draft-step-cancel'));
     expect(screen.queryByTestId('assistant-nav-workflows-unsaved')).toBeNull();
     nav('behavioral');
     expect(await persona()).toBe('You advise briefly.');
   });
 });
+
+
+/** The welcome's opening text box, in the workflows builder: the built-in welcome copied in where the draft has none. */
+async function welcomeOpening(field: 'text' | 'examples' = 'text'): Promise<HTMLTextAreaElement> {
+  const edit = screen.queryByTestId('assistant-edit-workflow-welcome');
+  if (edit) fireEvent.click(edit);
+  const step = await screen.findByTestId('draft-step-events');
+  const list = within(step).queryByTestId('wfb-view-list');
+  if (list) fireEvent.click(list);
+  const box = step.querySelector(`[data-testid$="-opening-${field}"]`) as HTMLTextAreaElement | null;
+  if (!box) throw new Error('no welcome opening in the workflows builder');
+  return box;
+}
 
 describe('dropping an unsaved edit asks first', () => {
   it('on leaving the assistant, naming the area, and stays when declined', async () => {
@@ -149,7 +162,50 @@ describe('dropping an unsaved edit asks first', () => {
     expect(svc.activateProfileDraft).not.toHaveBeenCalled();
     confirm.mockReturnValueOnce(true);
     fireEvent.click(screen.getByRole('button', { name: 'Activate draft as v4' }));
-    await waitFor(() => expect(svc.activateProfileDraft).toHaveBeenCalledWith('advisor'));
+    // Named by the draft the page is showing, the one that was reviewed.
+    await waitFor(() => expect(svc.activateProfileDraft).toHaveBeenCalledWith('advisor', 'draft-1'));
+  });
+});
+
+describe('a write names the draft the page is showing (SPEC-PORTABLE-PROFILES FR19)', () => {
+  it('a save names the draft it was based on, and the next save names the draft that save made', async () => {
+    await editPersona();
+    nav('workflows');
+    fireEvent.change(await welcomeOpening(), { target: { value: 'Hello.' } });
+    fireEvent.click(within(screen.getByTestId('draft-step-events')).getByTestId('draft-step-save'));
+    await waitFor(() => expect(svc.editProfileDraft).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(svc.editProfileDraft).mock.calls[0][2]).toBe('draft-1');
+    await waitFor(() => expect(screen.queryByTestId('assistant-nav-workflows-unsaved')).toBeNull());
+    nav('behavioral');
+    await screen.findByTestId('draft-persona');
+    fireEvent.click(within(screen.getByTestId('draft-step-identity')).getByTestId('draft-step-save'));
+    await waitFor(() => expect(svc.editProfileDraft).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(svc.editProfileDraft).mock.calls[1][2]).toBe('draft-2');
+  });
+
+  it('a save refused because the draft was saved elsewhere says so, reloads, and keeps the edit', async () => {
+    vi.mocked(svc.editProfileDraft).mockRejectedValueOnce(Object.assign(new Error('changed'), {
+      status: 409, body: { code: 'DRAFT_CHANGED', configId: 'draft-9', error: 'saved again' },
+    }));
+    await editPersona();
+    const loads = vi.mocked(svc.listProfilesAndTools).mock.calls.length;
+    fireEvent.click(within(screen.getByTestId('draft-step-identity')).getByTestId('draft-step-save'));
+    expect(await screen.findByText(/Not saved: someone saved a newer draft/)).toBeTruthy();
+    await waitFor(() => expect(vi.mocked(svc.listProfilesAndTools).mock.calls.length).toBeGreaterThan(loads));
+    expect(await persona()).toBe('You advise briefly.');
+  });
+
+  it('an activation refused because the draft changed since it was reviewed says so above the newer draft and activates nothing', async () => {
+    vi.mocked(svc.activateProfileDraft).mockRejectedValueOnce(Object.assign(new Error('changed'), {
+      status: 409, body: { code: 'DRAFT_CHANGED', configId: 'draft-9', error: 'saved again' },
+    }));
+    render(<CapabilityTestProvider capabilities={ADMIN_CAPS}><ProfilesTab /></CapabilityTestProvider>);
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Advisor' }));
+    fireEvent.click(await screen.findByTestId('assistant-mode-draft'));
+    await screen.findByTestId('draft-persona');
+    fireEvent.click(screen.getByRole('button', { name: 'Activate draft as v4' }));
+    await waitFor(() => expect(svc.activateProfileDraft).toHaveBeenCalledWith('advisor', 'draft-1'));
+    expect(await screen.findByText(/Not activated: someone saved a newer draft/)).toBeTruthy();
   });
 });
 

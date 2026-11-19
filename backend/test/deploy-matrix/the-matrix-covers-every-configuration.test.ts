@@ -48,10 +48,12 @@ describe('the deploy matrix covers every configuration', () => {
   });
 
 
-  it('names C0 to C7, headless C1 alone and with each layer, the example configuration, C0 + admin, C1-custom + enterprise and C7-custom + research, with C4 declared absent and why', () => {
+  it('names C0 to C7, headless C1 alone and with each layer, the example configuration, C0 + admin, C1-custom + enterprise and C7-custom + research, and leaves none out', () => {
     const ids = [...CONFIGURATIONS.map((c) => c.id), ...ABSENT_CONFIGURATIONS.map((c) => c.id)].sort();
     expect(ids).toEqual(['C0', 'C0+admin', 'C1', 'C1-custom', 'C1-custom+enterprise', 'C1-headless', 'C1-headless+chat', 'C1-headless+admin', 'C1-headless+chat+admin', 'C1-headless+experiments', 'C1-headless+duels', 'C-example', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C7-custom', 'C7-custom+research'].sort());
     for (const absent of ABSENT_CONFIGURATIONS) expect(absent.reason.length).toBeGreaterThan(40);
+    expect(ABSENT_CONFIGURATIONS).toEqual([]);
+    expect(configuration('C4').capabilities).toContain('meetings');
   });
 
   it('gives every configuration exactly one file, and every file in the matrix a configuration', () => {

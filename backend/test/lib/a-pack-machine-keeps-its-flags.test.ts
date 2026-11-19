@@ -145,12 +145,28 @@ describe('a pack-declared machine keeps the flags that change behaviour', () => 
     // `when` and `edgeWhen` are asserted in their own case below (ADR-060 decision 6).
     // `choices` and `rests` are asserted in their own case below (ADR-063 decisions 2 and 5).
     // `confirm` and `brief` are asserted in their own case below (ADR-064 decision G).
-    const ASSERTED = ['label', 'prompt', 'placeholder', 'produces', 'delivers', 'requiresTool', 'presented', 'resolvedByOneResponse', 'requires', 'awaits', 'awaitsUser', 'terminal', 'transitions', 'reopens', 'template', 'templates', 'defaultTemplate', 'tools', 'action', 'onSuccess', 'onFailure', 'when', 'edgeWhen', 'choices', 'rests', 'confirm', 'brief'];
+    // `auto`, `notice`, `records` and `requesterMoves` are asserted in their own cases below (ADR-067 G39, WT23, WT22, WT114).
+    const ASSERTED = ['label', 'prompt', 'placeholder', 'produces', 'delivers', 'requiresTool', 'presented', 'resolvedByOneResponse', 'requires', 'awaits', 'awaitsUser', 'terminal', 'transitions', 'reopens', 'template', 'templates', 'defaultTemplate', 'tools', 'action', 'onSuccess', 'onFailure', 'when', 'edgeWhen', 'choices', 'rests', 'confirm', 'brief', 'auto', 'notice', 'records', 'requesterMoves'];
     const src = readFileSync(join(__dirname, '..', '..', 'lambda', 'src', 'lib', 'task-state-machines.ts'), 'utf-8');
     const defBlock = src.slice(src.indexOf('export interface TaskStateDef'));
     const fields = [...defBlock.slice(0, defBlock.indexOf('\n}')).matchAll(/^\s{2}(\w+)\??:/gm)].map((m) => m[1]);
     expect(fields.length).toBeGreaterThan(5); // the scrape found the block, not nothing
     expect(fields.filter((f) => !ASSERTED.includes(f))).toEqual([]);
+  });
+
+  it('carries `auto`, `notice` and `records`, so a declared move, a notice on entry and a typed value survive the pack (ADR-067)', async () => {
+    const merged = await mergedMachines(packWith(
+      { auto: 'done', notice: { to: 'requester', template: 'workflow-step-withheld' } },
+      { awaits: { party: 'requester' }, requires: ['the budget'], records: { 'the budget': 'number' } },
+    ));
+    expect(merged.pack_flow?.states?.working?.auto).toBe('done');
+    expect(merged.pack_flow?.states?.working?.notice).toEqual({ to: 'requester', template: 'workflow-step-withheld' });
+    expect(merged.pack_flow?.states?.waiting?.records).toEqual({ 'the budget': 'number' });
+  });
+
+  it('carries `requesterMoves` on a step the worker holds, so a reschedule its author offered survives the pack (WT114)', async () => {
+    const merged = await mergedMachines(packWith({}, { awaits: { party: 'worker' }, requesterMoves: ['working'] }));
+    expect(merged.pack_flow?.states?.waiting?.requesterMoves).toEqual(['working']);
   });
 
   it('carries `confirm` and `brief` on a presented step, so a complete brief is drawn as the pack declared (ADR-064 decision G)', async () => {

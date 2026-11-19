@@ -572,9 +572,10 @@ test.describe.serial('Mentions — Multi-User', () => {
       pageA.locator('.message-input-sticky-target-chip--private'),
       'the privacy decoration must appear once the token resolves',
     ).toBeVisible({ timeout: 5000 });
-    // THE PICK WROTE THE MEMBER'S ID beside its name, so who reads the message is decided by the id.
+    // THE FIELD SHOWS THE MEMBER BY NAME (`.Name`), and the member's id rides beside it for the send: the privacy chip
+    // above is the field saying the pick resolved, and the message's delivery below is the id deciding who reads it.
     const written = await pageA.locator('.message-textarea').inputValue();
-    expect(written, `the private pick wrote no id, only a name: "${written}"`).toMatch(/^\.<[^>|]+\|[^>|]+> /);
+    expect(written, `the field shows the picked member by name, never the token: "${written}"`).toMatch(/^\.[^<>|]+ $/);
 
     await pageA.locator('.message-textarea').press('End');
     await pageA.locator('.message-textarea').pressSequentially(`please remember the codename ${secret}`);
@@ -888,7 +889,12 @@ test.describe('the @all handoff: a bypass turn is classified like any other', ()
     await expect(async () => {
       expect(await assistantResponseCount(channelArn)).toBeGreaterThan(botsBefore);
     }).toPass({ timeout: 120_000 });
-    await page.waitForTimeout(20000);
+    // THE TURN HAS SETTLED WHEN NO PLACEHOLDER IS LEFT, however long the model took. One still open at the bound is what the
+    // assertion below reports. The few seconds after it are for a second answer, were two entries to run the turn.
+    const carriesMarker = (c: string) => decodeURIComponent(c).includes('<!--corr:');
+    await expect.poll(async () => (await botMessagesForDiagnosis(channelArn)).filter(carriesMarker).length, { timeout: 90_000, intervals: [2000] })
+      .toBe(0).catch(() => undefined);
+    await page.waitForTimeout(5000);
 
     const messages = await botMessagesForDiagnosis(channelArn);
     for (const m of messages) {

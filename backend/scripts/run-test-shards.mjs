@@ -8,9 +8,9 @@
  *    gets, so it is killed mid-run. A killed pool reports "Jest worker encountered N child
  *    process exceptions", which reads exactly like a product regression. Splitting into shards
  *    solves that.
- * 2. Shards run CONCURRENTLY hard-lock the machine. Each Jest process runs 4 workers holding a
- *    full TypeScript program with `cache: false`, so four shards is 16 compiling workers. This
- *    has cost a session's uncommitted work.
+ * 2. Shards run CONCURRENTLY hard-lock the machine. Each Jest process runs its worker pool
+ *    (`maxWorkers`, 2 by default, `jest.config.js`), and some suites synthesize every CDK
+ *    stack inside a worker, so concurrent shards multiply that. This has cost a session's uncommitted work.
  *
  * So: shard, but serially, from a single supervising process. That process holds an exclusive
  * lock for its whole lifetime, which is what makes "serially" true even when something else in
@@ -56,6 +56,7 @@ import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gitState } from './lib/deployed-commit.mjs';
 
 const require = createRequire(import.meta.url);
 const lock = require('./lib/test-run-lock.cjs');
@@ -479,7 +480,7 @@ async function main() {
   // deliberately keeps what is there; that is what resuming means.
   if (isFullRun) {
     for (const f of fs.readdirSync(REPORT_DIR)) {
-      if (/^shard-\d+\.json$/.test(f) || f === 'summary.json') {
+      if (/^shard-\d+(\.meta)?\.json$/.test(f) || f === 'summary.json') {
         try { fs.rmSync(path.join(REPORT_DIR, f)); } catch { /* best effort */ }
       }
     }
@@ -495,8 +496,17 @@ async function main() {
   for (const i of todo) {
     console.log(`\n===== shard ${i}/${shards} =====\n`);
     const reportPath = path.join(REPORT_DIR, `shard-${i}.json`);
+    // THE COMMIT THIS SHARD RAN AGAINST, read as it starts and kept beside its report, so a release report can
+    // prove every shard ran against one commit (DESIGN-RELEASE-EVIDENCE section 10). A FILTERED run is marked so
+    // it is never taken for the whole suite.
+    let stamp = null;
+    try { stamp = gitState(BACKEND_ROOT); } catch { /* not a git checkout: the report carries no commit */ }
     // eslint-disable-next-line no-await-in-loop -- serial is the entire point of this script
     const result = await runShard(bin, i, shards, jestArgs, reportPath);
+    fs.writeFileSync(path.join(REPORT_DIR, `shard-${i}.meta.json`), `${JSON.stringify({
+      shard: i, shards, commit: stamp?.head ?? null, dirty: stamp?.dirty ?? null, filtered: jestArgs.length > 0,
+      at: new Date().toISOString(),
+    }, null, 2)}\n`);
     results.push({ shard: i, ...result });
 
     // PRINTED THE MOMENT IT IS KNOWN, not saved for a summary the caller may never reach. A run

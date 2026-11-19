@@ -9,7 +9,7 @@
  *   - the shipped personas open their section with the platform's marker, so the move lands in it.
  */
 import { HOW_TO_ANSWER_HEADING, movedIntoPersona } from '../../lambda/src/lib/persona-sections';
-import { BASIC_PERSONA, STANDARD_PERSONA, PREMIUM_PERSONA, OPS_PERSONA } from '../../demo/personas';
+import { BASIC_PERSONA, STANDARD_PERSONA, PREMIUM_PERSONA, OPS_PERSONA } from '../../../demo/stratum-company/personas';
 
 const MAX = 20000;
 

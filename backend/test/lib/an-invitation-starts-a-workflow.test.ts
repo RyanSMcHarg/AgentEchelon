@@ -19,7 +19,6 @@ import {
   EVENT_WORKFLOW_EVENTS,
   EVENTS_NAMING_A_PERSON,
   declaredWorkflowOn,
-  eventNaturalKey,
   eventRunKey,
   eventWorkflowErrors,
   runEventWorkflow,
@@ -29,6 +28,7 @@ import {
   type EventRunDeps,
   type EventWorkflow,
 } from '../../lambda/src/lib/event-workflow';
+import { eventNaturalKey } from '../../lambda/src/lib/event-natural-key';
 import { welcomeWorkflowErrors } from '../../lambda/src/lib/profile-lifecycle';
 import { EVENT_FIELDS, FIXED_SOURCES, buildSourceTable, sourceLookup, whenErrors } from '../../lambda/src/lib/variables';
 import { INVITATIONS_BY_CHANNEL, INVITATION_CHANNEL_ATTRIBUTE, INVITATION_RECORD_ATTRIBUTES, everyInvitation, findInvitation, pendingInvitation } from '../../lambda/src/lib/invitations';
@@ -302,9 +302,9 @@ describe('the router verifies the invitation against its record (ADR-061 decisio
     expect(read('invitations.ts')).toMatch(/invitationSentThroughRouter\)\(facts\.classification, channelArn, record\.invitationId, record\.pk\)/);
   });
 
-  it('verifies before anything runs: the classification, the record, the primary, then the declared workflow', () => {
+  it('verifies before anything runs: the classification, the record, the owning assistant, then its declared workflow', () => {
     const fn = router.slice(router.indexOf('export async function handleInvitationSent('), router.indexOf('export async function handlePersonJoined('));
-    const order = ['resolveChannelClassificationTag(channelArn)', 'verifyInvitationEvent(channelArn, invitationId, invitationKey)', 'primaryAssistantOf(', 'servedWelcomeVersion(', "declaredWorkflowOn(served?.version.eventWorkflows, 'invitation-sent')", 'runWorkflowFor('].map((t) => fn.indexOf(t));
+    const order = ['resolveChannelClassificationTag(channelArn)', 'verifyInvitationEvent(channelArn, invitationId, invitationKey)', 'eventWorkflowOwner(', 'servedWelcomeVersion(', "declaredWorkflowOn(served?.version.eventWorkflows, 'invitation-sent')", 'runWorkflowFor('].map((t) => fn.indexOf(t));
     expect(order.every((i) => i > -1)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     // The people are the record's, never the payload's, which carries ids alone.
@@ -316,7 +316,7 @@ describe('the router verifies the invitation against its record (ADR-061 decisio
 
   it('a hand-back after an agent step reads the invitation again, and continues nothing for one that no longer matters', () => {
     const fn = router.slice(router.indexOf('export async function handleEventContinuation('), router.indexOf('async function sayWorkflowSend('));
-    expect(fn).toMatch(/eventNaturalKey\(wf\.on, channelArn, person\(req\.eventPerson\), str\(req\.invitationId\), alarm\)/);
+    expect(fn).toContain('eventPerson: person(req.eventPerson), invitationId: str(req.invitationId), alarm,');
     expect(fn).toMatch(/isInvitationEvent\(wf\.on\) \? await verifyInvitationEvent\(channelArn, str\(req\.invitationId\)\)/);
     expect(fn).toMatch(/eventPerson: invitation\.record\.personArn, invitationId: invitation\.record\.invitationId, inviter: invitation\.record\.inviterArn/);
   });
@@ -329,7 +329,7 @@ describe('the router verifies the invitation against its record (ADR-061 decisio
   });
 
   it('the two agent steps of two invitations are two turns: the dispatch is correlated by the invitation', () => {
-    expect(router).toMatch(/eventNaturalKey\(args\.event, channelArn, args\.eventPerson, args\.invitationId, args\.alarm\)/);
+    expect(router).toContain('runNaturalKey(args.event, channelArn, { ...args, subjectMessageId: args.values?.message, meetingId: args.meeting?.meetingId })');
   });
 });
 

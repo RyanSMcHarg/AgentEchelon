@@ -14,7 +14,7 @@ jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
 
 process.env.ADMIN_IAM_ENFORCEMENT = 'true';
 
-import { handler, MESSAGE_FLOW_COLUMNS } from '../../lambda/src/analytics-aurora/analytics-query';
+import { handler, MESSAGE_FLOW_COLUMNS, WORK_INTENT_SQL } from '../../lambda/src/analytics-aurora/analytics-query';
 
 const SUB = '11111111-2222-3333-4444-555555555555';
 const teamPost = (assistant: string, body: Record<string, unknown>): APIGatewayProxyEvent => ({
@@ -45,6 +45,19 @@ describe('the message flow', () => {
     expect(order.every((p) => p > 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     expect(sql).toMatch(/tc\.kind = 'cancelled_response'/);
+  });
+
+  it('counts a task turn under its task\'s type, as the intent\'s Effectiveness row does', async () => {
+    const intentOf = `COALESCE(${WORK_INTENT_SQL('e')}, upd.metadata->>'intent', m.metadata->>'intent', 'unknown')`;
+    await handler(teamPost('analyst', { queryType: 'message_flow' }));
+    expect(firstSql()).toContain(`${intentOf} AS intent`);
+    mockDbQuery.mockClear();
+    await handler(teamPost('analyst', { queryType: 'intent_effectiveness', intent: 'report_generation' }));
+    expect(firstSql()).toContain(`${WORK_INTENT_SQL('e')} AS intent`);
+    mockDbQuery.mockClear();
+    // The turns behind an intent's node are the turns that node counts.
+    await handler(teamPost('analyst', { queryType: 'flow_turns', flowIntent: 'report_generation' }));
+    expect(firstSql()).toContain(`${intentOf} = $11`);
   });
 
   it('returns every latency average with the count it was taken over, so the console can weight them', () => {
@@ -103,5 +116,20 @@ describe('the turns behind a node', () => {
     await handler(teamPost('analyst', { queryType: 'flow_turn', messageId: 'm-1' }));
     expect(firstParams()).toEqual(expect.arrayContaining(['analyst', 'm-1']));
     expect(firstSql()).toMatch(/WHERE m\.id::text = \$10/);
+  });
+
+  it('names the step a turn ran in and the rule that chose its model', async () => {
+    await handler(teamPost('analyst', { queryType: 'flow_turn', messageId: 'm-1' }));
+    const select = firstSql().slice(0, firstSql().indexOf('FROM messages m'));
+    for (const col of ['e.task_type', 'e.task_step', 'e.task_state', 'e.model_from']) expect(select).toContain(col);
+  });
+
+  it('names how the classifier placed the message against the open work, off the answer\'s latest update then its create', async () => {
+    for (const queryType of ['flow_turn', 'flow_turns']) {
+      jest.clearAllMocks();
+      await handler(teamPost('analyst', { queryType, messageId: 'm-1' }));
+      const select = firstSql().slice(0, firstSql().indexOf('FROM messages m'));
+      expect(select).toContain("COALESCE(upd.metadata->>'routedAs', m.metadata->>'routedAs') AS routed_as");
+    }
   });
 });

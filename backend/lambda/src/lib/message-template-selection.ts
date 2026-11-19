@@ -167,7 +167,7 @@ export async function loadMessageTemplateSet(
   const key = `${at.classification}|${at.assistant ?? ''}|${JSON.stringify(at.messages ?? {})}|${JSON.stringify(at.variables ?? {})}`;
   // A RESOLVER-BOUND FIELD FITS THE SET as the catalog's least-permitting reading would admit it; the line that says
   // the template reads it through the turn's own resolver (`resolverValues`, `message-lines.ts`).
-  const fitLookup = withUnreadCatalog(versionLookup(buildSourceTable({ catalog: [] }), at.variables));
+  const fitLookup = withUnreadCatalog(versionLookup(buildSourceTable({ catalog: [] }), at.variables), at.variables);
   const now = Date.now();
   const hit = setCache.get(key);
   if (hit && now - hit.at < TEMPLATE_POINTER_TTL_MS && !deps) return hit.set;

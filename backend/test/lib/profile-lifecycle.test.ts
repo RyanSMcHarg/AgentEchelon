@@ -289,31 +289,23 @@ describe('profile lifecycle P1', () => {
     expect(v.errors.filter((e) => e.includes('would never fire'))).toEqual([]);
   });
 
-  it('refuses a workflow selection naming a graph that does not exist', async () => {
-    // A selection is narrowing, so the failure mode is not a security one - it is a workflow the
-    // assistant can never open, configured and doing nothing. Same shape as a byIntent route to an
-    // intent nothing classifies to, and refused for the same reason: it reads as set up and is not.
-    const { client } = fakeSsmStore();
-    await createDraft(client, ROOT, 'analyst', ACTOR);
-    await editDraft(client, ROOT, 'analyst', { workflows: ['report_generation', 'not_a_workflow'] } as never, ACTOR);
-    const v = await validateDraft(client, ROOT, 'analyst', CATALOG);
-    expect(v.errors.join(' ')).toMatch(/not_a_workflow.*names no workflow/);
-    // And it names what IS available, so the operator can fix it without reading the source.
-    expect(v.errors.join(' ')).toMatch(/available: .*report_generation/);
-  });
-
-  it('accepts a selection of workflows that exist, and accepts none at all', async () => {
+  it('refuses the retired workflow selection on a draft, and names what replaces it (ADR-067 stage 4)', async () => {
+    // An intent opens work when it is multi-step, which its workflow makes it; the selection that narrowed which could is
+    // retired, and a new draft carries a stored one as single-turn intents (retired-fields.ts). A draft edited to carry it
+    // again is refused by name, with what to do instead.
     const { client } = fakeSsmStore();
     await createDraft(client, ROOT, 'analyst', ACTOR);
     await editDraft(client, ROOT, 'analyst', { workflows: ['report_generation'] } as never, ACTOR);
-    const picked = await validateDraft(client, ROOT, 'analyst', CATALOG);
-    expect(picked.errors.filter((e) => e.includes('workflow'))).toEqual([]);
+    const v = await validateDraft(client, ROOT, 'analyst', CATALOG);
+    expect(v.errors.join(' ')).toMatch(/workflows is retired: an intent opens work when it is multi-step, so make each intent that should not open a task single-turn/);
+  });
 
-    // Absent ⇒ every available workflow. That is the pre-existing behaviour and must stay the default,
-    // or adding the field would silently narrow every assistant that never sets it.
+  it('accepts a draft with no selection', async () => {
+    const { client } = fakeSsmStore();
+    await createDraft(client, ROOT, 'analyst', ACTOR);
     await editDraft(client, ROOT, 'analyst', { workflows: null } as never, ACTOR);
     const all = await validateDraft(client, ROOT, 'analyst', CATALOG);
-    expect(all.errors.filter((e) => e.includes('workflow'))).toEqual([]);
+    expect(all.errors.filter((e) => e.startsWith('workflows'))).toEqual([]);
   });
 
   it('refuses a version that tries to DEFINE a workflow, and says where they live', async () => {
@@ -533,12 +525,12 @@ describe('nothing is published under the live name, and a candidate changes only
     await activateDraft(client, ROOT, 'advisor', CATALOG, ACTOR);
     const ALT = { baseProfile: 'advisor', targetProfile: 'alt-primary-premium' };
     // The premium classification selects it, so a candidate may use it.
-    await expect(publishVariantVersion(client, ROOT, ALT, { models: { byIntent: { image_generation: { image: { primary: 'openai_gpt_image_1' } } } } } as never, CATALOG, ACTOR, PROV))
+    await expect(publishVariantVersion(client, ROOT, ALT, { models: { byIntent: { image_generation: { image: { primary: 'openai_gpt_image_2' } } } } } as never, CATALOG, ACTOR, PROV))
       .resolves.toMatchObject({ profileName: 'alt-primary-premium' });
     // The standard classification does not, so neither a candidate nor the editor's own path may.
     await createDraft(client, ROOT, 'analyst', ACTOR);
     await activateDraft(client, ROOT, 'analyst', CATALOG, ACTOR);
-    await expect(publishVariantVersion(client, ROOT, PRIMARY_ROLE, { models: { byIntent: { image_generation: { image: { primary: 'openai_gpt_image_1' } } } } } as never, CATALOG, ACTOR, PROV))
+    await expect(publishVariantVersion(client, ROOT, PRIMARY_ROLE, { models: { byIntent: { image_generation: { image: { primary: 'openai_gpt_image_2' } } } } } as never, CATALOG, ACTOR, PROV))
       .rejects.toThrow(/not selected by the standard classification/);
     await createDraft(client, ROOT, 'analyst', ACTOR);
     await expect(editDraft(client, ROOT, 'analyst', { models: { byIntent: { image_generation: { image: { primary: 'fal_flux_pro_1_1' } } } } } as never, ACTOR)).resolves.toBeTruthy();
@@ -621,3 +613,33 @@ describe('a derived candidate cannot become live by a label move', () => {
   });
 });
 
+
+describe('a base model set back to the classification default', () => {
+  it('serves the classification default once the patched models name no base model', async () => {
+    const { client } = fakeSsmStore();
+    // Nothing active yet: the seed serves, on the classification default.
+    const classificationDefault = (await resolveActiveProfile('analyst', { ssm: client, ssmRoot: ROOT })).profile.modelKey;
+    await createDraft(client, ROOT, 'analyst', ACTOR);
+    await editDraft(client, ROOT, 'analyst', { modelKey: 'titan' }, ACTOR);
+    expect(classificationDefault).not.toBe('titan');
+
+    // The console's "Classification default": the draft's models, sent without `default`.
+    const { default: _base, ...models } = (await getDraft(client, ROOT, 'analyst'))!.models ?? {};
+    await editDraft(client, ROOT, 'analyst', { models }, ACTOR);
+    const draft = await getDraft(client, ROOT, 'analyst');
+    expect(draft?.models?.default).toBeUndefined();
+    expect(draft?.modelKey).toBe('default');
+
+    await activateDraft(client, ROOT, 'analyst', CATALOG, ACTOR);
+    __clearActiveProfileCache();
+    expect((await resolveActiveProfile('analyst', { ssm: client, ssmRoot: ROOT })).profile.modelKey).toBe(classificationDefault);
+  });
+
+  it('keeps the base model a patch of models names', async () => {
+    const { client } = fakeSsmStore();
+    await createDraft(client, ROOT, 'analyst', ACTOR);
+    const models = (await getDraft(client, ROOT, 'analyst'))!.models ?? {};
+    await editDraft(client, ROOT, 'analyst', { models: { ...models, default: 'titan' } }, ACTOR);
+    expect((await getDraft(client, ROOT, 'analyst'))?.modelKey).toBe('titan');
+  });
+});

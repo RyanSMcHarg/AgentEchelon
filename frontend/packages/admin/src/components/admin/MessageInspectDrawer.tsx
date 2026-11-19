@@ -112,7 +112,7 @@ const MessageInspectDrawer: React.FC<Props> = ({ message, onClose, onOpenAttachm
       <aside className="admin-drawer" onClick={(e) => e.stopPropagation()}>
         <header className="admin-drawer-header">
           <div>
-            <h4>{t('admin.messageInspect.message')}</h4>
+            <h3>{t('admin.messageInspect.message')}</h3>
             <code className="admin-mono-id">{message.id}</code>
           </div>
           <button className="btn-secondary" onClick={onClose} aria-label={t('admin.messageInspect.close')}>×</button>

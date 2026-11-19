@@ -83,6 +83,9 @@ import type { ProfileRegistry } from '../../../lib/profile-registry';
  * `golden_runs` and `golden_run_attempts` joined them in migration 094: a draft's run against the set holds answers
  * generated from that set, so it is bounded exactly like the set (ADR-065). `golden_batches` joined them in migration 095: the
  * report of an upload or a generation into one classification's set.
+ *
+ * `meeting_events` joined them in migration 076. It holds no message text: who was in a meeting, on which conversation,
+ * and when, which stays inside the conversation's classification like what was said there.
  */
 export const BOUNDED_TABLES = [
   'embeddings',
@@ -93,6 +96,7 @@ export const BOUNDED_TABLES = [
   'golden_runs',
   'golden_run_attempts',
   'golden_batches',
+  'meeting_events',
 ] as const;
 
 /**
@@ -318,6 +322,19 @@ END $do$;`,
   for (const table of BOUNDED_TABLES) {
     statements.push(`GRANT SELECT ON ${table} TO ${readerRoles.join(', ')};`);
     statements.push(`GRANT SELECT, INSERT, UPDATE, DELETE ON ${table} TO ${WRITER_ROLE};`);
+    // THE WRITER'S INSERT DRAWS THE TABLE'S OWN KEY: a serial column's sequence is a separate object with its own grant,
+    // so the writer is given USAGE on each sequence this table owns, and on no other.
+    statements.push(`DO $do$
+DECLARE seq text;
+BEGIN
+  FOR seq IN
+    SELECT s.oid::regclass::text FROM pg_class s
+    JOIN pg_depend d ON d.objid = s.oid AND d.deptype IN ('a', 'i')
+    WHERE s.relkind = 'S' AND d.refobjid = '${table}'::regclass
+  LOOP
+    EXECUTE format('GRANT USAGE ON SEQUENCE %s TO ${WRITER_ROLE}', seq);
+  END LOOP;
+END $do$;`);
   }
 
   // 4. The scope mapping the policies call.

@@ -41,13 +41,13 @@ async function drive(argv: string[], { status = 200, answer = {}, env = {}, reso
 
 describe('the assistant CLI signs every call', () => {
   it('sends a SigV4 POST for execute-api in the API region, with the session token and the body hashed in', async () => {
-    const { exitCode, sent } = await drive(['activate', 'standard', '--api', API]);
+    const { exitCode, sent } = await drive(['activate', 'standard', '--config', 'cfg-reviewed', '--api', API]);
     expect(exitCode).toBe(0);
     expect(sent).toHaveLength(1);
     const [{ url, init }] = sent;
     expect(url).toBe(`${API}/activate`);
     expect(init.method).toBe('POST');
-    expect(JSON.parse(init.body)).toEqual({ profileName: 'standard' });
+    expect(JSON.parse(init.body)).toEqual({ profileName: 'standard', configId: 'cfg-reviewed' });
     expect(init.headers.authorization).toMatch(
       /^AWS4-HMAC-SHA256 Credential=AKIDSTUBEXAMPLE\/20261018\/us-east-1\/execute-api\/aws4_request, SignedHeaders=[^,]*host[^,]*, Signature=[0-9a-f]{64}$/,
     );
@@ -69,10 +69,11 @@ describe('the assistant CLI signs every call', () => {
   it('routes each command to its profile route', () => {
     const parse = (argv: string[]) => cli.requestFor(API, cli.parseArgs(argv, { readFile: () => '{"displayName":"Ops"}' }));
     expect(parse(['draft', 'standard'])).toEqual({ url: `${API}/version`, body: { profileName: 'standard' } });
-    expect(parse(['draft', 'standard', '--patch', 'p.json', '--set', 'temperature=0.2']))
-      .toEqual({ url: `${API}/draft`, body: { profileName: 'standard', patch: { displayName: 'Ops', temperature: 0.2 } } });
+    expect(parse(['draft', 'standard', '--replace', 'cfg-old'])).toEqual({ url: `${API}/version`, body: { profileName: 'standard', replaceConfigId: 'cfg-old' } });
+    expect(parse(['draft', 'standard', '--config', 'cfg-1', '--patch', 'p.json', '--set', 'temperature=0.2']))
+      .toEqual({ url: `${API}/draft`, body: { profileName: 'standard', patch: { displayName: 'Ops', temperature: 0.2 }, configId: 'cfg-1' } });
     expect(parse(['validate', 'standard'])).toEqual({ url: `${API}/validate`, body: { profileName: 'standard' } });
-    expect(parse(['activate', 'standard'])).toEqual({ url: `${API}/activate`, body: { profileName: 'standard' } });
+    expect(parse(['activate', 'standard', '--config', 'cfg-2'])).toEqual({ url: `${API}/activate`, body: { profileName: 'standard', configId: 'cfg-2' } });
     expect(parse(['rollback', 'standard', '--version', '3'])).toEqual({ url: `${API}/rollback`, body: { profileName: 'standard', version: 3 } });
   });
 
@@ -94,14 +95,16 @@ describe('the assistant CLI signs every call', () => {
   });
 
   it('refuses a malformed command line before signing anything', async () => {
-    for (const argv of [[], ['publish', 'standard'], ['activate'], ['rollback', 'standard'], ['rollback', 'standard', '--version', '0'], ['validate', 'standard', '--set', 'a=1']]) {
+    for (const argv of [[], ['publish', 'standard'], ['activate'], ['rollback', 'standard'], ['rollback', 'standard', '--version', '0'], ['validate', 'standard', '--set', 'a=1'],
+      // A draft is named wherever it is replaced or promoted: an activation or an edit without --config is refused.
+      ['activate', 'standard'], ['draft', 'standard', '--set', 'a=1'], ['validate', 'standard', '--config', 'x'], ['draft', 'standard', '--config', 'x', '--replace', 'y', '--set', 'a=1']]) {
       const r = await drive([...argv, '--api', API]);
       expect([argv.join(' '), r.exitCode, r.sent.length]).toEqual([argv.join(' '), 2, 0]);
     }
   });
 
   it('names an IAM refusal as one, and fails a draft that does not validate', async () => {
-    const refused = await drive(['activate', 'standard', '--api', API], {
+    const refused = await drive(['activate', 'standard', '--config', 'cfg-1', '--api', API], {
       status: 403, answer: { Message: 'User: arn:aws:sts::111122223333:assumed-role/x/y is not authorized to perform: execute-api:Invoke' },
     });
     expect(refused.exitCode).toBe(1);

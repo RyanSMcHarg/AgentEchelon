@@ -6,8 +6,10 @@
  *  - a reply with a valid token whose From fails DMARC posts nothing, even with SPF and DKIM passing;
  *  - a From that is not the address the person's issuer holds for them now posts nothing, and a person
  *    offboarded or disabled at their pool (no address) posts nothing;
+ *  - a person whose current clearance does not reach the conversation's classification posts nothing, and
+ *    neither does one whose clearance or conversation classification cannot be read;
  *  - an accepted reply is posted to the token's conversation as the token's person, never as anyone a
- *    header names, on the person's own bearer-pinned session (the one-conversation role, `person` and
+ *    header names, on the person's own bearer-pinned session (the `restricted` role, `person` and
  *    `classification` tags, a session policy of one channel and `SendChannelMessage`);
  *  - a reply token is valid 14 days, is minted per (conversation, person, notice), and is stored only as its hash;
  *  - the receipt rule and the poster's grants, at synth.
@@ -35,6 +37,7 @@ import {
 import { newCaseFreeToken, tokenRecordOf, TOKEN_KINDS } from '../../lambda/src/lib/tokens';
 import { deployedEmailConsent } from '../../lambda/src/lib/email-consent';
 import { handleReceived, pinnedPoster, receivedMailOf, type EmailReplyDeps } from '../../lambda/src/email-reply';
+import type { Directory } from '../../lambda/src/lib/membership-source';
 import { NotificationStack } from '../../lib/stacks/notification-stack';
 import { assistantClassifications } from '../../lib/config/profiles';
 
@@ -61,6 +64,7 @@ function deps(over: Partial<ReplyDeps> = {}): ReplyDeps {
     now: NOW,
     token: async (t) => (t === TOKEN ? { ok: true, record: { channelArn: CHANNEL, personArn: RILEY, expiresAt: NOW + 60, noticeId: 'n-1' } } : { ok: false, reason: 'unknown' }),
     contactOf: async (arn) => (arn === RILEY ? 'riley@example.com' : null),
+    cleared: async () => ({ ok: true, classification: 'premium' }),
     text: async () => 'Sounds good, ship it.',
     ...over,
   };
@@ -129,14 +133,28 @@ describe('a valid token is not enough', () => {
   });
 
   it('otherwise, it is posted to the token\'s conversation as the token\'s person', async () => {
-    expect(await decideReply(mail(), deps())).toEqual({ post: true, channelArn: CHANNEL, personArn: RILEY, text: 'Sounds good, ship it.', noticeId: 'n-1' });
+    expect(await decideReply(mail(), deps())).toEqual({ post: true, channelArn: CHANNEL, personArn: RILEY, classification: 'premium', text: 'Sounds good, ship it.', noticeId: 'n-1' });
   });
 });
 
 describe('the handler', () => {
-  function world(record = tokenRecordOf('reply', TOKEN, { channelArn: CHANNEL, personArn: RILEY, issuer: '', expiresAt: NOW + 60 })) {
+  type Clearance = Awaited<ReturnType<Directory['clearanceOf']>>;
+  const held = (token: string): Clearance => ({ state: 'held', token, adminPlane: false, held: [token], groups: [], admin: false, issuers: ['deployment'] });
+  /**
+   * One received reply's world: the token names `channelArn`, whose tags read `tags`, and the person's
+   * clearance now is `clearance`. Each case that changes the conversation names a conversation of its own,
+   * so no tag a previous case read is remembered.
+   */
+  function world(opts: {
+    channelArn?: string;
+    clearance?: () => Promise<Clearance>;
+    tags?: () => Promise<{ Tags?: Array<{ Key?: string; Value?: string }> }>;
+  } = {}) {
+    const channelArn = opts.channelArn ?? CHANNEL;
+    const record = tokenRecordOf('reply', TOKEN, { channelArn, personArn: RILEY, issuer: '', expiresAt: NOW + 60 });
     const s3Calls: string[] = [];
     const posted: any[] = [];
+    const clearanceAsked: string[] = [];
     const d: EmailReplyDeps = {
       replyDomain: DOMAIN, tokensTable: 'Tokens', inboundBucket: 'inbound', inboundPrefix: 'replies/', restrictedRoleArn: 'arn:aws:iam::111122223333:role/restricted',
       doc: { send: async (cmd: any) => ({ Item: cmd.input.Key.pk === record.pk ? record : undefined }) },
@@ -148,11 +166,15 @@ describe('the handler', () => {
             : {};
         },
       },
-      directory: { contactFor: async () => ({ route: 'email', address: 'riley@example.com', name: 'Riley' }) } as never,
+      directory: {
+        contactFor: async () => ({ route: 'email', address: 'riley@example.com', name: 'Riley' }),
+        clearanceOf: async (arn: string) => { clearanceAsked.push(arn); return (opts.clearance ?? (async () => held('premium')))(); },
+      } as never,
+      tags: { send: async () => (opts.tags ?? (async () => ({ Tags: [{ Key: 'classification', Value: 'premium' }] })))() },
       postAsPerson: async (a) => { posted.push(a); return 'msg-1'; },
       now: () => NOW * 1000,
     };
-    return { d, s3Calls, posted };
+    return { d, s3Calls, posted, clearanceAsked };
   }
   const quiet = () => [jest.spyOn(console, 'log').mockImplementation(() => undefined)];
 
@@ -172,7 +194,61 @@ describe('the handler', () => {
     const res = await handleReceived(mail(), w.d);
     spies.forEach((s) => s.mockRestore());
     expect(res).toMatchObject({ post: true });
-    expect(w.posted).toEqual([{ personArn: RILEY, channelArn: CHANNEL, text: 'Yes, Thursday works.', idempotencyKey: sha('m-1') }]);
+    expect(w.posted).toEqual([{ personArn: RILEY, channelArn: CHANNEL, classification: 'premium', text: 'Yes, Thursday works.', idempotencyKey: sha('m-1') }]);
+    // The replier's clearance was read now, by person.
+    expect(w.clearanceAsked).toEqual([RILEY]);
+  });
+
+  /**
+   * A REPLY IS POSTED ONLY FOR A PERSON WHOSE CURRENT CLEARANCE REACHES THE CONVERSATION (`lib/email-clearance.ts`).
+   * A member whose clearance was lowered keeps their membership and their 14-day reply address until the
+   * membership audit acts; their reply is refused here, counted by reason, and nothing is posted.
+   */
+  describe('the replier\'s clearance', () => {
+    /** The decision, and every line logged while it was made (the EMF count among them). */
+    const refusedWith = async (w: ReturnType<typeof world>) => {
+      const log = jest.spyOn(console, 'log').mockImplementation(() => undefined);
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        const res = await handleReceived(mail(), w.d);
+        return { res, logged: JSON.stringify(log.mock.calls) };
+      } finally {
+        log.mockRestore();
+        warn.mockRestore();
+      }
+    };
+
+    it('a member whose clearance does not reach the conversation is refused, and nothing is posted', async () => {
+      const w = world({ channelArn: `${APP}/channel/lowered`, clearance: async () => held('basic') });
+      const { res, logged } = await refusedWith(w);
+      expect(res).toEqual({ post: false, reason: 'not-cleared' });
+      expect(w.posted).toEqual([]);
+      // Recorded the way every refusal is: logged and counted by its reason.
+      expect(logged).toContain('Refused_not-cleared');
+      // The stored copy is still deleted.
+      expect(w.s3Calls).toContain('DeleteObjectCommand replies/m-1');
+    });
+
+    it('a person whose clearance cannot be read, or only a sign-in token could establish, is refused', async () => {
+      const failed = world({ channelArn: `${APP}/channel/unread-clearance`, clearance: async () => { throw Object.assign(new Error('x'), { name: 'TooManyRequestsException' }); } });
+      expect((await refusedWith(failed)).res).toEqual({ post: false, reason: 'clearance-unresolved' });
+      const token = world({ channelArn: `${APP}/channel/token-only`, clearance: async () => ({ state: 'undetermined', issuers: ['partner'] }) });
+      expect((await refusedWith(token)).res).toEqual({ post: false, reason: 'clearance-unresolved' });
+      expect([...failed.posted, ...token.posted]).toEqual([]);
+    });
+
+    it('a conversation whose classification tag cannot be read, or names none, refuses before any clearance is read', async () => {
+      const cases = [
+        world({ channelArn: `${APP}/channel/tag-denied`, tags: async () => { throw Object.assign(new Error('x'), { name: 'ForbiddenException' }); } }),
+        world({ channelArn: `${APP}/channel/untagged`, tags: async () => ({ Tags: [] }) }),
+        world({ channelArn: `${APP}/channel/unknown-tag`, tags: async () => ({ Tags: [{ Key: 'classification', Value: 'not-a-classification' }] }) }),
+      ];
+      for (const w of cases) {
+        expect((await refusedWith(w)).res).toEqual({ post: false, reason: 'classification-unreadable' });
+        expect(w.posted).toEqual([]);
+        expect(w.clearanceAsked).toEqual([]);
+      }
+    });
   });
 
   it('reads SES\'s receipt event: recipients, From and every verdict', () => {
@@ -184,17 +260,22 @@ describe('the handler', () => {
 });
 
 describe('posted on the person\'s own bearer-pinned session, never as a service identity', () => {
-  it('assumes the one-conversation role with the person and classification tags, narrowed to one channel and SendChannelMessage', async () => {
+  it('assumes the restricted role with the person and classification tags, narrowed to one channel of the checked classification and SendChannelMessage', async () => {
     const assumes: any[] = [];
     const sts = { send: async (cmd: any) => { assumes.push(cmd.input); return { Credentials: { AccessKeyId: 'AK', SecretAccessKey: 'SK', SessionToken: 'ST' } }; } };
     mockChimeSend.mockResolvedValue({ MessageId: 'msg-1' });
-    const id = await pinnedPoster('arn:aws:iam::111122223333:role/restricted', sts)({ personArn: RILEY, channelArn: CHANNEL, text: 'hi', idempotencyKey: 'k' });
+    const id = await pinnedPoster('arn:aws:iam::111122223333:role/restricted', sts)({ personArn: RILEY, channelArn: CHANNEL, classification: 'premium', text: 'hi', idempotencyKey: 'k' });
     expect(id).toBe('msg-1');
     expect(assumes).toHaveLength(1);
     expect(assumes[0].RoleArn).toBe('arn:aws:iam::111122223333:role/restricted');
     expect(assumes[0].Tags).toEqual([{ Key: 'person', Value: PERSON_ID }, { Key: 'classification', Value: 'restricted' }]);
+    // The channel only while it carries the classification the clearance check decided on; the bearer, the person.
     expect(JSON.parse(assumes[0].Policy).Statement).toEqual([
-      { Sid: 'OneConversationReply', Effect: 'Allow', Action: ['chime:SendChannelMessage'], Resource: [CHANNEL, RILEY] },
+      {
+        Sid: 'OneConversationReply', Effect: 'Allow', Action: ['chime:SendChannelMessage'], Resource: [CHANNEL],
+        Condition: { StringEquals: { 'aws:ResourceTag/classification': 'premium' } },
+      },
+      { Sid: 'AsThePerson', Effect: 'Allow', Action: ['chime:SendChannelMessage'], Resource: [RILEY] },
     ]);
     // The message is sent on the vended credentials, bearing the person.
     expect(mockChimeCtor).toHaveBeenCalledWith(expect.objectContaining({ credentials: { accessKeyId: 'AK', secretAccessKey: 'SK', sessionToken: 'ST' } }));
@@ -203,8 +284,15 @@ describe('posted on the person\'s own bearer-pinned session, never as a service 
 
   it('refuses a person and a conversation of different app instances', async () => {
     const sts = { send: jest.fn() };
-    await expect(pinnedPoster('r', sts)({ personArn: RILEY, channelArn: 'arn:aws:chime:us-east-1:111122223333:app-instance/other/channel/c', text: 'x', idempotencyKey: 'k' }))
+    await expect(pinnedPoster('r', sts)({ personArn: RILEY, channelArn: 'arn:aws:chime:us-east-1:111122223333:app-instance/other/channel/c', classification: 'premium', text: 'x', idempotencyKey: 'k' }))
       .rejects.toThrow(/one app instance/);
+    expect(sts.send).not.toHaveBeenCalled();
+  });
+
+  it('refuses a reply that names no classification for its conversation', async () => {
+    const sts = { send: jest.fn() };
+    await expect(pinnedPoster('r', sts)({ personArn: RILEY, channelArn: CHANNEL, classification: '', text: 'x', idempotencyKey: 'k' }))
+      .rejects.toThrow(/no classification/);
     expect(sts.send).not.toHaveBeenCalled();
   });
 });
@@ -228,7 +316,7 @@ describe('the receipt rule and the poster, at synth', () => {
   const host = new cdk.Stack(app, 'Host', { env });
   const t = Template.fromStack(new NotificationStack(app, 'N', {
     env, appInstanceArn: APP, userPoolId: 'us-east-1_PRIMARY', classifications: assistantClassifications(),
-    senderEmail: 'assistant@example.com', appUrl: 'https://app.example.com',
+    senderEmail: 'assistant@example.com', appUrl: 'https://app.example.com', notifyBridge: true,
     messageStream: kinesis.Stream.fromStreamArn(host, 'S', 'arn:aws:kinesis:us-east-1:111122223333:stream/s'),
     tokens: dynamodb.Table.fromTableArn(host, 'T', 'arn:aws:dynamodb:us-east-1:111122223333:table/tokens'),
     replyPoster: { roleArn: 'arn:aws:iam::111122223333:role/poster', restrictedRoleArn: 'arn:aws:iam::111122223333:role/restricted' },
@@ -258,9 +346,25 @@ describe('the receipt rule and the poster, at synth', () => {
     expect(tokenReads).toEqual([expect.objectContaining({ Action: 'dynamodb:GetItem', Condition: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['reply#*'] } } })]);
     expect(JSON.stringify(statements)).not.toMatch(/chime:SendChannelMessage|ses:Send/);
   });
+
+  it('the poster reads a conversation\'s tags and a person\'s groups, for the clearance check, and nothing broader', () => {
+    const statements = (Object.values(t.findResources('AWS::IAM::Policy')) as any[])
+      .filter((p) => JSON.stringify(p.Properties.Roles).includes('poster'))
+      .flatMap((p) => p.Properties.PolicyDocument.Statement);
+    const tagReads = statements.filter((s) => [s.Action].flat().includes('chime:ListTagsForResource'));
+    expect(tagReads).toEqual([expect.objectContaining({ Action: 'chime:ListTagsForResource', Resource: `${APP}/channel/*` })]);
+    expect(statements.some((s) => [s.Action].flat().includes('cognito-idp:AdminListGroupsForUser'))).toBe(true);
+  });
+
+  it('the bridge reads each recipient\'s groups, for the clearance check', () => {
+    const statements = (Object.values(t.findResources('AWS::IAM::Policy')) as any[])
+      .filter((p) => JSON.stringify(p.Properties.Roles).includes('NotificationBridge'))
+      .flatMap((p) => p.Properties.PolicyDocument.Statement);
+    expect(statements.some((s) => [s.Action].flat().includes('cognito-idp:AdminListGroupsForUser'))).toBe(true);
+  });
 });
 
-describe('the poster may assume the one-conversation role only with the person pinned, at synth', () => {
+describe('the poster may assume the restricted role only with the person pinned, at synth', () => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { MessagingStack } = require('../../lib/stacks/messaging-stack');
   // eslint-disable-next-line @typescript-eslint/no-var-requires

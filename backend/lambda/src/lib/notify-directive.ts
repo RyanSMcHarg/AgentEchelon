@@ -25,6 +25,12 @@ export function notifyDirective(args: {
    * only with `targets`: a membership-wide or mentioned email is always `conversation`.
    */
   kind?: DirectiveNoticeKind;
+  /** The email's body, where it differs from the message: an assistant's own `email.body` section. A person's is never read. */
+  body?: string;
+  /** Where the email's button leads, with `conversationId`: its meeting window (`meeting`), else the conversation. */
+  link?: 'meeting';
+  /** People a room-wide email leaves out, by AppInstanceUser id: the person a notice is about who already knows it. */
+  exclude?: string[];
 }): Record<string, unknown> {
   const targets = (args.targets || []).filter(Boolean);
   return {
@@ -33,7 +39,48 @@ export function notifyDirective(args: {
     ...(targets.length ? { notifyTargets: targets.map((person) => ({ person })) } : {}),
     ...(targets.length && args.kind && args.kind !== 'conversation' ? { notifyKind: args.kind } : {}),
     ...(args.conversationId ? { notifyConversationId: args.conversationId } : {}),
+    ...(args.body ? { notifyBody: args.body } : {}),
+    ...(args.link && args.conversationId ? { notifyLink: args.link } : {}),
+    ...(args.exclude?.filter(Boolean).length ? { notifyExclude: args.exclude.filter(Boolean) } : {}),
   };
+}
+
+/**
+ * A MESSAGE'S METADATA WITHIN THE SERVICE'S CAP (`max`, encoded as every message is sent). What gives way, in order:
+ *  1. an email's own words, its body and then its subject, so the email falls back to the message's text and the default
+ *     subject and is still sent;
+ *  2. the oldest of a workflow run's moves (`eventRun.transitions`), down to the newest one. A run's every message
+ *     carries its moves so far, so the earlier ones are already on the run's earlier messages, and a long run's card
+ *     (its task, its buttons, its email directive) is still posted;
+ *  3. the last of a meeting card's hosts (`meetingCard.hosts`), first recorded kept longest. The list only decides who an
+ *     app offers the transcript and the recording to; the download path signs them for the recorded hosts whatever the
+ *     card lists, so a shorter list hides a link and grants nothing.
+ * Everything else the Metadata carries stays as it is.
+ */
+export function withinMetadataCap(metadata: Record<string, unknown>, max: number): Record<string, unknown> {
+  const size = (m: Record<string, unknown>) => encodeURIComponent(JSON.stringify(m)).length;
+  let out = metadata;
+  for (const key of ['notifyBody', 'notifySubject']) {
+    if (size(out) <= max) break;
+    if (key in out) { const { [key]: _shed, ...rest } = out; out = rest; }
+  }
+  const run = out.eventRun as { transitions?: unknown } | undefined;
+  if (size(out) > max && run && Array.isArray(run.transitions)) {
+    let moves = run.transitions as unknown[];
+    while (moves.length > 1 && size(out) > max) {
+      moves = moves.slice(1);
+      out = { ...out, eventRun: { ...run, transitions: moves } };
+    }
+  }
+  const card = out.meetingCard as { hosts?: unknown } | undefined;
+  if (size(out) > max && card && Array.isArray(card.hosts)) {
+    let hosts = card.hosts as unknown[];
+    while (hosts.length > 0 && size(out) > max) {
+      hosts = hosts.slice(0, -1);
+      out = { ...out, meetingCard: { ...card, hosts } };
+    }
+  }
+  return out;
 }
 
 /**
@@ -63,6 +110,24 @@ export function conversationDeepLink(appUrl: string, conversationId: string | un
 export function conversationRef(conversationId: string): string {
   return `conversation=${encodeURIComponent(conversationId)}`;
 }
+
+/**
+ * The query that opens a conversation's meeting window in the chat app: the meeting full-window, with the conversation's
+ * chat beside it, after sign-in. Relative, as `conversationRef` is.
+ */
+export function meetingRef(conversationId: string): string {
+  return `meeting=${encodeURIComponent(conversationId)}`;
+}
+
+/** THE ONE MEETING LINK, built as {@link conversationDeepLink} is: from an id and this deployment's own origin, or none. */
+export function meetingDeepLink(appUrl: string, conversationId: string | undefined): string | undefined {
+  if (!appUrl || !conversationId || !/^[A-Za-z0-9_-]{1,128}$/.test(conversationId)) return undefined;
+  return `${appUrl}?${meetingRef(conversationId)}`;
+}
+
+/** Where an email's button leads: the conversation (absent), or its meeting window. */
+export const DIRECTIVE_LINKS = ['meeting'] as const;
+export type DirectiveLink = (typeof DIRECTIVE_LINKS)[number];
 
 /** The query that opens the chat app's signed-in email preferences screen. */
 export const PREFERENCES_SCREEN_QUERY = 'settings=email-preferences';

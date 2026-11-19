@@ -72,3 +72,94 @@ export function judgeTranscript(preceding: unknown): string {
   if (!msgs.length) return '(none — this is the first turn of the conversation)';
   return msgs.map((m) => `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${m.content}`).join('\n');
 }
+
+// ── THE EXCHANGE A MULTI-STEP ENTRY CARRIES (ADR-066 decision 7, migration 096) ─────────────────────────────────────
+
+/** A person's turn of the source task, from the de-identified copy. */
+export interface WalkPersonTurn {
+  kind: 'person';
+  text: string;
+}
+
+/** A tool call of the source task, with its result, both de-identified. `step` is the state the turn started in. */
+export interface WalkToolTurn {
+  kind: 'tool';
+  name: string;
+  /** The call's arguments as JSON text, as recorded (`ToolCallRecord.args`), de-identified. */
+  args: string;
+  /** The tool's result as JSON text, as recorded (`ToolCallRecord.result`), de-identified. */
+  result: string;
+  ok: boolean;
+  step: string | null;
+}
+
+export interface WalkExchange {
+  version: 1;
+  /** The type of the task the answer belonged to. */
+  taskType: string | null;
+  turns: Array<WalkPersonTurn | WalkToolTurn>;
+}
+
+/** The most turns an exchange keeps: a walk is bounded by its machine, and a task longer than this is not a test case. */
+export const WALK_EXCHANGE_MAX_TURNS = 60;
+
+/** One archived turn of the source task, oldest first, as nomination reads it. */
+export interface WalkSourceRow {
+  user_mid: string;
+  task_step: string | null;
+  agent_metadata: Record<string, unknown> | null;
+}
+
+/**
+ * The exchange a multi-step entry carries: every person turn of the task from the de-identified copy (`cleanByMid`,
+ * keyed by the person message's id), and every tool call with its result, whose arguments and result pass through
+ * `deIdentify` in one call. Null when a person turn has no de-identified copy yet, so the entry is never made from
+ * raw text. Pure apart from the detector it is handed.
+ */
+export async function walkExchangeOf(
+  rows: WalkSourceRow[],
+  cleanByMid: ReadonlyMap<string, string>,
+  taskType: string | null,
+  deIdentify: (texts: string[]) => Promise<string[]>,
+): Promise<WalkExchange | null> {
+  const turns: Array<WalkPersonTurn | WalkToolTurn> = [];
+  for (const r of rows) {
+    const text = cleanByMid.get(r.user_mid);
+    if (text === undefined) return null;
+    if (text.trim()) turns.push({ kind: 'person', text });
+    const calls = Array.isArray(r.agent_metadata?.toolCalls) ? (r.agent_metadata!.toolCalls as Array<Record<string, unknown>>) : [];
+    for (const c of calls) {
+      if (!c || typeof c.name !== 'string' || !c.name) continue;
+      turns.push({
+        kind: 'tool',
+        name: c.name,
+        args: typeof c.args === 'string' ? c.args : JSON.stringify(c.args ?? null),
+        result: typeof c.result === 'string' ? c.result : JSON.stringify(c.result ?? null),
+        ok: c.ok !== false,
+        step: r.task_step ?? null,
+      });
+    }
+  }
+  const kept = turns.slice(0, WALK_EXCHANGE_MAX_TURNS);
+  const tools = kept.filter((t): t is WalkToolTurn => t.kind === 'tool');
+  const masked = await deIdentify(tools.flatMap((t) => [t.args, t.result]));
+  if (masked.length !== tools.length * 2) throw new Error(`detector returned ${masked.length} texts for ${tools.length * 2}`);
+  tools.forEach((t, i) => { t.args = masked[2 * i]; t.result = masked[2 * i + 1]; });
+  return { version: 1, taskType, turns: kept };
+}
+
+/** A stored exchange read back, or null when the entry carries none or it is not one this version reads. */
+export function storedWalkExchange(value: unknown): WalkExchange | null {
+  const v = (typeof value === 'string' ? safeJson(value) : value) as Partial<WalkExchange> | null;
+  if (!v || v.version !== 1 || !Array.isArray(v.turns)) return null;
+  const turns = v.turns.filter((t): t is WalkPersonTurn | WalkToolTurn =>
+    !!t && ((t.kind === 'person' && typeof (t as WalkPersonTurn).text === 'string')
+      || (t.kind === 'tool' && typeof (t as WalkToolTurn).name === 'string' && typeof (t as WalkToolTurn).args === 'string'
+        && typeof (t as WalkToolTurn).result === 'string')));
+  if (!turns.some((t) => t.kind === 'person')) return null;
+  return { version: 1, taskType: typeof v.taskType === 'string' ? v.taskType : null, turns };
+}
+
+function safeJson(s: string): unknown {
+  try { return JSON.parse(s); } catch { return null; }
+}

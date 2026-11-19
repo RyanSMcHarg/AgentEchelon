@@ -84,7 +84,14 @@ describe('no handler reads the registry before it loads it', () => {
         const at = exports[exports.length - 1].index!;
         const rest = text.slice(at);
         const next = rest.slice(1).search(/\nexport\s/);
-        const body = next < 0 ? rest : rest.slice(0, next + 1);
+        let body = next < 0 ? rest : rest.slice(0, next + 1);
+        // A handler wrapped so its refusals are recorded (`refusalsRecorded`, lib/vend.ts) runs the function it
+        // wraps, so the load is looked for at the start of that function.
+        const wrapped = /refusalsRecorded\(\s*'[^']+'\s*,\s*([A-Za-z0-9_]+)/.exec(body)?.[1];
+        if (wrapped) {
+          const start = text.search(new RegExp(`\\n(?:const|async function|function)\\s+${wrapped}\\b`));
+          body = start < 0 ? '' : text.slice(start, start + 400);
+        }
         if (!/await loadProfileRegistry\(\)|withProfileRegistry\(/.test(body)) missing.push(`${rel(f)} ${h}`);
       }
     }

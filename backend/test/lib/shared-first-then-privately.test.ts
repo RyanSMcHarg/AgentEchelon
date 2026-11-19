@@ -82,6 +82,19 @@ describe('reaching each person, and only them', () => {
     expect(targets).toEqual([[{ MemberArn: ALICE }], [{ MemberArn: BOB }]]);
   });
 
+  it('declares what each message is: a question put to that person alone', async () => {
+    // The follow-up carries its phase in Metadata, so a reader of the conversation can tell it from a bare carrier
+    // still being written.
+    await sendPrivateFollowUps({
+      chime, channelArn: CHANNEL, botArn: BOT, appInstanceArn: INSTANCE, groups: privateSubjectsByRequestor(SUBJECTS),
+    });
+    const metadata = mockSend.mock.calls.map((c: any[]) => JSON.parse(c[0].input.Metadata));
+    expect(metadata).toEqual([
+      { botResponse: true, respPhase: 'interim', targetedSender: ALICE },
+      { botResponse: true, respPhase: 'interim', targetedSender: BOB },
+    ]);
+  });
+
   it('never names one person subject in another person message', async () => {
     await sendPrivateFollowUps({
       chime, channelArn: CHANNEL, botArn: BOT, appInstanceArn: INSTANCE, groups: privateSubjectsByRequestor(SUBJECTS),

@@ -13,11 +13,18 @@
  *    changes, console output), any backend log line naming one of the test's conversations, a message on a
  *    runner-side messaging session, and a helper read whose answer changed.
  *
+ *  - TARGET MISMATCHES. Every page of every test is listened to for the client's own target-mismatch error
+ *    (`[target-mismatch]`, `frontend/packages/chat/src/utils/targetIntegrity.ts`): a message whose `Target` disagrees
+ *    with what it says about itself, or a send refused for it. One that a test did not declare fails that test, and
+ *    a test that declared one and saw none fails too, so the check is known to be both quiet and working. This
+ *    listener runs whether or not the watchdog is enabled.
+ *
  * What a spec declares, inside the test that needs it:
  *
  *  - `expectAlarm('…-context-source-failure-rate')`: an alarm (or notice type) the spec trips on purpose.
  *    It holds for the rest of the run, since an alarm evaluates minutes after the test that caused it.
  *  - `allowBackendError(/pattern/)`: an error line this test causes on purpose.
+ *  - `expectTargetMismatch()`: this test produces a target mismatch on purpose, and must see the client report it.
  *  - `declareWait('the invitation deadline', dueAt)`: the test waits on a timer, so silence until `dueAt` plus
  *    a margin is expected rather than a stall.
  *  - `test.use({ stallWindowMs })`: a wider window for a step with no event at all.
@@ -28,14 +35,32 @@ import { test as base, expect } from '@playwright/test';
 import { currentWatch, declaredBackendErrors, trackConversation, noteProgress } from './watchdog/current';
 import { DEFAULT_STALL_WINDOW_MS, toPattern } from './watchdog/logic';
 import { RunWatch, watchdogEnabled } from './watchdog/run-watch';
+import { targetWatch, watchContextForTargetMismatch } from './target-mismatch';
 
 export { expect, trackConversation, noteProgress };
+
+export { TARGET_MISMATCH_LOG } from './target-mismatch';
+
+/** The target-mismatch reports the running test's pages have logged so far. */
+export function targetMismatchesSeen(): string[] {
+  return [...targetWatch.seen];
+}
+
+/**
+ * This test produces a target mismatch on purpose (a message whose `Target` disagrees with its own words). It then
+ * MUST see the client report one, so a check that has gone quiet fails here rather than passing unnoticed.
+ */
+export function expectTargetMismatch(): void {
+  targetWatch.expected = true;
+}
 
 interface WatchedTestFixtures {
   /** How long the test may go with no progress signal. */
   stallWindowMs: number;
   /** The watch itself, auto-started for every test. */
   watchdog: void;
+  /** The target-mismatch listener's verdict, taken for every test. */
+  targetIntegrity: void;
 }
 
 interface WatchedWorkerFixtures {
@@ -77,22 +102,37 @@ export const test = base.extend<WatchedTestFixtures, WatchedWorkerFixtures>({
     }
   }, { auto: true }],
 
+  // A TARGET MISMATCH THE CLIENT REPORTS FAILS THE TEST THAT DID NOT DECLARE IT, and a declared one must be seen.
+  targetIntegrity: [async ({}, use) => {
+    targetWatch.seen = [];
+    targetWatch.expected = false;
+    await use();
+    const { seen, expected } = targetWatch;
+    if (seen.length && !expected) {
+      throw new Error(`[target-mismatch] the client reported ${seen.length} message(s) or send(s) whose Target disagrees with what they say:\n`
+        + seen.map((t, i) => `  ${i + 1}. ${t}`).join('\n'));
+    }
+    if (expected && !seen.length) {
+      throw new Error('[target-mismatch] this test declared a target mismatch and the client reported none: the check did not fire');
+    }
+  }, { auto: true }],
+
   // Every context a test uses reports its page events: the built-in one here, and any a spec builds itself
   // through `browser.newContext` below.
   context: async ({ context, runWatch }, use) => {
+    watchContextForTargetMismatch(context);
     if (watchdogEnabled()) await runWatch.attachContext(context);
     await use(context);
   },
 
   browser: [async ({ browser, runWatch }, use) => {
-    if (watchdogEnabled()) {
-      const newContext = browser.newContext.bind(browser);
-      browser.newContext = async (...args: Parameters<typeof browser.newContext>) => {
-        const c = await newContext(...args);
-        await runWatch.attachContext(c);
-        return c;
-      };
-    }
+    const newContext = browser.newContext.bind(browser);
+    browser.newContext = async (...args: Parameters<typeof browser.newContext>) => {
+      const c = await newContext(...args);
+      watchContextForTargetMismatch(c);
+      if (watchdogEnabled()) await runWatch.attachContext(c);
+      return c;
+    };
     await use(browser);
   }, { scope: 'worker' }],
 });

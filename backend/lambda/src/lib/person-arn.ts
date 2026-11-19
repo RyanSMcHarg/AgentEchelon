@@ -55,6 +55,8 @@ export function botIdFromArn(arn: string | null | undefined): string | null {
  */
 export const personIdSql = (expr: string): string => `split_part(${expr}, '${PERSON_SEGMENT}', 2)`;
 export const botIdSql = (expr: string): string => `split_part(${expr}, '${ASSISTANT_SEGMENT}', 2)`;
+/** Whether the ARN `expr` names an assistant, as SQL (Athena and PostgreSQL both have `strpos`). */
+export const isAssistantSql = (expr: string): string => `strpos(${expr}, '${ASSISTANT_SEGMENT}') > 0`;
 
 /** Which kind of principal an ARN names, and its id. Null when it names neither. */
 export function principalFromArn(arn: string | null | undefined): Principal | null {

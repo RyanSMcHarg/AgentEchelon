@@ -99,7 +99,7 @@ For deployment instructions, see [README.md](../../README.md). For Aurora-specif
 
 ## Layers and Capabilities
 
-The platform has four layers - **Interface** (the clients), **Communication** (the APIs, their authorizers, the messaging WebSocket, meeting media, email), **Interaction** (the engine: the conversation substrate, identity and the credential exchange, conversations, meetings, assistants, connectors, the archive) and **Foundations** (the CDK app, tags, deploy scripts, operations). A service is not a layer: the Amazon Chime SDK and Cognito each span three, so stacks are cut by capability. In the design every stack is one capability labeled with its layer, the four deployable components stand up in order (the core, then the chat interface and the admin backend on it, then the admin interface on the admin backend), and a deployment declares its capabilities in one `capabilities` list; the minimal deployment is an anonymous visitor in the widget talking to one assistant, with no accounts. Person-facing routes sit on one HTTP API, `PersonApi`, behind one edge authorizer, and admin routes on one IAM-authorized HTTP API, `AdminApi`. The core is `Messaging`, `Identity`, `Conversations` and `Archive`, then the channel flow, the assistant stacks, post-processing and `PersonApi`; `AdminApi` is part of the `admin` capability. Each stack declares its routes beside its handlers (`RouteSpec` in `backend/lib/constructs/http-api.ts`), and the API stack serves the routes of the stacks it is built on. The capability list is read (`backend/lib/config/capabilities.ts`): `chat`, `admin`, `notifications`, `experiments`, `battle`, `operations`, `connectors` and `widget` are built, and `meetings` is **NOT BUILT** and refused at synth. No vendor calls an HTTP API: a connector that subscribes to vendor events receives them through the vendor's Amazon EventBridge partner event source, on a rule pinned to that source ([SPEC-CONNECTORS.md](../specs/communication/SPEC-CONNECTORS.md)). `IngressApi`, for a vendor with no EventBridge integration, is **NOT BUILT**. The target stacks, the component rule and the capability list are in [STACKS.md](STACKS.md#layers-and-capabilities); the decisions are [ADR-055](../design/decisions/055-stacks-are-capabilities-in-layers.md) and [ADR-056](../design/decisions/056-two-http-apis-and-no-aws-waf.md), both Accepted.
+The platform has four layers - **Interface** (the clients), **Communication** (the APIs, their authorizers, the messaging WebSocket, meeting media, email), **Interaction** (the engine: the conversation substrate, identity and the credential exchange, conversations, meetings, assistants, connectors, the archive) and **Foundations** (the CDK app, tags, deploy scripts, operations). A service is not a layer: the Amazon Chime SDK and Cognito each span three, so stacks are cut by capability. In the design every stack is one capability labeled with its layer, the four deployable components stand up in order (the core, then the chat interface and the admin backend on it, then the admin interface on the admin backend), and a deployment declares its capabilities in one `capabilities` list; the minimal deployment is an anonymous visitor in the widget talking to one assistant, with no accounts. Person-facing routes sit on one HTTP API, `PersonApi`, behind one edge authorizer, and admin routes on one IAM-authorized HTTP API, `AdminApi`. The core is `Messaging`, `Identity`, `Conversations` and `Archive`, then the channel flow, the assistant stacks, post-processing and `PersonApi`; `AdminApi` is part of the `admin` capability. Each stack declares its routes beside its handlers (`RouteSpec` in `backend/lib/constructs/http-api.ts`), and the API stack serves the routes of the stacks it is built on. The capability list is read (`backend/lib/config/capabilities.ts`): `chat`, `admin`, `notifications`, `experiments`, `battle`, `operations`, `connectors`, `widget` and `meetings` are built. No vendor calls an HTTP API: a connector that subscribes to vendor events receives them through the vendor's Amazon EventBridge partner event source, on a rule pinned to that source ([SPEC-CONNECTORS.md](../specs/communication/SPEC-CONNECTORS.md)). `IngressApi`, for a vendor with no EventBridge integration, is **NOT BUILT**. The target stacks, the component rule and the capability list are in [STACKS.md](STACKS.md#layers-and-capabilities); the decisions are [ADR-055](../design/decisions/055-stacks-are-capabilities-in-layers.md) and [ADR-056](../design/decisions/056-two-http-apis-and-no-aws-waf.md), both Accepted.
 
 ---
 
@@ -115,7 +115,7 @@ Messaging                         (the app instance, its service admin and reten
      │                             roles, Identities, offboarding, the platform trail; references the AppInstance ARN)
      │
      ├──► Conversations           (task tables + abuse-controls table [rate limit / spend budget / dedup] +
-     │                             conversation-actions audit table + feedback table + attachments bucket;
+     │                             conversation-actions audit table + feedback table + attachments, company and profile buckets;
      │                             create-conversation, conversation-management [archive/remove-member/leave],
      │                             presigned-URL and feedback handlers; depends on Identity)
      │
@@ -175,7 +175,7 @@ Messaging                         (the app instance, its service admin and reten
                                    on every stack whose person routes it serves)
 ```
 
-The required core deploys in both modes: Messaging, Identity, Conversations, Archive (Athena or Aurora under one name), one `Assistants-*` stack per declared classification (three by default), ChannelFlow, PostProcessing and PersonApi. Conditional `ImageGuardrail-{region}` stacks are added, one per region that hosts an active image model outside the deploy region. Everything else is a declared capability in `capabilities`: `chat` (`ChatApp`), `admin` (`AdminServices`, `AdminApi` and `AdminApp`), `notifications` (`Notifications`), `experiments` (`Experiments`), `battle` (`Battle`, requiring `experiments`), `connectors` (`Connectors`), `widget` (`Widget`) and `operations` (`Operations`). `meetings` is **NOT BUILT** and refused at synth.
+The required core deploys in both modes: Messaging, Identity, Conversations, Archive (Athena or Aurora under one name), one `Assistants-*` stack per declared classification (three by default), ChannelFlow, PostProcessing and PersonApi. Conditional `ImageGuardrail-{region}` stacks are added, one per region that hosts an active image model outside the deploy region. Everything else is a declared capability in `capabilities`: `chat` (`ChatApp`), `admin` (`AdminServices`, `AdminApi` and `AdminApp`), `notifications` (`Notifications`), `experiments` (`Experiments`), `battle` (`Battle`, requiring `experiments`), `connectors` (`Connectors`), `widget` (`Widget`), `operations` (`Operations`) and `meetings` (`Meetings`, requiring `chat`).
 
 **Stack outputs flow:** Each stack exports values (ARNs, URLs) as CloudFormation outputs; the per-classification stacks instead publish their processor/bot ARNs to SSM. The frontend `.env` file is populated from these outputs. See `.env.example` for the mapping.
 
@@ -185,7 +185,7 @@ The required core deploys in both modes: Messaging, Identity, Conversations, Arc
 | Identity                                | `UserPoolId`, `UserPoolClientId` (when the registry declares this deployment's own pool), `AdminUserPoolClientId` (with `admin`) |
 | AdminServices                           | `AdminNotificationChannelArn`, `AdminAgentBotArn` |
 | AdminApi                                | `AdminApiUrl`, `AdminApiCapabilities` (with `admin`) |
-| Conversations                           | `AttachmentsBucketName`, `AgentTasksTableName`, `UserTasksTableName`, `ChannelContextTableName`, `UserProfileTableName` |
+| Conversations                           | `AttachmentsBucketName`, `CompanyBucketName`, `ProfileBucketName`, `AgentTasksTableName`, `UserTasksTableName`, `ChannelContextTableName`, `UserProfileTableName` |
 | Experiments                             | `ExperimentsTableName`                                                                                                       |
 | Notifications                           | `SenderEmailIdentityArn`, `ReplyDomainMx` (with `replyDomain`) |
 | Assistants-<classification>             | SSM: `/agent-echelon/assistant/{classification}/{processor-arn,bot-arn}`                                                     |
@@ -254,23 +254,23 @@ The diagram is the deployment pool's password flow. The sign-in screen lists eve
 
 | Failure | What happens |
 |---------|-------------|
-| Wrong password | `AuthProvider` catches `NotAuthorizedException` → error shown on LoginScreen |
-| Unverified email | Cognito returns `UserNotConfirmedException` → redirects to verification screen |
+| Wrong password | `AuthProvider` maps `NotAuthorizedException` to "Invalid email or password", shown on `LoginScreen` |
+| Unverified email | `AuthProvider` maps `UserNotConfirmedException` to a message asking the person to verify their address, shown on `LoginScreen` |
 | Token expired mid-session | 50-minute refresh interval fires `REFRESH_TOKEN_AUTH` → if refresh fails, user is redirected to login |
-| Network error during login | Catch-all error → "Unable to sign in" message on LoginScreen |
+| Network error during login | `LoginScreen` shows the error's own message (`frontend/packages/shared/src/components/LoginScreen.tsx`) |
 | Refresh token expired (30 days) | `REFRESH_TOKEN_AUTH` returns `NotAuthorizedException` → user must re-login |
 
-**Who the caller is.** The credential exchange is the only minter of AppInstanceUsers: it creates an opaque id once per `(issuer, subject)` and records it in the `Identities` index, and it returns the caller's `userArn`, which is the client's identity. On the server the caller is resolved once per request, at the edge authorizer or from the vended session's role session name, and handlers never read `claims.sub`, `cognito:username` or `claims.email`. Built, and **NOT VERIFIED** on a deployment:
-- the minter and the `Identities` index (`backend/lambda/src/lib/person-identity.ts`), keyed by the issuer's registry id and the subject that entry declares;
-- the edge authorizer (`backend/lambda/src/edge-authorizer.ts`), on both HTTP APIs, which verifies the token against the trusted-issuer registry, resolves its subject through `Identities` and hands the handler its context; `callerPersonId` (`backend/lambda/src/lib/auth.ts`) reads that context or the IAM console session, so no handler looks a caller up in `Identities` itself;
-- the client keeps the `userArn` the exchange returns (`frontend/packages/shared/src/services/credentialExchange.ts`) and refuses to start the Amazon Chime SDK without `VITE_PERSON_API_URL` (`frontend/packages/chat/src/services/chimeService.ts`).
+**Who the caller is.** The credential exchange is the only minter of AppInstanceUsers: it creates an opaque id once per `(issuer, subject)` and records it in the `Identities` index, and it returns the caller's `userArn`, which is the client's identity. On the server the caller is resolved once per request, at the edge authorizer or from the vended session's role session name, and handlers never read `claims.sub`, `cognito:username` or `claims.email` (`backend/test/a-person-is-their-app-instance-user.test.ts`, "no source outside the resolver and the exchanges reads a caller off their token"):
+- the minter and the `Identities` index (`backend/lambda/src/lib/person-identity.ts`), keyed by the issuer's registry id and the subject that entry declares. Verified by `backend/test/lib/person-identity.test.ts` (one row and one AppInstanceUser for ten concurrent first sign-ins; an offboarded subject is never re-minted);
+- the edge authorizer (`backend/lambda/src/edge-authorizer.ts`), on both HTTP APIs, which verifies the token against the trusted-issuer registry, resolves its subject through `Identities` and hands the handler its context; `callerPersonId` (`backend/lambda/src/lib/auth.ts`) reads that context or the IAM console session, so no handler looks a caller up in `Identities` itself. Verified by `backend/test/lib/the-edge-admits-a-token-only-where-its-person-is-served.test.ts` and `backend/test/the-edge-authorizer-reads-identities-and-never-writes-them.test.ts`;
+- the client keeps the `userArn` the exchange returns (`frontend/packages/shared/src/services/credentialExchange.ts`; `frontend/packages/shared/src/services/personIdentity.test.ts`) and refuses to start the Amazon Chime SDK without `VITE_PERSON_API_URL` (`frontend/packages/chat/src/services/chimeService.ts`).
 
 **Key files:**
 - `frontend/packages/shared/src/providers/AuthProvider.tsx` - sign-in (the pool's password flow, and code plus PKCE for a redirect issuer), token management, refresh logic
 - `frontend/packages/chat/src/providers/AwsClientProvider.tsx` - SDK clients over the exchange's vended credentials
 - `backend/lambda/src/credential-exchange.ts` - the credential exchange
 - `backend/lib/stacks/identity-stack.ts` - the user pool when the registry declares one, the credential exchange and its roles, `Identities`, Lambda triggers
-- `backend/lambda/cognito-triggers/post-confirmation.js` - marks a confirmed signup unapproved and mirrors `custom:tier` into its group; it creates no AppInstanceUser
+- `backend/lambda/cognito-triggers/post-confirmation.js` - marks a confirmed signup unapproved and records the tier it asked for; it adds nobody to a group and creates no AppInstanceUser
 
 ---
 
@@ -371,7 +371,7 @@ This is the core flow: user sends a message and receives an AI response.
 | PLACEHOLDER_UPDATE | "One moment..." placeholder appears as a bot message; replaced in-place when real response arrives |
 | TASK_MULTI_STEP | `isBotTyping` indicator shows a pulsing dot; status updates stream into the channel; task completes when done |
 | WebSocket disconnect | `ConnectionStatus` component shows reconnecting state; Amazon Chime SDK auto-reconnects |
-| Async processor fails | Placeholder message stays as-is (user sees "One moment..." indefinitely - no automatic error recovery) |
+| Async processor fails | A caught error replaces the placeholder with the assistant's own `turnFailed` line and marks the task failed (`handleProcessingError`, `async-processor-core.ts`). An invocation the platform kills is re-dispatched, and once its attempts are spent the assistant says the turn failed (`backend/lambda/src/turn-lock-release-on-failure.ts`; `backend/test/lib/turn-lock-release-on-failure.test.ts`) |
 
 **Key files:**
 - `frontend/packages/chat/src/components/MessageInput.tsx` - User input, file attachment, send button
@@ -394,7 +394,7 @@ This is the core flow: user sends a message and receives an AI response.
 
 A message is classified once, and that single classification drives **two independent decisions**: how the reply is **delivered** (next), and which **model** answers it (Model routing, below).
 
-**The default is the LLM classifier, for every profile.** Each profile carries a `classifierMode` (`'llm' | 'keyword'`). The shipped member profiles set `'llm'` - basic included, which is a deliberate choice rather than an omission - and the shipped `ops-premium` role sets `'keyword'` (`backend/lib/config/profiles.ts`). The keyword classifier is an **opt-in alternative** a profile selects where classification cost matters more than accuracy. It is not a stage every message passes through, and the two modes are alternatives rather than a chain.
+**The default is the LLM classifier, for every profile.** Each profile carries a `classifierMode` (`'llm' | 'keyword'`). Every shipped profile sets `'llm'`, basic and the `ops-premium` role included (`backend/lib/config/profiles.ts`). The keyword classifier is an **opt-in alternative** a profile selects where classification cost matters more than accuracy. It is not a stage every message passes through, and the two modes are alternatives rather than a chain.
 
 ```
   User message arrives at agent handler
@@ -402,9 +402,9 @@ A message is classified once, and that single classification drives **two indepe
           ▼
      profile.classifierMode
           │
-          ├───────────────── 'keyword' (OPT-IN; shipped only on ops-premium) ────────┐
+          ├───────────────── 'keyword' (OPT-IN; no shipped profile sets it) ─────────┐
           │                                                                          │
-          ▼ 'llm'  (the default, every shipped member profile)                       ▼
+          ▼ 'llm'  (the default, every shipped profile)                              ▼
   ┌─────────────────────────────────────────┐              ┌──────────────────────────────────┐
   │ Exact-match short-circuit               │              │ classifyIntentByKeyword          │
   │ (fastPathIntent)                        │              │                                  │
@@ -486,7 +486,7 @@ A classification experiment cannot run alongside an intent or base-model experim
 
 The flow above is one message being answered. People do not wait for that: they send a second, then a correction to the first, while the assistant is still working.
 
-**A conversation answers one turn at a time** (ADR-033). Anything arriving while a turn is running is held rather than starting a second turn, and the person is told so - one notice, updated in place, not one per message. What is held is then read **as a group**, because three messages that are really one request are only recognisable together, and each becomes a durable task before any of it is executed.
+**A conversation answers one turn at a time** (ADR-033) when the deployment sets `turnQueue` in `deploy.config.json`; it is off by default, and with it off a second message starts a second turn. Anything arriving while a turn is running is held rather than starting a second turn, and the person is told so - one notice, updated in place, not one per message. What is held is then read **as a group**, because three messages that are really one request are only recognisable together, and each becomes a durable task before any of it is executed.
 
 | | |
 |---|---|
@@ -517,7 +517,7 @@ Detail: [SPEC-TURN-QUEUE](../specs/interaction/conversation/SPEC-TURN-QUEUE.md) 
   API Gateway → presigned-url Lambda
   (creates an S3 presigned POST: a policy whose content-length-range
   is a true 1..10MiB cap, with type/encryption/metadata pinned as
-  policy conditions; 1-hour default expiry)
+  policy conditions; 5-minute expiry, EXPIRATION_SECONDS)
           │
           ▼
   attachmentService.ts: uploadToS3()
@@ -541,6 +541,8 @@ Detail: [SPEC-TURN-QUEUE](../specs/interaction/conversation/SPEC-TURN-QUEUE.md) 
 
 `<personId>` is the uploader's AppInstanceUser id, the same id the message's sender ARN carries. The presigned-url Lambda composes the key server-side from `callerPersonId` (`backend/lambda/presigned-url/index.js`), never from the request body.
 
+**A URL is signed only for a current member cleared for the conversation.** The presigner signs with its own role, so before it signs an upload or a download from `attachments/`, `generated-docs/` or `battle-images/` it checks the caller's membership with the caller as `ChimeBearer`, and the caller's clearance against the conversation's `classification` tag (`lib/conversation-access.ts`). A removed member, a person whose clearance does not reach the conversation, and a conversation whose tag cannot be read are refused. Its role writes `attachments/` and reads those three key families only (`conversations-stack.ts`). A signed URL lives five minutes (`EXPIRATION_SECONDS`) and cannot be revoked, so a person removed from a conversation keeps what was already signed for them for at most that long. Verified by `a-conversation-file-is-signed-only-for-a-cleared-member` and `the-presigner-holds-only-the-key-families-it-signs`.
+
 **Key files:**
 - `frontend/packages/chat/src/services/attachmentService.ts` - Upload/download via presigned URLs
 - `frontend/packages/chat/src/components/FileUploadPreview.tsx` - Drag-and-drop preview
@@ -563,20 +565,21 @@ Detail: [SPEC-TURN-QUEUE](../specs/interaction/conversation/SPEC-TURN-QUEUE.md) 
   POST /share-conversation
   {
     conversationArn: "...",
-    conversationTitle: "Q3 Planning",
     recipientEmail: "user@example.com",
     senderName: "Alice"
   }
           │
           ▼
   share-conversation Lambda:
-  1. Resolve the recipient by address (Directory.findByAddress)
-  2. Resolve channel classification from the immutable `classification` tag
+  1. Resolve channel classification from the immutable `classification` tag
      (ListTagsForResource, refusing a missing or unknown tag - never
      DescribeChannel metadata, which a member could tamper)
+  2. Resolve the recipient by address (Directory.findByAddress)
   3. Resolve recipient clearance (Directory.groupsFor → held classifications)
-  4. Reject with 403 TIER_FORBIDDEN if the recipient's clearance does not
-     include the channel's classification
+  4. Reject with 403 RECIPIENT_NOT_ADDABLE if nobody is found, if the
+     recipient's clearance does not include the channel's classification, or
+     if the conversation's type does not admit their issuer: one answer for
+     all three, naming nothing about the person
   5. CreateChannelMembership (bot bearer)
   6. Bot posts public announcement: "X joined." In newly multi-user channels,
      append a mention-required reminder.
@@ -597,7 +600,7 @@ Detail: [SPEC-TURN-QUEUE](../specs/interaction/conversation/SPEC-TURN-QUEUE.md) 
   calls selectConversation() once conversations load, strips the param.
 ```
 
-**Recipient identity.** The share resolves its recipient through the `Directory` seam: the address finds one subject in the deployment's primary issuer's directory, resolved to a person through `Identities` (`Directory.findByAddress`), and the recipient's clearance groups are read by AppInstanceUser (`Directory.groupsFor`) (`backend/lambda/share-conversation/index.js`). An address never binds or creates an identity: no such subject, more than one, or a subject who has never signed in is refused. A person whose only issuer is another registry issuer is not found by address.
+**Recipient identity.** The share resolves its recipient through the `Directory` seam: the address finds one subject in the deployment's primary issuer's directory, resolved to a person through `Identities` (`Directory.findByAddress`), and the recipient's clearance groups are read by AppInstanceUser (`Directory.groupsFor`) (`backend/lambda/share-conversation/index.js`). An address never binds or creates an identity: no such subject, more than one, or a subject who has never signed in is refused. Every recipient who cannot be added gets the same answer, `403 RECIPIENT_NOT_ADDABLE`, so a share never discloses whether an address has an account, how its owner signs in, or which classifications they hold, and the log names a found recipient by person id, never by the typed address. A person whose only issuer is another registry issuer is not found by address.
 
 **Why this matters:** the email is the welcome message itself, sent by the one bridge every conversation notice goes through, so it carries the same consent, unsubscribe and reply handling as any other notice and the recipient can mute it as a `conversation-shared` notice. The mention hint + targeted summary land in multi-user channels so a dropped-in user (a) sees that the dynamic changed and (b) has context to jump in.
 
@@ -611,7 +614,7 @@ Detail: [SPEC-TURN-QUEUE](../specs/interaction/conversation/SPEC-TURN-QUEUE.md) 
 - `backend/lib/stacks/notification-stack.ts` - SES identity + IAM + the share route (served by `PersonApi`)
 - `backend/lambda/src/router-agent-handler.ts` - effective classification = the channel's classification (IAM already refused a caller without clearance for it)
 - `backend/lambda/src/channel-flow-processor.ts` - multi-member mention routing
-- `backend/lambda/cognito-triggers/post-confirmation.js` - `custom:tier` → group sync
+- `backend/lambda/cognito-triggers/post-confirmation.js` - marks a confirmed signup unapproved
 
 ---
 
@@ -755,8 +758,8 @@ If a provider fails to initialize, everything below it is unavailable. The `Conn
 | Debug message delivery | `backend/lambda/src/lib/async-processor-core.ts` → CloudWatch Logs |
 | Debug auth token issues | `frontend/packages/shared/src/providers/AuthProvider.tsx` → browser console |
 | Understand the database schema | `backend/lambda/src/analytics-aurora/schema/001-initial.sql` |
-| Run E2E tests | `tests/e2e/` → `npm test` (requires deployed backend) |
-| Run backend unit tests | `backend/test/` → `npm test` |
+| Run E2E tests | `tests/e2e/`, driven from `backend/` by `node scripts/validate.mjs --only=<phase>` (requires deployed backend) |
+| Run backend unit tests | from `backend/`, `node scripts/run-test-shards.mjs --shards=8 --only=<n>`, one shard at a time |
 | Review security posture | Security Model section below + `docs/guides/developer/SECURITY-NPM-SUPPLY-CHAIN.md` |
 | Apply design tokens | `frontend/packages/shared/src/styles/design-tokens.css` → [DESIGN-SYSTEM.md](../guides/developer/DESIGN-SYSTEM.md) |
 
@@ -766,11 +769,13 @@ If a provider fails to initialize, everything below it is unavailable. The `Conn
 
 Access to AI models is enforced at the IAM level. Deployments can choose Anthropic, Amazon, or OpenAI-on-Bedrock options per tier, but a Basic user still cannot invoke premium-only models directly.
 
-| Tier | Models Available | Handler Timeout | Task Tracking | File Access |
+| Tier | Models Available | Processor Timeout | Task Tracking | File Access |
 |------|-----------------|----------------|---------------|-------------|
-| Basic | Configurable basic model (default: Claude Haiku) | 30s | DynamoDB tasks | `context/basic/*` prefix |
-| Standard | Configurable standard model plus standard-safe fallbacks (default: Sonnet) | 60s | DynamoDB tasks | `context/standard/*` prefix |
-| Premium | Configurable premium model with full catalog access (default: Opus) | 90s | DynamoDB tasks | `context/premium/*` prefix |
+| Basic | Configurable basic model (default: Claude Haiku) | 30s | DynamoDB tasks | `context/basic/*` |
+| Standard | Configurable standard model plus standard-safe fallbacks (default: Sonnet) | 60s | DynamoDB tasks | `context/basic/*`, `context/standard/*` |
+| Premium | Configurable premium model, the sample's widest model selection (text and image) (default: Opus) | 90s | DynamoDB tasks | `context/basic/*`, `context/standard/*`, `context/premium/*` |
+
+File access is the `context/<c>/` prefix of every classification in the classification's `grants` (`contextPrefixesGranted`, `backend/lib/profile-registry.ts`; `backend/test/analytics-aurora/retrieval-reaches-the-grant-set.test.ts`). The sample's grant sets nest, so standard reads basic's context and premium reads both; a deployment whose grant sets do not nest gets disjoint prefixes. A role can be narrowed within that set (`roleContext`, `contextPrefixesForRole`): the shipped premium `ops` role reads `basic` and `standard` only.
 
 Which models a classification uses is its own selection (`models` on its entry in `profiles`), granted by its own stack; no context key overrides it ([MODEL_STRATEGY](../guides/developer/MODEL_STRATEGY.md#three-layers)).
 
@@ -808,16 +813,16 @@ The admin console groups its views into **7 sections** (section rail + sub-tabs,
 
 | Scenario | Behavior |
 |----------|----------|
-| **Bedrock unavailable** | Async processor catches `ServiceException` → logs error; placeholder message stays as "One moment..." with no automatic recovery |
+| **Bedrock unavailable** | The resilience layer retries and falls back to the route's fallback model; an error that still escapes replaces the placeholder with the assistant's `turnFailed` line (`handleProcessingError`) |
 | **WebSocket disconnect** | Amazon Chime SDK `MessagingSession` auto-reconnects with exponential backoff; `ConnectionStatus` component shows state |
 | **Token expires mid-conversation** | 50-minute refresh interval prevents this in most cases; if refresh fails, user is redirected to login; in-flight messages may be lost |
 | **S3 upload fails** | `attachmentService.ts` catches error → `FileUploadPreview` shows error state; user can retry |
-| **Presigned URL expires before upload** | URL defaults to 1-hour expiry; if expired, `attachmentService` returns error and user must re-attach |
+| **Presigned URL expires before upload** | A URL lives five minutes (`EXPIRATION_SECONDS`, `backend/lambda/presigned-url/index.js`); if expired, `attachmentService` returns an error and the user must re-attach |
 | **Email fails (sharing)** | The share function sends no email: the `Notifications` email bridge sends the welcome's notice, so a failed send is the bridge's and does not fail the share |
 | **Lex returns `FallbackIntent`** | The fulfillment handler classifies the request itself and applies its default routing (Lex is only the trigger) |
-| **Concurrent messages in same channel** | Amazon Chime SDK handles ordering; each message gets a unique `MessageId`; no deduplication - duplicate sends produce duplicate messages |
+| **Concurrent messages in same channel** | Amazon Chime SDK handles ordering, and each send is its own message with its own `MessageId`. A redelivery of the same turn is dispatched once while the dedup store answers (best-effort: `claimCorrelation` fails open, ADR-022; `dedup#<correlationId>` in `lib/abuse-controls.ts`; `backend/test/lib/flow-dedup-survives-a-cold-container.test.ts`). With `turnQueue` set, a message arriving during a turn is held (see One turn at a time, above); without it, each message starts its own turn |
 | **Aurora connection failure** | `db-client.ts` pool reconnects on auth errors; other errors thrown to caller |
-| **Lambda timeout (30-90s by tier)** | Async processor is killed; placeholder message stays; no automatic cleanup of DynamoDB task state |
+| **Lambda timeout (30-90s by classification)** | The killed invocation is re-dispatched with the same payload while the turn keeps its lock; once the attempts are spent the assistant posts that the turn failed, and the lock is released (`turn-lock-release-on-failure.ts`; `backend/test/lib/turn-lock-release-on-failure.test.ts`) |
 
 ---
 
@@ -828,7 +833,7 @@ This section summarizes security controls.
 **Authentication:**
 - Every token is verified at the edge authorizer against the trusted-issuer registry; a token from an undeclared issuer reaches nothing
 - The deployment's own Cognito pool, when declared, with email verification and configurable admin approval
-- Tokens stored in browser memory (React state) - not localStorage, not cookies
+- The ID and access tokens are kept in `localStorage` and the refresh token in `sessionStorage` (tab-scoped), never in cookies (`storeTokens`, `frontend/packages/shared/src/providers/AuthProvider.tsx`), so script running in the page can read them
 - 50-minute refresh interval, plus a credential refresh before the WebSocket re-opens on a stale reconnect (page hidden >5 min or no messages >5 min)
 - The credential exchange maps an authenticated person to temporary IAM credentials pinned to their AppInstanceUser; it is the only source of a person's AWS credentials (there is no Identity Pool)
 
@@ -836,12 +841,12 @@ This section summarizes security controls.
 - Tier-based IAM policies scope Bedrock model access per user role
 - Each Lambda handler has its own IAM role with least-privilege permissions
 - Lambda invoke permissions scoped to each handler's own async processor (no cross-tier invocation)
-- S3 file access scoped by tier prefix (`context/basic/*`, `context/standard/*`, `context/premium/*`)
+- S3 context access scoped to the `context/<c>/` prefixes of the classification's `grants` (see User Tiers & Access Control)
 
 **Input handling:**
-- React escapes all rendered content (no `dangerouslySetInnerHTML`)
+- React escapes rendered content, and no component sets `dangerouslySetInnerHTML`; the widget renders Markdown through its own element builder (`frontend/packages/widget/src/messaging/markdown.tsx`)
 - Message metadata markers (`<!--ACTIVE_TASK:-->`) stripped by `messageParser.ts` before display
-- File uploads enforced server-side by the presigned-url Lambda (`backend/lambda/presigned-url/index.js`): MIME allow-list, filename sanitizing (path separators / control characters / traversal segments rejected), identity-bound keys (the caller's AppInstanceUser id from `callerPersonId`, never a body-supplied userId), and a POST-policy `content-length-range` of 1 byte to 10 MiB; the client mirrors the same limit and type checks. No server-side malware scanning
+- File uploads enforced server-side by the presigned-url Lambda (`backend/lambda/presigned-url/index.js`): MIME allow-list, filename sanitizing (path separators / control characters / traversal segments rejected), identity-bound keys (the caller's AppInstanceUser id from `callerPersonId`, never a body-supplied userId), membership and clearance checked before any upload or download is signed, and a POST-policy `content-length-range` of 1 byte to 10 MiB; the client mirrors the same limit and type checks. No server-side malware scanning
 - SQL queries in Aurora mode use parameterized queries; table/column names validated against identifier regex
 
 **CORS:**
@@ -863,7 +868,7 @@ This section summarizes security controls.
 |------|---------|-----------|---------------|
 | Messages | Amazon Chime SDK AppInstance | Controlled by Amazon Chime SDK (not configurable in this project) | Yes - message content, sender ARN |
 | File attachments | S3 bucket | 90 days (lifecycle rule) | Possible - depends on uploaded files |
-| Analytics (Athena) | Kinesis → Firehose → S3 | 90 days (S3 lifecycle) | Yes - sender ARN, message content |
+| Analytics (Athena) | Kinesis → Firehose → S3 | `conversations/` kept; telemetry, delivery errors and query results expire by prefix (S3 lifecycle) | Yes - sender ARN, message content |
 | Analytics (Aurora) | Aurora PostgreSQL | 90 days for evaluation_results (`expires_at`); messages table has no auto-expiry | Yes - `sender_name`, `sender_arn`, and the person key (`person_id`) |
 | Task tracking | DynamoDB | TTL-based expiry (set per task) | Yes - the person key (`personId`) |
 | Cross-conversation context | Aurora PostgreSQL | No auto-expiry | Yes - the person key (`person_id`), conversation summaries |
@@ -874,7 +879,7 @@ This section summarizes security controls.
 - **Amazon SES:** Recipient email addresses are sent to SES for conversation sharing. SES is subject to the AWS DPA.
 - **Image models hosted outside AWS:** where a classification selects one (`models.selected`), a workflow's image step sends its recorded brief to that provider ([ADR-064](../design/decisions/064-a-turn-takes-its-model-from-the-intent-and-the-step-it-runs.md) security posture). The brief may carry a requirement drawn from the classification's corpus. The platform does not block it; it records each such call on the turn's archive record (`imageEgress`: the provider, the model, and whether the brief carried a context-sourced requirement). Whether a classification may use an external image model is the admin's choice.
 
-**PII in analytics:** The analytics pipeline stores user identifiers in queryable tables. Admin users can query conversation history, evaluation scores, and cross-conversation context by the person key, the AppInstanceUser id (`person_id` in Aurora, `personId` in DynamoDB). Deleting a person erases their records by AppInstanceUser over every store and keeps their battle votes and feedback, still carrying that id (`backend/lambda/src/lib/offboarding.ts`, **NOT VERIFIED** on a deployment). Organizations with GDPR/CCPA requirements should implement data subject access/deletion procedures against these tables.
+**PII in analytics:** The analytics pipeline stores user identifiers in queryable tables. Admin users can query conversation history, evaluation scores, and cross-conversation context by the person key, the AppInstanceUser id (`person_id` in Aurora, `personId` in DynamoDB). Deleting a person erases their records by AppInstanceUser over every store and keeps their battle votes and feedback, still carrying that id (`backend/lambda/src/lib/offboarding.ts`, `OFFBOARDING_KEPT`). Verified by `backend/test/lib/offboarding-reaches-every-store-that-names-a-person.test.ts` and `backend/test/battle-stack-outcome-wiring.test.ts` ("a pick is kept when its voter is offboarded"); the deployed e2e, `tests/e2e/h1-offboard.spec.ts`, has no recorded run. Organizations with GDPR/CCPA requirements should implement data subject access/deletion procedures against these tables.
 
 ---
 
@@ -882,25 +887,20 @@ This section summarizes security controls.
 
 | Test type | Location | What it covers | Gaps |
 |-----------|----------|---------------|------|
-| **E2E (Playwright)** | `tests/e2e/` | Signup, signin, agent intents (per tier), admin dashboard | Disabled in CI; requires deployed AWS environment |
-| **Backend unit (Jest)** | `backend/test/` | CDK synth validation, Aurora modules (db-client, drift-detection, cross-conversation-context) | Tests mock all external dependencies; no integration tests against real databases |
-| **Frontend unit (Vitest)** | `frontend/packages/*/src/**/*.test.{ts,tsx}` | Components, providers, services, and utils (about 220 test files across chat, admin, shared and widget; run with `cd frontend && npm test`) | Coverage is targeted at behavior-heavy modules, not exhaustive |
+| **E2E (Playwright)** | `tests/e2e/` (129 spec files) | Live behavior on a deployed instance, phase by phase through `node backend/scripts/validate.mjs`; which spec covers which spec document is the generated [e2e coverage matrix](../reference/e2e-coverage-matrix.md) | Not run in CI (the job in `.github/workflows/ci.yml` is commented out, since it needs a deployed AWS environment); many specs are gated behind an opt-in variable |
+| **Backend (Jest)** | `backend/test/` (about 945 test files) | Handlers and libraries against in-process fakes, CDK synth of every stack and deploy configuration, IAM deny tests, and doc guards (`code-doc-references`, `docs-drift-guard`, `e2e-coverage-matrix`) | No test reaches a real database, Bedrock or the Amazon Chime SDK; that is the Playwright suite's job |
+| **Frontend unit (Vitest)** | `frontend/packages/*/src/**/*.test.{ts,tsx}` | Components, providers, services, and utils (about 230 test files across chat, admin, shared and widget; run with `cd frontend && npm test`) | Coverage is targeted at behavior-heavy modules, not exhaustive |
 
 ```bash
-# Run E2E tests (requires deployed backend + running frontend)
-cd tests && npm test
+# Run E2E phases against a deployment (requires a deployed backend)
+cd backend && node scripts/validate.mjs --only=<phase>
 
-# Run backend unit tests
-cd backend && npm test
+# Run backend tests one shard at a time (the whole suite in one call is refused)
+cd backend && node scripts/run-test-shards.mjs --shards=8 --only=1
+cd backend && npm run test:report
 ```
 
-**Known testing gaps:**
-- E2E tests are disabled in CI (`.github/workflows/ci.yml`) because they require a deployed AWS environment
-- Backend unit tests mock everything - no integration tests verify actual database queries, Bedrock calls, or Amazon Chime SDK interactions
-- No load/performance testing
-- Error paths and edge cases are largely untested
-
-This is a significant gap for production use.
+**Known testing gaps:** E2E runs only against a deployment and outside CI, and there is no load or performance testing.
 
 ---
 

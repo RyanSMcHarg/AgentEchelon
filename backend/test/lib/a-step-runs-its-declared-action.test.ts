@@ -317,7 +317,7 @@ describe('a step declares the tools its turn may use, which narrows and never wi
   });
 
   it('takes the step\'s own list where the profile allows every registered tool', () => {
-    expect(toolsForStep(undefined, def(['load_platform_info']))).toEqual(['load_platform_info', 'advance_task_state', 'deliver_document']);
+    expect(toolsForStep(undefined, def(['load_platform_info']))).toEqual(['load_platform_info', 'advance_task_state', 'deliver_document', 'open_new_request']);
   });
 
   it('changes nothing for a step that declares no tools', () => {
@@ -336,8 +336,8 @@ describe('a step declares the tools its turn may use, which narrows and never wi
       initial: 'a', states: { a: { transitions: ['b'], tools: tools as string[] }, b: { transitions: [], terminal: 'success' } },
     });
     expect(() => validateTaskStateMachine('m', m(['load_company_context']))).not.toThrow();
-    expect(() => validateTaskStateMachine('m', m(['crm_write']))).toThrow(/unknown tool/);
+    expect(() => validateTaskStateMachine('m', m(['crm_write']))).toThrow(/"crm_write", which is not a registered tool/);
     expect(() => validateTaskStateMachine('m', m(['load_company_context', 'load_company_context']))).toThrow(/twice/);
-    expect(() => validateTaskStateMachine('m', m('load_company_context'))).toThrow(/not a list/);
+    expect(() => validateTaskStateMachine('m', m('load_company_context'))).toThrow(/is a list of tool names/);
   });
 });

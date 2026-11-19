@@ -12,6 +12,8 @@
  * what "per-classification ownership" means.
  */
 
+import { dashboardPrefix, DASHBOARDS_FAMILY } from '../../lambda/src/lib/dashboard-keys';
+import { transcriptPrefix } from '../../lambda/src/lib/meeting-transcript';
 import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
@@ -28,6 +30,7 @@ import { INSTANCE_TAG } from '../tagging';
 import { AUDIENCE_TAG } from '../../lambda/src/lib/channel-classification';
 import { classificationPackPrefix } from '../../lambda/src/lib/profile-bodies';
 import { templatePrefix, templatePointerPath } from '../../lambda/src/lib/template-store';
+import { toolOfferedToRole, toolRolesOf } from '../../lambda/src/lib/tool-registry';
 
 // RE-EXPORTED, NOT RESTATED. This was a second literal copy of the union, which is two places to edit
 // and one of them to forget: a classification declared in the registry and in `model-strategy` but not
@@ -834,11 +837,22 @@ export function assistantRolesFor(classification: string): string[] {
 }
 
 /**
- * THE ATTACHMENTS BUCKET'S UNCLASSIFIED KEY FAMILIES A TURN READS OR WRITES (tenet D15): a member's upload, an
- * assistant's deliverable, a duel's images and the content-addressed profile bodies. Each is narrowed further
- * by the acting role's own grants and by code; the boundary admits the family and nothing classified.
+ * THE ATTACHMENTS BUCKET'S KEY FAMILIES A TURN READS OR WRITES (tenet D15): a member's upload, an assistant's
+ * deliverable and a duel's images. Each is narrowed further by the acting role's own grants and by code.
  */
-export const TURN_OBJECT_FAMILIES = ['attachments/', 'generated-docs/', 'battle-images/', 'profiles/'] as const;
+export const TURN_OBJECT_FAMILIES = ['attachments/', 'generated-docs/', 'battle-images/'] as const;
+
+/**
+ * THE THREE BUCKETS A TURN TOUCHES, each with one owner. `attachments` holds what members and assistants produce in
+ * conversations; `company` holds the company corpus (`context/`) and the platform's self-knowledge
+ * (`platform-knowledge/`); `profile` holds what an assistant is: profile bodies (`profiles/`), intent packs
+ * (`classification-packs/`) and message templates (`templates/`).
+ */
+export interface TurnBuckets {
+  attachmentsBucketArn: string;
+  companyBucketArn: string;
+  profileBucketArn: string;
+}
 
 /** The classified prefixes one classification's assistants may read: its granted `context/` and `platform-knowledge/`. */
 function classifiedPrefixesOf(classification: string): string[] {
@@ -848,17 +862,39 @@ function classifiedPrefixesOf(classification: string): string[] {
   ];
 }
 
-/** The S3 an acting role's boundary allows (`assistantActingRole`): none without a bucket. */
-function boundaryS3Statements(classification: string, bucketArn: string | undefined, readsTemplates: boolean): iam.PolicyStatement[] {
-  if (!bucketArn) return [];
+/** The S3 an acting role's boundary allows (`assistantActingRole`): none without its buckets. */
+function boundaryS3Statements(classification: string, buckets: TurnBuckets | undefined, readsTemplates: boolean): iam.PolicyStatement[] {
+  if (!buckets) return [];
+  const { attachmentsBucketArn, companyBucketArn, profileBucketArn } = buckets;
   const classified = classifiedPrefixesOf(classification);
+  // ONE STATEMENT PER ACTION SET: the boundary is a single managed policy with a fixed size limit, so families that share
+  // their actions share a statement.
   return [
+    // The turn's object families, and ITS OWN CLASSIFICATION'S DASHBOARDS (DESIGN-CONVERSATION-DASHBOARDS section 3), and no
+    // other's: the classification is in the key, so another classification's dashboard is outside the boundary unnamed.
     new iam.PolicyStatement({
       sid: 'BoundaryObjectsATurnUses',
       effect: iam.Effect.ALLOW,
       actions: ['s3:GetObject', 's3:PutObject'],
-      // The classification's OWN intent-pack bodies (`classification-packs/{classification}/`) and no other's.
-      resources: [...TURN_OBJECT_FAMILIES, ...classified, classificationPackPrefix(classification)].map((p) => `${bucketArn}/${p}*`),
+      resources: [
+        ...TURN_OBJECT_FAMILIES.map((p) => `${attachmentsBucketArn}/${p}*`),
+        `${attachmentsBucketArn}/${dashboardPrefix(classification)}*`,
+      ],
+    }),
+    // WHAT THE ASSISTANT IS AND WHAT ITS CLASSIFICATION KNOWS, ONLY TO READ: the content-addressed profile bodies, the
+    // classification's OWN intent-pack bodies (`classification-packs/{classification}/`) and no other's, of the company
+    // bucket the classified prefixes this classification grants, and ITS OWN CLASSIFICATION'S MEETING TRANSCRIPTS
+    // (SPEC-ASSISTANT-MEETINGS FR28; the classification is in the key, `meeting-transcript.ts`). A turn never writes any.
+    new iam.PolicyStatement({
+      sid: 'BoundaryWhatATurnReads',
+      effect: iam.Effect.ALLOW,
+      actions: ['s3:GetObject'],
+      resources: [
+        `${profileBucketArn}/profiles/*`,
+        `${profileBucketArn}/${classificationPackPrefix(classification)}*`,
+        ...classified.map((p) => `${companyBucketArn}/${p}*`),
+        `${attachmentsBucketArn}/${transcriptPrefix(classification)}*`,
+      ],
     }),
     // The classification's OWN document templates (`templates/{classification}/`), and only to read: a
     // turn never writes a template, so the boundary does not admit the write a mistaken grant would ask for.
@@ -867,16 +903,31 @@ function boundaryS3Statements(classification: string, bucketArn: string | undefi
       sid: 'BoundaryItsOwnTemplates',
       effect: iam.Effect.ALLOW,
       actions: ['s3:GetObject'],
-      resources: [`${bucketArn}/${templatePrefix(classification)}*`],
+      resources: [`${profileBucketArn}/${templatePrefix(classification)}*`],
     })] : []),
     new iam.PolicyStatement({
       sid: 'BoundaryListingItsOwnPrefixes',
       effect: iam.Effect.ALLOW,
       actions: ['s3:ListBucket'],
-      resources: [bucketArn],
-      // Its own template prefix too, where it reads templates: a turn lists which templates a family holds.
-      conditions: { StringLike: { 's3:prefix': [...classified, ...(readsTemplates ? [templatePrefix(classification)] : [])].map((p) => `${p}*`) } },
+      resources: [companyBucketArn],
+      conditions: { StringLike: { 's3:prefix': classified.map((p) => `${p}*`) } },
     }),
+    // Its own transcripts, listed in the attachments bucket alone (each bucket holds one owner's data).
+    new iam.PolicyStatement({
+      sid: 'BoundaryListItsOwnTranscripts',
+      effect: iam.Effect.ALLOW,
+      actions: ['s3:ListBucket'],
+      resources: [attachmentsBucketArn],
+      conditions: { StringLike: { 's3:prefix': [`${transcriptPrefix(classification)}*`] } },
+    }),
+    // Its own template prefix, where it reads templates: a turn lists which templates a family holds.
+    ...(readsTemplates ? [new iam.PolicyStatement({
+      sid: 'BoundaryListingItsOwnTemplates',
+      effect: iam.Effect.ALLOW,
+      actions: ['s3:ListBucket'],
+      resources: [profileBucketArn],
+      conditions: { StringLike: { 's3:prefix': [`${templatePrefix(classification)}*`] } },
+    })] : []),
   ];
 }
 
@@ -966,17 +1017,21 @@ function alarmArns(scope: Construct, prefixes: readonly string[]): string[] {
 }
 
 /**
- * THIS INSTANCE'S ALARMS, AS ONE SESSION-POLICY RESOURCE. A session policy only narrows the acting role, whose
- * grant names each declared stack's alarms (`assistantActingRole`), so the session edge names the instance's
- * stack-name family and stays the same whichever capabilities a deployment declares.
+ * WHICH OF A CLASSIFICATION'S ASSISTANT ROLES MAY PUBLISH A CONVERSATION DASHBOARD (DESIGN-CONVERSATION-DASHBOARDS section 5):
+ * the roles either dashboard tool is offered to. A tool naming no role grants none, as for telemetry.
  */
-function instanceAlarmArns(scope: Construct): string[] {
-  return alarmArns(scope, [STACK_PREFIX]);
+export function dashboardRoles(roles: string[]): string[] {
+  const tools = ['publish_dashboard', 'publish_dashboard_page'].filter((t) => (toolRolesOf(t) ?? []).length);
+  return roles.filter((r) => tools.some((t) => toolOfferedToRole(t, r)));
 }
 
 /** Which of a classification's assistant roles may read this deployment's own telemetry. */
 export function observabilityRoles(roles: string[]): string[] {
-  return roles.filter((r) => r === 'ops');
+  // The roles `read_deployment_health` is offered to, so the grant and the offer name the same roles. A GRANT NEEDS A
+  // NAMED ROLE: a tool with no `roles` is offered to every role, and that default must never become telemetry for
+  // every assistant, so a tool that names none grants none (fails closed at synth).
+  if (!(toolRolesOf('read_deployment_health') ?? []).length) return [];
+  return roles.filter((r) => toolOfferedToRole('read_deployment_health', r));
 }
 
 /**
@@ -1017,8 +1072,8 @@ export function assistantActingRole(
     roles: string[];
     /** What a session may do in a conversation; narrower than the gated set. */
     sessionChannelActions: string[];
-    /** The bucket holding `context/`. */
-    contextBucketArn?: string;
+    /** The buckets a turn reads and writes (`TurnBuckets`). */
+    buckets?: TurnBuckets;
     /** Whether a workflow this classification serves declares a document template, so a turn reads its own. */
     readsTemplates?: boolean;
     /** The capabilities this deployment declares: an observability role reads their stacks' alarms beside the core's. */
@@ -1028,6 +1083,7 @@ export function assistantActingRole(
   const own = opts.classification;
   const channelValues = channelsAnAssistantMayActIn(own as Classification);
   const observers = observabilityRoles(opts.roles);
+  const publishers = dashboardRoles(opts.roles);
 
   const boundary = new iam.ManagedPolicy(scope, 'AssistantBoundary', {
     managedPolicyName: `${STACK_PREFIX}AssistantActingBoundary-${own}`,
@@ -1060,29 +1116,50 @@ export function assistantActingRole(
         actions: ['iam:*', 'sts:AssumeRole', 'sts:TagSession', 'chime:TagResource', 'chime:UntagResource'],
         resources: ['*'],
       }),
-      new iam.PolicyStatement({
-        sid: 'BoundaryNoChannelOutsideThisClassification',
-        effect: iam.Effect.DENY,
-        actions: CLASSIFICATION_GATED_CHANNEL_ACTIONS,
-        resources: [`${opts.appInstanceArn}/channel/*`],
-        conditions: { StringNotEquals: { 'aws:ResourceTag/classification': channelValues } },
-      }),
-      new iam.PolicyStatement({
-        sid: 'BoundaryNoBotOutsideThisClassification',
-        effect: iam.Effect.DENY,
-        actions: CLASSIFICATION_GATED_CHANNEL_ACTIONS,
-        resources: [`${opts.appInstanceArn}/bot/*`],
-        conditions: { StringNotEquals: { 'aws:ResourceTag/classification': own } },
-      }),
+      // A channel and a bot outside this classification are refused alike. Where the channels an assistant may act in are
+      // its own classification alone, one statement names both, since the boundary is one managed policy with a size limit.
+      ...(channelValues.length === 1 && channelValues[0] === own ? [
+        new iam.PolicyStatement({
+          sid: 'BoundaryNoChannelOrBotOutsideThisClassification',
+          effect: iam.Effect.DENY,
+          actions: CLASSIFICATION_GATED_CHANNEL_ACTIONS,
+          resources: [`${opts.appInstanceArn}/channel/*`, `${opts.appInstanceArn}/bot/*`],
+          conditions: { StringNotEquals: { 'aws:ResourceTag/classification': own } },
+        }),
+      ] : [
+        new iam.PolicyStatement({
+          sid: 'BoundaryNoChannelOutsideThisClassification',
+          effect: iam.Effect.DENY,
+          actions: CLASSIFICATION_GATED_CHANNEL_ACTIONS,
+          resources: [`${opts.appInstanceArn}/channel/*`],
+          conditions: { StringNotEquals: { 'aws:ResourceTag/classification': channelValues } },
+        }),
+        new iam.PolicyStatement({
+          sid: 'BoundaryNoBotOutsideThisClassification',
+          effect: iam.Effect.DENY,
+          actions: CLASSIFICATION_GATED_CHANNEL_ACTIONS,
+          resources: [`${opts.appInstanceArn}/bot/*`],
+          conditions: { StringNotEquals: { 'aws:ResourceTag/classification': own } },
+        }),
+      ]),
       // S3 ONLY WHERE A TURN USES IT, AND NO OTHER CLASSIFICATION'S COMPANY CONTEXT, whatever the identity
-      // policies grow to hold. The boundary allows the bucket's unclassified key families a turn reads or
-      // writes (`TURN_OBJECT_FAMILIES`), and of the classified ones (`context/`, `platform-knowledge/`) only
-      // the prefixes this classification grants, objects and listing alike. Every other prefix, another
+      // policies grow to hold. The boundary allows the attachment families a turn reads or writes
+      // (`TURN_OBJECT_FAMILIES`), the profile bodies, this classification's pack and templates to read, and of the
+      // company bucket's classified prefixes (`context/`, `platform-knowledge/`) only the ones this classification
+      // grants, objects and listing alike. Every other prefix, another
       // classification's, one declared after this stack was deployed, or an undeclared one, is outside it
       // without being named, so a mistaken S3 grant on the acting role still cannot read it, and declaring a
       // classification changes no other classification's boundary. A context source in another bucket is
       // added by the stack that grants it (`allowContextSourceObjects`).
-      ...boundaryS3Statements(own, opts.contextBucketArn, opts.readsTemplates === true),
+      ...boundaryS3Statements(own, opts.buckets, opts.readsTemplates === true),
+      // A DASHBOARD IS WRITTEN ONLY BY A ROLE A DASHBOARD TOOL IS OFFERED TO, whatever else the role is granted.
+      ...(opts.buckets ? [new iam.PolicyStatement({
+        sid: 'BoundaryDashboardsOnlyForDashboardRoles',
+        effect: iam.Effect.DENY,
+        actions: ['s3:PutObject'],
+        resources: [`${opts.buckets.attachmentsBucketArn}/${DASHBOARDS_FAMILY}*`],
+        ...(publishers.length ? { conditions: { StringNotEquals: { [`aws:PrincipalTag/${SESSION_TAG.role}`]: publishers } } } : {}),
+      })] : []),
       new iam.PolicyStatement({
         sid: 'BoundaryTelemetryOnlyForObservabilityRoles',
         effect: iam.Effect.DENY,
@@ -1158,8 +1235,18 @@ export function assistantActingRole(
   // every grant this role holds rather than the sends it was written next to.
 
   // ── WHAT AN ASSISTANT ROLE READS ────────────────────────────────────────────────────────────────
-  if (opts.contextBucketArn) {
-    for (const statement of roleContextStatements(own, opts.roles, opts.contextBucketArn)) role.addToPolicy(statement);
+  if (opts.buckets) {
+    for (const statement of roleContextStatements(own, opts.roles, opts.buckets.companyBucketArn)) role.addToPolicy(statement);
+  }
+  if (opts.buckets && publishers.length) {
+    // A DASHBOARD TOOL'S WRITE (DESIGN-CONVERSATION-DASHBOARDS section 5): its own classification's dashboards, read back for
+    // the message they are shown in, and only for a role a dashboard tool is offered to.
+    role.addToPolicy(new iam.PolicyStatement({
+      sid: 'RoleDashboardWrite',
+      actions: ['s3:GetObject', 's3:PutObject'],
+      resources: [`${opts.buckets.attachmentsBucketArn}/${dashboardPrefix(own)}*`],
+      conditions: { StringEquals: { [`aws:PrincipalTag/${SESSION_TAG.role}`]: publishers } },
+    }));
   }
   if (observers.length) {
     // THE CORE'S OBSERVABILITY READS ARE ONE MANAGED POLICY, NOT INLINE. They are the same in every deployment,
@@ -1180,26 +1267,13 @@ export function assistantActingRole(
       sid: 'RoleObservabilityAlarmRead',
       effect: iam.Effect.ALLOW,
       actions: ALARM_READ_ACTIONS,
-      // THE CORE'S ALARMS, by name prefix (`coreAlarmNamePrefixes`). Each declared capability's are its own policy, below.
-      resources: alarmArns(scope, coreAlarmNamePrefixes()),
+      // ANY ALARM IN THE ACCOUNT, READ BY NAME (SPEC-WORKFLOWS-AND-TASKS WT120): an incident is opened by
+      // whichever alarm its team attached, which need not be one of this deployment's, and its first look reads that alarm's
+      // state. What the tool names is the deployment's published alarms and the one its conversation watches, never a listing
+      // (`deployment-health.ts`); the grant reads alarm names, states and reasons, and stays an observability role's alone.
+      resources: alarmArns(scope, ['']),
       conditions: { StringEquals: { [`aws:PrincipalTag/${SESSION_TAG.role}`]: observers } },
     }));
-    // EACH DECLARED CAPABILITY'S ALARMS, one policy per capability (`capabilityAlarmNamePrefixes`): a capability
-    // adds its own read beside the core's, so the role reads exactly the alarms of the stacks this deployment has.
-    for (const capability of opts.capabilities ?? []) {
-      const prefixes = capabilityAlarmNamePrefixes(capability);
-      if (!prefixes.length) continue;
-      new iam.Policy(scope, `AssistantAlarmRead-${capability}`, {
-        roles: [role],
-        statements: [new iam.PolicyStatement({
-          sid: 'RoleObservabilityAlarmRead',
-          effect: iam.Effect.ALLOW,
-          actions: ALARM_READ_ACTIONS,
-          resources: alarmArns(scope, prefixes),
-          conditions: { StringEquals: { [`aws:PrincipalTag/${SESSION_TAG.role}`]: observers } },
-        })],
-      });
-    }
     // WHICH ALARMS THOSE ARE, as the stacks publish them (`publishAlarmNames`). `GetParametersByPath`
     // authorizes against the requested path itself, recursive or not.
     observability.addStatements(new iam.PolicyStatement({
@@ -1641,6 +1715,19 @@ export function alertEmitterWiring(scope: Construct): { env: Record<string, stri
   return { env, grant };
 }
 
+/**
+ * THE OWNER TEAM OF A RUN'S ASSISTANT, READ LIVE (SPEC-PROCESSES P8, O16): `chime:ListTagsForResource` on this app instance's
+ * bots that carry this classification's tag, and nothing else: no other classification's assistants and no channel.
+ */
+export function readOwnAssistantsTagsStatement(appInstanceArn: string, classification: string): iam.PolicyStatement {
+  return new iam.PolicyStatement({
+    sid: 'ReadItsOwnAssistantsOwnerTeam',
+    actions: ['chime:ListTagsForResource'],
+    resources: [`${appInstanceArn}/bot/*`],
+    conditions: { StringEquals: { 'aws:ResourceTag/classification': classification } },
+  });
+}
+
 /** The source every platform alert carries on the default bus, which the `AdminServices` rule matches. */
 export const ALERT_SOURCE = 'ae.alert';
 
@@ -1662,6 +1749,24 @@ export function speakAsAssistantEnv(): Record<string, string> {
  * is written by the classification's own router and nothing else.
  */
 export const SPEAK_ROUTES_ONLY = { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': [`${SPEAK_ROUTE_PREFIX}*`] } };
+
+/** The attributes of a conversation's context row a meeting read names: which room or meeting it is, its meeting, and its role holdings. */
+export const MEETING_ROW_ATTRIBUTES = ['channelArn', 'conversationType', 'participantRoles', 'meetingOf', 'meetingConversation', 'activeMeeting'] as const;
+
+/**
+ * A READ OF A CONVERSATION'S MEETING FIELDS ALONE (`propose_meeting_invites` on the assistant's session, an `add_to_meeting`
+ * proposal's decision): `GetItem` of a channel of this app instance (`dynamodb:LeadingKeys`), with a projection naming only
+ * the meeting attributes (`dynamodb:Attributes`, required present by `Null`, so a read without a projection is refused),
+ * and `SPECIFIC_ATTRIBUTES` where the request carries a `Select`.
+ */
+export function meetingRowReadConditions(appInstanceArn: string): Record<string, Record<string, unknown>> {
+  return {
+    'ForAllValues:StringEquals': { 'dynamodb:Attributes': [...MEETING_ROW_ATTRIBUTES] },
+    'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': [`${appInstanceArn}/channel/*`] },
+    StringEqualsIfExists: { 'dynamodb:Select': 'SPECIFIC_ATTRIBUTES' },
+    Null: { 'dynamodb:Attributes': 'false' },
+  };
+}
 
 /**
  * WHAT `primaryAssistantOf` AND `primaryAssignmentOf` READ (DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION §3.8): a room's
@@ -1781,6 +1886,24 @@ export function speakAsAssistantStatements(
  */
 export function turnRoutingTableName(classification: string): string {
   return `${RES_PREFIX}-turn-routing-${classification}`;
+}
+
+/**
+ * THE KEYS A DEPLOY PUBLISHES UNDER `${SSM_ROOT}/assistant/<classification>/`, by what each holds. The stack names
+ * each key through `deployOwnedAssistantKey` and the console's profile role is refused a write on every one
+ * (`admin-assistant-administration.ts`), so a key added here is published and protected by the same name.
+ */
+export const DEPLOY_OWNED_ASSISTANT_KEYS = {
+  guardrails: 'guardrails',
+  contextSources: 'context-sources',
+  intentPack: 'assistant-intent-pack',
+  systemPrompt: 'assistant-system-prompt',
+  onboardingIntake: 'onboarding-intake',
+  welcomeOrientation: 'welcome-orientation',
+} as const;
+export type DeployOwnedAssistantKey = keyof typeof DEPLOY_OWNED_ASSISTANT_KEYS;
+export function deployOwnedAssistantKey(classification: string, key: DeployOwnedAssistantKey): string {
+  return `${SSM_ROOT}/assistant/${classification}/${DEPLOY_OWNED_ASSISTANT_KEYS[key]}`;
 }
 
 export function botArnKey(classification: Classification): string {
@@ -2001,6 +2124,16 @@ export function resolveSharedSSM(scope: Construct): {
   };
 }
 
+/** The stand-ins a meeting entry's name carries in place of a classification: a runtime placeholder, and an IAM wildcard. */
+const MEETING_ENTRY_STANDINS: readonly string[] = ['{classification}', '*'];
+
+/** A classification's meeting entry, by its fixed name. A name longer than Lambda's 64 characters is refused at synth. */
+function meetingEntryName(entry: 'MeetingRun' | 'MeetingSummary', classification: string): string {
+  const name = `${STACK_PREFIX}Meetings-${entry}-${classification}`;
+  if (name.length > 64 && !MEETING_ENTRY_STANDINS.includes(classification)) throw new Error(`${entry}: "${name}" is longer than Lambda's 64 characters`);
+  return name;
+}
+
 /**
  * THE NAMES A CAPABILITY'S RESOURCES ARE GIVEN, FIXED, SO A CORE STACK NAMES THEM WITHOUT REFERENCING THEIR
  * STACK (STACKS.md, additivity).
@@ -2017,6 +2150,17 @@ export const CAPABILITY_RESOURCES = {
   channelBattleConfigTable: `${RES_PREFIX}-channel-battle-config`,
   battleOutcomeTable: `${RES_PREFIX}-battle-outcome`,
   battleOrchestrator: `${STACK_PREFIX}Battle-BattleOrchestrator`,
+  /**
+   * A classification's run entry, which its router invokes for a workflow's `start_meeting` step, a meeting's end and an
+   * ended meeting's transcript, in `Meetings` (`lambda/src/meeting-api.ts`). One per classification: each acts only in
+   * conversations of its own classification, and only that classification's router may invoke it.
+   */
+  meetingRun: (classification: string): string => meetingEntryName('MeetingRun', classification),
+  /**
+   * A classification's summary entry, which its router reads a meeting's figures through, in `Meetings`
+   * (`lambda/src/meeting-summary.ts`). One per classification, on the same terms as the run entry.
+   */
+  meetingSummary: (classification: string): string => meetingEntryName('MeetingSummary', classification),
   /** The invitation and claim emails' sender, in `Notifications` (`lambda/src/transactional-mail.ts`). */
   transactionalMail: `${STACK_PREFIX}Notifications-TransactionalMail`,
 } as const;
@@ -2331,7 +2475,7 @@ export function driftChannelCreateStatements(
     new iam.PolicyStatement({
       sid: 'DriftConfigureOwnClassificationChannel',
       effect: iam.Effect.ALLOW,
-      actions: ['chime:AssociateChannelFlow', 'chime:PutChannelExpirationSettings'],
+      actions: ['chime:AssociateChannelFlow', 'chime:PutChannelExpirationSettings', 'chime:DescribeChannel'],
       resources: [`${appInstanceArn}/channel/*`],
       conditions: {
         StringEquals: { 'aws:ResourceTag/classification': channelsAnAssistantMayActIn(classification) },
@@ -2349,7 +2493,7 @@ export function driftChannelCreateStatements(
     new iam.PolicyStatement({
       sid: 'DriftConfigureChannelAsBearerIdentity',
       effect: iam.Effect.ALLOW,
-      actions: ['chime:AssociateChannelFlow', 'chime:PutChannelExpirationSettings'],
+      actions: ['chime:AssociateChannelFlow', 'chime:PutChannelExpirationSettings', 'chime:DescribeChannel'],
       resources: [serviceAdminArn],
     }),
     // ── AND THE CHANNEL FLOW ITSELF, WHICH IS THE THIRD RESOURCE IN THIS AUTHORIZATION ───────────
@@ -2532,16 +2676,24 @@ export function assistantGrantCatalog(
 ): { edges: string[]; policyArnPrefix: string; policies: iam.ManagedPolicy[] } {
   const invoke = opts.streaming ? ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'] : ['bedrock:InvokeModel'];
   const name = (edge: string) => `${STACK_PREFIX}AssistantGrant-${opts.classification}-${edge}`;
-  const NARROWED = [...invoke, 'bedrock:InvokeModelWithResponseStream', 's3:GetObject', 's3:ListBucket', ...OBSERVABILITY_READ_ACTIONS];
+  const NARROWED = [...invoke, 'bedrock:InvokeModelWithResponseStream', 's3:GetObject', 's3:PutObject', 's3:ListBucket', ...OBSERVABILITY_READ_ACTIONS];
+  const DASHBOARD_OBJECTS = `arn:aws:s3:::*/${DASHBOARDS_FAMILY}*`;
   const CONTEXT_OBJECTS = 'arn:aws:s3:::*/context/*';
   // PLATFORM KNOWLEDGE BY GRANT: `platform-knowledge/{c}/` for each classification this one
   // grants, so the external classification's session reaches the public overview and nothing internal.
   const PLATFORM_PREFIXES = profiles.grantsFor(opts.classification).map((c) => `platform-knowledge/${c}/`);
   const PLATFORM_OBJECT_ARNS = PLATFORM_PREFIXES.map((p) => `arn:aws:s3:::*/${p}*`);
+  // THE DEPLOYMENT'S TELEMETRY, what the `telemetry` edge is and what the `dashboard` edge draws from.
+  const telemetryStatements = () => [
+    new iam.PolicyStatement({ actions: [...METRIC_READ_ACTIONS], resources: ['*'] }),
+    new iam.PolicyStatement({ actions: [...ALARM_READ_ACTIONS], resources: alarmArns(scope, ['']) }),
+  ];
   const policies: Record<string, iam.PolicyStatement[]> = {
     base: [
       new iam.PolicyStatement({ sid: 'EverythingNoDefinitionFieldSelects', notActions: [...new Set(NARROWED)], resources: ['*'] }),
-      new iam.PolicyStatement({ sid: 'ObjectsOutsideTheNarrowedPrefixes', actions: ['s3:GetObject'], notResources: [CONTEXT_OBJECTS, 'arn:aws:s3:::*/platform-knowledge/*'] }),
+      new iam.PolicyStatement({ sid: 'ObjectsOutsideTheNarrowedPrefixes', actions: ['s3:GetObject'], notResources: [CONTEXT_OBJECTS, 'arn:aws:s3:::*/platform-knowledge/*', DASHBOARD_OBJECTS] }),
+      // EVERY WRITE A TURN MAKES BUT A DASHBOARD's, which only the `dashboard` edge selects.
+      new iam.PolicyStatement({ sid: 'WritesOutsideTheDashboards', actions: ['s3:PutObject'], notResources: [DASHBOARD_OBJECTS] }),
       // WHICH TEMPLATES ITS OWN CLASSIFICATION HOLDS (ADR-062 decision 2). Every turn says messages, and wording one
       // is part of the assistant's turn, so the session lists each family it may say a line from: one listing per
       // family names the templates it holds, and each body and pointer is then read by the key the pointer gives
@@ -2554,6 +2706,16 @@ export function assistantGrantCatalog(
         resources: ['*'],
         conditions: { StringLike: { 's3:prefix': [`${templatePrefix(opts.classification)}*`] } },
       }),
+      // ITS OWN CLASSIFICATION'S MEETING TRANSCRIPTS (SPEC-ASSISTANT-MEETINGS FR28, FR66): a turn lists a conversation's
+      // transcripts to find the newest as grounding, and a summary turn lists one meeting's segments. Each object is then
+      // read by the statement above. The acting role and its boundary confine the listing to the attachments bucket and this
+      // classification's family (`AssistantTranscriptRead`, `BoundaryListItsOwnTranscripts`); the condition repeats the prefix.
+      new iam.PolicyStatement({
+        sid: 'ItsOwnClassificationsTranscriptListing',
+        actions: ['s3:ListBucket'],
+        resources: ['*'],
+        conditions: { StringLike: { 's3:prefix': [`${transcriptPrefix(opts.classification)}*`] } },
+      }),
     ],
     context: [
       new iam.PolicyStatement({ actions: ['s3:GetObject'], resources: [CONTEXT_OBJECTS] }),
@@ -2563,10 +2725,14 @@ export function assistantGrantCatalog(
       new iam.PolicyStatement({ actions: ['s3:GetObject'], resources: PLATFORM_OBJECT_ARNS }),
       new iam.PolicyStatement({ actions: ['s3:ListBucket'], resources: ['*'], conditions: { StringLike: { 's3:prefix': PLATFORM_PREFIXES.map((p) => `${p}*`) } } }),
     ],
-    telemetry: [
-      new iam.PolicyStatement({ actions: [...METRIC_READ_ACTIONS], resources: ['*'] }),
-      new iam.PolicyStatement({ actions: [...ALARM_READ_ACTIONS], resources: instanceAlarmArns(scope) }),
+    // A CONVERSATION DASHBOARD (DESIGN-CONVERSATION-DASHBOARDS section 5), selected by either dashboard tool. The acting role
+    // and its boundary confine it to this classification's prefix and the publishing roles.
+    dashboard: [
+      new iam.PolicyStatement({ actions: ['s3:GetObject', 's3:PutObject'], resources: [DASHBOARD_OBJECTS] }),
+      // THE TELEMETRY IT DRAWS FROM, in the same edge, so the edge replaces `telemetry` rather than adding a policy beside it.
+      ...telemetryStatements(),
     ],
+    telemetry: telemetryStatements(),
     // A SPEAK SESSION (Phase 1c): what a service posting as this assistant outside a turn may do, and no
     // more. The acting role still pins the bearer to the assistant's own bot and the room to this
     // classification; this edge removes everything else - models, context, telemetry, the data plane.

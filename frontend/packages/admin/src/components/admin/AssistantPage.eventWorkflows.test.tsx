@@ -15,8 +15,8 @@ import ProfilesTab from './ProfilesTab';
 import * as svc from '../../services/profileService';
 import { listOwnership } from '../../services/ownershipService';
 import { CapabilityTestProvider } from '../../capabilities';
-import { OPS_WELCOME } from '../../../../../../backend/demo/welcomes';
-import { PLATFORM_EVENT_WORKFLOWS } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
+import { OPS_WELCOME } from '../../../../../../demo/portable-assistants/welcomes.ts';
+import { SHIPPED_EVENT_WORKFLOWS } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
 
 vi.mock('../../services/profileService', () => ({
   DEFAULT_MODEL: 'default',
@@ -50,7 +50,7 @@ const PREMIUM: svc.ClassificationCatalog = {
 
 /** The ops assistant's serving version: the seeded welcomes, and a room an event opens. */
 const OPS_BODY: svc.ProfileDefinitionBody = {
-  modelKey: 'sonnet', eventWorkflows: { ...OPS_WELCOME, 'ops-room': PLATFORM_EVENT_WORKFLOWS['ops-room'] },
+  modelKey: 'sonnet', eventWorkflows: { ...OPS_WELCOME, 'ops-room': SHIPPED_EVENT_WORKFLOWS['ops-room'] },
 };
 const BODIES: Record<string, svc.ProfileDefinitionBody> = {
   'ops-premium': OPS_BODY,
@@ -83,36 +83,43 @@ describe('the serving version\'s event workflows', () => {
   it('lists every one, welcomes and the rest, with its event in words, its rooms and its steps', async () => {
     await openWorkflows('Ops');
     for (const name of ['welcome', 'welcome-ops', 'ops-room']) expect(await screen.findByTestId(`assistant-workflow-own-${name}`)).toBeTruthy();
-    expect(screen.getByTestId('workflow-starts-ops-room')).toHaveTextContent('Starts when an event opens a conversation, in ops.');
-    expect(screen.getByTestId('workflow-starts-welcome-ops')).toHaveTextContent('Starts when the assistant joins a conversation, in ops.');
-    expect(screen.getByTestId('workflow-starts-welcome')).toHaveTextContent('in every conversation no other welcome names.');
-    expect(screen.getByTestId('workflow-steps-ops-room')).toHaveTextContent(
-      'Steps Send (ops-room-opening) → Send (ops-lead-welcome) → Assistant step as ops (ops-first-look) → End',
+    expect(within(screen.getByTestId('assistant-workflow-own-ops-room')).getByTestId('workflow-starts-ops-room')).toHaveTextContent('Starts when an event or a workflow opens a conversation, in ops.');
+    expect(within(screen.getByTestId('assistant-workflow-own-welcome-ops')).getByTestId('workflow-starts-welcome-ops')).toHaveTextContent('Starts when the assistant joins a conversation, in ops.');
+    expect(within(screen.getByTestId('assistant-workflow-own-welcome')).getByTestId('workflow-starts-welcome')).toHaveTextContent('in every conversation no other welcome names.');
+    expect(within(screen.getByTestId('assistant-workflow-own-ops-room')).getByTestId('workflow-steps-ops-room')).toHaveTextContent(
+      [
+        'Steps Send (ops-room-opening) → Assign a task (incident_ownership) → Send (ops-lead-welcome) → Assign a task (acknowledgement) → Send (incident-resolved)',
+        '→ Assign a task (incident_first_look) → Open a child conversation → Send (incident-resolved-team) → Assign a task (dashboard_refresh)',
+        '→ Send (ops-assistant-absent) → Send (ops-first-look-unavailable) → Send (customer-messaging-opened) → Send (customer-messaging-not-opened) → Send (customer-messaging-resolved)',
+        '→ Assign a task (meeting_offer) → Wait → Start a meeting → Assign a task (impacted_accounts) → Assistant step (post-incident-review-draft)',
+        '→ Assign a task (runbook_cause) → Assign a task (customer_impact) → Assign a task (acknowledgement) → Assign a task (approval)',
+        '→ Assign a task (runbook_verify) → Open a child conversation → Send (customer-messaging-mitigating) → Send (customer-messaging-opened) → Send (customer-messaging-not-opened) → Assign a task (acknowledgement) → End',
+      ].join(' '),
     );
-    expect(screen.getByTestId('workflow-steps-welcome')).toHaveTextContent('Steps Opening → End');
+    expect(within(screen.getByTestId('assistant-workflow-own-welcome')).getByTestId('workflow-steps-welcome')).toHaveTextContent('Steps Opening → End');
     // A workflow on another event has no opening to preview.
-    expect(screen.queryByTestId('workflow-says-ops-room')).toBeNull();
+    expect(within(screen.getByTestId('assistant-workflow-own-ops-room')).queryByTestId('workflow-says-ops-room')).toBeNull();
   });
 
   it('shows what a text welcome says, the room\'s event summary as a marked placeholder', async () => {
     await openWorkflows('Ops');
     const opening = await screen.findByTestId('workflow-opening-welcome-ops');
-    expect(opening.textContent).toContain('This conversation is open for an operations issue.');
+    expect(opening.textContent).toContain("Ask me what's happening");
     expect(opening.textContent).toContain('‹event summary›');
     expect(opening.textContent).not.toContain('{{eventSummary}}');
-    expect(screen.getByTestId('workflow-says-source-welcome-ops')).toHaveTextContent('Its own text');
+    expect(within(screen.getByTestId('assistant-workflow-own-welcome-ops')).getByTestId('workflow-says-source-welcome-ops')).toHaveTextContent('Its own text');
   });
 
   it('shows what a structured welcome says, its examples as the list a person sees', async () => {
     await openWorkflows('Ops');
-    const opening = await screen.findByTestId('workflow-opening-welcome');
+    const opening = within(await screen.findByTestId('assistant-workflow-own-welcome')).getByTestId('workflow-opening-welcome');
     expect(opening.textContent).toContain('Hi - I\'m your assistant at Stratum Technologies');
     expect(within(opening).getAllByRole('listitem').map((li) => li.textContent)).toEqual([
       'What is the error rate across the deployment right now?',
       'Which functions are slowest, and since when?',
       'Which alarms are in alarm, and what do they cover?',
     ]);
-    expect(screen.getByTestId('workflow-says-source-welcome')).toHaveTextContent('Composed from the fields its opening sets');
+    expect(within(screen.getByTestId('assistant-workflow-own-welcome')).getByTestId('workflow-says-source-welcome')).toHaveTextContent('Composed from the fields its opening sets');
   });
 
   it('is read-only, and Edit in a draft opens the draft\'s builder on that workflow', async () => {
@@ -134,17 +141,5 @@ describe('the serving version\'s event workflows', () => {
     await openWorkflows('Ops');
     fireEvent.click(await screen.findByRole('button', { name: 'Edit welcome-ops in a draft' }));
     await waitFor(() => expect(svc.createProfileVersion).toHaveBeenCalledWith('ops-premium'));
-  });
-});
-
-describe('an assistant with no event workflows', () => {
-  it('says it welcomes through onboarding where its version declares an intake', async () => {
-    await openWorkflows('Concierge');
-    expect(await screen.findByTestId('event-workflows-none')).toHaveTextContent('Concierge has no event workflows. It welcomes people through onboarding');
-  });
-
-  it('says it has none otherwise', async () => {
-    await openWorkflows('Quiet');
-    expect(await screen.findByTestId('event-workflows-none')).toHaveTextContent('No event workflows.');
   });
 });

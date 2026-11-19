@@ -50,13 +50,15 @@ export interface AdminAnalyticsProps extends cdk.NestedStackProps {
   classificationRoleScopes: string;
   /** The thumbs table, for the per-variant thumbs join (Aurora mode). */
   feedbackTable: { tableName: string; tableArn: string };
+  /** The access log, where every content read is recorded with its stated reason before it is served (ADR-052). */
+  accessLogTable: { tableName: string; tableArn: string };
   /**
    * The BattleOutcome table's name when `battle` is declared, for the battle-wins join (Aurora mode).
    * Resolved by the parent stack at deploy from the battle SSM contract (the VPC has no SSM endpoint).
    */
   battleOutcomeTableName?: string;
-  /** The attachments bucket ARN, where profile bodies live (the replay starter reads them). */
-  attachmentsBucketArn: string;
+  /** The profile bucket ARN, where profile bodies and intent packs live (the replay starter reads them). */
+  profileBucketArn: string;
 }
 
 export class AdminAnalytics extends cdk.NestedStack {
@@ -94,11 +96,16 @@ export class AdminAnalytics extends cdk.NestedStack {
                 `arn:aws:glue:${stack.region}:${stack.account}:table/${ANALYTICS_DB_NAME}/*`,
               ],
             }),
-            // Athena verifies the result bucket's region (GetBucketLocation), reads the source data,
-            // lists partitions and writes its results to the archive bucket.
+            // Athena verifies the result bucket's region (GetBucketLocation), reads the source data and
+            // lists partitions. Its only write is its results, which the workgroup puts under
+            // `athena-results/`: a reader never writes the conversation record.
             new iam.PolicyStatement({
-              actions: ['s3:GetBucketLocation', 's3:GetObject', 's3:ListBucket', 's3:PutObject'],
+              actions: ['s3:GetBucketLocation', 's3:GetObject', 's3:ListBucket'],
               resources: [props.archiveBucketArn, `${props.archiveBucketArn}/*`],
+            }),
+            new iam.PolicyStatement({
+              actions: ['s3:PutObject'],
+              resources: [`${props.archiveBucketArn}/athena-results/*`],
             }),
             // The archive bucket is SSE-KMS on the archive's own key. Scoped to KMS-via-S3, which with the
             // bucket statement above is effectively the archive alone.
@@ -150,6 +157,10 @@ export class AdminAnalytics extends cdk.NestedStack {
     const stack = cdk.Stack.of(this);
 
     // ── THE QUERY, IN THE ARCHIVE'S VPC ──────────────────────────────────────────────────────────
+    //
+    // `rds-db:connect` names a database user, never a row, so IAM cannot hold a team route's query to one assistant.
+    // A team read is bound where the rows are: the gateway narrows the console session to the assistants the team owns,
+    // and the handler binds the query to the path's assistant (`analytics/assistants/{assistant}/...`, `analytics-query.ts`).
     const queryRole = new iam.Role(this, 'AnalyticsLambdaRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaVPCAccessExecutionRole')],
@@ -181,6 +192,8 @@ export class AdminAnalytics extends cdk.NestedStack {
         USER_POOL_ID: props.userPoolId,
         // Thumbs per-variant join, read over the VPC's DynamoDB endpoint.
         FEEDBACK_TABLE: props.feedbackTable.tableName,
+        // Content reads are recorded here, over the same DynamoDB endpoint, before they are served.
+        ACCESS_LOG_TABLE: props.accessLogTable.tableName,
         // Battle-wins join: the BattleOutcome table name, resolved at DEPLOY time from the battle SSM
         // contract (the VPC has no SSM endpoint), so the Battle stack deploys first.
         ...(props.battleOutcomeTableName ? { BATTLE_OUTCOME_TABLE: props.battleOutcomeTableName } : {}),
@@ -208,7 +221,17 @@ export class AdminAnalytics extends cdk.NestedStack {
         `arn:aws:bedrock:*:${stack.account}:inference-profile/us.anthropic.*`,
       ],
     }));
+    // THE CLEAN COPY'S DETECTOR, which de-identifies a task's recorded tool calls when an answer of a multi-step task is
+    // nominated to the golden set (ADR-066 decision 7). Referenced from the Archive stack, so this one deploys after it.
+    queryFn.addEnvironment('DEIDENTIFY_GUARDRAIL_ID', aurora.deidentifyGuardrail.id);
+    queryFn.addEnvironment('DEIDENTIFY_GUARDRAIL_VERSION', aurora.deidentifyGuardrail.version);
+    queryFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['bedrock:ApplyGuardrail'],
+      resources: [aurora.deidentifyGuardrail.arn],
+    }));
     queryFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:Scan'], resources: [props.feedbackTable.tableArn] }));
+    // Write-once records only: the reader of the log is another function.
+    queryFn.addToRolePolicy(new iam.PolicyStatement({ actions: ['dynamodb:PutItem'], resources: [props.accessLogTable.tableArn] }));
     if (props.battleOutcomeTableName) {
       // The BattleOutcome table by the fixed name the Battle stack creates it under
       // (`CAPABILITY_RESOURCES.battleOutcomeTable`), so the ARN is exact with no cross-stack reference. Read only.
@@ -264,7 +287,7 @@ export class AdminAnalytics extends cdk.NestedStack {
         ALLOWED_ORIGINS: adminAppUrl,
         SSM_ROOT,
         // The body store a version's pack and a classification's pack pointer resolve against.
-        PROFILE_BODY_BUCKET: cdk.Fn.select(5, cdk.Fn.split(':', props.attachmentsBucketArn)),
+        PROFILE_BODY_BUCKET: cdk.Fn.select(5, cdk.Fn.split(':', props.profileBucketArn)),
       },
       bundling: { externalModules: ['@aws-sdk/*'], minify: true, sourceMap: true },
     });
@@ -286,7 +309,7 @@ export class AdminAnalytics extends cdk.NestedStack {
       actions: ['s3:GetObject'],
       // The version bodies, and every classification's pack body behind its parameter's pointer: the
       // admin plane replays any classification's assistant.
-      resources: [`${props.attachmentsBucketArn}/profiles/*`, `${props.attachmentsBucketArn}/${CLASSIFICATION_PACK_PREFIX}/*`],
+      resources: [`${props.profileBucketArn}/profiles/*`, `${props.profileBucketArn}/${CLASSIFICATION_PACK_PREFIX}/*`],
     }));
     route('POST', '/classifier-replay-start', replayStartFn);
 
@@ -310,7 +333,22 @@ export class AdminAnalytics extends cdk.NestedStack {
         },
         bundling: { externalModules: ['@aws-sdk/*'], minify: true, sourceMap: true },
       });
-      auditTable.grantReadWriteData(auditAdminFn);
+      // ITS TWO PARTITIONS AND WHAT IT DOES IN EACH: the findings are listed, read and marked reviewed (`finding`),
+      // and the enforce toggle is read and set (`config`). The audit's own rows of any other partition are the
+      // audit's alone.
+      const auditPartition = (pk: string) => ({ 'ForAllValues:StringEquals': { 'dynamodb:LeadingKeys': [pk] } });
+      auditAdminFn.addToRolePolicy(new iam.PolicyStatement({
+        sid: 'ReadAndReviewTheFindings',
+        actions: ['dynamodb:Query', 'dynamodb:GetItem', 'dynamodb:UpdateItem'],
+        resources: [auditTable.tableArn],
+        conditions: auditPartition('finding'),
+      }));
+      auditAdminFn.addToRolePolicy(new iam.PolicyStatement({
+        sid: 'ReadAndSetTheEnforceToggle',
+        actions: ['dynamodb:GetItem', 'dynamodb:PutItem'],
+        resources: [auditTable.tableArn],
+        conditions: auditPartition('config'),
+      }));
       // An administrator's eviction: a classified channel and the service admin's exact ARN (step 38).
       for (const stmt of adminPlaneMembershipStatements('AuditAdminEvicts', props.appInstanceArn, {
         bearerArns: [serviceAdminArnOf(props.appInstanceArn)],

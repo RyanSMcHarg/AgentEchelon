@@ -75,7 +75,7 @@ export default function PromoteExperiment(props: {
       {open && (
         <div className="admin-modal-overlay" role="dialog" aria-modal="true" aria-label={translate('admin.experiments.promoteTitle')}>
           <div className="admin-modal experiment-confirm admin-section">
-            <h4>{translate('admin.experiments.promoteTitle')}</h4>
+            <h3>{translate('admin.experiments.promoteTitle')}</h3>
             <p>{translate('admin.experiments.promoteConfirm', { id: exp.experimentId, assistant })}</p>
             <label>
               {translate('admin.experiments.promoteNote')}

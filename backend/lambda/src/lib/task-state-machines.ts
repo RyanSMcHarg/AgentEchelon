@@ -13,7 +13,9 @@
  * `placeholder` is optional. Carrying both here makes them pack-configurable and localizable (§4).
  */
 
-import { TOOL_REGISTRY, isKnownTool } from './tool-registry.js';
+import { PARTICIPANT_ROLE_NAME } from '../../../lib/config/participant-roles.js';
+import { TOOL_REGISTRY } from './tool-registry.js';
+import { toolListErrors } from './step-fields.js';
 import { parseBinding } from './step-bindings.js';
 import {
   buildSourceTable, evaluateWhen, sourceKindOf, sourceLookup, whenErrors, withUnreadCatalog,
@@ -330,6 +332,13 @@ export interface TaskStateDef {
    */
   choices?: string[];
   /**
+   * THE MOVES THE REQUESTER MAY ASK FOR WHILE THE WORKER HOLDS THIS STEP (ADR-067 G8, WT114): a reschedule, a cancel. Each a
+   * declared transition of this state, which awaits the worker. The requester's message binds to the task only where the
+   * step declares some, and the turn it runs may take only these: a move the step leaves to the worker stays the worker's.
+   * Absent, the requester's message does not reach a task someone else holds.
+   */
+  requesterMoves?: string[];
+  /**
    * THIS STEP RESTS UNTIL SOMEBODY ASKS OR A TIME PASSES (ADR-063 decision 5): an assistant that is idle in the
    * conversation does not take it up on its own. Declared on a state that awaits nobody and is not terminal, where the
    * work is done and the task is held as the room's (`incident_first_look.findings_shared`), or where something other
@@ -337,6 +346,64 @@ export interface TaskStateDef {
    * the assistant's to take up proactively.
    */
   rests?: boolean;
+  /**
+   * THE STATE'S AUTOMATIC MOVE (ADR-067 decision 2, G39): one of its own transitions, which the runtime takes once a task
+   * turn of this state has answered, once per entry. A runtime advance on an edge the machine declares, never one the
+   * runtime chose, so a team's edit names the edge and a turn that did not call `advance_task_state` cannot stall the
+   * task. Only on a state the assistant works (it awaits nobody and does not rest).
+   */
+  auto?: string;
+  /**
+   * AN UPDATE ON ENTERING THIS STATE (ADR-067 WT23): a message template, said once per entry to the whole room, to the
+   * task's requester, to a person who works it, or to a participant role's holders. What it says is the template's
+   * (ADR-062), in the reader's language; the state names who reads it, which template, and whether it is also emailed
+   * (`lib/channel-notify.ts`, where the deployment declares the `notifications` capability). A private task's update
+   * to the room or a role is withheld (WT72).
+   */
+  notice?: { to: 'room' | 'requester' | 'worker' | { participantRole: string }; template: string; email?: boolean };
+  /**
+   * THE NEEDS THIS STATE RECORDS AS TYPED VALUES (ADR-067 G6, WT22): a need's name to `number`, `boolean` or `time`. The
+   * model, which understands the person's answer, records the value as that data once, beside the answer's text. A
+   * condition reads a number or a yes-or-no as `task:value:<need>` and compares it; a time (an instant, ISO 8601) is what a
+   * run's wait waits until and a later task step's deadline falls at. A need named here is one this state `requires`.
+   */
+  records?: Record<string, RecordedType>;
+}
+
+/** The values a task's conditions read of the task itself (WT22): how often it entered each state, and its typed values. */
+export const TASK_ENTRIES_SOURCE_PREFIX = 'task:entries:';
+export const TASK_VALUE_SOURCE_PREFIX = 'task:value:';
+
+/** The types a need may be recorded as (WT22): a number, a yes or no, or a time. */
+export type RecordedType = 'number' | 'boolean' | 'time';
+export const RECORDED_TYPES: readonly RecordedType[] = ['number', 'boolean', 'time'];
+
+/** The typed needs a machine records, across its states. */
+export function machineRecords(machine: TaskStateMachine | undefined): Record<string, RecordedType> {
+  const out: Record<string, RecordedType> = {};
+  for (const def of Object.values(machine?.states ?? {})) Object.assign(out, def.records ?? {});
+  return out;
+}
+
+/** What a task's conditions read of it: each state's entry count from its history, and each typed value it recorded. */
+export function taskConditionValues(
+  task: { stateHistory?: ReadonlyArray<{ to?: unknown }>; details?: Record<string, unknown> } | null | undefined,
+  machine: TaskStateMachine | undefined,
+): Record<string, VariableValue> {
+  const out: Record<string, VariableValue> = {};
+  if (!machine) return out;
+  for (const state of Object.keys(machine.states)) {
+    out[`${TASK_ENTRIES_SOURCE_PREFIX}${state}`] = (task?.stateHistory ?? []).filter((e) => e && e.to === state).length;
+  }
+  const typed = task?.details?.typed;
+  const declared = machineRecords(machine);
+  if (typed && typeof typed === 'object') {
+    for (const [need, value] of Object.entries(typed as Record<string, unknown>)) {
+      if (declared[need] === 'number' && typeof value === 'number' && Number.isFinite(value)) out[`${TASK_VALUE_SOURCE_PREFIX}${need}`] = value;
+      if (declared[need] === 'boolean' && typeof value === 'boolean') out[`${TASK_VALUE_SOURCE_PREFIX}${need}`] = value;
+    }
+  }
+  return out;
 }
 
 /**
@@ -712,6 +779,46 @@ export const PLATFORM_TASK_MACHINE_KEYS = [
   'work_still_wanted',
 ] as const;
 
+/**
+ * THE PLATFORM'S MACHINES (ADR-066 decision 2): the ones every assistant uses to interact, whatever its intents. The turn
+ * queue's own (`PLATFORM_TASK_MACHINE_KEYS`), the work items any assistant opens for a person (`action_item`,
+ * `place_item`), and what a workflow `task` step opens to have a person decide or confirm (`approval`, `acknowledgement`).
+ *
+ * One declaration read by every layer: a version that declares a machine under one of these keys is refused by name at
+ * draft, validate, activate and import, and the runtime resolves these keys only from `DEFAULT_TASK_STATE_MACHINES`,
+ * never from a version (`machinesForVersion`, version-machines.ts).
+ */
+export const PLATFORM_MACHINE_KEYS = [
+  ...PLATFORM_TASK_MACHINE_KEYS,
+  'action_item',
+  'place_item',
+  'approval',
+  'acknowledgement',
+  // An incident a team room holds open (WT122).
+  'incident_ownership',
+  // A drift offer (WT89): the person whose message changed the subject moves it to a new conversation or keeps it here.
+  'drift_offer',
+  // A meeting offer: the person or role holder a workflow asks starts the conversation's meeting or declines it.
+  'meeting_offer',
+  // Customer impact confirmed on a card (DESIGN-PROCESSES O27): impacted or not, recorded as the task's ending.
+  'customer_impact',
+  // The account team's customer messaging after the initial notice (O28): draft an update, or the final notice.
+  'customer_updates',
+  // The account team's lead asks for the final notice once the incident is resolved (O33).
+  'final_notice',
+  // A conversation dashboard refreshed by a workflow that requires it (DESIGN-CONVERSATION-DASHBOARDS section 5).
+  'dashboard_refresh',
+  // A form (WT50): a written answer or a short set of fields, collected the same way by every assistant.
+  'form',
+  // A meeting's action item (SPEC-ASSISTANT-MEETINGS FR67): what a person was given to do in a recorded meeting.
+  'meeting_action_item',
+] as const;
+
+/** Whether a machine key is one of the platform's own (`PLATFORM_MACHINE_KEYS`). */
+export function isPlatformMachineKey(key: string): boolean {
+  return (PLATFORM_MACHINE_KEYS as readonly string[]).includes(key);
+}
+
 /** The platform's report template (`lib/config/default-templates/report.md`), which `report_generation` delivers in. */
 export const REPORT_TEMPLATE = 'report';
 
@@ -898,18 +1005,22 @@ Do NOT propose solutions yet. Focus on understanding the problem.`,
     states: {
       reading_health: {
         transitions: ['findings_shared'],
-        tools: ['read_deployment_health'],
+        // THE DECLARED MOVE (G39): once the first look's turn has answered, the task rests on its findings.
+        auto: 'findings_shared',
+        // THE ASSISTANT MAY PUBLISH THE ROOM'S DASHBOARD here, where its version declares the tool (DESIGN-CONVERSATION-DASHBOARDS).
+        tools: ['read_deployment_health', 'publish_dashboard'],
         prompt: `This is the first step of the incident's first look. Read the deployment's health with read_deployment_health and report:
 - Which alarms are firing or recently changed state, and what each points at
 - The one thing worth checking first
+Where publish_dashboard is available, publish the conversation's dashboard so everyone here shares one current view, and say so in one line.
 Say plainly when the read shows nothing wrong or could not be made. Do not guess at causes the data does not show.`,
       },
       // RESTS: the first look is in the room, and the next read is asked for, never taken up by itself.
       findings_shared: {
         rests: true,
         transitions: ['reading_health', 'resolved'],
-        prompt: `Your first look is in the room. When someone asks for another read, or the situation changes, read the health again
-(reading_health). When the room says the incident is over, advance to resolved.`,
+        prompt: `Your first look is in the conversation. When someone asks for another read, or the situation changes, read the health again
+(reading_health). When the conversation says the incident is over, advance to resolved.`,
       },
       resolved: { transitions: [], terminal: 'success' },
     },
@@ -1352,6 +1463,169 @@ your job now is to record their decision, not to make it again:
     },
   },
 
+  /**
+   * A MEETING'S ACTION ITEM (SPEC-ASSISTANT-MEETINGS FR67): what the meeting's summary found a person was given to do, held
+   * by that person (or by a host, for an item nobody was named for) until they mark it done on its card. A platform
+   * machine, fixed, so every meeting's items are tracked and followed up the same way.
+   */
+  meeting_action_item: {
+    initial: 'open',
+    states: {
+      open: {
+        transitions: ['done'],
+        awaits: { party: 'worker' },
+        choices: ['done'],
+        resolvedByOneResponse: true,
+        prompt: `This task is an action item from a meeting. When the person you are waiting on says it is done, advance to done.`,
+      },
+      done: { transitions: [], terminal: 'success' },
+    },
+  },
+
+  // AN INCIDENT ITS OWN CONVERSATION HOLDS OPEN (WT122): what its on-call resolves once the work there is done. While it is
+  // open, the team conversation that opened it has an open incident, so a repeat of its event opens no second conversation,
+  // and it counts against the policy's open incidents. A platform machine, fixed: every team counts one the same way.
+  // RESOLVING WHILE THE RUNBOOK HAS STEPS OPEN IS CONFIRMED FIRST (owner decision 2026-11-14): the `ops-room` step that opens it
+  // names `confirming_resolve` as its `confirmEnd`, so a press of Resolved while its run is mid-way moves the task there, and
+  // the on-call is asked, naming the steps still open, to resolve it or keep it open. Kept open, they are handed its card again.
+  incident_ownership: {
+    initial: 'open',
+    states: {
+      open: {
+        transitions: ['resolved', 'confirming_resolve'],
+        awaits: { party: 'worker' },
+        choices: ['resolved'],
+        resolvedByOneResponse: true,
+        prompt: `This incident stays open until the on-call resolves it, once the work in its conversation is done.`,
+        notice: { to: 'worker', template: 'incident-kept-open' },
+      },
+      confirming_resolve: {
+        transitions: ['resolved', 'open'],
+        awaits: { party: 'worker' },
+        choices: ['resolved', 'open'],
+        resolvedByOneResponse: true,
+        prompt: `The on-call asked to resolve this incident while its runbook still has steps open. When they confirm, advance to resolved; when they keep it open, advance to open.`,
+        notice: { to: 'worker', template: 'incident-resolve-confirm' },
+      },
+      resolved: { transitions: [], terminal: 'success' },
+    },
+  },
+
+  // A DASHBOARD THE WORKFLOW REQUIRES (DESIGN-CONVERSATION-DASHBOARDS section 5): one step, whose declared action publishes this
+  // conversation's dashboard on entry, so no model decides whether it is refreshed. Its outcome is the action's.
+  dashboard_refresh: {
+    initial: 'publishing',
+    states: {
+      publishing: {
+        transitions: ['published', 'failed'],
+        action: { tool: 'publish_dashboard' },
+        onSuccess: 'published',
+        onFailure: 'failed',
+        prompt: 'Say in one line that the dashboard is updated. Do not restate its figures.',
+      },
+      published: { transitions: [], terminal: 'success' },
+      failed: { transitions: [], terminal: 'failure' },
+    },
+  },
+  // THE DRIFT OFFER (WT89): a person's message changed the subject, and the room is offered a new conversation for it. Only
+  // that person answers, `move` or `keep`, each an ending the run reads; their reply is the model's reading of what they wrote
+  // (`drift-offer-answer.ts`), relayed to the task as a card press is. The task is the offer's one record, and an offer
+  // nobody answers ends at its step's deadline.
+  drift_offer: {
+    initial: 'offered',
+    states: {
+      offered: {
+        transitions: ['move', 'keep'],
+        awaits: { party: 'worker' },
+        choices: ['move', 'keep'],
+        resolvedByOneResponse: true,
+        prompt: `Move this subject to a new conversation, or keep it here.`,
+      },
+      move: { transitions: [], terminal: 'success' },
+      keep: { transitions: [], terminal: 'success' },
+    },
+  },
+
+  // THE MEETING OFFER (SPEC-ASSISTANT-MEETINGS FR40): before a workflow starts a conversation's meeting, the person or role
+  // holder it asks, the on-call for an ops room, starts it or declines it on the card. Both are endings the run reads, so the
+  // step after the offer starts the meeting on `start` alone. A platform machine, fixed: every meeting is offered the same way.
+  meeting_offer: {
+    initial: 'offered',
+    states: {
+      offered: {
+        transitions: ['start', 'declined'],
+        awaits: { party: 'worker' },
+        choices: ['start', 'declined'],
+        resolvedByOneResponse: true,
+        prompt: `This task asks whether to start a meeting in this conversation now. When the person you are waiting on says to start it, advance to start; when they decline, advance to declined. If their reply is not a clear answer, ask for one.`,
+      },
+      start: { transitions: [], terminal: 'success' },
+      declined: { transitions: [], terminal: 'success' },
+    },
+  },
+
+  // CUSTOMERS IMPACTED? (DESIGN-PROCESSES O27): asked on a card of the person triaging or leading an incident, whose press is the
+  // answer, recorded as the task's ending and never read from what anyone wrote (D11). Both endings are a success: the scope was
+  // confirmed either way, and the run branches on which (`task:state`). An open step carries it to the conversation it opens.
+  customer_impact: {
+    initial: 'asking',
+    states: {
+      asking: {
+        transitions: ['impacted', 'not_impacted'],
+        awaits: { party: 'worker' },
+        choices: ['impacted', 'not_impacted'],
+        resolvedByOneResponse: true,
+        prompt: 'This task asks whether customers are impacted. When the person you are waiting on says they are, advance to impacted; when they say they are not, advance to not_impacted. If their reply is not a clear answer, ask for one.',
+      },
+      impacted: { transitions: [], terminal: 'success' },
+      not_impacted: { transitions: [], terminal: 'success' },
+    },
+  },
+
+  // THE ACCOUNT TEAM'S MESSAGING AFTER ITS INITIAL NOTICE (O28): its lead asks for an update draft or, once the incident is
+  // resolved, the final notice. Both are endings the run branches on.
+  customer_updates: {
+    initial: 'open',
+    states: {
+      open: {
+        transitions: ['draft_update', 'draft_final'],
+        awaits: { party: 'worker' },
+        choices: ['draft_update', 'draft_final'],
+        resolvedByOneResponse: true,
+        prompt: 'This task waits for the account team lead to ask for the next customer notice: an update, or the final notice once the incident is resolved. Advance to draft_update or draft_final as they say.',
+      },
+      draft_update: { transitions: [], terminal: 'success' },
+      draft_final: { transitions: [], terminal: 'success' },
+    },
+  },
+
+  // THE FINAL NOTICE, ASKED FOR BY THE ACCOUNT TEAM'S LEAD (O33): pressed once the incident conversation says it is resolved.
+  final_notice: {
+    initial: 'open',
+    states: {
+      open: {
+        transitions: ['draft_final'],
+        awaits: { party: 'worker' },
+        choices: ['draft_final'],
+        resolvedByOneResponse: true,
+        prompt: 'This task waits for the account team lead to ask for the final customer notice once the incident is resolved. When they do, advance to draft_final.',
+      },
+      draft_final: { transitions: [], terminal: 'success' },
+    },
+  },
+
+  // THE FORM (ADR-067 G16, G24, WT50): a written answer or a short set of fields, filled on the task's card by the person it
+  // is for, or declined. The fields are the task step's (`TaskStep.fields`), carried on the task, and the answers are kept
+  // on the task's record as the person wrote them. A platform machine, fixed: every assistant collects a form the same way.
+  form: {
+    initial: 'asked',
+    states: {
+      asked: { transitions: ['answered', 'declined'], awaits: { party: 'requester' }, choices: ['answered', 'declined'] },
+      answered: { transitions: [], terminal: 'success' },
+      declined: { transitions: [], terminal: 'failure' },
+    },
+  },
+
   queued_request: {
     initial: 'proposed',
     states: {
@@ -1509,17 +1783,52 @@ export function validateTaskStateMachine(name: string, machine: TaskStateMachine
       const outside = def.choices.filter((c) => !def.transitions.includes(c));
       if (outside.length) throw new TaskMachineValidationError(name, `state "${state}" declares choices ${outside.map((c) => `"${c}"`).join(', ')} that are not its transitions`);
     }
+    // THE REQUESTER'S MOVES (WT114) are put to the requester while the WORKER holds the step, so they are the step's own
+    // transitions on a state that awaits the worker.
+    if (def.requesterMoves !== undefined) {
+      if (!Array.isArray(def.requesterMoves) || !def.requesterMoves.length || def.requesterMoves.some((c) => typeof c !== 'string')) {
+        throw new TaskMachineValidationError(name, `state "${state}" declares requesterMoves that is not a non-empty list of its transitions`);
+      }
+      if (awaitedPartyOf(def)?.party !== 'worker') throw new TaskMachineValidationError(name, `state "${state}" declares requesterMoves but does not await the worker`);
+      const outside = def.requesterMoves.filter((c) => !def.transitions.includes(c));
+      if (outside.length) throw new TaskMachineValidationError(name, `state "${state}" declares requesterMoves ${outside.map((c) => `"${c}"`).join(', ')} that are not its transitions`);
+    }
     // A RESTING STEP IS ONE THE ASSISTANT HOLDS (ADR-063 decision 5): it awaits nobody and still has a way out.
     if (def.rests !== undefined) {
       if (def.rests !== true) throw new TaskMachineValidationError(name, `state "${state}" declares rests, which is true or absent`);
       if (isTerminalByEdges) throw new TaskMachineValidationError(name, `state "${state}" rests but is terminal, which nothing takes up anyway`);
       if (awaitedPartyOf(def)) throw new TaskMachineValidationError(name, `state "${state}" rests but awaits somebody, which already holds it`);
     }
+    if (def.notice !== undefined) {
+      const n = def.notice as { to?: unknown; template?: unknown; email?: unknown };
+      const role = n && typeof n.to === 'object' && n.to !== null ? (n.to as { participantRole?: unknown }).participantRole : undefined;
+      const validTo = n && (n.to === 'room' || n.to === 'requester' || n.to === 'worker'
+        || (typeof role === 'string' && PARTICIPANT_ROLE_NAME.test(role) && Object.keys(n.to as object).length === 1));
+      if (!n || typeof n !== 'object' || !validTo || typeof n.template !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(n.template)
+        || (n.email !== undefined && typeof n.email !== 'boolean')
+        || Object.keys(n).some((k) => k !== 'to' && k !== 'template' && k !== 'email')) {
+        throw new TaskMachineValidationError(name, `state "${state}" declares a notice, which is { to: room, requester, worker or { participantRole }, template: a message template's name, email?: true or false }`);
+      }
+    }
+    if (def.auto !== undefined) {
+      if (typeof def.auto !== 'string' || !def.transitions.includes(def.auto)) throw new TaskMachineValidationError(name, `state "${state}" declares auto "${String(def.auto)}", which is not one of its transitions`);
+      if (awaitedPartyOf(def)) throw new TaskMachineValidationError(name, `state "${state}" declares auto but awaits somebody, whose answer moves it`);
+      if (def.rests) throw new TaskMachineValidationError(name, `state "${state}" declares auto but rests, so no turn takes it up to move it`);
+    }
+    // AUTOMATIC MOVES END (G39): each one follows a turn, so a loop of them would run turns, and their cost, without end.
+    // Followed from this state, they reach a state that declares none, or the machine is refused.
+    if (def.auto !== undefined) {
+      const seen = new Set<string>([state]);
+      for (let at: string | undefined = def.auto; at !== undefined; at = machine.states[at]?.auto) {
+        if (seen.has(at)) throw new TaskMachineValidationError(name, `state "${state}" declares auto, and its automatic moves loop back to "${at}": a chain of automatic moves must end at a state that declares none`);
+        seen.add(at);
+      }
+    }
     validateConfirmDeclaration(name, state, def);
     validateTemplateDeclaration(name, machine, state, def);
     validateStepTools(name, state, def);
     validateStepAction(name, machine, state, def);
-    validateStepConditions(name, state, def);
+    validateStepConditions(name, state, def, machine);
     for (const target of def.transitions) {
       if (!machine.states[target]) {
         throw new TaskMachineValidationError(name, `state "${state}" transitions to undeclared state "${target}"`);
@@ -1761,16 +2070,9 @@ function validateTemplateDeclaration(name: string, machine: TaskStateMachine, st
  */
 function validateStepTools(name: string, state: string, def: TaskStateDef): void {
   if (def.tools === undefined) return;
-  if (!Array.isArray(def.tools) || !def.tools.every((t) => typeof t === 'string' && t.trim())) {
-    throw new TaskMachineValidationError(name, `state "${state}" declares tools that is not a list of tool names`);
-  }
-  if (new Set(def.tools).size !== def.tools.length) {
-    throw new TaskMachineValidationError(name, `state "${state}" names the same tool twice in tools`);
-  }
-  const unknown = def.tools.filter((t) => !isKnownTool(t));
-  if (unknown.length) {
-    throw new TaskMachineValidationError(name, `state "${state}" declares unknown tool(s) ${unknown.map((t) => `"${t}"`).join(', ')}`);
-  }
+  // Checked as a run's steps check theirs (`toolListErrors`, the shared step fields), the first refusal thrown.
+  const errs = toolListErrors(def.tools, `state "${state}" tools`);
+  if (errs.length) throw new TaskMachineValidationError(name, errs[0]);
 }
 
 let fixedMachineLookup: SourceLookup | undefined;
@@ -1784,32 +2086,61 @@ function machineLookup(): SourceLookup {
 }
 
 /**
+ * A MACHINE'S CONDITIONS MAY READ ITS OWN TASK (WT22): `task:entries:<state>` for each of its states, a number, and
+ * `task:value:<need>` for each need it records as a typed value, of that type. Both are platform trust: the history is
+ * the task service's, and a typed value is the model's reading recorded once as data (tenet D11), never the person's text.
+ */
+export function taskSourceLookup(machine: TaskStateMachine, base: SourceLookup = machineLookup()): SourceLookup {
+  const records = machineRecords(machine);
+  return (name: string) => {
+    if (name.startsWith(TASK_ENTRIES_SOURCE_PREFIX) && machine.states[name.slice(TASK_ENTRIES_SOURCE_PREFIX.length)]) {
+      return { source: name, type: 'number', trust: 'platform', describesPerson: false, availability: 'always', insertAs: 'id', origin: 'how often the task entered the state, from its history' } as ReturnType<SourceLookup>;
+    }
+    if (name.startsWith(TASK_VALUE_SOURCE_PREFIX)) {
+      const type = records[name.slice(TASK_VALUE_SOURCE_PREFIX.length)];
+      // A TIME IS WAITED UNTIL, NEVER COMPARED: it is not a condition's source.
+      if (type && type !== 'time') return { source: name, type, trust: 'platform', describesPerson: false, availability: 'always', insertAs: 'id', origin: 'a value the model recorded as data at a step' } as ReturnType<SourceLookup>;
+    }
+    return base(name);
+  };
+}
+
+/**
  * A STEP'S CONDITIONS ARE HELD TO ADR-060 decision 3 (`whenErrors`): a published source, never member text, an
  * operator on a type it applies to. A move is addressed to the person whose turn asked for it, so a fact about that
  * person may gate it. An edge condition names one of the state's own transitions. A `ctx:` key is held where the
  * classification's catalog is read (`machineCatalogConditionErrors`, at the classification's synth).
  */
-function validateStepConditions(name: string, state: string, def: TaskStateDef): void {
+function validateStepConditions(name: string, state: string, def: TaskStateDef, machine?: TaskStateMachine): void {
   const fail = (msg: string) => { throw new TaskMachineValidationError(name, `state "${state}" ${msg}`); };
+  const lookup = machine ? taskSourceLookup(machine) : machineLookup();
+  if (def.records !== undefined) {
+    if (!def.records || typeof def.records !== 'object' || Array.isArray(def.records)) fail('declares records that is not a map of a need to number, boolean or time');
+    for (const [need, type] of Object.entries(def.records)) {
+      if (!(RECORDED_TYPES as readonly unknown[]).includes(type)) fail(`records "${need}" as ${String(type)}; a typed value is number, boolean or time`);
+      if (!(def.requires ?? []).includes(need)) fail(`records "${need}", which it does not require`);
+    }
+  }
   if (def.when !== undefined) {
-    const errors = whenErrors(def.when, machineLookup(), { selects: 'addressed', catalog: 'deferred' });
+    const errors = whenErrors(def.when, lookup, { selects: 'addressed', catalog: 'deferred' });
     if (errors.length) fail(`declares a when that is refused: ${errors.join('; ')}`);
   }
   if (def.edgeWhen === undefined) return;
   if (!def.edgeWhen || typeof def.edgeWhen !== 'object' || Array.isArray(def.edgeWhen)) fail('declares edgeWhen that is not a map of a transition to its when');
   for (const [target, when] of Object.entries(def.edgeWhen)) {
     if (!def.transitions.includes(target)) fail(`declares edgeWhen for "${target}", which is not one of its transitions`);
-    const errors = whenErrors(when, machineLookup(), { selects: 'addressed', catalog: 'deferred' });
+    const errors = whenErrors(when, lookup, { selects: 'addressed', catalog: 'deferred' });
     if (errors.length) fail(`declares an edgeWhen for "${target}" that is refused: ${errors.join('; ')}`);
   }
 }
 
 /**
  * A MACHINE'S `ctx:` CONDITIONS, HELD AGAINST THE CATALOG OF THE CLASSIFICATION THAT SERVES IT (ADR-060 decision 3).
- * A machine is a global workflow, deployed with its classification's pack beside that classification's catalog, so the
+ * A classification pack's machine is deployed with that pack beside the classification's catalog, so the
  * classification's synth reads both and refuses a condition on a `ctx:` field its catalog does not publish, publishes
  * as member text, or tests with an operator its type does not take. `lookup` is the classification's table
- * (`sourceLookup(buildSourceTable({ catalog }))`). Every reason at once, each naming its machine and state.
+ * (`sourceLookup(buildSourceTable({ catalog }))`). Every reason at once, each naming its machine and state. A version's own
+ * machines (ADR-066) are held to the same catalog at validate, activate and import (`versionConditionErrors`).
  */
 export function machineCatalogConditionErrors(machines: Readonly<Record<string, TaskStateMachine>>, lookup: SourceLookup): string[] {
   const errors: string[] = [];
@@ -1853,10 +2184,10 @@ function validateStepAction(name: string, machine: TaskStateMachine, state: stri
   const fail = (msg: string) => { throw new TaskMachineValidationError(name, `state "${state}" ${msg}`); };
   // A REQUIRED TOOL (ADR-064 decision 3) is a registered tool the step offers; the platform already runs an action's.
   if (def.requiresTool !== undefined) {
-    if (!Array.isArray(def.requiresTool) || def.requiresTool.some((t) => typeof t !== 'string' || !t)) fail('declares requiresTool that is not a list of tool names');
+    const listErrs = toolListErrors(def.requiresTool, 'requiresTool');
+    if (listErrs.length) fail(listErrs[0]);
     if (def.action !== undefined) fail('declares both an action and requiresTool; the platform already runs the action\'s tool');
     for (const t of def.requiresTool) {
-      if (!TOOL_REGISTRY.some((d) => d.name === t)) fail(`requiresTool names "${t}", which is not a registered tool`);
       if (def.tools && !def.tools.includes(t)) fail(`requiresTool names \`${t}\`, which \`${state}\` does not offer`);
     }
   }
@@ -2177,4 +2508,59 @@ export function successTerminalStates(
     }
   }
   return out.sort();
+}
+
+/** The moves a state lets the requester ask for while the worker holds it (WT114), or none. */
+export function requesterMovesOf(machine: TaskStateMachine | undefined, state: string | undefined): string[] {
+  const def = state ? machine?.states?.[state] : undefined;
+  return def && awaitedPartyOf(def)?.party === 'worker' && Array.isArray(def.requesterMoves) ? def.requesterMoves.filter((m) => def.transitions.includes(m)) : [];
+}
+
+/** Whether any state of these machines lets a requester move a task the worker holds: the gate on the router's look-up. */
+export function anyRequesterMoves(machines: Readonly<Record<string, TaskStateMachine>> | undefined): boolean {
+  return Object.values(machines ?? {}).some((m) => Object.keys(m.states).some((s) => requesterMovesOf(m, s).length > 0));
+}
+
+/**
+ * THE VALUES A SETTLED TASK HANDS ITS RUN (ADR-067 G6, WT20 to WT22): each value it recorded for a need its machine records,
+ * as `task:value:<need>`, written as text into the run's values so they ride every continuation. A run's later step
+ * reads a number or a yes-or-no on its edges, and waits until, or falls due at, a time.
+ */
+export function recordedRunValues(
+  task: { details?: Record<string, unknown> } | null | undefined,
+  machine: TaskStateMachine | undefined,
+): Record<string, string> {
+  const typed = task?.details?.typed;
+  if (!typed || typeof typed !== 'object' || !machine) return {};
+  const declared = machineRecords(machine);
+  const out: Record<string, string> = {};
+  for (const [need, value] of Object.entries(typed as Record<string, unknown>)) {
+    const type = declared[need];
+    if (type === 'number' && typeof value === 'number' && Number.isFinite(value)) out[`${TASK_VALUE_SOURCE_PREFIX}${need}`] = String(value);
+    else if (type === 'boolean' && typeof value === 'boolean') out[`${TASK_VALUE_SOURCE_PREFIX}${need}`] = String(value);
+    else if (type === 'time' && typeof value === 'string' && Number.isFinite(Date.parse(value))) out[`${TASK_VALUE_SOURCE_PREFIX}${need}`] = new Date(value).toISOString();
+  }
+  return out;
+}
+
+/**
+ * THE RUN'S VALUES ONCE A TASK SETTLES: each need the settled task's machine records is read from this task alone, so a
+ * value an earlier task (or an earlier pass of the same step) recorded for that need never stands in for this one.
+ */
+export function withRecordedRunValues(
+  values: Record<string, string> | undefined,
+  task: { details?: Record<string, unknown> } | null | undefined,
+  machine: TaskStateMachine | undefined,
+): Record<string, string> {
+  const own = new Set(Object.keys(machineRecords(machine)).map((need) => `${TASK_VALUE_SOURCE_PREFIX}${need}`));
+  const kept = Object.fromEntries(Object.entries(values ?? {}).filter(([k]) => !own.has(k)));
+  return { ...kept, ...recordedRunValues(task, machine) };
+}
+
+/** A run value as its recorded type reads it in a condition: a number or a yes-or-no, else undefined. */
+export function typedRunValue(raw: string | undefined, type: RecordedType | undefined): number | boolean | undefined {
+  if (raw === undefined) return undefined;
+  if (type === 'number') { const n = Number(raw); return Number.isFinite(n) ? n : undefined; }
+  if (type === 'boolean') return raw === 'true' ? true : raw === 'false' ? false : undefined;
+  return undefined;
 }

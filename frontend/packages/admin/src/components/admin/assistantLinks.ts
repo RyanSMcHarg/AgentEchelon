@@ -31,7 +31,7 @@ export function linkFilters(link: AssistantLink): PerformanceFilters {
   return {
     ...EMPTY_FILTERS,
     assistant: link.assistant,
-    ...(link.tab === 'effectiveness' && link.version != null ? { version: String(link.version) } : {}),
+    ...(link.tab === 'effectiveness' && link.version != null ? { version: [String(link.version)] } : {}),
   };
 }
 
@@ -61,6 +61,65 @@ export function withIntentParam(intent: string | null, search: string = window.l
   const q = new URLSearchParams(search);
   if (intent) q.set(INTENT_PARAM, intent); else q.delete(INTENT_PARAM);
   if (intent && step) q.set(STEP_PARAM, step); else q.delete(STEP_PARAM);
+  const s = q.toString();
+  return s ? `?${s}` : '';
+}
+
+/**
+ * ONE WORKFLOW, OPENED IN ITS ASSISTANT'S WORKFLOW EDITOR, AS A URL THE CONSOLE OPENS ON.
+ *
+ * `?admin=profiles&assistant=<assistant>` opens the assistant's page, and `&workflow=<name>` or `&task=<machine>` beside it
+ * opens its Workflows section on that workflow. A `workflow` is a name a run records: an event workflow's name, or an
+ * intent's key for the intent's workflow; the page reads it as the event workflow the version or the platform names so,
+ * and otherwise as the intent. With `&step=<state>` beside it, `workflow` is an intent's key, and the page opens the task
+ * machine that intent runs, resolved as the runtime resolves it, with that step selected. A `task` is a task machine's
+ * key, which opens that machine's steps. The page opens the
+ * draft's editor where there is a draft and the person may edit it, and the active version's read-only view otherwise.
+ */
+export interface WorkflowEditorLink {
+  /** The assistant's identifier (its profile name). */
+  assistant: string;
+  /** An event workflow's name, or an intent's key. */
+  workflow?: string | null;
+  /** A task machine's key. */
+  task?: string | null;
+  /** With `workflow` as an intent's key: the step of the intent's task machine to select. */
+  step?: string | null;
+}
+
+/** The URL keys the editor link rides on. */
+export const ASSISTANT_PARAM = 'assistant';
+export const WORKFLOW_PARAM = 'workflow';
+export const TASK_PARAM = 'task';
+const EDITOR_PARAMS = [ASSISTANT_PARAM, WORKFLOW_PARAM, TASK_PARAM];
+
+/** The query string that opens the editor on one workflow. Nothing else the URL carried is kept. */
+export function workflowEditorSearch(link: WorkflowEditorLink): string {
+  const q = new URLSearchParams({ admin: 'profiles', [ASSISTANT_PARAM]: link.assistant });
+  if (link.task) q.set(TASK_PARAM, link.task);
+  else if (link.workflow) {
+    q.set(WORKFLOW_PARAM, link.workflow);
+    if (link.step) q.set(STEP_PARAM, link.step);
+  }
+  return `?${q.toString()}`;
+}
+
+/** The editor link a URL opens on, or null when it names no assistant. */
+export function workflowEditorFromUrl(search: string = window.location.search): WorkflowEditorLink | null {
+  const q = new URLSearchParams(search);
+  const assistant = q.get(ASSISTANT_PARAM);
+  if (!assistant) return null;
+  const task = q.get(TASK_PARAM);
+  const workflow = q.get(WORKFLOW_PARAM);
+  const step = workflow && !task ? q.get(STEP_PARAM) : null;
+  return { assistant, ...(task ? { task } : workflow ? { workflow } : {}), ...(step ? { step } : {}) };
+}
+
+/** The URL with the editor link's keys removed, everything else kept. Its `step` rides with its `workflow`; Effectiveness's rides with an `intent` and stays. */
+export function withoutWorkflowEditorParams(search: string = window.location.search): string {
+  const q = new URLSearchParams(search);
+  if (q.has(WORKFLOW_PARAM) && !q.has(INTENT_PARAM)) q.delete(STEP_PARAM);
+  for (const key of EDITOR_PARAMS) q.delete(key);
   const s = q.toString();
   return s ? `?${s}` : '';
 }
