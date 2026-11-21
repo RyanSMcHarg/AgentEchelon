@@ -422,6 +422,16 @@ export async function advanceAsAssignee(input: {
   }
 }
 
+/** A reopen run's step takes the reopened task (`takes: 'reopened'`). Null when refused, undefined on a fault. */
+export async function takeReopenedTask(input: { taskId: string; channelArn: string; fromRunKey: string; workflowRun: Record<string, unknown>; ttlSeconds?: number }): Promise<Task | null | undefined> {
+  try {
+    return (await invoke<Task | null>('takeReopenedTask', input)) ?? null;
+  } catch (err) {
+    console.warn('[task-service-client] takeReopenedTask failed', { err: (err as Error)?.message });
+    return undefined;
+  }
+}
+
 /** A request whose task no router turn opened takes its intent's run (WT115, WT106). Null when refused or not written. */
 export async function attachRequestRun(input: { taskId: string; channelArn: string; workflowRun: Record<string, unknown>; dueBy?: string; ttlSeconds?: number }): Promise<Task | null | undefined> {
   try {
@@ -530,7 +540,7 @@ export async function settleArchivedTasks(input: { channelArn: string }): Promis
 }
 
 /** Cancel the open work of a run a settlement ended mid-way (`endsRun`): the ids it cancelled, or null when it could not. */
-export async function endRunTasks(input: { channelArn: string; runKey: string }): Promise<string[] | null> {
+export async function endRunTasks(input: { channelArn: string; runKey: string; keepAlongside?: boolean; keepTaskId?: string }): Promise<string[] | null> {
   try {
     const out = await invoke<{ cancelled?: string[]; failed?: true }>('endRunTasks', input);
     return Array.isArray(out?.cancelled) ? out!.cancelled : null;
@@ -551,11 +561,17 @@ export async function readEventSteps(input: { runKey: string; channelArn: string
   }
 }
 
-/** The ids of a conversation's open tasks a workflow step opened (`evt-` ids), for deleting their deadlines on archive. */
-export async function workflowTaskIds(input: { channelArn: string }): Promise<string[]> {
+/**
+ * The ids of a conversation's open tasks a workflow step opened (`evt-` ids), for deleting their deadlines on archive.
+ * `skipMachines` leaves out the tasks of the machines the platform runs itself: a runbook refresh, a meeting's
+ * action item, which no workflow run waits on.
+ */
+export async function workflowTaskIds(input: { channelArn: string; skipMachines?: readonly string[] }): Promise<string[]> {
   try {
-    const rows = (await invoke<Array<{ taskId: string }>>('adminListTasks', input)) ?? [];
-    return rows.map((r) => r.taskId).filter((id) => typeof id === 'string' && id.startsWith('evt-'));
+    const rows = (await invoke<Array<{ taskId: string; taskType?: string }>>('adminListTasks', { channelArn: input.channelArn })) ?? [];
+    return rows
+      .filter((r) => !input.skipMachines?.length || !input.skipMachines.includes(r.taskType ?? ''))
+      .map((r) => r.taskId).filter((id) => typeof id === 'string' && id.startsWith('evt-'));
   } catch (err) {
     console.warn('[task-service-client] workflowTaskIds failed', { err: (err as Error)?.message });
     return [];
@@ -573,5 +589,25 @@ export async function answerableTaskById(input: { channelArn: string; taskId: st
   } catch (err) {
     console.warn('[task-service-client] answerableTaskById failed', { err: (err as Error)?.message });
     return null;
+  }
+}
+
+/** A revision that will not land is cleared, so another may be asked. Never throws. */
+export async function abandonRevision(input: { taskId: string; channelArn: string; n: number }): Promise<{ cleared: boolean }> {
+  try {
+    return (await invoke<{ cleared: boolean }>('abandonRevision', input)) ?? { cleared: false };
+  } catch (err) {
+    console.warn('[task-service-client] abandonRevision failed', { err: (err as Error)?.message });
+    return { cleared: false };
+  }
+}
+
+/** The drafting assistant's revision lands as the task's next version. Never throws. */
+export async function addRevisedDocument(input: { taskId: string; channelArn: string; fileKey: string; name: string; by: string }): Promise<{ ok: boolean; error?: string }> {
+  try {
+    return (await invoke<{ ok: boolean; error?: string }>('addRevisedDocument', input)) ?? { ok: false };
+  } catch (err) {
+    console.warn('[task-service-client] addRevisedDocument failed', { err: (err as Error)?.message });
+    return { ok: false };
   }
 }

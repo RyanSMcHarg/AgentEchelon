@@ -73,6 +73,7 @@ describe("a version's processes on the assistant's page (SPEC-PROCESSES P1)", ()
     fireEvent.click(screen.getByTestId('process-done'));
     expect(onPatch).toHaveBeenLastCalledWith({ processes: { 'incident-response': { label: 'Incidents', workflows: ['incident-triage', 'ops-room'] } } });
     fireEvent.click(screen.getByTestId('process-remove-incident-response'));
+    fireEvent.click(screen.getByTestId('process-remove-incident-response-confirm-button'));
     expect(onPatch).toHaveBeenLastCalledWith({ processes: null });
     expect(screen.getByTestId('processes-none')).toBeTruthy();
   });

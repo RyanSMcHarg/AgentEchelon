@@ -52,8 +52,11 @@ export const MAX_RECORDED_RESULT_CHARS = 8000;
 
 /** What the turn gives the runner: how to run a registered tool, and whether this turn may. */
 export interface StepActionEnv {
-  /** Run a registered tool exactly as a model's call would (same handler, same session). */
-  runTool(name: string, input: Record<string, unknown>): Promise<Record<string, unknown>>;
+  /**
+   * Run a registered tool exactly as a model's call would (same handler, same session). `declared` names the task whose
+   * step declared the call, so a handler may take arguments only a declared step of a platform machine supplies.
+   */
+  runTool(name: string, input: Record<string, unknown>, declared?: { taskType: string }): Promise<Record<string, unknown>>;
   /** The turn's allowlist permits the tool AND its runtime precondition holds this turn. */
   toolAvailable(name: string): boolean;
   /**
@@ -202,7 +205,7 @@ export async function runStepActions(ctx: TaskLoopContext, env: StepActionEnv): 
       } else {
         let payload: Record<string, unknown>;
         try {
-          payload = await env.runTool(tool, bound.args);
+          payload = await env.runTool(tool, bound.args, { taskType: task.taskType ?? '' });
         } catch (err) {
           payload = { error: err instanceof Error ? err.message : 'tool execution failed' };
         }
@@ -241,6 +244,7 @@ export async function runStepActions(ctx: TaskLoopContext, env: StepActionEnv): 
       details,
       ...(ctx.assistantId ? { assistantId: ctx.assistantId } : {}),
       action: { tool, outcome: record.ok ? 'success' : 'failure' },
+      ...(ctx.quiet ? { quiet: true as const } : {}),
       // The outcome edge is held to the machine's conditions like any move (ADR-060 decision 6).
       conditionValues: turnConditionValues(ctx),
     });

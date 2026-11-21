@@ -1,5 +1,5 @@
 /**
- * "I HAVE IT, AND I CANNOT TELL WHAT IT ASKS FOR" (maintainer, 2026-09-03).
+ * "I HAVE IT, AND I CANNOT TELL WHAT IT ASKS FOR".
  *
  * The reading's vocabulary was `amends` or `new`, and nothing else. Every queued message was forced
  * to be one of them - and `new` opens a `queued_request` in `proposed`, which is a row that says
@@ -151,7 +151,7 @@ describe('the clarification machine', () => {
 });
 
 /**
- * A WHOLE READING THAT FAILED SAYS SO (maintainer, 2026-09-03).
+ * A WHOLE READING THAT FAILED SAYS SO.
  *
  * The derived floor runs when the judged reading was UNUSABLE - nothing was understood about any of
  * these messages. It marked every one `new` anyway, so a reading that understood nothing produced the

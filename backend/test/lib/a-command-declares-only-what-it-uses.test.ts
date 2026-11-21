@@ -228,6 +228,10 @@ describe('every conditional write of the conversation store declares only what i
     await s.recordEndedMeetingCard(OTHER, 'm', 'msg', 'arn:bot', ROOM);
     await s.recordMeetingInvites(OTHER, { 'p-1': { brief: 'b' } });
     await s.claimArrivalBrief(OTHER, 'p-1');
+    await s.claimPatternCreation('premium', 'ticket', 25);
+    item = { channelArn: ROOM, generation: 2, participantRoles: {} };
+    await s.resetPatternRoomContext(ROOM, 2);
+    item = undefined;
   });
 
   afterAll(() => {

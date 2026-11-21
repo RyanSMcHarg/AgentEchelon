@@ -1,5 +1,5 @@
 /**
- * CREATING AN ASSISTANT IS ONE WIZARD IN VISIBLE STEPS (owner decisions, 2026-10-23, 2026-10-24 and 2026-10-29).
+ * CREATING AN ASSISTANT IS ONE WIZARD IN VISIBLE STEPS.
  *
  * What it proves: the seven steps are listed with the assistant page's section names, and the current one is marked;
  * the first step cannot be left until it is complete; each field reads label, help, then control, in the page's words;

@@ -137,7 +137,7 @@ describe('holding a private address to its Target', () => {
   });
 
   it('KEEPS a misdirected message too, and deletes NOTHING on any branch', async () => {
-    // The owner's correction, 2026-09-16: the wrong-target branch does not delete either. The delete
+    // The wrong-target branch does not delete either. The delete
     // never unsent anything there either - the wrong member has already had the message - so all it
     // reliably did was destroy the sender's words. The check now issues NO delete at all, which is
     // asserted across every branch at once rather than case by case, because "somebody re-added a

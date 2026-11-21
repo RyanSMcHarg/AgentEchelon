@@ -1,5 +1,5 @@
 /**
- * THE STOP QUESTION OWNS ITS FOLLOW-UP (ADR-033, owner 2026-09-14).
+ * THE STOP QUESTION OWNS ITS FOLLOW-UP (ADR-033).
  *
  * `/stop` cancels the work in progress and asks how the person wants to proceed. Their answer is the
  * next thing they say, in their own words, and ordinary routing cannot be trusted with it.

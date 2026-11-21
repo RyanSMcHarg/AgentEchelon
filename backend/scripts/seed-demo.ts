@@ -889,7 +889,9 @@ async function main(): Promise<void> {
     // assistant's own welcomes ride its manifest.
     ...(opsRoleDeclared ? { advisor: ADVISOR_WELCOME } : {}),
   }, [OPS_ASSISTANT])) {
-    console.log(`  ✓ ${r.profileName} definition v${r.version} labeled active`);
+    console.log(r.left
+      ? `  - ${r.profileName}: active v${r.version} is not the seed's own (a team or an import advanced it), so it is left as it is`
+      : `  ✓ ${r.profileName} definition v${r.version} labeled seeded and active`);
   }
   console.log('');
 

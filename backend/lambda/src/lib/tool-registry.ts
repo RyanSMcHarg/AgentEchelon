@@ -20,7 +20,7 @@ export interface ToolDescriptor {
   name: string;
   category: ToolCategory;
   /**
-   * TRUE when running this tool CHANGES something (maintainer, 2026-09-02).
+   * TRUE when running this tool CHANGES something.
    *
    * It exists so a turn can say what it did without guessing. When a model ends on a tool block with
    * no text, the reply the person gets depends entirely on this: if only reading happened, nothing

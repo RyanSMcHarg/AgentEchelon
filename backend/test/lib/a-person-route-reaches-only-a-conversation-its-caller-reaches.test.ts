@@ -463,11 +463,11 @@ describe('GET /tasks/mine lists only items from conversations the caller still r
 
   it('DENIED: an outsider, a removed member and an uncleared member are shown nothing', async () => {
     Object.assign(state, { person: OUTSIDER, member: false });
-    expect((await mine()).body).toEqual({ items: [], count: 0 });
+    expect((await mine()).body).toEqual({ items: [], count: 0, complete: true });
     Object.assign(state, { person: MEMBER, member: false });
-    expect((await mine()).body).toEqual({ items: [], count: 0 });
+    expect((await mine()).body).toEqual({ items: [], count: 0, complete: true });
     Object.assign(state, { member: true, token: 'basic' });
-    expect((await mine()).body).toEqual({ items: [], count: 0 });
+    expect((await mine()).body).toEqual({ items: [], count: 0, complete: true });
   });
 
   it('UNAVAILABLE: a check that cannot be answered fails the list with a 503, never a shorter list', async () => {

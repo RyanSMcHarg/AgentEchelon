@@ -169,7 +169,7 @@ describe('a queue with nothing readable in it still empties', () => {
     expect(settleQueueNotice).not.toHaveBeenCalled();
   });
 
-  it('clears under the claim it took, and settles nothing once displaced (queue review, 2026-09-12)', async () => {
+  it('clears under the claim it took, and settles nothing once displaced', async () => {
     // `triage-on-arrival` passed its claim here and this path did not, so a reading displaced as stale
     // could strip `noticeId` and `drainTaskId` from the reading that displaced it. A refused clear
     // means the notice and the drain are that successor's to end, even though the re-read is empty.

@@ -10,6 +10,7 @@
  */
 import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { ConfirmAction } from './ConfirmAction';
 import {
   MAX_VERSION_PROCESSES, versionProcessesErrors, type ProcessMetric, type VersionProcess,
 } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
@@ -686,11 +687,11 @@ export const ProcessesFields: React.FC<{
             onClick={() => setEditing({ saved: key, name: key, step: 2, entry: { ...processes[key], workflows: [...(processes[key].workflows ?? [])] } })}>
             {t('admin.processes.editor.edit')}
           </button>
-          <button type="button" className="btn-link" data-testid={`process-remove-${key}`}
-            aria-label={t('admin.processes.editor.removeAria', { label: processes[key].label || key })}
-            onClick={() => { const { [key]: _gone, ...rest } = processes; write(rest); }}>
-            {t('admin.processes.editor.remove')}
-          </button>
+          <ConfirmAction testId={`process-remove-${key}`} className="btn-link"
+            ariaLabel={t('admin.processes.editor.removeAria', { label: processes[key].label || key })}
+            title={t('admin.confirm.processRemove', { label: processes[key].label || key })} confirmLabel={t('admin.confirm.remove')} cancelLabel={t('admin.confirm.cancel')}
+            onConfirm={() => { const { [key]: _gone, ...rest } = processes; write(rest); }}
+            label={t('admin.processes.editor.remove')} />
         </>
       ) : undefined} />
       {canEdit && (

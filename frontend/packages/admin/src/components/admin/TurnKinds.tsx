@@ -1,8 +1,8 @@
 /**
  * WHICH TURNS ARE IN THE ANSWER POPULATION, AND WHICH ARE DELIBERATELY NOT.
  *
- * Owner direction, 2026-09-11: "Drift can be excluded from normal responses, but should still be
- * tracked in analytics and filterable / separately viewable like readings."
+ * Drift is excluded from normal responses, and is still tracked in analytics and filterable and separately
+ * viewable, like readings.
  *
  * CHECKING THAT PRECEDENT FOUND IT DID NOT EXIST. A reading was excluded and diagnosable, which is
  * not the same as tracked and viewable: the kind lived in metadata JSON, exactly one query surfaced

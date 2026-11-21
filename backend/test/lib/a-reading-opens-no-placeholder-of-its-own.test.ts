@@ -1,7 +1,7 @@
 /**
  * ONE THING SHOWS PROGRESS WHILE A QUEUE IS READ, AND THE PROPOSAL LANDS AT THE END.
  *
- * Owner's rule (2026-09-09): one placeholder, updated as each new message arrives, until the lock is
+ * The rule: one placeholder, updated as each new message arrives, until the lock is
  * released - then a final response that falls at the end of the conversation.
  *
  * A reading turn was breaking the first half. A queue already draws a NOTICE, which is the message a

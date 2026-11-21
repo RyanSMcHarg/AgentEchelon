@@ -42,7 +42,8 @@ import {
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { CognitoIdentityProviderClient, ListUsersCommand, ListUsersInGroupCommand } from '@aws-sdk/client-cognito-identity-provider';
-import { DynamoDBClient, QueryCommand, BatchWriteItemCommand, GetItemCommand } from '@aws-sdk/client-dynamodb';
+import { DynamoDBClient, QueryCommand, BatchWriteItemCommand, GetItemCommand, ScanCommand, UpdateItemCommand, DeleteItemCommand } from '@aws-sdk/client-dynamodb';
+import { unmarshall } from '@aws-sdk/util-dynamodb';
 import { createRequire } from 'node:module';
 
 const REGION = process.env.AWS_REGION || 'us-east-1';
@@ -50,7 +51,7 @@ const REGION = process.env.AWS_REGION || 'us-east-1';
 // cleanup run by validate addresses the deployment under test and never the default one.
 const { resolveInstanceName } = createRequire(import.meta.url)('./lib/stack-lookup.cjs');
 const { appInstanceArnOf, personIdFromArn } = createRequire(import.meta.url)('./lib/person-arn.cjs');
-const { isTeamRoom, teamRoomClearing, seededAccountTeamEmails, ACCOUNT_TEAM_GROUP } = createRequire(import.meta.url)('./lib/reset-demo.cjs');
+const { isTeamRoom, teamRoomClearing, seededAccountTeamEmails, ACCOUNT_TEAM_GROUP, recordsNamingDeleted } = createRequire(import.meta.url)('./lib/reset-demo.cjs');
 const INSTANCE = resolveInstanceName(process.env);
 const SECRET_NAME = process.env.TEST_SECRET_NAME || 'agent-interface/test-credentials';
 const APPLY = process.argv.includes('--apply');
@@ -416,6 +417,47 @@ for (const arn of [...failed]) {
   } catch { /* reported below */ }
 }
 console.log(`Deleted ${deleted} of ${picked.length} conversation(s).${failed.length ? ` ${failed.length} could not be deleted.` : ''}`);
+
+// WHAT THE DELETED CONVERSATIONS LEAVE BEHIND in the conversation-context table: a parent's `children` entry, which its
+// open-incident count reads, and a watch record naming one as its room. Each goes under a condition that it still names
+// the deleted room, so a record written since is kept.
+let staleFailures = 0;
+const goneArns = picked.filter((a) => !failed.includes(a));
+const contextTable = await tableName('channel-context');
+if (contextTable && goneArns.length) {
+  const rows = [];
+  let ExclusiveStartKey;
+  do {
+    const page = await dynamo.send(new ScanCommand({
+      TableName: contextTable, ProjectionExpression: 'channelArn, children, room',
+      FilterExpression: 'attribute_exists(children) OR begins_with(channelArn, :w)', ExpressionAttributeValues: { ':w': { S: 'watch#' } },
+      ...(ExclusiveStartKey ? { ExclusiveStartKey } : {}),
+    }));
+    rows.push(...(page.Items ?? []).map((i) => unmarshall(i)));
+    ExclusiveStartKey = page.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  const stale = recordsNamingDeleted(rows, goneArns);
+  for (const c of stale.children) {
+    try {
+      await dynamo.send(new UpdateItemCommand({
+        TableName: contextTable, Key: { channelArn: { S: c.channelArn } }, UpdateExpression: `REMOVE children[${c.index}]`,
+        ConditionExpression: `children[${c.index}].channelId = :id`, ExpressionAttributeValues: { ':id': { S: c.channelId } },
+      }));
+    } catch (err) {
+      if (err?.name !== 'ConditionalCheckFailedException') { staleFailures += 1; console.warn(`  could not forget ${c.channelId} in ${c.channelArn.split('/').pop()}: ${err?.name}`); }
+    }
+  }
+  for (const w of stale.watches) {
+    try {
+      await dynamo.send(new DeleteItemCommand({
+        TableName: contextTable, Key: { channelArn: { S: w.key } }, ConditionExpression: 'room = :room', ExpressionAttributeValues: { ':room': { S: w.room } },
+      }));
+    } catch (err) {
+      if (err?.name !== 'ConditionalCheckFailedException') { staleFailures += 1; console.warn(`  could not drop ${w.key}: ${err?.name}`); }
+    }
+  }
+  console.log(`Forgot ${stale.children.length} child entr(ies) and ${stale.watches.length} watch record(s) naming a deleted conversation.${staleFailures ? ` ${staleFailures} could not be changed.` : ''}`);
+}
 console.log(`Deleted ${tasksDeleted} task row(s) across ${TASK_TABLES.map((t) => t.name).join(', ') || 'no task tables'}.${taskFailures.length ? ` The tasks of ${taskFailures.length} room(s) could not be deleted.` : ''}`);
 if (teamRoomFailures) console.log(`${teamRoomFailures} team room(s) could not be cleared.`);
-process.exit(failed.length || taskFailures.length || teamRoomFailures ? 1 : 0);
+process.exit(failed.length || taskFailures.length || teamRoomFailures || staleFailures ? 1 : 0);

@@ -91,6 +91,7 @@ import {
   cors,
   credentialsOf,
   displayNameOf,
+  realNameOf,
   isRefusal,
   literalChannelId,
   noteRefusalFacts,
@@ -402,7 +403,8 @@ const exchange = async (event: any): Promise<HttpResult> => {
   try {
     // The minter created the identity (or found it); here it is classified with the same token the role
     // was chosen from, and its name refreshed from the IdP's own name claim and only that.
-    const idpName = typeof claims.name === 'string' ? claims.name : undefined;
+    // THE NAME THE IDP GIVES: `name`, else the given and family names, so a person whose provider sends only those is named by them.
+    const idpName = realNameOf(claims) || undefined;
     await classifyIdentity(personId, roleKey, idpName, personCreated);
     const bearerArn = userArnFor(APP_INSTANCE_ARN, personId);
 

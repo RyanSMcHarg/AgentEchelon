@@ -1,6 +1,5 @@
 /**
- * THE JUDGEMENT IS THE MODEL'S; THE SELECTION THAT DRIVES THE PROCESS IS A CHOICE FROM A SET
- * (maintainer, 2026-09-03).
+ * THE JUDGEMENT IS THE MODEL'S; THE SELECTION THAT DRIVES THE PROCESS IS A CHOICE FROM A SET.
  *
  * Whether a message amends the work in flight, whether it can be understood at all, how it ranks -
  * none of that is mechanical, and all of it stays with the model. What was also the model's, and
@@ -160,7 +159,7 @@ describe('the directive asks for the channel that is actually offered', () => {
     expect(d).not.toMatch(/calling the `record_reading` tool/i);
   });
 
-  // ── THE FORM IS THE CHANNEL'S; THE RULE IS NOT (owner-reported, 2026-09-05) ──────────────────
+  // ── THE FORM IS THE CHANNEL'S; THE RULE IS NOT ──────────────────
   //
   // `TRIAGE: <id>` was gated on the channel and `TOPIC:` was not, so the tool channel carried three
   // instructions where two of them contradict: record by calling the tool, write TOPIC lines in
@@ -184,7 +183,7 @@ describe('the directive asks for the channel that is actually offered', () => {
     expect(d).not.toMatch(/`topics` field/i);
   });
 
-  // ── POSITIONS, NOT SUBJECTS (owner-reported, 2026-09-05) ────────────────────────────────────
+  // ── POSITIONS, NOT SUBJECTS ────────────────────────────────────
   //
   // `openWork` hands the reading a type, a priority and whether a task is private - never a label -
   // so a private task can hold its place in the order without its contents reaching the turn. The
@@ -264,7 +263,7 @@ describe('the proposal is asked for in terms that make sense on the channel', ()
 });
 
 /**
- * "UNCLEAR" COVERS AN UNSUPPLIED REFERENT, NOT ONLY AN UNINTELLIGIBLE MESSAGE (maintainer, 2026-09-04).
+ * "UNCLEAR" COVERS AN UNSUPPLIED REFERENT, NOT ONLY AN UNINTELLIGIBLE MESSAGE.
  *
  * Measured on the deployment. Given "Same as the other one, but do it the way we did before" behind a
  * running onboarding report, the model chose NEW and labeled it "Reformat onboarding report to match
@@ -470,7 +469,7 @@ describe('the spoken half carries no machine marks', () => {
     expect(spokenFromReply('')).toBe('');
   });
 
-  // ── THE ONE THAT REACHED A PERSON (owner-reported, 2026-09-05) ───────────────────────────────
+  // ── THE ONE THAT REACHED A PERSON ───────────────────────────────
   //
   // `PROPOSAL:` was stripped and `TOPIC:` was not, so a reply on the tool channel opened with
   // `TOPIC: Status / what's happening next | IN_FLIGHT, 60c1373a...` in front of somebody. The

@@ -263,7 +263,7 @@ describe('loadIntakeConfig is cached for a bounded time, present or absent', () 
 /**
  * ── AN INTAKE NEVER SITS IN FRONT OF A QUESTION SOMEBODY IS WAITING ON ─────────────────────────
  *
- * The owner rule is from 2026-09-03 and it was failing live on 2026-09-21. A person opened a premium
+ * Where one did, a person opened a premium
  * conversation, was asked "what should I default to covering in reports for you", typed "What is
  * AgentEchelon?" - and that question was STORED as their answer. Every message after it was met with
  * "Please reply yes to confirm or no to start over", because only yes/no advances the confirmation.

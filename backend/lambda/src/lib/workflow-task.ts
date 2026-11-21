@@ -15,6 +15,7 @@
  *  - ONE TOTAL ORDER (`orderForPickup`): priority, then age, then id.
  */
 import { createHash } from 'crypto';
+import { documentsOf } from './task-documents.js';
 import { actionRunKey, awaitedPartyOf, entrySequenceOf, terminalKindOf, type TaskStateMachine } from './task-state-machines.js';
 import type { Task, TaskPriority } from './task-tracking.js';
 
@@ -52,6 +53,10 @@ export interface TaskCard {
   fields?: import('./task-step.js').FormField[];
   /** Epoch seconds: the card offers nothing after it. */
   expiresAt?: number;
+  /** It approves a document with versions: the card reads them, offers to attach an edited one, and names the one it approves. */
+  documents?: true;
+  /** Its choices are offered at the top of the conversation, not on its message. */
+  pinned?: true;
 }
 
 /** The card for a task whose current state declares choices, or undefined. */
@@ -62,11 +67,13 @@ export function taskCardOf(task: Pick<Task, 'taskId' | 'taskType' | 'taskState' 
     id: task.taskId, state: task.taskState, choices: [...def.choices],
     ...(task.workflowRun?.fields?.length ? { fields: task.workflowRun.fields } : {}),
     ...(typeof task.workflowRun?.deadlineAt === 'number' ? { expiresAt: task.workflowRun.deadlineAt } : {}),
+    ...(documentsOf(task).length ? { documents: true as const } : {}),
+    ...(task.workflowRun?.pinned ? { pinned: true as const } : {}),
   };
 }
 
 /** Why a card press is refused, as the route answers it, or undefined when it may be taken. */
-export type AssigneeAdvanceRefusal = 'NOT_FOUND' | 'NOT_ASSIGNEE' | 'SETTLED' | 'STATE_MOVED' | 'NOT_A_CHOICE';
+export type AssigneeAdvanceRefusal = 'NOT_FOUND' | 'NOT_ASSIGNEE' | 'SETTLED' | 'STATE_MOVED' | 'NOT_A_CHOICE' | 'DOCUMENT_MOVED' | 'DOCUMENT_REQUIRED';
 
 /**
  * WHETHER THE CALLER MAY TAKE A CHOICE ON THIS TASK'S CARD (decision 2, the FR17 submission advance). Only the task's
@@ -75,15 +82,28 @@ export type AssigneeAdvanceRefusal = 'NOT_FOUND' | 'NOT_ASSIGNEE' | 'SETTLED' | 
  * itself (`authorizeTransition`).
  */
 export function assigneeAdvanceRefusal(
-  task: Pick<Task, 'taskType' | 'taskState' | 'status' | 'assigneeId' | 'assigneeType'> | null,
+  task: Pick<Task, 'taskType' | 'taskState' | 'status' | 'assigneeId' | 'assigneeType' | 'workflowRun'> | null,
   machines: Record<string, TaskStateMachine>,
-  press: { callerPersonId: string; state: string; choice: string },
+  press: {
+    callerPersonId: string; state: string; choice: string;
+    /** The participant roles the caller holds in the task's conversation, read from its record by the caller's route. */
+    callerRoles?: readonly string[];
+  },
 ): AssigneeAdvanceRefusal | undefined {
   if (!task?.taskType || !task.taskState) return 'NOT_FOUND';
+  // A DECIDER (`decidedBy` on the step) holds a role the step names, by the conversation's record of who holds it.
+  const decider = !!press.callerPersonId && (task.workflowRun?.decidedBy ?? []).some((r) => (press.callerRoles ?? []).includes(r));
+  // A FINISHED TASK IS REOPENED ONLY BY A DECIDER, into a state its ending declares (`reopens`), from the state the card showed.
+  const ending = machines[task.taskType]?.states[task.taskState];
+  if (ending && !ending.transitions.length && (ending.reopens ?? []).includes(press.choice) && task.workflowRun?.decidedBy?.length) {
+    if (!decider) return 'NOT_ASSIGNEE';
+    return task.taskState === press.state ? undefined : 'STATE_MOVED';
+  }
   // A SETTLED TASK IS SAID TO BE SETTLED, whoever presses: once it ends it is handed back to its assistant, so the person
   // who pressed a second time is no longer its assignee, and "not yours" would be the wrong reason.
   if (!LIVE_STATUSES.has(task.status) || !machines[task.taskType]?.states[task.taskState]?.transitions.length) return 'SETTLED';
-  if (!press.callerPersonId || task.assigneeType !== 'user' || task.assigneeId !== press.callerPersonId) return 'NOT_ASSIGNEE';
+  const assignee = !!press.callerPersonId && task.assigneeType === 'user' && task.assigneeId === press.callerPersonId;
+  if (!assignee && !decider) return 'NOT_ASSIGNEE';
   if (task.taskState !== press.state) return 'STATE_MOVED';
   const choices = machines[task.taskType]?.states[task.taskState]?.choices ?? [];
   return choices.includes(press.choice) ? undefined : 'NOT_A_CHOICE';

@@ -129,6 +129,6 @@ describe('a listed trigger names the assistant it was attached for', () => {
 
   it('the triggers function may read the tags of this instance\'s team room trigger rules', () => {
     const stack = require('fs').readFileSync(require('path').join(__dirname, '../../lib/stacks/admin-services-stack.ts'), 'utf8') as string;
-    expect(stack).toContain("sid: 'ReadTriggerRuleTags', actions: ['events:ListTagsForResource'], resources: [triggerRules[0]]");
+    expect(stack).toContain("sid: 'ReadTriggerRuleTags', actions: ['events:ListTagsForResource'], resources: [triggerRules[0], triggerRules[2]]");
   });
 });

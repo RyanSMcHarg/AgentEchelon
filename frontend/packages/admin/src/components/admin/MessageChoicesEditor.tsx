@@ -13,6 +13,7 @@
  */
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { ConfirmAction } from './ConfirmAction';
 import type { MessageChoice, MessageEntry } from '../../../../../../backend/lambda/src/lib/message-template.ts';
 import { messageAudience } from '../../../../../../backend/lambda/src/lib/shipped-message-templates.ts';
 import type { PublishedVariables, VersionVariable } from '../../../../../../backend/lambda/src/lib/variables.ts';
@@ -135,9 +136,8 @@ const MessageChoicesEditor: React.FC<{
             {t('admin.messageChoices.addAlternative')}
           </button>
           {choices.length > 0 && (
-            <button type="button" className="btn-secondary" data-testid="message-choice-reset" onClick={() => set([])}>
-              {t('admin.messageChoices.reset')}
-            </button>
+            <ConfirmAction testId="message-choice-reset" className="btn-secondary" label={t('admin.messageChoices.reset')}
+              title={t('admin.confirm.choicesReset')} confirmLabel={t('admin.confirm.clear')} cancelLabel={t('admin.confirm.cancel')} onConfirm={() => set([])} />
           )}
         </div>
       )}

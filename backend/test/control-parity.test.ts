@@ -96,7 +96,7 @@ describe('control parity: every model-dispatch path runs the shared controls', (
 });
 
 describe('both entries meter the same person by the same rule', () => {
-  // WHAT THIS GUARDS IS PARITY, AND THE RULE IT IS PARITY ON CHANGED (maintainer, 2026-08-31).
+  // WHAT THIS GUARDS IS PARITY, AND THE RULE IT IS PARITY ON CHANGED.
   //
   // It asserted that each side capped its metering input at min(channel, clearance). That cap is
   // gone from both: one channel has one classification, and IAM decides it (ADR-033). The

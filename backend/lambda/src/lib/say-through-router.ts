@@ -79,6 +79,19 @@ export interface InvitationSentNaming { event: 'invitation-sent'; channelArn: st
  * declares for it. Returns whether a run started and, for `person-joined`, the people whose welcome a run owns, so
  * the source sends no welcome of its own to them. Any failure reports no run, and the source welcomes as before.
  */
+/**
+ * HAND A WATCH EVENT BACK TO THIS CLASSIFICATION'S ROUTER (DESIGN-EVENT-TARGETS 11.2): the creator opened the pattern conversation
+ * the event names, and the router now runs the event there. Asynchronous, as the relay's own invoke is; one that cannot be made
+ * throws, so the creator's invocation is tried again.
+ */
+export async function handWatchEventBack(aeWatchEvent: Record<string, unknown>): Promise<void> {
+  const classification = process.env.DEPLOYED_CLASSIFICATION || process.env.CLASSIFICATION || '';
+  const routerArn = await resolveRouterArn(classification);
+  if (!routerArn) throw new Error(`no router wired for ${classification}`);
+  lambda = lambda ?? new LambdaClient({});
+  await lambda.send(new InvokeCommand({ FunctionName: routerArn, InvocationType: InvocationType.Event, Payload: Buffer.from(JSON.stringify({ aeWatchEvent })) }));
+}
+
 export async function nameEventThroughRouter(
   classification: string,
   event: ConversationOpenedNaming | PersonJoinedNaming,
@@ -288,7 +301,7 @@ export async function meetingSummaryThroughRouter(
  * What the task service names: a task a run waits on that `settled`; one that is `ready` for an idle assistant; and one
  * whose run goes on once it leaves its first state (`continue: opened`) that has `entered` another (ADR-067 WT18).
  */
-export interface TaskNaming { kind: 'settled' | 'ready' | 'entered' | 'reopened' | 'notice' | 'request'; channelArn: string; taskId: string }
+export interface TaskNaming { kind: 'settled' | 'ready' | 'entered' | 'reopened' | 'notice' | 'request' | 'revise'; channelArn: string; taskId: string }
 
 /** Name a task's change to the router, asynchronously. Never throws; false when it could not be handed over. */
 export async function nameTaskThroughRouter(classification: string, naming: TaskNaming): Promise<boolean> {

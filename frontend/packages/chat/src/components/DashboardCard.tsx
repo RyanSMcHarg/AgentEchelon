@@ -3,7 +3,7 @@
  *
  * Every dashboard opens in a tab of its own, so the conversation stays usable beside it. An in-app (snapshot) dashboard is
  * painted into that tab as a sandboxed frame: no script runs in it and it can reach nothing of the app, whatever the
- * snapshot holds. The figures are read with the member's own credentials when it opens, and read again when the assistant
+ * snapshot holds. A link in it (a runbook step's card) may only open a new tab of the app, where it is an ordinary deep link. The figures are read with the member's own credentials when it opens, and read again when the assistant
  * updates the message, so an open tab follows the conversation without polling; a tab the person closed is left alone. A
  * page dashboard is sent to a five-minute link issued to members only.
  */
@@ -36,9 +36,10 @@ function paintTab(tab: Window, label: string, content: { status?: string; html?:
   d.body.replaceChildren();
   if (content.html !== undefined) {
     const frame = d.createElement('iframe');
-    frame.setAttribute('sandbox', '');
+    // NO SCRIPT, NO SAME ORIGIN, NO NAVIGATION OF THIS TAB: only a link's new tab, which leaves the sandbox as the app itself.
+    frame.setAttribute('sandbox', 'allow-popups allow-popups-to-escape-sandbox');
     frame.title = label;
-    frame.srcdoc = dashboardDocument(content.html, content.lang);
+    frame.srcdoc = dashboardDocument(content.html, content.lang, `${window.location.origin}${window.location.pathname}`);
     frame.style.cssText = 'display:block;width:100%;height:100vh;border:0';
     d.body.appendChild(frame);
   } else if (content.status) {
@@ -50,7 +51,7 @@ function paintTab(tab: Window, label: string, content: { status?: string; html?:
   }
 }
 
-export function DashboardCard({ dashboard, channelArn, conversationName, read = readDashboardSnapshot, link = dashboardPageLink }: DashboardCardProps) {
+export function DashboardCard({ dashboard, channelArn, conversationName, read = readDashboardSnapshot, link = dashboardPageLink, compact = false }: DashboardCardProps & { compact?: boolean }) {
   const { t, i18n } = useTranslation();
   // THE TAB IS TITLED FOR ITS CONVERSATION, so a reader with several open knows which incident each is.
   const tabTitle = conversationName ? t('dashboard.titleOf', { conversation: conversationName }) : t('dashboard.label');
@@ -114,9 +115,9 @@ export function DashboardCard({ dashboard, channelArn, conversationName, read = 
   const stateLabel = dashboard.state ? t(`dashboard.state.${dashboard.state}`) : '';
 
   return (
-    <div className="proposal-card dashboard-card" role="group" aria-label={t('dashboard.label')}>
+    <div className={`proposal-card dashboard-card${compact ? ' dashboard-card--compact' : ''}`} role="group" aria-label={t('dashboard.label')}>
       <div className="dashboard-card-summary">
-        {stateLabel && <span className={`dashboard-card-state dashboard-card-state-${dashboard.state}`}>{stateLabel}</span>}
+        {stateLabel && !compact && <span className={`dashboard-card-state dashboard-card-state-${dashboard.state}`}>{stateLabel}</span>}
         <span className="proposal-card-help">{t('dashboard.updated', { time: when })}</span>
       </div>
       <div className="proposal-card-actions">
@@ -124,7 +125,7 @@ export function DashboardCard({ dashboard, channelArn, conversationName, read = 
           {dashboard.kind === 'page' ? t('dashboard.openPage') : t('dashboard.open')}
         </button>
       </div>
-      <span className="proposal-card-help">{dashboard.kind === 'page' ? t('dashboard.pageHelp') : t('dashboard.tabHelp')}</span>
+      {!compact && <span className="proposal-card-help">{dashboard.kind === 'page' ? t('dashboard.pageHelp') : t('dashboard.tabHelp')}</span>}
       <div role="status" className="proposal-card-status">{error}</div>
     </div>
   );

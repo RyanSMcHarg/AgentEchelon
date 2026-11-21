@@ -16,6 +16,7 @@
  */
 
 import { TEAM_ROOM_TAG, teamRoomChannelId } from './event-triggers.js';
+import { PATTERN_ROOM_TAG_KEY } from '../../../lib/config/conversation-types.js';
 import { withTurnDeclarationLine } from './turn-declaration.js';
 import { templateLine } from './message-lines.js';
 import { conversationNameFor, conversationNameText, PLACEHOLDER_TITLE } from './conversation-name.js';
@@ -186,6 +187,11 @@ export interface CreateConversationFromEventInput {
   appInstanceArn: string;
   /** This is its type's one team room, so its id and tag follow the convention (`lib/event-triggers.ts`). */
   teamRoom?: boolean;
+  /**
+   * A PATTERN CONVERSATION (DESIGN-EVENT-TARGETS 11.2): created at this derived id (`patternChannelId`), create-or-get, with its
+   * generation where it recreates an archived one at the same id.
+   */
+  patternRoom?: { channelId: string; generation: number };
   /** The assistant the conversation is created FOR. Never the `CreateChannel` bearer: it is added as a
    *  member and moderator after the flow is attached. */
   botArn: string;
@@ -905,8 +911,10 @@ export async function createConversationFromEvent(
     // NOT `conv-drift-...`. The drift id is member-visible in every client that shows a conversation id,
     // and an `ops` conversation branded a drift child is a thing an audience reads on screen.
     // A TEAM ROOM'S ID IS ITS NAME, the same every time, and its tag says what it is: the room is found by its ARN, with no table.
-    channelId: input.teamRoom ? teamRoomChannelId(input.typeKey, input.classification) : newTypedChannelId(input.typeKey),
+    channelId: input.patternRoom ? input.patternRoom.channelId : input.teamRoom ? teamRoomChannelId(input.typeKey, input.classification) : newTypedChannelId(input.typeKey),
     ...(input.teamRoom ? { createOrGet: true, tagExtras: [{ Key: TEAM_ROOM_TAG, Value: input.typeKey }] } : {}),
+    // A PATTERN CONVERSATION'S GENERATION is on its tags, so a reader of the archive tells one creation at this id from the next.
+    ...(input.patternRoom ? { createOrGet: true, tagExtras: [{ Key: PATTERN_ROOM_TAG, Value: input.typeKey }, { Key: GENERATION_TAG, Value: String(input.patternRoom.generation) }] } : {}),
     title: conversationNameText(input.name) || sanitizeTitle(input.topicLabel),
     modelId: input.modelId,
     modelName: input.modelName,
@@ -950,6 +958,8 @@ export async function createConversationFromEvent(
       ...(input.participantRoles && Object.keys(input.participantRoles).length ? { participantRoles: input.participantRoles } : {}),
       ...(input.watchedAlarm ? { watchedAlarm: input.watchedAlarm } : {}),
       ...(input.watchedRefs?.length ? { watchedRefs: input.watchedRefs } : {}),
+      // A PATTERN CONVERSATION RECORDS ITS GENERATION, which a later recreation's reset of this row is conditioned on.
+      ...(input.patternRoom ? { generation: input.patternRoom.generation } : {}),
       ...(sanitizeTriggerContext(input.topicLabel)
         ? (input.parentChannelArn
           ? { priorSubject: sanitizeTriggerContext(input.topicLabel) }
@@ -993,10 +1003,36 @@ export async function createConversationFromEvent(
  * classification's tag rather than re-opening ones its assistant cannot act in.
  */
 export function contextChannelId(classification: string, contextType: string, contextId: string): string {
-  // A DIGEST OF THE CONTEXT'S PARTS, so two contexts never share a channel: a readable prefix alone folds `-` and every other
-  // separator together and is cut at the length limit.
-  const digest = createHash('sha256').update(JSON.stringify([classification, contextType, contextId])).digest('hex').slice(0, CONTEXT_ID_DIGEST_LENGTH);
-  return `${`ctx-${classification}-${contextType}-${contextId}`.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, CHANNEL_ID_MAX - CONTEXT_ID_DIGEST_LENGTH - 1)}-${digest}`;
+  return derivedChannelId('ctx', [classification, contextType, contextId]);
+}
+
+/**
+ * THE CHANNEL ID OF A PATTERN CONVERSATION (DESIGN-EVENT-TARGETS 11.2): the context conversation's derivation under a namespace of
+ * its own, so a host application's context type and id can never produce it, and a type's pattern never chooses a raw id.
+ * Deterministic from the classification, the type and the value the pattern resolved to, so one event names one conversation.
+ */
+export function patternChannelId(classification: string, typeKey: string, resolved: string): string {
+  return derivedChannelId('pat', [classification, typeKey, resolved]);
+}
+
+/**
+ * THE ADMIN NOTIFICATIONS CONVERSATION'S ID (DESIGN-EVENT-TARGETS section 12): fixed by the deployment's app instance, so its ARN
+ * follows from the deployment alone and two deployments never share one. Its own `adm` namespace, apart from the context and
+ * pattern ids.
+ */
+export function adminNoticesChannelId(appInstanceArn: string): string {
+  return `adm-notices-${createHash('sha256').update(JSON.stringify(['adm', 'notices', appInstanceArn])).digest('hex').slice(0, CONTEXT_ID_DIGEST_LENGTH)}`;
+}
+
+/**
+ * A CREATE-OR-GET CHANNEL ID: a readable prefix and a digest of every part with the namespace, charset-safe for an Amazon Chime
+ * SDK ChannelId and within its length. The digest is what keeps two ids apart: the readable part folds separators together
+ * and is cut at the limit.
+ */
+function derivedChannelId(namespace: 'ctx' | 'pat', parts: readonly string[]): string {
+  // THE CONTEXT CONVERSATION'S DIGEST IS UNCHANGED (its parts alone), so every context channel that exists keeps its id.
+  const digest = createHash('sha256').update(JSON.stringify(namespace === 'ctx' ? parts : [namespace, ...parts])).digest('hex').slice(0, CONTEXT_ID_DIGEST_LENGTH);
+  return `${`${namespace}-${parts.join('-')}`.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, CHANNEL_ID_MAX - CONTEXT_ID_DIGEST_LENGTH - 1)}-${digest}`;
 }
 
 /** An Amazon Chime SDK ChannelId's limit, and how much of a context channel's id is its digest. */
@@ -1237,6 +1273,19 @@ export async function completeTeamRoom(input: {
   }
 }
 
+/** The tag a pattern conversation carries (its type), and the generation of its id it is. */
+export const PATTERN_ROOM_TAG = PATTERN_ROOM_TAG_KEY;
+export const GENERATION_TAG = 'generation';
+
+/**
+ * DELETE AN ARCHIVED PATTERN CONVERSATION so it is created again at its id: its history stays in the
+ * conversation archive, which records the deletion and the creation that follows. As the service admin, on a channel IAM admits
+ * only where it is archived, of this classification and in the pattern namespace (`conversation-creator.ts`).
+ */
+export async function deleteArchivedPatternRoom(channelArn: string, bearerArn: string): Promise<void> {
+  await messagingClient.send(new DeleteChannelCommand({ ChannelArn: channelArn, ChimeBearer: bearerArn }));
+}
+
 /** Whether a channel stands, as the service admin reads it. A channel never created reads as refused, so both mean no. */
 export async function channelStands(channelArn: string, bearerArn: string): Promise<boolean> {
   try {
@@ -1369,12 +1418,30 @@ export async function createAdminNotificationChannel(input: {
       input.primaryTag,
     ],
     ClientRequestToken: randomBytes(16).toString('hex'),
-    Metadata: JSON.stringify({ kind: 'admin-notifications' }),
-  }));
+    ChannelId: adminNoticesChannelId(input.appInstanceArn),
+    Metadata: JSON.stringify({ kind: ADMIN_NOTICES_KIND }),
+  })).catch(async (err) => {
+    // ONE ALREADY AT THE FIXED ID, left by an earlier delete, is reused only where the admin bot created it and its tags, set at
+    // creation and never member-writable, name it the admin notifications conversation of this classification. Its Metadata,
+    // which a member can write, decides nothing. Anything else there is refused rather than adopted.
+    if ((err as { name?: string })?.name !== 'ConflictException') throw err;
+    const arn = `${input.appInstanceArn}/channel/${adminNoticesChannelId(input.appInstanceArn)}`;
+    const [{ Channel }, tags] = await Promise.all([
+      input.client.send(new DescribeChannelCommand({ ChannelArn: arn, ChimeBearer: input.botArn })),
+      readChannelTags(input.client as never, arn),
+    ]);
+    if (Channel?.CreatedBy?.Arn !== input.botArn || tags[input.kindTag.key] !== input.kindTag.value || tags.classification !== input.classification) {
+      throw new Error('a conversation the admin assistant did not create as its notifications conversation holds the fixed id; it is not adopted');
+    }
+    return { ChannelArn: arn };
+  });
   const arn = created.ChannelArn || '';
   if (!arn) throw new Error('CreateChannel returned no ARN');
   return arn;
 }
+
+/** The admin notifications conversation's kind, on its Metadata. */
+export const ADMIN_NOTICES_KIND = 'admin-notifications';
 
 /** The refusal when no service admin is configured or readable: a conversation is never created as an assistant. */
 export class NoServiceAdminError extends Error {

@@ -24,7 +24,7 @@
  */
 
 import { estimateStepCostUsd } from './lib/model-rate-table.js';
-import { deliversDocument, withConfirmBrief } from './lib/task-state-machines.js';
+import { deliversDocument, isQuietStep, withConfirmBrief } from './lib/task-state-machines.js';
 import { machinesForVersion, machinesOfTask, resolveTaskMachines } from './lib/version-machines.js';
 import { intentRunWorkflows } from './lib/intent-workflow.js';
 import { INTENT_TRIGGER } from './lib/event-workflow.js';
@@ -82,7 +82,7 @@ import { isResumeParkedEvent, type ResumeParkedEvent } from './lib/parked-turn.j
 import { readTurnState, takeParkedTurn } from './lib/turn-lock.js';
 import { messagingClient } from './lib/async-processor-core.js';
 import { topicMovedLink, sanitizeTitle } from './lib/channel-creation.js';
-import { actAsAssistant, actingAs, releaseAssistantIdentity, endAssistantTurn, companyContextScope } from './lib/async-processor-core.js';
+import { actAsAssistant, actingAs, releaseAssistantIdentity, endAssistantTurn, companyContextScope, actingCredentials, actingRole, invokeBedrock } from './lib/async-processor-core.js';
 import {
   ChannelMessageType,
   ChannelMessagePersistenceType,
@@ -231,6 +231,8 @@ import { clampResponseMaxTokens, toolsForIntent, hydrateIntentPackFromSsm, getIn
 import { documentWrittenOnStep, enteredStepModel, modelTheTurnEndedOn, stepOutputOf, taskIntentOf, type StepModelChoice } from './lib/step-models.js';
 import { classificationAllows } from '../../lib/config/model-availability.js';
 import { intentDefFor, deliverAsFile, fileForAnswer, answerShapeIssues } from './lib/intent-answer.js';
+import { DRAFT_FILE_VALUE, draftFileValue, revisionNumberOfStep } from './lib/task-documents.js';
+import { abandonRevision, addRevisedDocument } from './lib/task-store.js';
 import { buildReferentHint } from './lib/task-referent.js';
 import { taskRefHintLine, taskStillOpenLine } from './lib/task-reference.js';
 import { buildOpenWorkSummary } from './lib/open-work-summary.js';
@@ -627,7 +629,7 @@ export async function recordWhatThisTurnIsAnswering(
 }
 
 /**
- * RESUME AN ANSWER THAT WAITED FOR A READING (ADR-033, owner 2026-09-14).
+ * RESUME AN ANSWER THAT WAITED FOR A READING (ADR-033).
  *
  * The answer was finished and parked at the fold checkpoint while a reading beside it was still deciding
  * which queued messages are follow-ups. The reading has now recorded them and handed the conversation
@@ -1395,7 +1397,7 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
       console.warn('[AssistantAsyncProcessor] conversation task hint failed (non-fatal):', err);
     }
 
-    // ── WHICH OF THEIR OPEN ITEMS THIS MESSAGE IS ABOUT (maintainer, 2026-09-04; ADR-024 D7) ────
+    // ── WHICH OF THEIR OPEN ITEMS THIS MESSAGE IS ABOUT (ADR-024 D7) ────
     //
     // The router ranked and assumed one. The ranking sees the work - which is in flight, which is
     // parked, which is newest - and the question is which work the MESSAGE is about, which only
@@ -1419,7 +1421,7 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
       console.warn('[AssistantAsyncProcessor] referent hint failed (non-fatal):', err);
     }
 
-    // ── ANSWERING A CLARIFICATION HAS TO MOVE IT FORWARD (maintainer, 2026-09-03) ────────────────────
+    // ── ANSWERING A CLARIFICATION HAS TO MOVE IT FORWARD ────────────────────
     //
     // A clarification stores the message's ID and none of its words, which is what keeps a targeted
     // request out of a row the room can read. Kept only that far, the rule is half a rule: the row is
@@ -1517,7 +1519,7 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
         // So one queued message arriving during a long turn is still asked about: the subject it
         // raises is separable from the work already running, even though the queue holds one thing.
         !!event.triage.inFlight,
-        // NEW WORK IS NOT NEXT WORK (maintainer, 2026-09-01): the arrivals are ranked against the open
+        // NEW WORK IS NOT NEXT WORK: the arrivals are ranked against the open
         // work listed above, not against each other alone.
         hasOpenWork,
         // The reading tool is offered on this turn, so the directive must ask for a CALL rather than
@@ -1865,9 +1867,11 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
         return;
       }
       // THE RUN GOES BACK TO THE ROUTER of the assistant whose version declares it, naming the step's outcome.
+      // A FILE THE STEP DELIVERED rides the run on as its draft, so the approval it opens next carries it.
+      const delivered: Record<string, string> = {};
       const handBack = async (outcome: string) => continueEventRunThroughRouter((await resolveRouterArn(CLASSIFICATION)) ?? '', {
         runKey: req.runKey, workflow: req.workflow, step: req.step, outcome: asked ? askedTurnOutcome(outcome) : outcome, event: req.event,
-        channelArn: event.channelArn, botArn: asked ? asked.askerBotArn : event.botArn, values: req.values ?? {}, ...identity,
+        channelArn: event.channelArn, botArn: asked ? asked.askerBotArn : event.botArn, values: { ...(req.values ?? {}), ...delivered }, ...identity,
         transitions: req.transitions ?? [],
       });
       // EACH ASSISTANT ACTS ONLY AS ITSELF (tenet D1, WT118), the second layer behind the router: a step naming another
@@ -1892,7 +1896,7 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
       const targetsOf = (to: import('./lib/event-workflow.js').EventAudience) => { if (asked) return asked.to; const a = audienceOf(to, ctx); return a === 'room' ? [] : a; };
       // THE STEP'S MODEL CALL AND WHAT IT ASKED, recorded on what it posts (FR43).
       const stepTurn: PlatformTurnRecord = { ...(typeof event.triggerAtMs === 'number' ? { triggerAtMs: event.triggerAtMs } : {}) };
-      const post = async (content: string, to: string[], outcome: string, proposal?: ProposalCard) => {
+      const post = async (content: string, to: string[], outcome: string, proposal?: ProposalCard, file?: GeneratedDocument) => {
         // ONE RESPONSE, IN AS MANY PARTS AS IT NEEDS: a model chose its length, and every part reaches the same audience.
         // A refused part throws, so the step records `post_failed` for the response (`runAgentStep`).
         const sent = await sendInParts(messagingClient, {
@@ -1922,6 +1926,8 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
             ...(to.length ? { targetedSender: to[0] } : {}),
             // A CONFIRMATION CARD (ADR-061 decision 8, rule 8): the proposal's handle, which only its addressee receives.
             ...(proposal ? { proposal } : {}),
+            // THE STEP'S OUTPUT AS A FILE, the attachment the client draws and offers to download.
+            ...(file ? { attachment: file } : {}),
           }, CHIME_METADATA_MAX)),
           ...(to.length ? { Target: to.map((MemberArn) => ({ MemberArn })) } : {}),
         });
@@ -1985,9 +1991,38 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
       // AN ASKED TURN MAY OFFER ITS CARD TO THE PERSON THE REQUEST IS FOR, and to nobody else (`proposalAddresseeOf`): an
       // incident's runbook asks for the customers affected on its lead's behalf, so the lead confirms adding their account teams.
       const askedInvites = asked && !narrowed ? await meetingInvitesFor(proposalAddresseeOf({ channelArn: event.channelArn, asked }), def.tools ?? []) : {};
+      // DELIVERED AS A FILE where the step says so, the step that asked says so, or the asked intent declares its
+      // answer a file: the output becomes a Markdown attachment, posted with one line. An upload that fails posts the text.
+      const asFile = def.deliver === 'file' || asked?.deliver === 'file' || (asked ? intentDefFor(asked.intent, turnPack)?.answer?.form === 'file' : false);
+      // A REVISION READS THE VERSION IT REVISES (stage 2): a file an assistant delivered or a member attached in this conversation.
+      const revising = asked?.revisionOf;
+      const conversationIdHere = event.channelArn.split('/').pop() ?? '';
+      const revisedText = revising && process.env.ATTACHMENTS_BUCKET
+        && (revising.fileKey.startsWith(`generated-docs/${conversationIdHere}/`) || revising.fileKey.startsWith(`attachments/${conversationIdHere}/`)) && !revising.fileKey.includes('..')
+        ? await fetchAttachmentBytes(s3Client as never, process.env.ATTACHMENTS_BUCKET, revising.fileKey)
+          .then((b) => new TextDecoder().decode(b).slice(0, 12_000))
+          .catch((err) => { console.warn('[event-step] the version to revise could not be read', { err: (err as Error)?.name }); return ''; })
+        : '';
+      // WHETHER THE REVISION LANDED as the task's next version; a drafting turn that ends without it clears the request.
+      let revisedLanded = false;
+      const postAsFile = async (content: string): Promise<void> => {
+        const bucket = process.env.ATTACHMENTS_BUCKET;
+        const file = bucket
+          ? await generateAndUploadDocument(content, event.channelArn, stamp.workflow, bucket, fileForAnswer({ fileType: 'markdown' }, content)).catch((err) => {
+            console.warn('[event-step] the step\'s file could not be stored; it is posted as a message', { err: (err as Error)?.name });
+            return undefined;
+          })
+          : undefined;
+        if (!file) return post(content, targetsOf(def.to), 'posted');
+        const said = templateLine('step-file-delivered', { copy: versionCopy }, { values: { name: file.name } }) || file.name;
+        await post(said, targetsOf(def.to), 'posted', undefined, file);
+        delivered[DRAFT_FILE_VALUE] = draftFileValue({ fileKey: file.fileKey, name: file.name, by: `assistant:${turnProfileName}`, ...(actingRole() ? { role: actingRole() } : {}), ...(asked ? { intent: asked.intent } : {}) });
+        // A REVISION LANDS AS ITS TASK'S NEXT VERSION, recorded by the task service against the revision asked for.
+        if (revising) revisedLanded = (await addRevisedDocument({ taskId: revising.taskId, channelArn: event.channelArn, fileKey: file.fileKey, name: file.name, by: `assistant:${turnProfileName}` })).ok;
+      };
       const run = await runAgentStep({
         // AN ASKED TURN IS TOLD WHAT WAS ASKED, AS DATA, AND ANSWERS AS ITS OWN INTENT INSTRUCTS.
-        template, values: asked ? { ask: asked.ask, instructions: instructionsForIntent(asked.intent, turnPack) ?? '' } : narrowed ? promptValues : ctx.values, deadlineMs: def.deadlineMs,
+        template, values: asked ? { ask: revisedText ? `${asked.ask}\n\n${revisedText}` : asked.ask, instructions: instructionsForIntent(asked.intent, turnPack) ?? '' } : narrowed ? promptValues : ctx.values, deadlineMs: def.deadlineMs,
         ...(readsRoom && nothingToRecap(wf.states[req.step], pipeline.personSpoke) ? { nothingToRead: true } : {}),
       }, {
         // No person asked: metered against the global budget only, as the join recap is.
@@ -2010,7 +2045,7 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
         claim: (outcome) => claimEventStep({ runKey: req.runKey, channelArn: event.channelArn, step: stepClaim, outcome }),
         // A DRAFT THAT REACHES SOMEONE OUTSIDE THE ROOM carries no link, handle or address (rule 6).
         ...(op ? { vet: (text: string) => !proposalDraftRefusal(text) } : {}),
-        postOutput: (content) => (op ? offerProposal(content) : post(content, targetsOf(def.to), 'posted')),
+        postOutput: (content) => (op ? offerProposal(content) : asFile ? postAsFile(content) : post(content, targetsOf(def.to), 'posted')),
         postFallback: async (outcome) => {
           // AN ASKED TURN SAYS NOTHING WHERE IT COULD NOT ANSWER: the asking run takes its failure edge, and says so in its words.
           if (asked) return;
@@ -2073,7 +2108,14 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
       }
       // ONLY THE WINNER HANDS THE RUN ON: the invocation whose output or fallback won the step's claim names the
       // continuation back to the router, which claims it once and runs the steps that follow.
-      if (run.won) await handBack(run.outcome);
+      // A REVISION HANDS NO RUN ON: the run waits on the approval, whose next version this turn delivered.
+      // A REVISION THAT DID NOT LAND (no answer, a timeout, a file that could not be stored) is cleared, so the approver may
+      // ask again at once.
+      const revisionN = revising ? revisionNumberOfStep(req.step) : undefined;
+      if (revising && run.won && !revisedLanded && revisionN !== undefined) {
+        await abandonRevision({ taskId: revising.taskId, channelArn: event.channelArn, n: revisionN }).catch(() => undefined);
+      }
+      if (run.won && !revising) await handBack(run.outcome);
       return;
     }
 
@@ -2469,6 +2511,24 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
       },
       ...(turnTemplates ? { templates: turnTemplates } : {}),
     });
+
+    // ── A QUIET STEP TAKEN UP (`isQuietStep`, DESIGN-CONVERSATION-DASHBOARDS section 8.1) ──────────────────────────
+    //
+    // The router took the step up with nothing posted. Its declared action runs on this assistant's own session, held to the
+    // turn's allowlist as a model's call is, and the turn ends there: no model call and no message. The step's move closes
+    // and archives a settlement through the task service, which is the turn's record. Read from the task's own machine, so a
+    // payload cannot make a speaking step quiet.
+    if (event.taskPickup && taskContext && taskContext.task.taskState === event.taskPickup.state
+      && isQuietStep(turnMachines[taskContext.task.taskType ?? '']?.states?.[event.taskPickup.state])) {
+      taskContext.quiet = true;
+      const quiet = await invokeBedrock('', [], bedrockInvokeConfig, undefined, false, false, undefined, undefined, taskContext);
+      console.log('[AssistantAsyncProcessor] a quiet step ran', JSON.stringify({
+        taskType: taskContext.task.taskType, state: event.taskPickup.state, now: taskContext.task.taskState,
+        actions: (quiet.steps ?? []).map((st) => st.action).filter(Boolean),
+        ...(typeof event.triggerAtMs === 'number' ? { totalMs: Date.now() - event.triggerAtMs } : {}),
+      }));
+      return;
+    }
 
     // Attachment-in (non-battle): the user sent an image/PDF/doc — fetch it and attach a Converse
     // image or document block so the assistant can read it. Best-effort: a fetch/format miss degrades
@@ -3310,7 +3370,7 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
         ? Object.entries(taskMachine.states).filter(([, d]) => deliversDocument(d)).map(([name]) => name)
         : [];
       if (event.taskType && event.taskId && deliveryStates.length > 0) {
-        // THE DELIVERY CONTRACT IS DECLARED, NOT INFERRED (maintainer decision 2026-08-18). The model is
+        // THE DELIVERY CONTRACT IS DECLARED, NOT INFERRED. The model is
         // told, per state, to advance_task_state when it delivers — the final state is explicit and
         // MEASURED. Attachment therefore keys on a transition the model DECLARED this turn: into a
         // delivering state, or from a delivering state to a terminal (the deliver-and-finish turn).
@@ -3439,7 +3499,7 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
         generate = false;
       }
 
-      // WRITE, CHECK, CORRECT - then deliver (maintainer, 2026-08-20). The loop has just written a
+      // WRITE, CHECK, CORRECT - then deliver. The loop has just written a
       // document and is about to hand it over; this is the last point at which it is still ours to
       // fix, and the only point at which the finished text exists.
       //
@@ -3984,7 +4044,7 @@ export const handler = async (event: AsyncProcessorEvent, context?: TurnContext)
       // Empty for a reading, which is how `finalizePlaceholderResponse` knows to post its own
       // message rather than write into one. Every other turn resolved one above or returned.
       messageId: deliverMessageId || '',
-      // NEW WORK IS NOT NEXT WORK (maintainer, 2026-09-01): the proposal shows where the arrivals fall
+      // NEW WORK IS NOT NEXT WORK: the proposal shows where the arrivals fall
       // against this, not a fresh list of its own.
       ...(openWorkHere.length ? { openWork: openWorkHere } : {}),
       guardMs,

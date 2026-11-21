@@ -130,4 +130,31 @@ function seededAccountTeamEmails(secret, groupEmails, { emailDomain } = {}) {
     .filter((e) => e.includes('@') && domains.has(e.slice(e.lastIndexOf('@') + 1)));
 }
 
-module.exports = { assistantsToRetire, parseResetArgs, isTeamRoom, teamRoomClearing, authorKind, seededAccountTeamEmails, ACCOUNT_TEAM_GROUP, DEMO_DEFAULT_EMAIL_DOMAIN, RETIRABLE_STATUS };
+/**
+ * WHAT A DELETED CONVERSATION LEAVES BEHIND in the conversation-context table, from its rows: the entries naming it in a
+ * parent's `children` (so the parent's open-incident count forgets it) and the watch records (`watch#...`) naming it as their
+ * room (so an alarm or a key no longer points at it). Children come highest index first, so removing each in turn leaves the
+ * lower indexes where they were.
+ */
+function recordsNamingDeleted(rows, deletedArns) {
+  const gone = new Set(deletedArns);
+  const goneIds = new Set(deletedArns.map((a) => String(a).split('/').pop()));
+  const children = [];
+  const watches = [];
+  for (const row of rows) {
+    const key = row?.channelArn;
+    if (typeof key !== 'string' || gone.has(key)) continue;
+    if (key.startsWith('watch#')) {
+      if (typeof row.room === 'string' && gone.has(row.room)) watches.push({ key, room: row.room });
+      continue;
+    }
+    const list = Array.isArray(row.children) ? row.children : [];
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+      const id = list[i]?.channelId;
+      if (typeof id === 'string' && goneIds.has(id)) children.push({ channelArn: key, index: i, channelId: id });
+    }
+  }
+  return { children, watches };
+}
+
+module.exports = { recordsNamingDeleted, assistantsToRetire, parseResetArgs, isTeamRoom, teamRoomClearing, authorKind, seededAccountTeamEmails, ACCOUNT_TEAM_GROUP, DEMO_DEFAULT_EMAIL_DOMAIN, RETIRABLE_STATUS };

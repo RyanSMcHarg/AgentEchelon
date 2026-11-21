@@ -11,8 +11,8 @@
 import { agentStepOpsRoom } from '../../test/agentStepOpsRoom';
 import { useState } from 'react';
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent, within } from '@testing-library/react';
-import EventWorkflowEditor, { convertStep } from './EventWorkflowEditor';
+import { render, screen, fireEvent, within, cleanup } from '@testing-library/react';
+import EventWorkflowEditor, { convertStep, edgeSaid, roomMayRead, stepSaid, templateNames } from './EventWorkflowEditor';
 import { shippedMessageTemplates } from '../../../../../../backend/lambda/src/lib/shipped-message-templates.ts';
 import { EventWorkflowsFields } from './AssistantConfigFields';
 import { type EventWorkflow, type IntakeAction, versionEventWorkflowsErrors } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
@@ -27,6 +27,19 @@ vi.mock('../../services/profileService', async (orig) => ({
     return { assistant: 'a', classification: 'premium', templates: [], family: {} };
   },
 }));
+
+vi.mock('../../services/eventTriggerService', () => ({
+  listEventTriggers: async () => ({ channelArn: null, triggers: [] }), attachEventTrigger: vi.fn(), removeEventTrigger: vi.fn(),
+  listAccountAlarms: async () => [], listAccountRules: async () => [], readEventPolicy: async () => ({ allowedEventTypes: [] }), listDeclaredHandoffs: async () => [],
+}));
+
+/** WHAT STARTS THE WORKFLOW, CHANGED AS A PERSON CHANGES IT: Edit on its line, an AgentEchelon event, the event from its list, Save. */
+function runOn(event: string) {
+  fireEvent.click(screen.getByTestId('trigger-edit-on'));
+  fireEvent.click(screen.getByTestId('trigger-source-ae'));
+  fireEvent.change(screen.getByTestId('trigger-event-select'), { target: { value: `on:${event}` } });
+  fireEvent.click(screen.getByTestId('trigger-save'));
+}
 
 const TOOLS: ToolDescriptor[] = [
   { name: 'read_deployment_health', category: 'context', changesState: false, description: 'reads', requires: '' },
@@ -65,14 +78,14 @@ describe('the event workflow editor', () => {
     const { last } = renderEditor();
     fireEvent.change(screen.getByTestId('event-workflow-new-name'), { target: { value: 'greet-joiner' } });
     fireEvent.click(screen.getByTestId('event-workflow-add'));
-    fireEvent.change(screen.getByTestId('event-workflow-on'), { target: { value: 'person-joined' } });
+    runOn('person-joined');
     expect(last()!['greet-joiner'].on).toBe('person-joined');
     const audience = screen.getByTestId('event-workflow-steps').querySelector('select option[value="joined"]')!.parentElement as HTMLSelectElement;
     fireEvent.change(audience, { target: { value: 'joined' } });
     expect(last()!['greet-joiner'].states.opening.send).toMatchObject({ to: 'joined' });
     expect(screen.queryByTestId('event-workflow-errors')).toBeNull();
     // `joined` is refused at an event that names nobody who joined, by the server's own rule.
-    fireEvent.change(screen.getByTestId('event-workflow-on'), { target: { value: 'assistant-joined' } });
+    runOn('assistant-joined');
     expect(screen.getByTestId('event-workflow-errors').textContent).toMatch(/is joined, which only person-joined carries/);
   });
 
@@ -80,40 +93,44 @@ describe('the event workflow editor', () => {
     const { last } = renderEditor();
     fireEvent.change(screen.getByTestId('event-workflow-new-name'), { target: { value: 'tell-inviter' } });
     fireEvent.click(screen.getByTestId('event-workflow-add'));
-    fireEvent.change(screen.getByTestId('event-workflow-on'), { target: { value: 'invitation-sent' } });
+    runOn('invitation-sent');
     expect(last()!['tell-inviter'].on).toBe('invitation-sent');
     const audience = screen.getByTestId('event-workflow-steps').querySelector('select option[value="invitation:inviter"]')!.parentElement as HTMLSelectElement;
     fireEvent.change(audience, { target: { value: 'invitation:inviter' } });
     expect(last()!['tell-inviter'].states.opening.send).toMatchObject({ to: { people: 'invitation:inviter' } });
     expect(screen.queryByTestId('event-workflow-errors')).toBeNull();
     // The inviter exists only at an invitation's events, by the server's own rule.
-    fireEvent.change(screen.getByTestId('event-workflow-on'), { target: { value: 'person-joined' } });
+    runOn('person-joined');
     expect(screen.getByTestId('event-workflow-errors').textContent).toMatch(/names invitation:inviter, which only invitation-sent and invitation-unredeemed carry/);
   });
 
   it('runs a workflow on the deadline invitation-unredeemed, with its deadline, and an agent step proposing a reminder (ADR-061 slice 3d)', () => {
     const { last } = renderEditor();
     fireEvent.change(screen.getByTestId('event-workflow-new-name'), { target: { value: 'chase' } });
-    fireEvent.change(screen.getByTestId('event-workflow-copy-from'), { target: { value: 'chase-unredeemed' } });
-    fireEvent.click(screen.getByTestId('event-workflow-copy'));
+    fireEvent.click(screen.getByTestId('event-workflow-start-copy'));
+    fireEvent.change(screen.getByTestId('event-workflow-copy-from'), { target: { value: 'platform:chase-unredeemed' } });
+    fireEvent.click(screen.getByTestId('event-workflow-add'));
     expect(last()!.chase).toMatchObject({ on: 'invitation-unredeemed', deadline: { afterMinutes: 4320 } });
     expect(screen.queryByTestId('event-workflow-errors')).toBeNull();
+    fireEvent.click(screen.getByTestId('trigger-edit-on'));
     fireEvent.change(screen.getByTestId('event-workflow-deadline-after'), { target: { value: '60' } });
+    fireEvent.click(screen.getByTestId('trigger-save'));
     expect(last()!.chase.deadline).toEqual({ afterMinutes: 60 });
     // The step proposes a reminder; turned off, it only posts.
     expect((screen.getByTestId('event-workflow-step-0-propose') as HTMLSelectElement).value).toBe('send_nudge');
     fireEvent.change(screen.getByTestId('event-workflow-step-0-propose'), { target: { value: '' } });
     expect(last()!.chase.states['draft-nudge'].agent!.propose).toBeUndefined();
     // Moved to an event with no deadline, the workflow drops its deadline, as the server requires.
-    fireEvent.change(screen.getByTestId('event-workflow-on'), { target: { value: 'invitation-sent' } });
+    runOn('invitation-sent');
     expect(last()!.chase.deadline).toBeUndefined();
   });
 
   it('copies a platform workflow under a new name, whose re-read is a request to the ops assistant saying what it needs', () => {
     const { last } = renderEditor();
     fireEvent.change(screen.getByTestId('event-workflow-new-name'), { target: { value: 'watch-mine' } });
-    fireEvent.change(screen.getByTestId('event-workflow-copy-from'), { target: { value: 'incident-watch' } });
-    fireEvent.click(screen.getByTestId('event-workflow-copy'));
+    fireEvent.click(screen.getByTestId('event-workflow-start-copy'));
+    fireEvent.change(screen.getByTestId('event-workflow-copy-from'), { target: { value: 'platform:incident-watch' } });
+    fireEvent.click(screen.getByTestId('event-workflow-add'));
     expect(Object.keys(last()!)).toEqual(['watch-mine']);
     expect(last()!['watch-mine'].on).toBe('alarm-state-changed');
     // A REQUEST (WT118): what is needed is this assistant's to say, and the rest is the owning assistant's.
@@ -151,8 +168,9 @@ describe('the event workflow editor', () => {
   it('a request changes only what it asks for, and a step of the run\'s own takes back its own controls (WT118)', () => {
     const { last } = renderEditor();
     fireEvent.change(screen.getByTestId('event-workflow-new-name'), { target: { value: 'watch' } });
-    fireEvent.change(screen.getByTestId('event-workflow-copy-from'), { target: { value: 'incident-watch' } });
-    fireEvent.click(screen.getByTestId('event-workflow-copy'));
+    fireEvent.click(screen.getByTestId('event-workflow-start-copy'));
+    fireEvent.change(screen.getByTestId('event-workflow-copy-from'), { target: { value: 'platform:incident-watch' } });
+    fireEvent.click(screen.getByTestId('event-workflow-add'));
     fireEvent.change(screen.getByTestId('event-workflow-step-2-task-ask'), { target: { value: '' } });
     expect(last()!.watch.states.recheck.task).toEqual({ machine: 'deployment_health', by: { assistantRole: 'ops' } });
     // A request names any intent its owner advertises, typed, because this version's machines say nothing about the owner's.
@@ -164,15 +182,43 @@ describe('the event workflow editor', () => {
     expect(screen.queryByTestId('event-workflow-step-2-task-ask')).toBeNull();
   });
 
-  it('shows a deadline past the maximum and a conversation-opened workflow with no types as the server refuses them', () => {
-    renderEditor();
+  // DELIVERED AS A FILE: an agent step's output, and a request's answer, attached as a Markdown file.
+  it('an agent step and a request each deliver as a file when ticked, and only a request that asks shows it', () => {
+    const { last } = renderEditor();
+    fireEvent.change(screen.getByTestId('event-workflow-new-name'), { target: { value: 'w' } });
+    fireEvent.click(screen.getByTestId('event-workflow-add'));
+    fireEvent.click(screen.getByTestId('event-workflow-add-agent'));
+    fireEvent.click(screen.getByTestId('event-workflow-step-2-deliver-file'));
+    expect(last()!.w.states[Object.keys(last()!.w.states).find((k) => last()!.w.states[k].agent)!].agent!.deliver).toBe('file');
+    fireEvent.click(screen.getByTestId('event-workflow-step-2-deliver-file'));
+    expect(last()!.w.states[Object.keys(last()!.w.states).find((k) => last()!.w.states[k].agent)!].agent!.deliver).toBeUndefined();
+
+    // A second workflow is created from the Workflows list, never from beside an open one: a fresh editor here.
+    cleanup();
+    const second = renderEditor();
+    fireEvent.change(screen.getByTestId('event-workflow-new-name'), { target: { value: 'watch' } });
+    fireEvent.click(screen.getByTestId('event-workflow-start-copy'));
+    fireEvent.change(screen.getByTestId('event-workflow-copy-from'), { target: { value: 'platform:incident-watch' } });
+    fireEvent.click(screen.getByTestId('event-workflow-add'));
+    fireEvent.click(screen.getByTestId('event-workflow-step-2-task-deliver-file'));
+    expect(second.last()!.watch.states.recheck.task!.deliver).toBe('file');
+    // A request that asks for nothing has no answer to deliver, so the choice goes with the ask.
+    fireEvent.change(screen.getByTestId('event-workflow-step-2-task-ask'), { target: { value: '' } });
+    expect(second.last()!.watch.states.recheck.task!.deliver).toBeUndefined();
+    expect(screen.queryByTestId('event-workflow-step-2-task-deliver-file')).toBeNull();
+  });
+
+  it('shows a deadline past the maximum as the server refuses it, and runs a conversation-opened workflow in a type an event opens', () => {
+    const { last } = renderEditor();
     fireEvent.change(screen.getByTestId('event-workflow-new-name'), { target: { value: 'w' } });
     fireEvent.click(screen.getByTestId('event-workflow-add'));
     fireEvent.click(screen.getByTestId('event-workflow-add-agent'));
     fireEvent.change(screen.getByTestId('event-workflow-step-2-deadline'), { target: { value: '600' } });
     expect(screen.getByTestId('event-workflow-errors').textContent).toMatch(/deadlineMs is a whole number of milliseconds, at most 60000/);
-    fireEvent.change(screen.getByTestId('event-workflow-on'), { target: { value: 'conversation-opened' } });
-    expect(screen.getByTestId('event-workflow-errors').textContent).toMatch(/declares the types an event opens/);
+    runOn('conversation-opened');
+    // "Any" is not offered: a conversation-opened workflow names the types an event opens, as the server requires.
+    expect(last()!.w).toMatchObject({ on: 'conversation-opened', types: ['ops'] });
+    expect(screen.getByTestId('event-workflow-errors').textContent).not.toMatch(/declares the types an event opens/);
   });
 
   it('in the draft, the welcome is a workflow in the builder, and the default one is required: removed, the built-in one runs and can be copied back', () => {
@@ -184,6 +230,7 @@ describe('the event workflow editor', () => {
     fireEvent.click(screen.getByTestId('wfb-view-list'));
     expect(screen.getByTestId('event-workflow-required')).toHaveTextContent('The default welcome. Removing it uses the built-in one.');
     fireEvent.click(screen.getByTestId('event-workflow-remove'));
+    fireEvent.click(screen.getByTestId('event-workflow-remove-confirm-button'));
     expect(onPatch).toHaveBeenLastCalledWith({ eventWorkflows: null });
     expect(screen.getByTestId('draft-welcome-required')).toHaveTextContent('the built-in one is used');
   });
@@ -200,9 +247,35 @@ describe('the event workflow editor', () => {
     expect(Object.values(last()!.greet.states).some((d) => d.prompt)).toBe(true);
     expect(screen.queryByTestId('event-workflow-errors')).toBeNull();
     // Off assistant-joined the welcome's own steps are not offered, and the server refuses the ones the workflow has.
-    fireEvent.change(screen.getByTestId('event-workflow-on'), { target: { value: 'person-joined' } });
+    runOn('person-joined');
     expect(screen.queryByTestId('event-workflow-add-opening')).toBeNull();
     expect(screen.getByTestId('event-workflow-errors').textContent).toMatch(/which only the welcome takes \(on assistant-joined\)/);
+  });
+
+  it('a renamed workflow stays linked from every process that links or measures it, on the canvas and in the list, rename after rename', () => {
+    const own: EventWorkflow = { on: 'invitation-unredeemed', deadline: { afterMinutes: 4320 }, initial: 'nudge', states: { nudge: { send: { to: 'room', template: 'workflow-opening' }, onSuccess: 'done' }, done: { disposition: 'success' } } };
+    const processes = {
+      onboarding: { label: 'Onboarding', workflows: ['chase', 'other'], metrics: [{ id: 'chased', label: 'Chased', workflow: 'chase' }, { id: 'kept', label: 'Kept', workflow: 'other' }] },
+      unrelated: { label: 'Unrelated', workflows: ['other'] },
+    };
+    const onPatch = vi.fn();
+    render(<EventWorkflowsFields config={{ modelKey: 'm', eventWorkflows: { chase: own }, processes }} onPatch={onPatch} profileName="a" tools={TOOLS} />);
+    const rename = (to: string) => {
+      fireEvent.click(screen.getByTestId('event-workflow-name-edit'));
+      fireEvent.change(screen.getByTestId('event-workflow-rename-input'), { target: { value: to } });
+      fireEvent.click(screen.getByTestId('event-workflow-rename-save'));
+    };
+    rename('chase-two');
+    expect(onPatch).toHaveBeenCalledWith({ processes: {
+      onboarding: { label: 'Onboarding', workflows: ['chase-two', 'other'], metrics: [{ id: 'chased', label: 'Chased', workflow: 'chase-two' }, { id: 'kept', label: 'Kept', workflow: 'other' }] },
+      unrelated: processes.unrelated,
+    } });
+    fireEvent.click(screen.getByTestId('wfb-view-list'));
+    rename('chase-three');
+    expect(onPatch).toHaveBeenLastCalledWith({ processes: {
+      onboarding: { label: 'Onboarding', workflows: ['chase-three', 'other'], metrics: [{ id: 'chased', label: 'Chased', workflow: 'chase-three' }, { id: 'kept', label: 'Kept', workflow: 'other' }] },
+      unrelated: processes.unrelated,
+    } });
   });
 
   it('EVERY WORKFLOW, THE WELCOME INCLUDED, IS EDITED IN THE ONE BUILDER, which says what they are behind its help', () => {
@@ -296,8 +369,25 @@ describe('mentions and a step\'s kind (ADR-061 decision 2)', () => {
     expect(agent).toMatchObject({ agent: { to: { participantRole: 'lead' }, prompt: 'ops-first-look', deadlineMs: 20000 }, onSuccess: 'first-look', onFailure: 'first-look' });
     fireEvent.change(screen.getByTestId('event-workflow-step-1-kind'), { target: { value: 'end' } });
     expect(last()!.mine.states['greet-lead']).toEqual({ disposition: 'success' });
+    // Every message template here names a person, which the whole conversation may not read without a mention, so a new
+    // send to the room starts with none chosen and says so, rather than defaulting to one Validate refuses.
     fireEvent.change(screen.getByTestId('event-workflow-step-1-kind'), { target: { value: 'send' } });
-    expect(last()!.mine.states['greet-lead']).toEqual({ send: { to: 'room', template: 'ops-room-opening' } });
+    expect(last()!.mine.states['greet-lead']).toEqual({ send: { to: 'room', template: '' } });
+    expect(screen.getByTestId('event-workflow-step-1-template-choose')).toHaveTextContent('Choose a message the whole conversation may read');
+  });
+
+  it('a new agent step never defaults its fallback to a template addressed to one person', () => {
+    const shippedAll = shippedMessageTemplates();
+    const both = ['notification-email', 'workflow-opening'].map((name) => ({ name, kind: 'message' as const, source: shippedAll.get(name)!.source, origin: 'shipped' as const }));
+    // notification-email sorts first and binds person:displayName; the room may read workflow-opening.
+    expect(roomMayRead(both[0].source)).toBe(false);
+    expect(roomMayRead(both[1].source)).toBe(true);
+    expect(templateNames(both).roomMessages).toEqual(['workflow-opening']);
+    const onChange = vi.fn();
+    render(<EventWorkflowEditor workflows={{ w: ops() }} templates={[...both, ...WITH_SOURCES.filter((x) => x.kind === 'prompt')]} tools={TOOLS} onChange={onChange} />);
+    fireEvent.click(screen.getByTestId('event-workflow-add-agent'));
+    const added = Object.values(onChange.mock.calls.at(-1)![0].w.states as Record<string, { agent?: { fallback: { send: { template: string } } } }>).filter((d) => d.agent).at(-1)!;
+    expect(added.agent!.fallback.send.template).toBe('workflow-opening');
   });
 
   it('convertStep is the same rule on its own', () => {
@@ -455,5 +545,125 @@ describe('a meeting step\'s start', () => {
     expect(Object.keys(states)).toEqual(['tell', 'meet', 'done']);
     expect(states.tell.onSuccess).toBe('meet');
     expect(states.meet.send).toBeDefined();
+  });
+});
+
+describe('the list view is one card per step, in run order, saying where each goes', () => {
+  const ops = (): EventWorkflow => {
+    const wf = agentStepOpsRoom();
+    wf.states['first-look'] = { ...wf.states['first-look'], label: 'Notify the team' };
+    return wf;
+  };
+
+  it('heads each card with what the step is called and does, and says where it goes next and if it fails in words', () => {
+    render(<EventWorkflowEditor workflows={{ w: ops() }} templates={TEMPLATES} tools={TOOLS} onChange={vi.fn()} />);
+    const cards = screen.getByTestId('event-workflow-steps').querySelectorAll(':scope > li.admin-wfl-step');
+    expect([...cards].map((c) => c.getAttribute('data-testid'))).toEqual(['event-workflow-step-0', 'event-workflow-step-1', 'event-workflow-step-2', 'event-workflow-step-3']);
+    expect(screen.getByTestId('event-workflow-step-0-said')).toHaveTextContent('Send a message');
+    expect(screen.getByTestId('event-workflow-step-1-next')).toHaveTextContent('Next: Notify the team');
+    expect(screen.getByTestId('event-workflow-step-1-next')).toHaveTextContent('If it fails: Notify the team');
+    expect(screen.getByTestId('event-workflow-step-2-title')).toHaveTextContent('Notify the team');
+    expect(screen.getByTestId('event-workflow-step-2-said')).toHaveTextContent('Ask the assistant');
+    expect(screen.getByTestId('event-workflow-step-2-next')).toHaveTextContent('Next: done');
+    expect(screen.getByTestId('event-workflow-step-3-said')).toHaveTextContent('End: success');
+    expect(screen.queryByTestId('event-workflow-step-3-next')).toBeNull();
+    // Every field stays editable on the card.
+    expect(screen.getByTestId('event-workflow-step-2-deadline')).toBeTruthy();
+  });
+
+  it('says an edge with no step as the run ending, and a conditioned one as depending on its conditions', () => {
+    const t = (k: string, o?: Record<string, unknown>) => (k.endsWith('endRun') ? 'the run ends' : k.endsWith('conditioned') ? `depends (${String(o?.steps)})` : k);
+    const wf = ops();
+    expect(edgeSaid(t, wf, undefined)).toBe('the run ends');
+    expect(edgeSaid(t, wf, 'first-look')).toBe('Notify the team');
+    expect(edgeSaid(t, wf, [{ to: 'first-look', when: { 'conversation:type': { eq: 'ops' } } as never }, { to: 'done' }])).toBe('depends (Notify the team, done)');
+    expect(stepSaid((k, o) => `${k}:${JSON.stringify(o ?? {})}`, { wait: { minutes: 30 } } as never)).toContain('waitMinutes');
+  });
+
+  it('heads a hand-off step\'s card with the hand-off, never as the run\'s end', () => {
+    const said = stepSaid((k, o) => `${k}:${JSON.stringify(o ?? {})}`, { handoff: { process: 'customer-request', name: 'security-review', fields: {} }, onSuccess: 'done' } as never);
+    expect(said).toBe('admin.workflowEditor.card.handoff:{"name":"security-review"}');
+  });
+});
+
+describe('the workflow page holds its name at the top and removing it at the foot, confirmed', () => {
+  const STEPS_ONLY: EventWorkflow = { on: 'person-joined', initial: 'done', states: { done: { disposition: 'success' } } } as EventWorkflow;
+
+  it('shows the name as a heading, an input only once clicked, and renames it in place', () => {
+    const { onChange, last } = renderEditor({ first: STEPS_ONLY, second: STEPS_ONLY });
+    expect(screen.getByTestId('event-workflow-name')).toHaveTextContent('first');
+    expect(screen.queryByTestId('event-workflow-rename-input')).toBeNull();
+    fireEvent.click(screen.getByTestId('event-workflow-name-edit'));
+    fireEvent.change(screen.getByTestId('event-workflow-rename-input'), { target: { value: 'renamed' } });
+    fireEvent.click(screen.getByTestId('event-workflow-rename-save'));
+    expect(Object.keys(last()!)).toEqual(['renamed', 'second']);
+    expect(screen.getByTestId('event-workflow-name')).toHaveTextContent('renamed');
+    // A name another workflow has is refused, said beside the field.
+    fireEvent.click(screen.getByTestId('event-workflow-name-edit'));
+    fireEvent.change(screen.getByTestId('event-workflow-rename-input'), { target: { value: 'second' } });
+    fireEvent.click(screen.getByTestId('event-workflow-rename-save'));
+    expect(screen.getByTestId('event-workflow-rename-refused')).toBeTruthy();
+    expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
+  it('the editor of an existing workflow offers no new, create or copy control', () => {
+    renderEditor({ first: STEPS_ONLY, second: STEPS_ONLY });
+    for (const id of ['event-workflow-new', 'event-workflow-create', 'event-workflow-new-name', 'event-workflow-copy-from', 'event-workflow-add']) {
+      expect(screen.queryByTestId(id), id).toBeNull();
+    }
+    expect(screen.queryByRole('button', { name: /new workflow|create|copy/i })).toBeNull();
+  });
+
+  it('the create view is only a name, where it starts from, Start and Cancel', () => {
+    const onCancel = vi.fn();
+    render(<EventWorkflowEditor workflows={{ first: STEPS_ONLY }} startCreating onCancelCreate={onCancel} templates={TEMPLATES} tools={TOOLS} onChange={vi.fn()} />);
+    const view = screen.getByTestId('event-workflow-create');
+    expect(screen.queryByTestId('event-workflow-select')).toBeNull();
+    expect(screen.queryByTestId('workflow-triggers')).toBeNull();
+    expect(screen.queryByTestId('event-workflow-steps')).toBeNull();
+    expect([...view.querySelectorAll('input, select, button')].map((x) => x.getAttribute('data-testid'))).toEqual([
+      'event-workflow-new-name', 'event-workflow-start-empty', 'event-workflow-start-copy', 'event-workflow-copy-from', 'event-workflow-add', 'event-workflow-new-cancel',
+    ]);
+    expect((screen.getByTestId('event-workflow-start-empty') as HTMLInputElement).checked).toBe(true);
+    expect(screen.getByTestId('event-workflow-copy-from')).toBeDisabled();
+    fireEvent.click(screen.getByTestId('event-workflow-new-cancel'));
+    expect(onCancel).toHaveBeenCalled();
+  });
+
+  it('Start waits for a name, and for a copy a workflow to copy, then opens the new workflow', () => {
+    const onChange = vi.fn();
+    function Creating() {
+      const [workflows, setWorkflows] = useState<Record<string, EventWorkflow>>({ first: STEPS_ONLY });
+      return <EventWorkflowEditor workflows={workflows} startCreating templates={TEMPLATES} tools={TOOLS} onChange={(n) => { onChange(n); setWorkflows(n ?? {}); }} />;
+    }
+    render(<Creating />);
+    expect(screen.getByTestId('event-workflow-add')).toBeDisabled();
+    fireEvent.change(screen.getByTestId('event-workflow-new-name'), { target: { value: 'again' } });
+    expect(screen.getByTestId('event-workflow-add')).not.toBeDisabled();
+    fireEvent.click(screen.getByTestId('event-workflow-start-copy'));
+    expect(screen.getByTestId('event-workflow-add')).toBeDisabled();
+    const options = [...(screen.getByTestId('event-workflow-copy-from') as HTMLSelectElement).querySelectorAll('optgroup')].map((g) => g.label);
+    expect(options).toEqual(["This assistant's workflows", 'Platform workflows']);
+    fireEvent.change(screen.getByTestId('event-workflow-copy-from'), { target: { value: 'own:first' } });
+    fireEvent.click(screen.getByTestId('event-workflow-add'));
+    expect(onChange.mock.calls.at(-1)![0]).toEqual({ first: STEPS_ONLY, again: STEPS_ONLY });
+    // The editor opens on the new workflow.
+    expect(screen.queryByTestId('event-workflow-create')).toBeNull();
+    expect(screen.getByTestId('event-workflow-name')).toHaveTextContent('again');
+  });
+
+  it('removes the workflow from the foot of the page, as a danger action, only once confirmed', () => {
+    const { onChange } = renderEditor({ first: STEPS_ONLY });
+    const remove = screen.getByTestId('event-workflow-remove');
+    expect(remove.className).toContain('btn-danger');
+    // The foot of the page: after the steps.
+    expect(screen.getByTestId('event-workflow-steps').compareDocumentPosition(remove) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(remove);
+    expect(screen.getByTestId('event-workflow-remove-confirm')).toHaveTextContent('Remove first?');
+    fireEvent.click(screen.getByTestId('event-workflow-remove-cancel'));
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId('event-workflow-remove'));
+    fireEvent.click(screen.getByTestId('event-workflow-remove-confirm-button'));
+    expect(onChange).toHaveBeenLastCalledWith(null);
   });
 });

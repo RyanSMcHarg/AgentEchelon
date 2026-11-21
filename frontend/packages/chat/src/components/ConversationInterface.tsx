@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useTurnState } from '../hooks/useTurnState';
-import { useTranslation, Trans } from 'react-i18next';
+import { useTranslation } from 'react-i18next';
 import { useConversations } from '../providers/ConversationProvider.chime';
 import { memberNameResolver, shownAssistantText } from '@ae/shared/utils/addressTokens.ts';
 import TaskStatusIndicator from './TaskStatusIndicator';
@@ -8,7 +8,10 @@ import QueueStatusIndicator from './QueueStatusIndicator';
 import AttachmentDisplay from './AttachmentDisplay';
 import { ProposalCard } from './ProposalCard';
 import { TaskCard } from './TaskCard';
+import { uploadFile } from '../services/attachmentService';
+import { readTaskDocuments, attachTaskDocument, reviseTaskDocument, decideFromBand } from '../services/taskCardService';
 import { DashboardCard } from './DashboardCard';
+import { PinnedStatus, pinnedDashboardOf } from './PinnedStatus';
 import ShareConversationModal from './ShareConversationModal';
 import { shareDisabledReason } from './shareAvailability';
 import ArchiveConversationModal from './ArchiveConversationModal';
@@ -42,7 +45,7 @@ import { BattleSideReply } from './BattleSideReply';
 import { mayAnswerSide, personIdOfArn, waitingSides } from '../utils/battleSideReply';
 import { AudienceLabel, ClassificationBadge, headerAudienceClass } from './ConversationClassification';
 import './ConversationInterface.css';
-import { clearMessageFocus, hasPendingMessageFocus, noteMessageFocusMiss, peekMessageFocus, scrollToMessage } from '../utils/focusMessage';
+import { clearMessageFocus, hasPendingMessageFocus, noteMessageFocusMiss, peekMessageFocus, scrollToMessage, TASK_FOCUS_PREFIX } from '../utils/focusMessage';
 import { conversationTitleFor, isUnnamedConversation } from '../utils/conversationTitle';
 
 /** Multi-day date divider: a divider
@@ -233,7 +236,35 @@ const battleBriefingStyles: Record<string, React.CSSProperties> = {
   },
 };
 
+/**
+ * WHETHER A TASK CARD IS CLOSED, only where that is positively known: its task is there in the person's open items in another
+ * state, or missing from a read asked after the card arrived that lists every open item (`complete`). A list at the service's
+ * cap may leave the task out, so absence from it closes nothing. Before the first read, or where the card is newer than the
+ * read, it is drawn as sent.
+ */
+export function cardClosed(
+  message: Pick<Message, 'taskCard' | 'timestamp'>, loaded: boolean, askedAt: number,
+  items: ReadonlyArray<{ taskId: string; taskState?: string }>, complete: boolean,
+): boolean {
+  const card = message.taskCard;
+  if (!card || !loaded) return false;
+  const item = items.find((i) => i.taskId === card.id);
+  if (item) return !!item.taskState && item.taskState !== card.state;
+  return complete && new Date(message.timestamp).getTime() <= askedAt;
+}
+
+/**
+ * WHETHER THE PINNED BAND OFFERS THIS PERSON A TASK'S CHOICES: the band's decision is that task's and names them among those who
+ * decide it. Only then does a pinned card defer its choices to the band; otherwise the card keeps them.
+ */
+export function bandOffersChoices(
+  decide: { taskId: string; by: readonly string[] } | undefined, taskId: string, viewerId: string | undefined,
+): boolean {
+  return !!decide && decide.taskId === taskId && !!viewerId && decide.by.includes(viewerId);
+}
+
 /** When this person's newest message has had no assistant message after it: its time, else undefined. */
+
 function awaitingReplySinceOf(messages: readonly Message[], currentUserArn: string | null | undefined): number | undefined {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const m = messages[i];
@@ -246,7 +277,7 @@ function awaitingReplySinceOf(messages: readonly Message[], currentUserArn: stri
 /** `inMeetingWindow`: the conversation is the chat column of its own meeting window (`MeetingWindow`). */
 const ConversationInterface: React.FC<{ inMeetingWindow?: boolean }> = ({ inMeetingWindow = false }) => {
   const { t } = useTranslation();
-  const { activeConversation, messages: loadedMessages, isLoadingMessages, isBotTyping, channelMembers, renameConversation, archiveConversation, selectConversation, battleWaitingBots = [], replyingToSides = [], replyToSides, answeringTaskId, refreshOpenWorkItems } = useConversations();
+  const { activeConversation, messages: loadedMessages, isLoadingMessages, isBotTyping, channelMembers, renameConversation, archiveConversation, selectConversation, battleWaitingBots = [], replyingToSides = [], replyToSides, answeringTaskId, refreshOpenWorkItems, openWorkItems = [], openWorkLoaded = false, openWorkAskedAt = 0, openWorkComplete = false } = useConversations();
   // A continuation part is shown with the message it continues, not wherever its creation time put it:
   // a queue notice posted while the answer was generating otherwise lands between the two halves.
   // Ordered once here so every index-based read below sees the same order.
@@ -255,6 +286,14 @@ const ConversationInterface: React.FC<{ inMeetingWindow?: boolean }> = ({ inMeet
   // window the meeting is open already, so nothing is read there.
   const conversationMeeting = useConversationMeeting(inMeetingWindow ? undefined : activeConversation?.conversationArn, loadedMessages);
   const { userArn: currentUserArn } = useAwsClient();
+  // THE TASK WHOSE CHOICES THE PINNED BAND OFFERS THIS PERSON, where it offers any: a pinned card defers its choices to the
+  // band only for that task, so a card is never left without its choices when the band shows none.
+  const bandDecide = useMemo(() => pinnedDashboardOf(messages)?.dashboard?.decide, [messages]);
+  const viewerId = personIdOfArn(currentUserArn) ?? undefined;
+  const bandDecidesTask = (taskId: string) => bandOffersChoices(bandDecide, taskId, viewerId);
+  // A REVISED VERSION ARRIVES AS AN ASSISTANT'S FILE: a card that approves a document re-reads its versions when one arrives,
+  // and on no other message.
+  const assistantFileCount = useMemo(() => messages.filter((m) => m.isBot && m.attachment).length, [messages]);
   // The message each waiting duel side waits on, so its answer control is drawn there and nowhere else.
   const liveWaitingMessageIds = useMemo(
     () => new Set(waitingSides(loadedMessages).map((side) => side.messageId)),
@@ -333,7 +372,6 @@ const ConversationInterface: React.FC<{ inMeetingWindow?: boolean }> = ({ inMeet
     if (!activeConversation) return;
     await archiveConversation(activeConversation.id);
   }, [activeConversation, archiveConversation]);
-  const [isMentionBannerDismissed, setIsMentionBannerDismissed] = useState(false);
   const [feedbackState, setFeedbackState] = useState<Record<string, 'up' | 'down' | 'pending'>>({});
   // The message whose "what went wrong" picker is open, and the one showing the acknowledgement
   // after a reason was given. Both are single-valued: only the most recent down vote is being asked
@@ -551,7 +589,6 @@ const ConversationInterface: React.FC<{ inMeetingWindow?: boolean }> = ({ inMeet
   const isMultiUser = humanMemberCount >= 2;
   // Shown only where an assistant is present to answer; a room of people alone has nobody to mention.
   // NOT IN A MEETING'S CHAT: the meeting window is narrow, and its chat is the meeting's side channel.
-  const showMentionBanner = !inMeetingWindow && isMultiUser && channelMembers.some((m) => m.isBot) && !isMentionBannerDismissed;
 
   // Briefing fields ride on the battle config (DESIGN-EXPERIMENTS-BATTLE A.5),
   // snapshotted at enable time. Read them via a local augmentation so this stays
@@ -606,9 +643,13 @@ const ConversationInterface: React.FC<{ inMeetingWindow?: boolean }> = ({ inMeet
   // yanking them away - on this render and on later ones, which is also the right behavior while
   // someone is reading history.
   useEffect(() => {
-    const id = peekMessageFocus(activeConversationId);
-    if (!id) return;
-    if (!scrollToMessage(id)) {
+    const pendingId = peekMessageFocus(activeConversationId);
+    if (!pendingId) return;
+    // A TASK'S CARD (`#task=<id>`) IS ITS NEWEST CARD IN THE LOADED HISTORY, as answering from the task list finds it.
+    const id = pendingId.startsWith(TASK_FOCUS_PREFIX)
+      ? [...messages].reverse().find((m) => m.taskCard?.id === pendingId.slice(TASK_FOCUS_PREFIX.length))?.id ?? ''
+      : pendingId;
+    if (!id || !scrollToMessage(id)) {
       // NOT WHILE THE LIST IS STILL LOADING. A miss is meant to mean "the history rendered and the
       // target was not in it", which is what the attempt budget exists to bound. While
       // `isLoadingMessages` is true the list is a skeleton, so the target cannot be there and a miss
@@ -640,6 +681,7 @@ const ConversationInterface: React.FC<{ inMeetingWindow?: boolean }> = ({ inMeet
     focusedTask.current = answeringTaskId;
     releaseFollow();
   }, [answeringTaskId, messages, isLoadingMessages, releaseFollow]);
+
 
   const formatTimestamp = (date: Date) => {
     return date.toLocaleTimeString('en-US', {
@@ -759,6 +801,8 @@ const ConversationInterface: React.FC<{ inMeetingWindow?: boolean }> = ({ inMeet
   return (
     <div className={`conversation-interface${isMembersPanelOpen ? ' with-members-panel' : ''}`}>
       <div className="conversation-interface-main">
+        {/* IN ITS MEETING'S WINDOW THE CHAT HAS NO HEADER: the window already names the meeting, its conversation and its access. */}
+        {!inMeetingWindow && (
         <header className={`conversation-header${headerAudienceClass(activeConversation.modelTier)}`} role="banner">
           <div className="conversation-header-content">
             <div className="conversation-header-title-group">
@@ -922,37 +966,14 @@ const ConversationInterface: React.FC<{ inMeetingWindow?: boolean }> = ({ inMeet
               </div>
             </div>
           )}
-          {showMentionBanner && (
-            <div className="mention-banner" role="status">
-              <div className="mention-banner-icon" aria-hidden="true">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" width="14" height="14">
-                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm.93-12.588a.75.75 0 10-1.49-.154l-.5 4.775a.75.75 0 001.49.154l.5-4.775zM10 15a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
-                </svg>
-              </div>
-              <div className="mention-banner-body">
-                {/* <Trans> (rather than dangerouslySetInnerHTML) keeps the
-                    variable parts of the i18n string as auto-escaped text
-                    nodes. The <strong> tags are rendered by React, not
-                    parsed out of a string. */}
-                <Trans
-                  i18nKey="mentionBanner.body"
-                  components={[<strong key="all" />]}
-                />
-              </div>
-              <button
-                type="button"
-                className="mention-banner-dismiss"
-                onClick={() => setIsMentionBannerDismissed(true)}
-                aria-label={t('mentionBanner.dismiss')}
-                title={t('mentionBanner.dismiss')}
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" width="14" height="14">
-                  <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
-                </svg>
-              </button>
-            </div>
-          )}
         </header>
+        )}
+      {/* WHAT THE CONVERSATION KEEPS AT ITS TOP: its newest dashboard, the step it is on and who holds its roles. */}
+      {activeConversation?.conversationArn && (
+        <PinnedStatus messages={messages} channelArn={activeConversation.conversationArn} conversationName={activeConversation.title}
+          personId={personIdOfArn(currentUserArn) ?? undefined}
+          onDecide={async (decision, choice) => { await decideFromBand(activeConversation.conversationArn, decision, choice); refreshOpenWorkItems(); }} />
+      )}
       <div className="messages-container" ref={containerRef} onScroll={handleScroll}>
         <div className="messages-content" ref={contentRef}>
         {/* Battle briefing (DESIGN-EXPERIMENTS-BATTLE §2.2): a compact,
@@ -1268,11 +1289,31 @@ const ConversationInterface: React.FC<{ inMeetingWindow?: boolean }> = ({ inMeet
                   // A TASK A WORKFLOW ASSIGNED THIS PERSON (ADR-063 decision 2): one card, its message's words above its
                   // choices, drawn from the targeted message's Metadata, which only they receive. They may answer on it or
                   // by writing here.
+                  // A PINNED CARD'S CHOICES ARE AT THE TOP where the band offers them to this person: its message keeps its words,
+                  // and says where they are. Where the band offers them nothing, the card keeps its own choices.
+                  if (message.isBot && message.taskCard?.pinned && activeConversation?.conversationArn && bandDecidesTask(message.taskCard.id)) {
+                    return (
+                      <>
+                        <CollapsibleText content={shownText} isBot resolveName={resolveMemberName} members={channelMembers} />
+                        <p className="proposal-card-help" data-testid="pinned-card-here">{t('pinned.choicesAtTop')}</p>
+                      </>
+                    );
+                  }
                   if (message.isBot && message.taskCard && activeConversation?.conversationArn) {
                     return (
                       <TaskCard
                         card={message.taskCard}
+                        // A CARD IS ANSWERABLE WHILE ITS TASK IS OPEN FOR THIS PERSON IN THE STATE IT ASKS FROM, read from the
+                        // task service's open items, the one record of what is open. A card whose task settled or moved on is
+                        // drawn closed, after a reload as before it; until the items are first read, it is drawn as sent, and a
+                        // card that arrived after the items were asked for is drawn as sent until a read asked after it answers.
+                        closed={cardClosed(message, openWorkLoaded, openWorkAskedAt, openWorkItems, openWorkComplete)}
                         channelArn={activeConversation.conversationArn}
+                        documents={{
+                          read: readTaskDocuments, attach: attachTaskDocument, revise: reviseTaskDocument,
+                          upload: (file) => uploadFile(file, activeConversation.id, personIdOfArn(currentUserArn) ?? ''),
+                        }}
+                        refreshKey={assistantFileCount}
                         onAnswered={refreshOpenWorkItems}
                         body={<CollapsibleText content={shownText} isBot resolveName={resolveMemberName} members={channelMembers} />}
                       />

@@ -1,5 +1,5 @@
 /**
- * NEW WORK IS NOT NEXT WORK (maintainer, 2026-09-01; DESIGN 2.3 step 5).
+ * NEW WORK IS NOT NEXT WORK (DESIGN 2.3 step 5).
  *
  * "Prioritise them, so the order the queue is worked is a decision rather than arrival order." The
  * decision was being made against the batch alone: `buildProposalMessage` ranked the arriving

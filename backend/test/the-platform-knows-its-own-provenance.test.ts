@@ -1,5 +1,5 @@
 /**
- * THE PLATFORM CAN SAY WHO MADE IT (owner-reported, 2026-09-05).
+ * THE PLATFORM CAN SAY WHO MADE IT.
  *
  * Asked "who created it", the assistant answered that the retrieved context does not name a creator
  * or founding team. It was telling the truth, which is the part worth keeping in mind: the curated

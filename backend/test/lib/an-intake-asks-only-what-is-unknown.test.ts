@@ -1,8 +1,6 @@
 /**
  * AN INTAKE ASKS ONLY FOR WHAT THE DEPLOYMENT DOES NOT ALREADY ASSERT.
  *
- * Owner rule 2026-09-03, "cheap" chosen 2026-09-14.
- *
  * Opening a standard conversation, the assistant asked "What company are you with?" - in a deployment
  * whose persona opens "You are the internal assistant for Stratum Technologies". Its two fields were
  * `company` and `role`: the two facts the deployment already asserts, because the persona names the

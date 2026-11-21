@@ -144,7 +144,7 @@ describe('the two accepted declarations normalize to one reference', () => {
 
 describe('every shipped machine says who it awaits, in the declared form', () => {
   /**
-   * THE ONE MACHINE THAT MUST NEVER WAIT (maintainer, 2026-09-03).
+   * THE ONE MACHINE THAT MUST NEVER WAIT.
    *
    * A drain is not somebody's workflow, it is the assistant reading a queue - and a drain that waits
    * is a QUEUE that lives until somebody answers, while every message still in it is somebody else's
@@ -157,7 +157,8 @@ describe('every shipped machine says who it awaits, in the declared form', () =>
   // `incident_first_look` is opened by an event, which has no requester, so no step of it waits on one (ADR-061
   // decision 8, `EVENT_TASK_MACHINES`); it rests as the room's work.
   // `dashboard_refresh` is a workflow's required refresh: its one step's action publishes on entry, so nobody is waited on.
-  const NEVER_WAITS = ['queue_drain', 'incident_first_look', 'dashboard_refresh'];
+  // `dashboard_runbook` is the platform's quiet runbook refresh: its one step's action draws, and nobody is waited on.
+  const NEVER_WAITS = ['queue_drain', 'incident_first_look', 'dashboard_refresh', 'dashboard_runbook'];
 
   // `incident_ownership` awaits its worker too: the team room's on-call resolves it (WT122).
   const WORKER_MACHINES = ['approval', 'acknowledgement', 'incident_ownership', 'drift_offer', 'meeting_offer', 'meeting_action_item', 'customer_impact', 'customer_updates', 'final_notice'];

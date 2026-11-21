@@ -1,5 +1,5 @@
 /**
- * A DRAIN CARRIES THE MESSAGE'S ID, AND IT CLOSES ITSELF (maintainer, 2026-09-03).
+ * A DRAIN CARRIES THE MESSAGE'S ID, AND IT CLOSES ITSELF.
  *
  * Two rules, both found by review of the change that made a drain a task, and both invisible until
  * something else went wrong.
@@ -206,7 +206,7 @@ describe('closing the drain when the queue is empty', () => {
 });
 
 /**
- * THE STAGE AND THE TASK STATE ARE ONE FACT (step 3, owner 2026-09-03).
+ * THE STAGE AND THE TASK STATE ARE ONE FACT (step 3).
  *
  * A person read the stage off the notice while the task carried a `taskState` that nothing moved, so
  * it sat in `waiting` for the drain's whole life. Two vocabularies for one drain is what adopting the
@@ -333,7 +333,7 @@ describe('a drain that asked something still ends properly', () => {
 });
 
 /**
- * THE QUESTION NOTHING WAS HOLDING (maintainer, 2026-09-03).
+ * THE QUESTION NOTHING WAS HOLDING.
  *
  * When the reading cannot tell whether the work already running is still wanted, it asks. That
  * question used to be a stage on the notice, a sentence in the proposal, and a log field - and

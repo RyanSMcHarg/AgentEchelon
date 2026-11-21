@@ -1,6 +1,6 @@
 /**
- * AN ALARM OPENS THE INCIDENT CONVERSATION AT ONCE, AND THE TEAM IS TOLD WHY (SPEC-WORKFLOWS-AND-TASKS WT120, WT129; owner
- * 2026-11-18): nobody is asked before the incident conversation opens, the whole team conversation is told with the on-call
+ * AN ALARM OPENS THE INCIDENT CONVERSATION AT ONCE, AND THE TEAM IS TOLD WHY (SPEC-WORKFLOWS-AND-TASKS WT120, WT129):
+ * nobody is asked before the incident conversation opens, the whole team conversation is told with the on-call
  * mentioned, and triage, customer impact included, is the incident conversation's own.
  *
  * What it proves: the shipped `incident-triage` opens first and then tells the team, naming the on-call by mention, and is a
@@ -43,7 +43,9 @@ describe('an alarm opens the incident conversation at once, and the team is told
   });
 
   it('triage, customer impact included, is the incident conversation\'s own stage', () => {
-    expect(opsRoom.states['impact-confirm']).toMatchObject({ label: 'Customers impacted?', task: { machine: 'customer_impact', by: { participantRole: 'lead' } } });
+    // NOBODY IS ASKED WHETHER CUSTOMERS ARE IMPACTED: naming the accounts opens customer messaging.
+    expect(opsRoom.states['impact-confirm']).toBeUndefined();
+    expect(opsRoom.states['customer-impact'].onSuccess).toEqual([{ to: 'runbook-cause', when: { 'event:customerImpact': 'impacted' } }, { to: 'messaging' }]);
   });
 
   it('says where the incident is worked, why it was opened, since when and where, and who owns it', () => {

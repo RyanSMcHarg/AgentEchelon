@@ -65,7 +65,7 @@ describe('the in-app dashboard', () => {
     await vi.waitFor(() => expect(frameIn()).not.toBeNull());
     expect(open).toHaveBeenCalledWith('about:blank', '_blank');
     expect(tab.opener).toBeNull();
-    expect(frameIn()!.getAttribute('sandbox')).toBe('');
+    expect(frameIn()!.getAttribute('sandbox')).toBe('allow-popups allow-popups-to-escape-sandbox');
     expect(frameIn()!.srcdoc).toContain('figures');
     expect(read).toHaveBeenCalledWith(ROOM);
     // Nothing modal is left in the app: the conversation can still be clicked.
@@ -142,6 +142,12 @@ describe('the in-app dashboard', () => {
     render(<DashboardCard dashboard={snapshot} channelArn={ROOM} read={vi.fn()} />);
     await user.click(screen.getByRole('button', { name: 'Open dashboard' }));
     expect(await screen.findByText(/blocked the new tab/)).toBeTruthy();
+  });
+
+  it('resolves its links against the app and opens them in a new tab, never in the frame', () => {
+    const doc = dashboardDocument('<a href="?conversation=c1#task=t1">card</a>', 'en', 'https://app.example.com/');
+    expect(doc).toContain('<base href="https://app.example.com/" target="_blank">');
+    expect(dashboardDocument('<main>x</main>', 'en', 'javascript:alert(1)')).not.toContain('<base');
   });
 
   it('wraps the markup in a document whose policy loads and runs nothing', () => {

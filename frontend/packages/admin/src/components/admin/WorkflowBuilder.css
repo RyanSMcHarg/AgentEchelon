@@ -127,3 +127,23 @@
   .admin-wfb-canvas { height: clamp(320px, 55vh, 560px); }
 }
 .admin-wfb-field { display: flex; flex-direction: column; gap: var(--space-1); margin-bottom: var(--space-3); border: 0; padding: 0; }
+
+/* THE LIST VIEW: one card per step in run order, headed by what it is called and does, where it goes next beneath, then
+   its fields as labelled rows. The card carries the only border; what sits inside it does not add another. */
+.admin-wfl-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-3); min-width: 0; }
+.admin-wfl-step {
+  display: flex; flex-direction: column; gap: var(--space-3);
+  padding: var(--space-4);
+  background: var(--surface-0);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-lg);
+  min-width: 0;
+}
+.admin-wfl-step-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2); }
+.admin-wfl-step-head strong { font-size: var(--text-lg); }
+.admin-wfl-next { display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-4); font-size: var(--text-sm); color: var(--text-secondary); }
+.admin-wfl-row { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; }
+.admin-wfl-step .admin-filter-group { align-items: flex-end; min-width: 0; }
+.admin-wfl-step label { min-width: 0; max-width: 100%; }
+.admin-wfl-step :is(.select, .input, .textarea) { max-width: 100%; }
+.admin-wfl-step .admin-event-trigger, .admin-wfl-step .admin-import-preview { border: 0; padding: 0; }

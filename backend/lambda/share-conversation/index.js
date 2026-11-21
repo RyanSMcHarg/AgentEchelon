@@ -36,8 +36,8 @@ const CHANNEL_CONTEXT_TABLE = process.env.CHANNEL_CONTEXT_TABLE || '';
  * registered type. Null when the row cannot be read, so the share is refused rather than decided on an unknown source or type.
  *
  * A conversation whose people come from a group is kept equal to that group by the membership reconcile, so
- * a person invited here would be silently removed on the next pass. Sharing is refused instead (owner
- * decision, 2026-10-05). Read from the context row, never from channel Metadata, which members can write.
+ * a person invited here would be silently removed on the next pass. Sharing is refused instead.
+ * Read from the context row, never from channel Metadata, which members can write.
  * A row that was read and names no type is the ordinary type, which is what every person-opened conversation
  * is. A deployment with no context table is refused earlier, by `typeAllows`.
  */

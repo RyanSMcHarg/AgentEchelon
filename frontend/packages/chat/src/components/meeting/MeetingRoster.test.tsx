@@ -92,11 +92,15 @@ describe('each state renders', () => {
     const away = screen.getByTestId('meeting-roster-away');
     expect(within(joined).getByText('Bo')).toBeTruthy();
     for (const name of ['Cy', 'Di', 'Ed']) expect(within(away).getByText(name)).toBeTruthy();
-    // THE AWAY LIST COMES AFTER EVERY OTHER: it is the bottom of the roster.
+    // THE AWAY LIST COMES AFTER EVERY OTHER: it is the bottom of the roster, below those in the meeting and the assistants.
+    const assistant = screen.getByTestId('meeting-roster-assistant');
+    expect(within(assistant).getByText('Advisor')).toBeTruthy();
     expect(joined.compareDocumentPosition(away) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(assistant.compareDocumentPosition(away) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(away.compareDocumentPosition(assistant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeFalsy();
     expect(rowOf('Cy').textContent).toContain('Left');
     // NEVER JOINED SAYS NOTHING MORE: the list's heading says it.
-    expect(rowOf('Di').textContent).not.toContain('Not joined');
+    expect(rowOf('Di').querySelector('.ae-meeting-roster-tag')).toBeNull();
     expect(rowOf('Ed').textContent).toContain('Removed');
     expect(guestRow().textContent).toContain('No audio connected');
     expect(rowOf('Bo').textContent).not.toContain('No audio connected');

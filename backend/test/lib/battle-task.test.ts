@@ -87,7 +87,7 @@ describe("a duel side's task, through the one creation path", () => {
     const put = mockSend.mock.calls.find((c) => c[0].input.TableName === 'tasks-test' && c[0].__t === 'Put')![0];
     expect(put.__t).toBe('Put');
     expect(put.input.Item.taskId).toBe(task.taskId);
-    // TWO FIELDS, TWO QUESTIONS (maintainer, 2026-08-14). The OWNER is who must act next, and
+    // TWO FIELDS, TWO QUESTIONS. The OWNER is who must act next, and
     // `report_generation` starts at `collecting_requirements`, which the machine declares
     // `awaits` - so the chain is blocked on the person from its first moment and they hold it.
     // Owning it is what puts it in their queue; the caller's assistant owner is honored only for a

@@ -301,7 +301,7 @@ describe('the caller\'s live-task signal reaches detectDrift', () => {
 //
 //   1. Return null the moment Battle Mode was on. A user who changed the subject mid-duel got no
 //      suggestion and no reason for its absence, which reads as being ignored.
-//   2. Detect as normal and RETURN AN EXPLANATION (maintainer, 2026-08-13). The router treats any
+//   2. Detect as normal and RETURN AN EXPLANATION. The router treats any
 //      drift response as the whole turn, and detection runs per answering assistant - so on a duel
 //      it fired for ONE side, that side sent the explanation INSTEAD of its round-1 reply, and the
 //      comparison ran with a single participant. Observed live 2026-09-21 on

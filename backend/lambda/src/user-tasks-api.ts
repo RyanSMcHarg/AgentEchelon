@@ -40,6 +40,8 @@ import { taskStateMachines, parseIntentPack, DEFAULT_INTENT_PACK, resolvePackPar
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
 import { userArnFor } from './lib/person-arn.js';
 import { callerPersonId } from './lib/auth.js';
+import { getChannelContext } from './lib/channel-context-client.js';
+import { holdersByRole } from './lib/participant-roles.js';
 import { callerReachesConversation, isNotAMemberError, listReach, refusalAnswer, type CheckUse, type ConversationAccess } from './lib/conversation-access.js';
 import { capabilityRefusal, typeAllows } from './lib/type-capability.js';
 import { responder, originsFrom, DEV_ORIGIN } from './lib/http-response.js';
@@ -194,7 +196,7 @@ export interface OpenWorkItem {
  * a to-do queue is worse than a generically named one, because the user cannot tell what they are
  * being asked to finish.
  *
- * ── THE PERSON'S OWN WORDS ARE THE FALLBACK, NOT THE TYPE (maintainer, 2026-09-03) ────────────────────
+ * ── THE PERSON'S OWN WORDS ARE THE FALLBACK, NOT THE TYPE ────────────────────
  *
  * `details` is where an assistant may record a title, and `createTask` initializes it EMPTY. Nothing
  * on the queued-request or report paths writes one, so every row fell through to the type and a
@@ -549,6 +551,18 @@ const CARD_REFUSALS: Record<string, { status: number; error: string }> = {
  * assignee, the task is still in the state the card showed, and the choice is one that state declares. This function
  * reads the tags, checks membership and clearance as the caller and invokes a task service by name.
  */
+/**
+ * THE PARTICIPANT ROLES A MEMBER HOLDS IN A CONVERSATION, from the conversation's own record (the roles it stores, never one a
+ * creating application asserts, which addresses and never decides). Nothing where the record cannot be read: a press it would
+ * have admitted as a decider is then refused, never admitted.
+ */
+async function rolesHeldBy(channelArn: string, personId: string): Promise<string[]> {
+  const row = await getChannelContext(channelArn, { consistent: true }).catch(() => null);
+  if (!row?.participantRoles) return [];
+  const held = holdersByRole(row.participantRoles, row.conversationType, [userArnFor(APP_INSTANCE_ARN, personId)]);
+  return Object.entries(held).filter(([, arns]) => arns.length > 0).map(([role]) => role);
+}
+
 async function advanceOnCard(event: APIGatewayProxyEvent, origin?: string): Promise<APIGatewayProxyResult> {
   const personId = await callerPersonId(event);
   if (!personId) return respond(401, { error: 'Unauthorized: this sign-in names no person' }, origin);
@@ -581,8 +595,15 @@ async function advanceOnCard(event: APIGatewayProxyEvent, origin?: string): Prom
     // A FORM'S ANSWERS (WT50) ride the press, bounded here and held to the form's fields by the task service.
     const answers = body?.answers && typeof body.answers === 'object' && !Array.isArray(body.answers) && JSON.stringify(body.answers).length <= 20_000
       ? body.answers as Record<string, unknown> : undefined;
+    // THE VERSION THE CARD SHOWED, where it approves a document.
+    const document = str(body?.document, 300);
+    // THE ROLES THE CALLER HOLDS HERE, from the conversation's own record of who holds each role (never the request), so a
+    // step that names deciders (`decidedBy`) admits its holders; the caller's membership was proven above, as them.
+    const callerRoles = await rolesHeldBy(channelArn, personId);
+    const confirmed = body?.confirmed === true;
     const out = await invokeTaskServiceOp<{ ok: boolean; to?: string; error?: string }>(lambdaClient, serviceArn, 'advanceAsAssignee', {
-      taskId, channelArn, callerPersonId: personId, state, choice, ...(answers ? { answers } : {}),
+      taskId, channelArn, callerPersonId: personId, state, choice, ...(answers ? { answers } : {}), ...(document ? { document } : {}),
+      ...(callerRoles.length ? { callerRoles } : {}), ...(confirmed ? { confirmed: true } : {}),
     });
     if (out?.ok) return respond(200, { taskId, state: out.to }, origin);
     const refusal = CARD_REFUSALS[out?.error ?? 'REFUSED'] ?? CARD_REFUSALS.REFUSED;
@@ -590,6 +611,49 @@ async function advanceOnCard(event: APIGatewayProxyEvent, origin?: string): Prom
   } catch (error) {
     console.error('[user-tasks-api] the card press could not be taken:', (error as Error)?.message);
     return respond(500, { error: 'Could not take that choice', code: 'TASK_ADVANCE_FAILED' }, origin);
+  }
+}
+
+/**
+ * POST /tasks/documents and /tasks/documents/add: THE VERSIONS OF THE DOCUMENT A TASK APPROVES, read, or one attached by its
+ * approver. The caller is checked exactly as a card press is (a member cleared for the conversation, not
+ * archived), and the task service holds the rest to the row: the caller is the task's assignee, and an attached file is their
+ * own Markdown upload in this conversation.
+ */
+async function documentsOnCard(event: APIGatewayProxyEvent, origin?: string): Promise<APIGatewayProxyResult> {
+  const personId = await callerPersonId(event);
+  if (!personId) return respond(401, { error: 'Unauthorized: this sign-in names no person' }, origin);
+  if (!APP_INSTANCE_ARN) return respond(500, { error: 'APP_INSTANCE_ARN is not configured', code: 'SERVER_MISCONFIG' }, origin);
+  let body: Record<string, unknown> | null = null;
+  try { body = (typeof event.body === 'string' ? JSON.parse(event.body) : event.body) as Record<string, unknown>; } catch { body = null; }
+  const str = (v: unknown, max = 128) => (typeof v === 'string' && v.length <= max ? v : '');
+  const channelArn = str(body?.channelArn, 512);
+  const taskId = str(body?.taskId);
+  const adding = /\/add\/?$/.test(event.path || event.resource || '');
+  const revising = /\/revise\/?$/.test(event.path || event.resource || '');
+  const fileKey = str(body?.fileKey, 300);
+  const instructions = str(body?.instructions, 2000).trim();
+  if (!channelArn.startsWith(`${APP_INSTANCE_ARN}/channel/`) || !taskId || (adding && !fileKey) || (revising && !instructions)) {
+    return respond(400, { error: 'channelArn and taskId are required, and fileKey to attach one', code: 'MALFORMED_BODY' }, origin);
+  }
+  const access = await callerReaches(event, channelArn, adding || revising);
+  if (!access.ok) {
+    const refused = refusalAnswer(access);
+    return respond(refused.statusCode, refused.body, origin);
+  }
+  if ((adding || revising) && String(access.tags?.archived) === 'true') return respond(409, { error: 'This conversation is archived and is read-only', code: 'CONVERSATION_ARCHIVED' }, origin);
+  const serviceArn = await taskServiceArnFor(access.classification);
+  if (!serviceArn) return respond(503, { error: 'No task service is published for this conversation', code: 'TASK_SERVICE_UNAVAILABLE' }, origin);
+  try {
+    const out = await invokeTaskServiceOp<{ ok: boolean; documents?: unknown[]; error?: string }>(lambdaClient, serviceArn, revising ? 'requestRevision' : adding ? 'addTaskDocument' : 'taskDocuments', {
+      taskId, channelArn, callerPersonId: personId, ...(adding ? { fileKey, name: str(body?.name, 200) } : {}), ...(revising ? { instructions } : {}),
+    });
+    if (out?.ok) return respond(200, { taskId, documents: out.documents ?? [] }, origin);
+    const status = out?.error === 'NOT_FOUND' ? 404 : out?.error === 'NOT_YOURS' ? 403 : 409;
+    return respond(status, { error: 'That version could not be read or attached', code: out?.error ?? 'REFUSED' }, origin);
+  } catch (error) {
+    console.error('[user-tasks-api] the versions could not be read or attached:', (error as Error)?.message);
+    return respond(500, { error: 'Could not read or attach that version', code: 'TASK_DOCUMENTS_FAILED' }, origin);
   }
 }
 
@@ -617,6 +681,7 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
   // POST /tasks opens a work item; GET /tasks/mine lists what the caller owns. One function owns the
   // resource, so the method is the only thing that distinguishes them.
   if (event.httpMethod === 'POST' && /\/tasks\/advance\/?$/.test(event.path || event.resource || '')) return advanceOnCard(event, origin);
+  if (event.httpMethod === 'POST' && /\/tasks\/documents(\/add|\/revise)?\/?$/.test(event.path || event.resource || '')) return documentsOnCard(event, origin);
   if (event.httpMethod === 'POST') return openWorkItem(event, origin);
   if (event.httpMethod !== 'GET') {
     return respond(405, { error: `${event.httpMethod} not supported` }, origin);
@@ -650,7 +715,7 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       if (outage) throw new ReachUnavailable(outage);
       return page.filter((task) => reach.get(task.channelArn)?.ok === true);
     };
-    const rows = await getActiveTasksForUser(personId, { limit: MAX_ITEMS, admit });
+    const rows = await getActiveTasksForUser(personId, { limit: MAX_ITEMS, admit, strict: true });
     // OWNED, not merely mentioned. `getActiveTasksForUser` queries the mirror partition keyed on the
     // owner, which since ADR-024 is written by one writer under one field - so a task an assistant
     // still owns cannot appear here, and one handed to this user cannot fail to.
@@ -660,7 +725,9 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       task,
       machinesOfTask(task, (task.assistantId && declared.get(task.assistantId)) || DEFAULT_MACHINES),
     ));
-    return respond(200, { items, count: items.length }, origin);
+    // WHETHER THE LIST IS EVERY OPEN ITEM: a list at its cap may leave some out, so a reader never takes an item missing from
+    // it as settled.
+    return respond(200, { items, count: items.length, complete: rows.length < MAX_ITEMS }, origin);
   } catch (error) {
     if (error instanceof ReachUnavailable) {
       const refused = refusalAnswer(error.access);

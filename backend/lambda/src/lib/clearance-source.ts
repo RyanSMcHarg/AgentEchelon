@@ -1,7 +1,7 @@
 /**
  * WHERE A PERSON'S CLEARANCE GROUPS COME FROM - the one identity-provider-specific step, behind a seam.
  *
- * ── WHY THIS EXISTS (owner decision 2026-09-14) ────────────────────────────────────────
+ * ── WHY THIS EXISTS ────────────────────────────────────────
  *
  * `user-clearance.ts` called `AdminListGroupsForUser` directly, on the live request path for both the
  * router and the channel flow, with no seam at all. Meanwhile IDENTITY-PROVIDER-GUIDE said two

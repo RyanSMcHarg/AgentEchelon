@@ -413,7 +413,7 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
     const turnStateTable = new dynamodb.Table(this, 'TurnStateTable', {
       partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      // THE LOCK AND ITS QUEUE NEVER EXPIRE, deliberately (maintainer, 2026-08-28): they carry no `ttl`. A
+      // THE LOCK AND ITS QUEUE NEVER EXPIRE, deliberately: they carry no `ttl`. A
       // drain holds that record across the time a person takes to answer a question the assistant asked,
       // so an expiry would delete a queue somebody was told was waiting. A conversation whose holder is
       // gone is recovered by the next message, which checks the state and takes the lock: an event
@@ -454,7 +454,7 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
     // alarm: an alarm that exists and is visible is the floor, and wiring it to a destination is the
     // deployer's choice.
     //
-    // IT WATCHES THE TAKEOVER NOW, not an expiry. The record no longer expires (maintainer, 2026-08-28),
+    // IT WATCHES THE TAKEOVER NOW, not an expiry. The record no longer expires,
     // because an expiry on a record that holds a queue and an unanswered question deletes work
     // somebody was told was waiting. The same failure is now observed by the next arriving message,
     // which takes a lock whose holder is past any possible turn - sooner, and by code that is running.
@@ -963,6 +963,10 @@ export class ConversationsStack extends cdk.Stack implements RouteSource {
       { api: 'person', method: 'GET', path: '/tasks/mine', handler: userTasksApiFn, capability: 'core', throttle: CONVERSATION_THROTTLE },
       // A PERSON TAKES A CHOICE ON THEIR TASK'S CARD (ADR-063 decision 2): no new grant; the task service authorizes it.
       { api: 'person', method: 'POST', path: '/tasks/advance', handler: userTasksApiFn, capability: 'core', throttle: CONVERSATION_THROTTLE },
+      // THE VERSIONS OF THE DOCUMENT A TASK APPROVES, read and attached by its approver.
+      { api: 'person', method: 'POST', path: '/tasks/documents', handler: userTasksApiFn, capability: 'core', throttle: CONVERSATION_THROTTLE },
+      { api: 'person', method: 'POST', path: '/tasks/documents/add', handler: userTasksApiFn, capability: 'core', throttle: CONVERSATION_THROTTLE },
+      { api: 'person', method: 'POST', path: '/tasks/documents/revise', handler: userTasksApiFn, capability: 'core', throttle: CONVERSATION_THROTTLE },
       { api: 'person', method: 'GET', path: '/turn-state', handler: turnStateApiFn, capability: 'core', throttle: CONVERSATION_THROTTLE },
     );
 

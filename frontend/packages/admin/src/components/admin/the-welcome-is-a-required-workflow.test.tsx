@@ -3,8 +3,8 @@
  *
  * The welcome is a required workflow, and every critical feature the console shows works. What it proves:
  *
- *  - a workflow's conversation types and the type an agent step opens are chosen from the declared types the
- *    classification may carry (and, on conversation-opened, those an event opens), never typed;
+ *  - where a workflow runs and the type an agent step opens are chosen from the declared types the classification
+ *    may carry (and, on conversation-opened, those an event opens), never typed;
  *  - a step the assistant takes itself offers only the version's own read tools, and names one it may not use;
  *  - the opening step carries the welcome's preview, which lays the opening's own fields over the deployment's welcome
  *    for the primary, resolves a version variable as the router does, says when a workflow that opens the room greets
@@ -12,7 +12,13 @@
  *  - the built-in opening is described as it is: only Opening text mentions an event.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent, within } from '@testing-library/react';
+import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
+
+vi.mock('../../services/eventTriggerService', () => ({
+  listEventTriggers: async () => ({ channelArn: 'arn:room', triggers: [] }), attachEventTrigger: vi.fn(), removeEventTrigger: vi.fn(),
+  listAccountAlarms: async () => [], listAccountRules: async () => [], listDeclaredHandoffs: async () => [],
+  readEventPolicy: async () => ({ allowedEventTypes: [{ source: 'ae.ops', detailType: 'Incident opened' }] }),
+}));
 import EventWorkflowEditor, { declaredTypesFor, stepReadTools, typesLeftOut } from './EventWorkflowEditor';
 import { GreetedWith, previewWelcome, welcomeContextFor } from './WelcomeEditorGuide';
 import type { EventWorkflow } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
@@ -38,7 +44,7 @@ describe('the types a workflow names are the declared ones', () => {
     expect(declaredTypesFor('conversation-opened', 'premium')).toEqual(['ops', 'customer-messaging']);
   });
 
-  it('offers an AWS event only the types it reaches, and says why each type is left out', () => {
+  it('offers an AWS event only the types it reaches, and says why each type is left out', async () => {
     expect(declaredTypesFor('event-received', 'premium')).toEqual(expect.arrayContaining(['ops-team', 'ops']));
     expect(declaredTypesFor('event-received', 'premium')).not.toContain('meeting');
     expect(declaredTypesFor('event-received', 'premium')).not.toContain('general');
@@ -49,15 +55,22 @@ describe('the types a workflow names are the declared ones', () => {
     ]));
     render(<EventWorkflowEditor workflows={{ esc: { on: 'event-received', types: ['ops-team'], initial: 'done', states: { done: { disposition: 'success' } } } as never }}
       onChange={vi.fn()} tools={TOOLS} classification="premium" />);
+    // Said beside the choice of where it runs, once an event is chosen.
+    fireEvent.click(screen.getByTestId('trigger-add'));
+    fireEvent.click(screen.getByTestId('trigger-source-ae'));
+    await waitFor(() => expect(screen.getByTestId('trigger-event-select').textContent).toContain('Incident opened'));
+    fireEvent.change(screen.getByTestId('trigger-event-select'), { target: { value: 'platform:ae.ops|Incident opened' } });
     expect(screen.getByTestId('event-workflow-type-left-out-meeting').textContent).toContain('meeting (a meeting\x27s conversation)');
   });
 
-  it('picks them by checkbox, so no name the deployment does not declare can be written', () => {
+  it('picks where it runs from a list, so no name the deployment does not declare can be written', () => {
     const onChange = vi.fn();
     render(<EventWorkflowEditor workflows={{ welcome: opens({}) }} onChange={onChange} tools={TOOLS} classification="premium" />);
-    const types = screen.getByTestId('event-workflow-types');
-    expect(within(types).queryByRole('textbox')).toBeNull();
-    fireEvent.click(screen.getByTestId('event-workflow-type-ops'));
+    fireEvent.click(screen.getByTestId('trigger-edit-on'));
+    const where = screen.getByTestId('trigger-where');
+    expect(within(where).queryByRole('textbox')).toBeNull();
+    fireEvent.change(screen.getByTestId('trigger-where-in-type'), { target: { value: 'ops' } });
+    fireEvent.click(screen.getByTestId('trigger-save'));
     expect(onChange).toHaveBeenLastCalledWith({ welcome: opens({}, ['ops']) });
   });
 });

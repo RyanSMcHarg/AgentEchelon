@@ -27,6 +27,7 @@ jest.mock('@aws-sdk/client-cloudwatch', () => ({
   CloudWatchClient: jest.fn((config: unknown) => { mockCwCtor(config); return { send: mockCwSend }; }),
   GetMetricDataCommand: jest.fn((input: unknown) => ({ __type: 'GetMetricData', input })),
   DescribeAlarmsCommand: jest.fn((input: unknown) => ({ __type: 'DescribeAlarms', input })),
+  ListMetricsCommand: jest.fn((input: unknown) => ({ __type: 'ListMetrics', input })),
 }), { virtual: true });
 
 jest.mock('@aws-sdk/client-ssm', () => ({
@@ -307,6 +308,42 @@ describe('the watched alarm in read_deployment_health', () => {
     }
     mockCwSend.mockImplementation(() => Promise.resolve({ MetricAlarms: [], MetricDataResults: [] }));
     expect((await readDeploymentHealth(CREDS, { watchedAlarm: WATCHED })).watchedAlarm?.unavailable).toMatch(/No alarm of this name exists/);
+  });
+
+  // WHAT CUSTOMERS EXPERIENCE IS READ FROM NUMBERS: the alarm's metric and the one beside it, before the change and since,
+  // with where they are measured, so the first look can say "4 in 10 requests fail" rather than "SuccessRate crossed 90".
+  it('carries the watched metric and the one beside it, before the change and since, with where they are measured', async () => {
+    const NOW = Date.parse('2026-11-07T20:30:00Z');
+    const pts = (vals: Array<[string, number]>) => ({ Timestamps: vals.map(([t]) => new Date(t)), Values: vals.map(([, v]) => v) });
+    mockCwSend.mockImplementation((cmd: { __type: string; input: { AlarmNames?: string[]; MetricDataQueries?: Array<{ Id: string }> } }) => {
+      if (cmd.__type === 'DescribeAlarms') {
+        return Promise.resolve({ MetricAlarms: (cmd.input.AlarmNames ?? []).includes(WATCHED)
+          ? [{ AlarmName: WATCHED, StateValue: 'ALARM', StateReason: 'Threshold Crossed', StateTransitionedTimestamp: new Date('2026-11-07T20:10:00Z'),
+            Namespace: 'Demo', MetricName: 'SuccessRate', Statistic: 'Average', Period: 60,
+            AlarmDescription: 'The Customer API serves sign-in\n  and workflow runs.',
+            Dimensions: [{ Name: 'Region', Value: 'us-east-1' }, { Name: 'Service', Value: 'customer-api' }] }]
+          : [] });
+      }
+      if (cmd.__type === 'ListMetrics') {
+        return Promise.resolve({ Metrics: [{ MetricName: 'LatencyP95', Dimensions: [{ Name: 'Region', Value: 'us-east-1' }, { Name: 'Service', Value: 'customer-api' }] }] });
+      }
+      if ((cmd.input.MetricDataQueries ?? []).some((q) => q.Id === 'a')) {
+        return Promise.resolve({ MetricDataResults: [
+          { Id: 'a', ...pts([['2026-11-07T19:40:00Z', 99.9], ['2026-11-07T19:50:00Z', 99.9], ['2026-11-07T20:05:00Z', 70], ['2026-11-07T20:20:00Z', 58], ['2026-11-07T20:29:00Z', 62.04]]) },
+          { Id: 'r0', ...pts([['2026-11-07T19:40:00Z', 210], ['2026-11-07T19:50:00Z', 190], ['2026-11-07T20:05:00Z', 2400], ['2026-11-07T20:29:00Z', 3100]]) },
+        ] });
+      }
+      return Promise.resolve({ MetricDataResults: [] });
+    });
+    const { readDeploymentHealth } = load(PATH);
+    const reading = (await readDeploymentHealth(CREDS, { watchedAlarm: WATCHED, now: () => NOW })).watchedAlarm;
+    expect(reading?.where).toBe('Region=us-east-1, Service=customer-api');
+    // WHAT THE SERVICE DOES, as its owner described it on the alarm: one line, for the first look to name what users cannot do.
+    expect(reading?.about).toBe('The Customer API serves sign-in and workflow runs.');
+    expect(reading?.figures).toEqual([
+      { metric: 'Demo/SuccessRate', before: 99.9, latest: 62, lowestSince: 58, highestSince: 70 },
+      { metric: 'Demo/LatencyP95', before: 200, latest: 3100, lowestSince: 2400, highestSince: 3100 },
+    ]);
   });
 
   it('reads no watched alarm where the conversation watches none', async () => {

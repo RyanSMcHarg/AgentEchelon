@@ -250,7 +250,7 @@ export async function handOverToFollowUpTriage(args: {
     return false;
   }
 
-  // ── AN AMENDMENT THE FOLD NEVER REACHED GOES BACK ON THE QUEUE (maintainer, 2026-09-01) ─────────────
+  // ── AN AMENDMENT THE FOLD NEVER REACHED GOES BACK ON THE QUEUE ─────────────
   //
   // The turn is over, so there is nothing left to fold into: whatever is still recorded here was
   // read, classified as amending, described back to the person, and then reached by nothing. It sat
@@ -364,7 +364,7 @@ export async function handOverToFollowUpTriage(args: {
   const awaiting = state.awaitingPeople?.length
     ? state.awaitingPeople
     : (state.awaitingPerson ? [state.awaitingPerson] : []);
-  // ── AND THE NOTICE A READING LEFT FOR THIS ANSWER IS SETTLED NOW (owner report, 2026-09-14) ─────
+  // ── AND THE NOTICE A READING LEFT FOR THIS ANSWER IS SETTLED NOW ─────
   //
   // A reading that folded follow-ups into this answer leaves the notice unsettled, because "caught
   // up" is not true for the person until the answer containing them is in the conversation. This is

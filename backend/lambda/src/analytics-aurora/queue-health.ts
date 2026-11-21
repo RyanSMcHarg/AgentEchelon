@@ -20,7 +20,7 @@
  * themselves. It is the one metric here with an alarm, and a zero is the healthy reading rather than a
  * missing one.
  *
- * It replaced `ReaperRelease` when the record's expiry was removed (maintainer, 2026-08-28). The expiry could
+ * It replaced `ReaperRelease` when the record's expiry was removed. The expiry could
  * only be observed after the fact by whatever swept the deletion; a takeover is observed at the moment
  * the recovery happens, by code that is running, which is strictly better evidence about the same failure.
  *

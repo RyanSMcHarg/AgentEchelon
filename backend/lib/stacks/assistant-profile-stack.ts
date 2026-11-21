@@ -22,6 +22,7 @@
  * declared) resolves via SSM dynamic refs (not Fn::importValue), so the assistant stacks deploy decoupled.
  */
 
+import { CONNECTOR_REPLAY_TABLE_PARAM } from './connectors-stack';
 import * as cdk from 'aws-cdk-lib';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
@@ -96,6 +97,11 @@ import {
   modelArnsForClassification,
   resolveSharedSSM,
   alertEmitterWiring,
+  putOwnProcessSourceStatement,
+  processEventBusName,
+  processBusRuleArn,
+  routerRoleName,
+  processBusSenderPolicy,
   readOwnAssistantsTagsStatement,
   abuseControlsWiring,
   turnQueueWiring,
@@ -1495,6 +1501,9 @@ export class AssistantsStack extends cdk.Stack {
     const profileServiceArn = userProfileServiceArn(this.node.tryGetContext('userProfileService'));
 
     const handlerRole = new iam.Role(this, 'AgentHandlerRole', {
+      // A FIXED NAME (DESIGN-PROCESSES section 12): the process event bus admits this classification's process source from this
+      // role's ARN alone, built from the name with no reference to this stack (`createProcessEventBus`).
+      roleName: routerRoleName(classification),
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       inlinePolicies: {
         // The handler READS channel classification metadata, member count and recent messages, and
@@ -2022,7 +2031,8 @@ export class AssistantsStack extends cdk.Stack {
       });
 
       // The same NARROW pair every other writer on this table holds: owned-field patches on a row this
-      // function is creating. No PutItem, no Delete, no Scan.
+      // function is creating, and the conditioned reset of an archived pattern conversation's row before its id is created
+      // again (`resetPatternRoomContext`, an UpdateItem that removes its fields). No PutItem, no Delete, no Scan.
       eventCreateRole.addToPrincipalPolicy(new iam.PolicyStatement({
         actions: ['dynamodb:GetItem', 'dynamodb:UpdateItem'],
         resources: [shared.channelContextArn],
@@ -2052,7 +2062,7 @@ export class AssistantsStack extends cdk.Stack {
     // ── THE GROUP-MEMBERSHIP RECONCILE (DESIGN-CONVERSATION-TYPES §6) ─────────────────────────────────
     //
     // Keeps every live conversation of a type whose membership is sourced from a group equal to that
-    // group, at THIS classification only. ONE PER CLASSIFICATION (owner decision, 2026-10-05): it acts as
+    // group, at THIS classification only. ONE PER CLASSIFICATION: it acts as
     // this classification's own assistant, which moderates only conversations created at this
     // classification, and Amazon Chime SDK refuses a membership change to anyone who is not a moderator.
     // IAM holds the same line: its membership changes are conditioned on the channel's classification
@@ -2588,7 +2598,7 @@ export class AssistantsStack extends cdk.Stack {
     // THE HANDOVER INVOKES THIS SAME FUNCTION as the assistant that owns the chain.
     //
     // A message answers the TASK, not whoever it was addressed to, so an assistant that receives one it
-    // does not own hands the turn to the one that does (rule 1, owner 2026-08-14). It cannot be sent as
+    // does not own hands the turn to the one that does (rule 1). It cannot be sent as
     // a message: ADR-023 measured that Amazon Chime SDK does not deliver a bot-authored message to
     // another bot's Lex, so it would reach nobody.
     //
@@ -2656,7 +2666,6 @@ export class AssistantsStack extends cdk.Stack {
       reservedConcurrentExecutions: Number(this.node.tryGetContext('eventTriggerRelayConcurrency') ?? 2),
     });
     agentHandler.grantInvoke(eventTriggerRelay);
-    agentHandler.addEnvironment('EVENT_POLICY_PARAM', `${SSM_ROOT}/event-triggers/policy`);
     agentHandler.addToRolePolicy(new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [cdk.Arn.format({ service: 'ssm', resource: 'parameter', resourceName: `${SSM_ROOT}/event-triggers/policy`.replace(/^\//, '') }, this)] }));
     // A RELAY THAT THROTTLES is a storm the concurrency is holding back, which an operator should hear about.
     new cloudwatch.Alarm(this, 'EventTriggerRelayThrottled', {
@@ -2676,10 +2685,46 @@ export class AssistantsStack extends cdk.Stack {
       sourceArn: `arn:aws:events:${this.region}:${this.account}:rule/${eventWatchRulePrefix(classification)}*`,
     });
     agentHandler.addEnvironment('WATCH_RULE_ARN_PREFIX', `arn:aws:events:${this.region}:${this.account}:rule/${eventWatchRulePrefix(classification)}`);
-    agentHandler.addToRolePolicy(new iam.PolicyStatement({
-      sid: 'ReadOwnWatchRuleBindings', actions: ['events:ListTagsForResource'],
-      resources: [`arn:aws:events:${this.region}:${this.account}:rule/${twelveCharIds(eventWatchRulePrefix(classification))}`],
-    }));
+    // THE PROCESS EVENT BUS (DESIGN-PROCESSES section 12): the one bus a hand-off is put on, and its watch rules are read on.
+    agentHandler.addEnvironment('PROCESS_EVENT_BUS', processEventBusName());
+    // A HAND-OFF'S RULES ARE ON THE PROCESS EVENT BUS, and reach the same relay: only this classification's, by their prefixes.
+    eventTriggerRelay.addPermission('ProcessBusTriggerRules', {
+      principal: new iam.ServicePrincipal('events.amazonaws.com'),
+      sourceArn: processBusRuleArn(this, `${eventTriggerRulePrefix(classification)}*`),
+    });
+    eventTriggerRelay.addPermission('ProcessBusWatchRules', {
+      principal: new iam.ServicePrincipal('events.amazonaws.com'),
+      sourceArn: processBusRuleArn(this, `${eventWatchRulePrefix(classification)}*`),
+    });
+    // THIS CLASSIFICATION'S PROCESS SOURCE IS ITS ROUTER'S ALONE, on the bus's own policy (layer one), held by this stack so it
+    // comes and goes with the classification; the router's identity statement below is layer two.
+    processBusSenderPolicy(this, classification);
+    // A CONNECTOR FACT'S PERSON OR CONVERSATION is trusted only where the receiver's own record agrees (DESIGN-EVENT-TARGETS 11.2,
+    // 11.3): the router reads that record, and nothing else of the receiver's.
+    // A MANAGED POLICY, since the handler's inline policy is at its bound: what an event trigger's run reads before it starts,
+    // and the one hand-off put a run may make (the role holds as many managed policies as IAM allows, so this one carries it).
+    new iam.ManagedPolicy(this, 'AgentHandlerReadsEventTriggerBindings', {
+      roles: [handlerRole],
+      statements: [
+        // A HAND-OFF IS PUT ON THE PROCESS EVENT BUS, ON THIS CLASSIFICATION'S OWN PROCESS SOURCE, and no other (SPEC-PROCESSES P4).
+        putOwnProcessSourceStatement(this, classification),
+        new iam.PolicyStatement({
+          sid: 'ReadTheConnectorReceiversRecordName', actions: ['ssm:GetParameter'],
+          resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${CONNECTOR_REPLAY_TABLE_PARAM}`],
+        }),
+        new iam.PolicyStatement({
+          sid: 'ReadTheConnectorReceiversRecord', actions: ['dynamodb:GetItem'],
+          resources: [`arn:aws:dynamodb:${this.region}:${this.account}:table/${STACK_PREFIX}Connectors-ConnectorReplayTable*`],
+        }),
+        // A WATCH, PATTERN OR NAMED TRIGGER'S BINDING, read from its rule's tags: this classification's watch rules alone.
+        new iam.PolicyStatement({
+          sid: 'ReadOwnWatchRuleBindings', actions: ['events:ListTagsForResource'],
+          // A HAND-OFF'S WATCH RULE is on the process event bus (DESIGN-PROCESSES section 12).
+          resources: [`arn:aws:events:${this.region}:${this.account}:rule/${twelveCharIds(eventWatchRulePrefix(classification))}`, processBusRuleArn(this, twelveCharIds(eventWatchRulePrefix(classification)))],
+        }),
+      ],
+    });
+
     // A WORKFLOW STEP OPENS A CHILD CONVERSATION (WT120) through this classification's own creator, by its fixed name, and no other.
     // The invoke itself is granted with the creator (`AgentHandlerOpensTypedConversations`).
     if (eventInitiatedTypes.length > 0) {

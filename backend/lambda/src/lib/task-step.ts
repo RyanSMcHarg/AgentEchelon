@@ -38,6 +38,28 @@ export type TaskStepPriority = typeof TASK_PRIORITIES[number];
 export interface TaskStep {
   /** The machine the task follows: one the version selects, or a platform reference machine. */
   machine: string;
+  /**
+   * WHAT THE ASKED ASSISTANT'S ANSWER IS DELIVERED AS, on a step that asks one (`ask`): `file` attaches it as a
+   * Markdown file whatever the intent declares, so the workflow decides that a draft is a document.
+   */
+  deliver?: 'file';
+  /**
+   * THE CARD IS KEPT AT THE TOP OF THE CONVERSATION: its choices are offered in the conversation's pinned band,
+   * beside where it stands, and its message keeps its words without them, so a decision as weighty as resolving an incident
+   * is taken from the top, with the state in view, never from an early message by reflex.
+   */
+  pinned?: true;
+  /**
+   * WHO DECIDES IT, BESIDES ITS ASSIGNEE: the participant roles whose holders may take its choices, and reopen it where its
+   * machine declares a reopen. Checked against the conversation's own record of who holds each role when the choice is
+   * pressed, never against the request. A step that names deciders is moved only by a press: no assistant's turn moves it.
+   */
+  decidedBy?: string[];
+  /**
+   * THE STEP TAKES THE TASK WHOSE REOPEN STARTED ITS RUN (`reopened`), rather than opening another: on a `task-reopened`
+   * workflow, the reopened task is this step's, so its next ending continues this run.
+   */
+  takes?: 'reopened';
   /** The person the task is for: its requester and owner. Absent, the task is for nobody. */
   for?: TaskPerson;
   /** Who does the work. Absent, the run's own assistant. */
@@ -84,7 +106,7 @@ export interface TaskStep {
    */
   assigned?: { template: string; withoutMeetings?: string };
   /**
-   * ITS SETTLEMENT ENDS THE RUN (owner decision 2026-11-14), on a step that goes on alongside its task only: where the run
+   * ITS SETTLEMENT ENDS THE RUN, on a step that goes on alongside its task only: where the run
    * has not reached its end when the task settles, the run ends now, on its success terminal, its other open tasks are
    * cancelled with the run's end as their reason, and the conversation that opened this one is told how it ended. Absent,
    * the settlement is recorded and the run ends once it reaches its end.
@@ -176,7 +198,10 @@ export const MAX_TASK_REMINDERS = 5;
 export const DEFAULT_TASK_REMINDERS = 3;
 
 /** The fields a task step declares, in the order the console and the visual builder show them. */
-export const TASK_STEP_FIELDS = ['machine', 'for', 'by', 'visibility', 'priority', 'deadline', 'continue', 'fields', 'ask', 'notice', 'assigned', 'endsRun', 'movesTo', 'confirmEnd'] as const;
+/** The most participant roles one step names as its deciders. */
+export const MAX_DECIDING_ROLES = 4;
+
+export const TASK_STEP_FIELDS = ['machine', 'for', 'by', 'visibility', 'priority', 'deadline', 'continue', 'fields', 'ask', 'notice', 'assigned', 'endsRun', 'movesTo', 'confirmEnd', 'deliver', 'pinned', 'decidedBy', 'takes'] as const;
 
 /**
  * THE FIELDS A REQUEST TO ANOTHER ASSISTANT'S ROLE LEAVES TO THAT ASSISTANT (WT118, DESIGN-WORKFLOWS-AND-TASKS section 1): who
@@ -295,6 +320,16 @@ export function taskStepErrors(
   const errs: string[] = [];
   for (const k of Object.keys(step)) {
     if (!(TASK_STEP_FIELDS as readonly string[]).includes(k)) errs.push(`${at}.${k} is not a field of a task step; it is { ${TASK_STEP_FIELDS.join(', ')} }`);
+    if (k === 'deliver' && (step.deliver !== 'file' || !step.ask)) errs.push(`${at}.deliver is file, on a step that asks an assistant (ask)`);
+    if (k === 'pinned' && step.pinned !== true) errs.push(`${at}.pinned is true, or left out`);
+    if (k === 'decidedBy') {
+      const roles = step.decidedBy;
+      const ok = Array.isArray(roles) && roles.length >= 1 && roles.length <= MAX_DECIDING_ROLES
+        && roles.every((r) => typeof r === 'string' && PARTICIPANT_ROLE_NAME.test(r)) && new Set(roles).size === roles.length;
+      if (!ok) errs.push(`${at}.decidedBy is a list of 1 to ${MAX_DECIDING_ROLES} participant role names, each once`);
+      if (!isObject(step.by) || typeof (step.by as { participantRole?: unknown }).participantRole !== 'string') errs.push(`${at}.decidedBy is on a step a participant role works (by: { participantRole })`);
+    }
+    if (k === 'takes' && step.takes !== 'reopened') errs.push(`${at}.takes is reopened, or left out`);
   }
   const allowed = machinesAStepMayOpen(ctx.machines);
   const machine = typeof step.machine === 'string' ? allowed[step.machine] : undefined;
@@ -420,7 +455,7 @@ export function endsRunErrors(step: Record<string, unknown>, at: string, machine
 }
 
 /**
- * WHERE A SETTLING PRESS GOES (owner decision 2026-11-14): the step's `confirmEnd` state, where the press would settle the
+ * WHERE A SETTLING PRESS GOES: the step's `confirmEnd` state, where the press would settle the
  * task from another state while the run has not reached its end; else the choice as pressed.
  */
 export function pressTarget(

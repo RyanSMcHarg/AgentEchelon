@@ -429,6 +429,17 @@ export interface StepAction {
  * The edges a state's action outcome drives: `onSuccess`, and `onFailure` or, absent, the state's
  * transition into a terminal `failure` state. Null when the state declares no action.
  */
+/**
+ * A QUIET STEP: a state the platform runs and nobody speaks in. It declares an `action` and no `prompt`, and hands nothing
+ * to a reply (it produces and delivers nothing, and its action is neither a drawn image nor a document, which ride the turn's
+ * reply), so its turn runs the action with no model call and posts no message. A state it lands on that declares a prompt is
+ * taken up as a turn of its own.
+ */
+export function isQuietStep(def: Pick<TaskStateDef, 'action' | 'prompt' | 'produces' | 'delivers'> | undefined): boolean {
+  if (!def?.action || (typeof def.prompt === 'string' && def.prompt.trim()) || def.produces || def.delivers) return false;
+  return def.action.tool !== GENERATE_IMAGE_ACTION && def.action.tool !== DELIVER_DOCUMENT_TOOL_NAME;
+}
+
 export function actionEdgesOf(
   machine: TaskStateMachine | undefined,
   state: string,
@@ -574,6 +585,9 @@ export const ADVANCE_TASK_STATE_TOOL_NAME = 'advance_task_state';
  * they are rendered by a module the tool's own module imports.
  */
 export const DELIVER_DOCUMENT_TOOL_NAME = 'deliver_document';
+
+/** The platform's machine a run's runbook is drawn on, quietly (DESIGN-CONVERSATION-DASHBOARDS section 8.1). */
+export const DASHBOARD_RUNBOOK_MACHINE = 'dashboard_runbook';
 
 /**
  * THE PLATFORM ACTION THAT GENERATES A STEP'S IMAGE (ADR-064 decision E): run on entering a state that produces an
@@ -808,6 +822,8 @@ export const PLATFORM_MACHINE_KEYS = [
   'final_notice',
   // A conversation dashboard refreshed by a workflow that requires it (DESIGN-CONVERSATION-DASHBOARDS section 5).
   'dashboard_refresh',
+  // A run's runbook drawn again on its conversation's dashboards, quietly (DESIGN-CONVERSATION-DASHBOARDS section 8.1).
+  'dashboard_runbook',
   // A form (WT50): a written answer or a short set of fields, collected the same way by every assistant.
   'form',
   // A meeting's action item (SPEC-ASSISTANT-MEETINGS FR67): what a person was given to do in a recorded meeting.
@@ -817,6 +833,17 @@ export const PLATFORM_MACHINE_KEYS = [
 /** Whether a machine key is one of the platform's own (`PLATFORM_MACHINE_KEYS`). */
 export function isPlatformMachineKey(key: string): boolean {
   return (PLATFORM_MACHINE_KEYS as readonly string[]).includes(key);
+}
+
+/**
+ * WHETHER THE PLATFORM RAISES A MACHINE'S TASKS ITSELF: one of its own machines whose first step acts on entry (a declared
+ * action, run when the task opens), so a workflow step or the platform opens its task and no person's message is ever
+ * classified as it. Its intent has no classified turns to measure.
+ */
+export function isPlatformRaisedMachine(key: string | undefined): boolean {
+  if (!key || !isPlatformMachineKey(key)) return false;
+  const machine = DEFAULT_TASK_STATE_MACHINES[key];
+  return !!machine?.states[machine.initial]?.action;
 }
 
 /** The platform's report template (`lib/config/default-templates/report.md`), which `report_generation` delivers in. */
@@ -840,7 +867,7 @@ export const DEFAULT_TASK_STATE_MACHINES: Record<string, TaskStateMachine> = {
    * owner so state and responsibility cannot disagree, stall supervision, an operator who can see and
    * stop one, and resolution timing that separates the assistant's work from human think time.
    *
-   * ONE DRAIN PER QUEUE, NOT PER PASS (maintainer, 2026-09-03). A chain of readings is ONE reading that
+   * ONE DRAIN PER QUEUE, NOT PER PASS. A chain of readings is ONE reading that
    * took more than one turn, so the task's identity has to survive the handover - carried on the turn
    * record rather than derived from a correlation id, which changes per link.
    *
@@ -865,7 +892,7 @@ export const DEFAULT_TASK_STATE_MACHINES: Record<string, TaskStateMachine> = {
       // room saw the drain skip from reading straight to done while the private half was still being
       // written. The messages were always delivered; the stage was what went missing.
       reviewing: { transitions: ['clarifying', 'addressing_private', 'clearing'], rests: true },
-      // Put to them - AND THE DRAIN DOES NOT WAIT FOR THE ANSWER (maintainer, 2026-09-03).
+      // Put to them - AND THE DRAIN DOES NOT WAIT FOR THE ANSWER.
       //
       // This is the one state in this machine with no `awaits`, deliberately, and it declared one
       // until the rule was stated: a drain must never depend on a human, because a queue that lives
@@ -1010,6 +1037,7 @@ Do NOT propose solutions yet. Focus on understanding the problem.`,
         // THE ASSISTANT MAY PUBLISH THE ROOM'S DASHBOARD here, where its version declares the tool (DESIGN-CONVERSATION-DASHBOARDS).
         tools: ['read_deployment_health', 'publish_dashboard'],
         prompt: `This is the first step of the incident's first look. Read the deployment's health with read_deployment_health and report:
+- Customer experience: what a customer of the affected service sees right now, in one or two plain sentences, read from the watched alarm's figures (its metric and the metrics beside it, before the change and now) and its description of what the service does. Name the actions users cannot take or that are slow (for example signing in, or starting a workflow), as the description names them. Turn each figure into what a person notices, with the figure beside it: for example "about 4 in 10 requests to the customer API fail (success rate 62%, normally 99.9%)" or "pages that load take 3 seconds instead of 0.2". Name the service and Region from where the alarm measures, and since when. Say only what the figures show; where they show no customer-facing signal, say so.
 - Which alarms are firing or recently changed state, and what each points at
 - The one thing worth checking first
 Where publish_dashboard is available, publish the conversation's dashboard so everyone here shares one current view, and say so in one line.
@@ -1256,7 +1284,7 @@ to confirm or correct it before you outline anything.`,
   // place_item advances on the propose_item tool's success side-effect (collecting -> confirming),
   // not a prose keyword or an in-band marker.
   //
-  // `placed` RECORDS THE APPROVAL, not the host apply (maintainer decision 2026-08-19). The comment here
+  // `placed` RECORDS THE APPROVAL, not the host apply. The comment here
   // used to call it the apply landing, with the task resting in `confirming` until the apply arrived,
   // and that described a system this is not: nothing outside a model turn can move a machine
   // (`advance_task_state` is callable only inside the tool loop, and the reply path keys on a message
@@ -1331,7 +1359,7 @@ your job now is to record their decision, not to make it again:
    * for the same reason `escalated` does: the ending is real, and it is not the assistant's own.
    */
   /**
-   * A QUEUED MESSAGE WHOSE REQUEST THE READING COULD NOT MAKE OUT (maintainer, 2026-09-03).
+   * A QUEUED MESSAGE WHOSE REQUEST THE READING COULD NOT MAKE OUT.
    *
    * The placeholder. Its whole point is that it claims NOTHING about what the work is: the message is
    * held safely, the assistant says it could not tell what was being asked, and one answer turns it
@@ -1348,7 +1376,7 @@ your job now is to record their decision, not to make it again:
    * having done its job - or drops it, which is a decision and not a failure.
    */
   /**
-   * TWO PEOPLE ASKED FOR WHAT LOOKS LIKE ONE THING (maintainer, 2026-09-03).
+   * TWO PEOPLE ASKED FOR WHAT LOOKS LIKE ONE THING.
    *
    * A queue is not one person's. When the reading groups messages from DIFFERENT senders under one
    * subject, that is the moment two requests might really be one - and merging them is not triage's
@@ -1396,7 +1424,7 @@ your job now is to record their decision, not to make it again:
   },
 
   /**
-   * IS THE WORK ALREADY RUNNING STILL WANTED (ADR-033, owner 2026-09-03).
+   * IS THE WORK ALREADY RUNNING STILL WANTED (ADR-033).
    *
    * When a reading cannot tell whether the turn it is queued behind is still wanted, it asks. That
    * question used to exist ONLY as a sentence in the proposal and a stage on the notice - nothing
@@ -1485,7 +1513,7 @@ your job now is to record their decision, not to make it again:
   // AN INCIDENT ITS OWN CONVERSATION HOLDS OPEN (WT122): what its on-call resolves once the work there is done. While it is
   // open, the team conversation that opened it has an open incident, so a repeat of its event opens no second conversation,
   // and it counts against the policy's open incidents. A platform machine, fixed: every team counts one the same way.
-  // RESOLVING WHILE THE RUNBOOK HAS STEPS OPEN IS CONFIRMED FIRST (owner decision 2026-11-14): the `ops-room` step that opens it
+  // RESOLVING WHILE THE RUNBOOK HAS STEPS OPEN IS CONFIRMED FIRST: the `ops-room` step that opens it
   // names `confirming_resolve` as its `confirmEnd`, so a press of Resolved while its run is mid-way moves the task there, and
   // the on-call is asked, naming the steps still open, to resolve it or keep it open. Kept open, they are handed its card again.
   incident_ownership: {
@@ -1507,7 +1535,8 @@ your job now is to record their decision, not to make it again:
         prompt: `The on-call asked to resolve this incident while its runbook still has steps open. When they confirm, advance to resolved; when they keep it open, advance to open.`,
         notice: { to: 'worker', template: 'incident-resolve-confirm' },
       },
-      resolved: { transitions: [], terminal: 'success' },
+      // A RESOLVED INCIDENT MAY BE REOPENED, by a press of someone its step names as deciding it (`decidedBy`).
+      resolved: { transitions: [], terminal: 'success', reopens: ['open'] },
     },
   },
 
@@ -1524,6 +1553,22 @@ your job now is to record their decision, not to make it again:
         prompt: 'Say in one line that the dashboard is updated. Do not restate its figures.',
       },
       published: { transitions: [], terminal: 'success' },
+      failed: { transitions: [], terminal: 'failure' },
+    },
+  },
+  // A RUN'S RUNBOOK DRAWN AGAIN (DESIGN-CONVERSATION-DASHBOARDS section 8.1): the platform opens it when a labeled step of a
+  // run moves, carrying the progress in `details.runbook`. Its one step is quiet (an action and no prompt): the action draws
+  // each dashboard already published again, with no model call and no message.
+  dashboard_runbook: {
+    initial: 'drawing',
+    states: {
+      drawing: {
+        transitions: ['drawn', 'failed'],
+        action: { tool: 'publish_dashboard', args: { runbook: 'detail:runbook', onlyIfPublished: true } },
+        onSuccess: 'drawn',
+        onFailure: 'failed',
+      },
+      drawn: { transitions: [], terminal: 'success' },
       failed: { transitions: [], terminal: 'failure' },
     },
   },
@@ -2448,14 +2493,18 @@ export function authorizeTransition(
    * (`decidingValues`, ADR-060 decision 6): plain data, already held back by trust, call site and audience, so the
    * task service decides the same move the turn would. Absent, every condition is unresolved and does not hold.
    */
-  opts: { by?: 'tool' | 'system'; conditionValues?: Readonly<Record<string, VariableValue>> } = {},
+  opts: {
+    by?: 'tool' | 'system'; conditionValues?: Readonly<Record<string, VariableValue>>;
+    /** A decider's own press, checked against the conversation's record of who holds the step's deciding roles: a person asking. */
+    reopenByDecider?: boolean;
+  } = {},
 ): TransitionAuthz {
   const machine = machines[taskType];
   const values = opts.conditionValues ?? {};
   const fromDef = machine?.states[from];
   const meets = (target: string) => conditionsHold(machine?.states[target], fromDef, target, values);
   const ordinary = legalTransitionsFrom(taskType, from, machines);
-  const reopens = (opts.by ?? 'tool') === 'tool' ? reopenTargetsFrom(taskType, from, machines) : [];
+  const reopens = (opts.by ?? 'tool') === 'tool' || opts.reopenByDecider ? reopenTargetsFrom(taskType, from, machines) : [];
   // THE LEGAL SET ECHOED BACK IS THE ONE THE CONDITIONS ADMIT, so a model refused a gated move is shown where it may go.
   const legal = [...ordinary, ...reopens].filter(meets);
   if (!isDeclaredState(taskType, to, machines)) {

@@ -69,7 +69,7 @@ export interface IntakeField {
   /**
    * WHAT ALREADY ASSERTS THIS FIELD, so the intake does not ask for it.
    *
-   * Owner rule (2026-09-03): an intake runs only after the assistant has CHECKED and cannot resolve
+   * An intake runs only after the assistant has CHECKED and cannot resolve
    * the field. That makes intake a FALLBACK rather than a gate, so a deployment can declare fields
    * without interrogating people about what it already knows.
    *
@@ -84,7 +84,7 @@ export interface IntakeField {
    *   `classification`  the conversation's classification IS the claim
    *   `profile`         the person's stored profile already has this key
    *
-   * CHECKED IS DELIBERATELY CHEAP (owner decision, 2026-09-14): only what the turn already holds. No
+   * CHECKED IS DELIBERATELY CHEAP: only what the turn already holds. No
    * tool call, because an intake must not sit in front of a question somebody is waiting on - and a
    * thorough check that consults company docs would do exactly that.
    *
@@ -471,8 +471,7 @@ export interface IntakeStep {
   /**
    * THIS TURN WAS NOT AN ANSWER: hand it back to ordinary routing instead of replying here.
    *
-   * The owner rule (2026-09-03) is that an intake must never sit in front of a question somebody is
-   * waiting on. It did: a person opened a conversation, was asked a preference question, typed "What
+   * An intake never sits in front of a question somebody is waiting on. Where it did, a person opened a conversation, was asked a preference question, typed "What
    * is AgentEchelon?" and had that STORED as their answer - then every following message was met with
    * "Please reply yes or no" forever, because only yes/no advances the confirmation. There was no
    * escape and no way to reach the assistant at all.

@@ -403,7 +403,8 @@ describe('the processor drafts and offers it, and executes nothing (rules 5 and 
 
   it('the draft is vetted, written as a proposal, and offered to its one addressee on a card; nothing runs it', () => {
     expect(processor).toMatch(/\.\.\.\(op \? \{ vet: \(text: string\) => !proposalDraftRefusal\(text\) \} : \{\}\)/);
-    expect(processor).toMatch(/postOutput: \(content\) => \(op \? offerProposal\(content\) : post\(content, targetsOf\(def\.to\), 'posted'\)\)/);
+    // A PROPOSAL IS OFFERED FIRST, whatever else the step declares: a step that delivers a file posts it only when it proposes nothing.
+    expect(processor).toMatch(/postOutput: \(content\) => \(op \? offerProposal\(content\) : asFile \? postAsFile\(content\) : post\(content, targetsOf\(def\.to\), 'posted'\)\)/);
     const offer = processor.slice(processor.indexOf('const offerProposal = async'), processor.indexOf('// THE BRIEF THE ADDRESSED PERSON'));
     expect(offer.indexOf('writeProposal(')).toBeGreaterThan(-1);
     expect(offer.indexOf('writeProposal(')).toBeLessThan(offer.indexOf('await post('));

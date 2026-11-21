@@ -1,5 +1,5 @@
 /**
- * A QUEUE IS THE CONVERSATION'S, NOT ONE MEMBER'S (maintainer, 2026-09-05).
+ * A QUEUE IS THE CONVERSATION'S, NOT ONE MEMBER'S.
  *
  * The queue holds whatever arrived while the assistant was working, from whoever sent it, and the
  * subjects read out of it belong to all of them. The offer that follows was addressed to a single

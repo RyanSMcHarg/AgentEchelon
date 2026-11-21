@@ -1,6 +1,5 @@
 /**
- * A READER THAT IS NOT A PERSON IS NAMED BY THE IAM PRINCIPAL THAT SIGNED ITS REQUEST (`access-log.ts`, owner decision
- * 2026-11-12).
+ * A READER THAT IS NOT A PERSON IS NAMED BY THE IAM PRINCIPAL THAT SIGNED ITS REQUEST (`access-log.ts`).
  *
  * A content read by a signed principal no person id resolves from is recorded with `actorKind: 'iam'`, its principal's ARN,
  * and `iam#<arn>` as its `byActor` key, then served. The ARN is the one API Gateway set on the request context; a header

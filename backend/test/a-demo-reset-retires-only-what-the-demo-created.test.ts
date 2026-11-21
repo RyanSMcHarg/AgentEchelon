@@ -171,3 +171,27 @@ describe("the seed's account teams are part of the cast", () => {
     expect(fn.slice(0, fn.indexOf('\n}'))).toContain(`return '${DEMO_DEFAULT_EMAIL_DOMAIN}';`);
   });
 });
+
+describe('a deleted conversation leaves nothing that names it', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { recordsNamingDeleted } = require('../scripts/lib/reset-demo.cjs');
+  const APP = 'arn:aws:chime:us-east-1:111122223333:app-instance/i';
+  const rows = [
+    { channelArn: `${APP}/channel/team`, children: [{ channelId: 'inc-a' }, { channelId: 'kept' }, { channelId: 'inc-b' }] },
+    { channelArn: 'watch#alarm#AgentEchelon-x', room: `${APP}/channel/inc-b` },
+    { channelArn: 'watch#alarm#AgentEchelon-y', room: `${APP}/channel/kept` },
+    { channelArn: `${APP}/channel/inc-a`, children: [{ channelId: 'inc-b' }] },
+  ];
+
+  it('names each parent entry, highest index first, and each watch record whose room was deleted', () => {
+    expect(recordsNamingDeleted(rows, [`${APP}/channel/inc-a`, `${APP}/channel/inc-b`])).toEqual({
+      children: [{ channelArn: `${APP}/channel/team`, index: 2, channelId: 'inc-b' }, { channelArn: `${APP}/channel/team`, index: 0, channelId: 'inc-a' }],
+      watches: [{ key: 'watch#alarm#AgentEchelon-x', room: `${APP}/channel/inc-b` }],
+    });
+  });
+
+  it('DENY: keeps every record naming a conversation that stands', () => {
+    expect(recordsNamingDeleted(rows, [])).toEqual({ children: [], watches: [] });
+    expect(recordsNamingDeleted(rows, [`${APP}/channel/other`])).toEqual({ children: [], watches: [] });
+  });
+});

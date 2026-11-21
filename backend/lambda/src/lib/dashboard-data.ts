@@ -22,7 +22,7 @@ export const RELATED_METRICS_MAX = 3;
 /** One series: points oldest first, each an ISO time and a value. A missing bucket is absent, never zero. */
 export interface DashboardSeries {
   key: 'invocations' | 'errors' | 'throttles' | 'durationMs' | 'alarmMetric' | 'related';
-  /** A related series' metric, as `Namespace/MetricName`; every other series is named by the dashboard's labels. */
+  /** The alarm's or a related series' metric, as `Namespace/MetricName`; every other series is named by the dashboard's labels. */
   metric?: string;
   points: Array<{ t: string; v: number }>;
 }
@@ -130,32 +130,43 @@ async function readAlarm(client: CloudWatchClient, now: number, name: string): P
       ...(typeof a.Threshold === 'number' ? { threshold: a.Threshold } : {}),
       ...(a.ComparisonOperator ? { comparison: a.ComparisonOperator } : {}),
     };
-    if (!a.Namespace || !a.MetricName) return { alarm };
-    const namespace = a.Namespace;
-    const period = Math.max(a.Period ?? DASHBOARD_PERIOD_SECONDS, 60);
-    const related = await relatedMetricNames(client, { Namespace: namespace, MetricName: a.MetricName, Dimensions: a.Dimensions });
-    // THE WATCHED METRIC AT THE ALARM'S OWN STATISTIC, those beside it at their average (the alarm's statistic is chosen
-    // for its metric alone), every series at the alarm's period so they line up point for point. One read for all.
-    const queries: MetricDataQuery[] = [
-      { Id: 'a', MetricStat: { Metric: { Namespace: namespace, MetricName: a.MetricName, Dimensions: a.Dimensions }, Period: period, Stat: a.Statistic ?? a.ExtendedStatistic ?? 'Average' } },
-      ...related.map((m, i) => ({ Id: `r${i}`, MetricStat: { Metric: { Namespace: namespace, MetricName: m, Dimensions: a.Dimensions }, Period: period, Stat: 'Average' } })),
-    ];
-    const data = await client.send(new GetMetricDataCommand({
-      StartTime: new Date(now - DASHBOARD_WINDOW_MINUTES * 60_000),
-      EndTime: new Date(now),
-      MetricDataQueries: queries,
-    })).catch(() => undefined);
-    const byId = new Map((data?.MetricDataResults ?? []).map((r) => [r.Id, r]));
-    return {
-      alarm,
-      series: [
-        { key: 'alarmMetric', points: pointsOf(byId.get('a')) },
-        ...related.map((m, i): DashboardSeries => ({ key: 'related', metric: `${namespace}/${m}`, points: pointsOf(byId.get(`r${i}`)) })),
-      ],
-    };
+    const series = await alarmSeries(client, now, a);
+    return series ? { alarm, series } : { alarm };
   } catch {
     return { unavailable: true };
   }
+}
+
+/**
+ * THE SERIES OF AN ALARM ALREADY DESCRIBED: its metric and the metrics beside it, over the dashboard's window. The health read
+ * uses the same series for the figures the first look reads customer experience from, so the dashboard and the assistant's
+ * words read one population. Undefined for an alarm that watches no single metric.
+ */
+export async function alarmSeries(
+  client: Pick<CloudWatchClient, 'send'>,
+  now: number,
+  a: { Namespace?: string; MetricName?: string; Dimensions?: Dimension[]; Period?: number; Statistic?: string; ExtendedStatistic?: string },
+): Promise<DashboardSeries[] | undefined> {
+  if (!a.Namespace || !a.MetricName) return undefined;
+  const namespace = a.Namespace;
+  const period = Math.max(a.Period ?? DASHBOARD_PERIOD_SECONDS, 60);
+  const related = await relatedMetricNames(client, { Namespace: namespace, MetricName: a.MetricName, Dimensions: a.Dimensions });
+  // THE WATCHED METRIC AT THE ALARM'S OWN STATISTIC, those beside it at their average (the alarm's statistic is chosen
+  // for its metric alone), every series at the alarm's period so they line up point for point. One read for all.
+  const queries: MetricDataQuery[] = [
+    { Id: 'a', MetricStat: { Metric: { Namespace: namespace, MetricName: a.MetricName, Dimensions: a.Dimensions }, Period: period, Stat: a.Statistic ?? a.ExtendedStatistic ?? 'Average' } },
+    ...related.map((m, i) => ({ Id: `r${i}`, MetricStat: { Metric: { Namespace: namespace, MetricName: m, Dimensions: a.Dimensions }, Period: period, Stat: 'Average' } })),
+  ];
+  const data = await client.send(new GetMetricDataCommand({
+    StartTime: new Date(now - DASHBOARD_WINDOW_MINUTES * 60_000),
+    EndTime: new Date(now),
+    MetricDataQueries: queries,
+  })).catch(() => undefined);
+  const byId = new Map((data?.MetricDataResults ?? []).map((r) => [r.Id, r]));
+  return [
+    { key: 'alarmMetric', metric: `${namespace}/${a.MetricName}`, points: pointsOf(byId.get('a')) },
+    ...related.map((m, i): DashboardSeries => ({ key: 'related', metric: `${namespace}/${m}`, points: pointsOf(byId.get(`r${i}`)) })),
+  ];
 }
 
 /** Read the dashboard's data as the assistant. Null credentials read nothing. */

@@ -9,7 +9,14 @@
 const { GetCommand } = require('@aws-sdk/lib-dynamodb');
 
 const NAMESPACE = 'AgentEchelon/Demo';
-const ALARM_NAME = 'AgentEchelon-demo-incident';
+/**
+ * THE ALARM IS NAMED FOR THE SERVICE IT WATCHES, so the incident it opens is too ("Customer API Availability"), and its
+ * description says what the service does for the people who use it, which the incident and its first look read.
+ */
+const ALARM_NAME = 'Customer-API-availability';
+const ALARM_DESCRIPTION = 'The Customer API serves the StratumFlow web app and customers\' own integrations: signing in, creating and '
+  + 'running workflows, approving workflow steps, and reading workflow status and results. When its requests fail or slow, '
+  + 'users cannot sign in, start or update workflows, or see their results, and integrations calling it receive errors.';
 
 /** The alarmed metric first; the others are found beside it by the conversation dashboard (same namespace and dimensions). */
 const METRICS = {
@@ -88,7 +95,7 @@ function missingMinutes(published, from, to) {
 function alarmInput(existing, dims) {
   return {
     AlarmName: ALARM_NAME,
-    AlarmDescription: 'Demo: request success rate in the region, from the network outage generator (scripts/demo-network-outage.mjs)',
+    AlarmDescription: ALARM_DESCRIPTION,
     Namespace: NAMESPACE,
     MetricName: ALARM_METRIC,
     Dimensions: dims,
@@ -171,6 +178,6 @@ function parseArgs(argv) {
 }
 
 module.exports = {
-  NAMESPACE, ALARM_NAME, ALARM_METRIC, ALARM_THRESHOLD, METRICS, HEALTHY, OUTAGE, RECOVERY, HOSTS,
+  NAMESPACE, ALARM_NAME, ALARM_DESCRIPTION, ALARM_METRIC, ALARM_THRESHOLD, METRICS, HEALTHY, OUTAGE, RECOVERY, HOSTS,
   valuesFor, dimensionsOf, metricData, minuteOf, missingMinutes, alarmInput, readCallRows, callStartedAt, nextPhase, line, parseArgs,
 };

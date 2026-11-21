@@ -1,5 +1,5 @@
 /**
- * A QUEUE COVERING TWO PEOPLE IS PUT TO BOTH OF THEM (maintainer, 2026-09-05).
+ * A QUEUE COVERING TWO PEOPLE IS PUT TO BOTH OF THEM.
  *
  * WHY THIS SPEC EXISTS, AND WHY IT COULD NOT LIVE IN `turn-queue.spec.ts`. That suite is 1:1 by
  * design and that is right for what it asserts - but the rule under test here is inert below three

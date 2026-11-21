@@ -129,7 +129,7 @@ describe('the reading contract names only what the prompt showed', () => {
  */
 /**
  * The suffix these assert on moved into `deliveryAttemptSuffix` when the AMENDMENT FOLD turned out
- * to need the same treatment as the pass (owner-reported, 2026-09-05) - two things re-enter the
+ * to need the same treatment as the pass - two things re-enter the
  * router on one correlation id, and one shared suffix is what stops them drifting apart.
  *
  * These stay as SOURCE guards because that is what they are for: the behavior of the suffix itself

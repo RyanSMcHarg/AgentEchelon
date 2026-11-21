@@ -1,7 +1,7 @@
 /**
  * AN ASSISTANT IS ASSIGNED EXACTLY ONE CLASSIFICATION, AND ANSWERS AT IT.
  *
- * Owner direction, 2026-09-13, stated twice because it kept not landing:
+ * The rule:
  *
  *   "an assistant should always answer based on its classification anyway, it should always be one
  *    level"

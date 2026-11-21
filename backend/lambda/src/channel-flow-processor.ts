@@ -2239,7 +2239,7 @@ async function enforceAbuseGate(
 ): Promise<boolean> {
   const personId = personIdFromArn(senderArn) || senderArn;
   // METERED AT THE CHANNEL'S CLASSIFICATION, which is the same rule the router now applies to this
-  // person's ordinary turns (ADR-033, owner 2026-08-31: one channel, one classification, and IAM
+  // person's ordinary turns (ADR-033: one channel, one classification, and IAM
   // decides it).
   //
   // This used to take min(channel, clearance), to stop a basic-clearance member of a premium channel
@@ -2468,7 +2468,7 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
   const { channelArn, classification: channelClassification, userMessageId, content, senderArn, defaultBotArn, imageAttachment } = params;
   console.log('[ChannelFlow][battle] Detected', { channelArn, senderArn });
 
-  // A BATTLE HAS AN INITIATOR, the way a task has an owner (ADR-024, owner 2026-08-20).
+  // A BATTLE HAS AN INITIATOR, the way a task has an owner (ADR-024).
   //
   // Every ownership rule in a duel is a rule about this person: they are who a waiting side is waiting
   // on, the only one whose reply resumes it, and the only one who may end it. When the sub could not be

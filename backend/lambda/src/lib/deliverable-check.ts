@@ -5,7 +5,7 @@
  * have saved, attached, created, uploaded or exported a file" since the first deploy of this work, and
  * the report that arrived opened: "Here's your report, Test - delivered as a downloadable markdown
  * document." An instruction the model can ignore is not a control. The e2e caught it; the runtime did
- * not, because nothing checked. So the loop writes, CHECKS, and corrects (maintainer, 2026-08-20).
+ * not, because nothing checked. So the loop writes, CHECKS, and corrects.
  *
  * WHAT IT CHECKS AGAINST, and why the source matters. Length is a REQUIREMENT the step declares
  * (`report_generation.collecting_requirements` lists "the length or format") and the person answers.

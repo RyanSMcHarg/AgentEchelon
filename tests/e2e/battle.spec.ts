@@ -1565,7 +1565,7 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     ).toHaveLength(0);
   });
 
-  // B-E8 — BATTLES ARE NOT PREMIUM-ONLY BY DESIGN (owner ruling 2026-08-18), but they are not
+  // B-E8 — BATTLES ARE NOT PREMIUM-ONLY BY DESIGN, but they are not
   // ambient either. Whether a duel may run is the CLASSIFICATION's `battleCapable` plus a runtime
   // setting an operator turns on (ADR-049), read per classification from the immutable tag - so what
   // a below-premium /battle must NEVER do is run silently on premium machinery, which is exactly how

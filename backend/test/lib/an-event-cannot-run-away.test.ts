@@ -85,7 +85,8 @@ describe('the admin action holds the policy at attach', () => {
   });
   it('counts the deployment\'s trigger rules at every classification against maxTriggers', () => {
     expect(api).toContain('new ListRulesCommand({ NamePrefix: RULE_PREFIX,');
-    expect(api).toContain('await triggerCount() >= policy.maxTriggers');
+    // An edit's replacement is counted once: the trigger it replaces leaves as it arrives.
+    expect(api).toContain('await triggerCount() - replacing >= policy.maxTriggers');
   });
   // A room whose creation stopped after `CreateChannel` carries its `team-room` tag with nobody in it, so an attach that
   // trusted the tag would attach a trigger to an empty room. Every attach asks the creator, which opens the
@@ -141,7 +142,7 @@ describe('the incident is a task the on-call resolves', () => {
     const room = SHIPPED_EVENT_WORKFLOWS['ops-room'];
     expect(room.states['lead-task'].task).toEqual({
       machine: 'incident_ownership', by: { participantRole: 'on-call:ops' }, continue: 'alongside', assigned: { template: 'incident-owner-task', withoutMeetings: 'incident-owner-task-no-call' }, deadline: { afterMinutes: 43_200 },
-      endsRun: true, confirmEnd: 'confirming_resolve', movesTo: 'resolved',
+      endsRun: true, confirmEnd: 'confirming_resolve', movesTo: 'resolved', pinned: true, decidedBy: ['on-call:ops', 'secondary:ops', 'lead'],
     });
   });
 

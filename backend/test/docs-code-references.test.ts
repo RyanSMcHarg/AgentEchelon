@@ -35,6 +35,8 @@ const NOT_YET_BUILT: Record<string, string> = {
     'DESIGN-PERSON-ROUTE-AUTHORIZATION section 5.1 specifies this guard; its status line marks it NOT BUILT.',
   'backend/scripts/deny-test-person-routes.mjs':
     'DESIGN-PERSON-ROUTE-AUTHORIZATION section 5.2 specifies this deployed deny test; its status line marks it NOT BUILT.',
+  'backend/lambda/src/admin-notice-run.ts':
+    'DESIGN-EVENT-TARGETS section 13 specifies the admin notice run; the section is marked NOT BUILT.',
 };
 
 /**

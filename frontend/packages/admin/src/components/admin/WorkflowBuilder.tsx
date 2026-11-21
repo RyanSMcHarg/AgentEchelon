@@ -30,7 +30,7 @@ import { layoutFor, type StepPosition, type WorkflowLayout } from '../../../../.
 import { HelpToggle, InfoTooltip } from './AdminHelp';
 import type { WelcomePromptOption } from './welcomeWorkflow';
 import EventWorkflowEditor, {
-  StepFields, WorkflowPicker, WorkflowSettings, audienceKey, templateNames, useAudienceLabel, workflowsWith, type WorkflowOptions,
+  CreateWorkflow, RemoveWorkflow, StepFields, WorkflowName, WorkflowPicker, WorkflowSettings, audienceKey, workflowsRenamed, templateNames, useAudienceLabel, workflowsWith, type WorkflowOptions,
 } from './EventWorkflowEditor';
 import {
   addStep, atStepLimit, connect, kindOf, kindsFor, removeStep, renameStep, startAt, unreachableSteps, updateStep, type EdgeName, type Kind,
@@ -63,6 +63,7 @@ const TERMINAL_KINDS = ['success', 'failure', 'handoff'] as const satisfies read
 const TEXT_OUTPUT = 'text';
 const NO_PARTY = '';
 import { routerHeldVariables } from '../../../../../../backend/lambda/src/lib/variables.ts';
+import { previewMessageTemplate } from './MessageTemplatesEditor';
 import './WorkflowBuilder.css';
 
 type T = (key: string, opts?: Record<string, unknown>) => string;
@@ -123,6 +124,10 @@ const WorkflowBuilder: React.FC<WorkflowOptions & {
   serverErrors?: readonly string[];
   /** The workflow shown first, when the version holds it; else its first. */
   initialWorkflow?: string;
+  /** Open on creating a workflow, with none shown until it is created. */
+  startCreating?: boolean;
+  /** Leave the create view for the page's list, where the page opened it. */
+  onCancelCreate?: () => void;
   /**
    * The rules a workflow is held to, where they are not an event workflow's: an intent's workflow (ADR-067 decision 1) is
    * checked by `intentWorkflowErrors`. Absent, `versionEventWorkflowsErrors`.
@@ -134,12 +139,19 @@ const WorkflowBuilder: React.FC<WorkflowOptions & {
    * the run. Absent, a task step names its machine and nothing opens.
    */
   taskMachines?: TaskMachineSource;
-}> = ({ workflows, onChange, layout, onLayoutChange, profileName, serverErrors = [], templates, tools, published, variables, versionTools, classification, welcomeContext, initialWorkflow, validate, taskMachines }) => {
+  /** A workflow renamed here, so what else on the version names it (its processes) follows. */
+  onRenamed?: (from: string, to: string) => void;
+  /** A workflow created here by Start, now shown. */
+  onCreated?: (name: string) => void;
+}> = ({ workflows, onChange, layout, onLayoutChange, profileName, serverErrors = [], templates, tools, published, variables, versionTools, classification, welcomeContext, initialWorkflow, startCreating, onCancelCreate, validate, taskMachines, onRenamed, onCreated }) => {
   const { t: translate } = useTranslation();
   const t = translate as unknown as T;
   const audienceLabel = useAudienceLabel();
   const names = Object.keys(workflows);
-  const [name, setName] = useState(initialWorkflow && workflows[initialWorkflow] ? initialWorkflow : names[0] ?? '');
+  // CREATING IS ITS OWN VIEW: a name and where it starts from, nothing else, until Start opens the editor on it.
+  const [creatingAsked, setCreating] = useState(!!startCreating);
+  const creating = creatingAsked || !names.length;
+  const [name, setName] = useState(startCreating ? '' : initialWorkflow && workflows[initialWorkflow] ? initialWorkflow : names[0] ?? '');
   // A workflow chosen on the page after the builder opened is shown too.
   useEffect(() => {
     if (initialWorkflow && workflows[initialWorkflow]) setName(initialWorkflow);
@@ -162,13 +174,26 @@ const WorkflowBuilder: React.FC<WorkflowOptions & {
   const suppressClick = useRef(false);
   const focusNext = useRef<string | null>(null);
   const plane = useRef<HTMLDivElement | null>(null);
-  const { messages, prompts } = templateNames(templates);
+  const { prompts, roomMessages } = templateNames(templates);
 
   const wf = workflows[name];
   const saved = layout?.[name];
   const positions = useMemo(() => (wf ? positionsOf(wf, saved) : {}), [wf, saved]);
   const drawn = (key: string): StepPosition => (dragAt?.key === key ? dragAt.at : positions[key]);
   const errors = useMemo(() => (wf ? [...new Set([...(validate ? validate(name, wf) : versionEventWorkflowsErrors({ [name]: wf }, { lookup: routerHeldVariables(variables).lookup })), ...serverErrors])] : []), [wf, name, serverErrors, variables, validate]);
+  /**
+   * WHETHER THERE IS ENOUGH TO PREVIEW: something starts it (its event, or for a rule-started workflow the one type its rule
+   * named), a step besides its end, and no step missing a required template or prompt. Until then Preview run is not shown
+   * at all. A workflow the server's rules refuse is still previewed, so the walk can say why.
+   */
+  const previewable = useMemo(() => {
+    if (!wf) return false;
+    const starts = wf.on !== 'event-received' || wf.types?.length === 1;
+    const defs = Object.values(wf.states);
+    const doesSomething = defs.some((d) => kindOf(d) !== 'end');
+    const templated = defs.every((d) => (!d.send || !!d.send.template) && (!d.agent || (!!d.agent.prompt && !!d.agent.fallback?.send?.template)) && (!d.prompt || !!d.prompt.template));
+    return starts && doesSomething && templated;
+  }, [wf]);
   const anchored = useMemo(() => anchoredErrors(errors, name, wf), [errors, name, wf]);
 
   useEffect(() => {
@@ -187,6 +212,39 @@ const WorkflowBuilder: React.FC<WorkflowOptions & {
     setPreview(null);
   };
   const put = (next: EventWorkflow, points?: Record<string, StepPosition> | null) => change({ ...workflows, [name]: next }, points);
+  /** Rename the shown workflow in its place, its layout moving with it; false when the name is refused. */
+  const rename = (to: string): boolean => {
+    const next = workflowsRenamed(workflows, name, to);
+    if (!next) return false;
+    onChange(next);
+    if (layout?.[name]) onLayoutChange(layoutFor({ ...layout, [to]: layout[name] }, next) ?? null);
+    if (to !== name) onRenamed?.(name, to);
+    setName(to);
+    setPreview(null);
+    return true;
+  };
+  /** How a step that waits on someone ends in the walk: success unless another is picked. */
+  const endingPicker = (step: string, offered: readonly Ending[], testId: string) => (
+    <label key={step} className="admin-stacked-field"><span className="admin-field-label">{t('admin.workflowBuilder.previewEnding', { step: wf?.states[step]?.label ?? step })}</span>
+      <select className="select" data-testid={testId} value={endings[step] ?? 'success'}
+        onChange={(e) => setEndings({ ...endings, [step]: e.target.value as Ending })}>
+        {offered.map((o) => <option key={o} value={o}>{t(`admin.workflowBuilder.ending_${o}`)}</option>)}
+      </select>
+    </label>
+  );
+  /** The text a send would post, rendered through the runtime's renderer from the walk's sample values; empty where unknown. */
+  const previewText = (template: string | undefined, values: Record<string, string> | undefined): string => {
+    const source = (templates ?? []).find((x) => x.name === template)?.source;
+    if (!source) return '';
+    const r = previewMessageTemplate(source, values ?? {});
+    return 'error' in r ? '' : r.sections.chat ?? Object.values(r.sections)[0] ?? '';
+  };
+  const removeShown = () => {
+    const { [name]: _gone, ...rest } = workflows;
+    change(rest, null);
+    setName(Object.keys(rest)[0] ?? '');
+    setSelected(null);
+  };
 
   /** Save where a step sits: every step's current point, so the flow stays as the person sees it. */
   const place = (key: string, at: StepPosition) => {
@@ -216,6 +274,7 @@ const WorkflowBuilder: React.FC<WorkflowOptions & {
     }
     if (def.action) return t('admin.workflowBuilder.detail_intake', { to: toLabel(def.action.to) });
     if (def.open) return t('admin.workflowBuilder.detail_open', { type: def.open.type });
+    if (def.handoff) return t('admin.workflowBuilder.detail_handoff', { name: def.handoff.name, process: def.handoff.process });
     if (def.opening) return t('admin.workflowBuilder.detail_opening');
     if (def.prompt) return t('admin.workflowBuilder.detail_prompt', { template: def.prompt.template });
     return t('admin.workflowBuilder.detail_end', { disposition: def.disposition ?? 'success' });
@@ -226,7 +285,7 @@ const WorkflowBuilder: React.FC<WorkflowOptions & {
   /** Add a step from the palette: after the selected step, or where it was dropped. */
   const addKind = (kind: Kind, at?: StepPosition) => {
     if (!wf || atStepLimit(wf)) return;
-    const { workflow, key } = addStep(wf, kind, messages, prompts, selected ? { after: selected } : {});
+    const { workflow, key } = addStep(wf, kind, roomMessages, prompts, selected ? { after: selected } : {});
     put(workflow, at ? { [key]: { x: Math.max(0, snap(at.x)), y: Math.max(0, snap(at.y)) } } : undefined);
     setSelected(key);
     focusNext.current = key;
@@ -279,16 +338,27 @@ const WorkflowBuilder: React.FC<WorkflowOptions & {
   };
 
   const picker = (
-    <WorkflowPicker workflows={workflows} selected={name} onSelect={(n) => { setName(n); setSelected(null); setPreview(null); }}
-      onAdd={(n, from) => {
-        const next = workflowsWith(workflows, n, from, templates);
-        if (!next) return false;
-        onChange(next);
-        setName(n);
-        setSelected(null);
-        return true;
-      }} />
+    <WorkflowPicker workflows={workflows} selected={name} onSelect={(n) => { setName(n); setSelected(null); setPreview(null); }} />
   );
+
+  if (creating) {
+    return (
+      <div className="admin-wfb" data-testid="workflow-builder">
+        <CreateWorkflow workflows={workflows}
+          onCancel={onCancelCreate}
+          onAdd={(n, from) => {
+            const next = workflowsWith(workflows, n, from, templates);
+            if (!next) return false;
+            onChange(next);
+            setName(n);
+            setSelected(null);
+            setCreating(false);
+            onCreated?.(n);
+            return true;
+          }} />
+      </div>
+    );
+  }
 
   if (view === 'list') {
     return (
@@ -297,7 +367,7 @@ const WorkflowBuilder: React.FC<WorkflowOptions & {
           <button type="button" className="btn-secondary" data-testid="wfb-view-canvas" onClick={() => setView('canvas')}>{t('admin.workflowBuilder.viewCanvas')}</button>
         </div>
         <EventWorkflowEditor workflows={workflows} initialSelected={name} onSelect={setName} templates={templates} tools={tools} published={published} variables={variables} versionTools={versionTools} classification={classification} welcomeContext={welcomeContext} assistant={profileName}
-          onChange={(next) => change(next ?? {})} />
+          onChange={(next) => change(next ?? {})} onRenamed={onRenamed} />
       </div>
     );
   }
@@ -335,9 +405,18 @@ const WorkflowBuilder: React.FC<WorkflowOptions & {
           <span role="status" data-testid="wfb-status" className={errors.length ? 'admin-wfb-status-bad' : 'admin-wfb-status-ok'}>
             {wf ? (errors.length ? t('admin.workflowBuilder.problems', { count: errors.length }) : t('admin.workflowBuilder.valid')) : ''}
           </span>
-          <button type="button" className="btn-secondary" data-testid="wfb-preview" disabled={!wf || !profileName || previewBusy} onClick={runPreview}>
-            {t('admin.workflowBuilder.previewRun')}
-          </button>
+          {previewable && (
+            <>
+              <button type="button" className="btn-secondary" data-testid="wfb-preview" disabled={!profileName || previewBusy} onClick={runPreview}
+                aria-describedby="wfb-preview-what">
+                {t('admin.workflowBuilder.previewRun')}
+              </button>
+              {/* WHAT PREVIEW RUN DOES, said before it is pressed, and why it cannot run where there is no draft. */}
+              <span className="admin-field-hint" id="wfb-preview-what" data-testid="wfb-preview-what">
+                {profileName ? t('admin.workflowBuilder.previewWhat') : t('admin.workflowBuilder.previewUnavailable')}
+              </span>
+            </>
+          )}
           <button type="button" className="btn-secondary" data-testid="wfb-view-list" onClick={() => setView('list')}>{t('admin.workflowBuilder.viewList')}</button>
           <HelpToggle label={t('admin.workflowBuilder.helpLabel')} testId="wfb-help">
             <p>{t('admin.workflowBuilder.help')}</p>
@@ -345,6 +424,8 @@ const WorkflowBuilder: React.FC<WorkflowOptions & {
           </HelpToggle>
         </div>
       </div>
+      {wf && <WorkflowName name={name} wf={wf} onRename={rename} />}
+      {wf && <WorkflowSettings name={name} wf={wf} onPut={(next) => put(next)} classification={classification} assistant={profileName} />}
       <p className="admin-field-hint" id="wfb-keys">{t('admin.workflowBuilder.keysHelp')}</p>
       <p className="admin-wfb-live" aria-live="polite" data-testid="wfb-announce">{said}</p>
 
@@ -544,14 +625,7 @@ const WorkflowBuilder: React.FC<WorkflowOptions & {
                 </div>
               </>
             ) : (
-              <>
-                <p className="admin-field-hint">{t('admin.workflowBuilder.inspectorNone')}</p>
-                <WorkflowSettings name={name} wf={wf} onPut={(next) => put(next)} classification={classification} assistant={profileName} onRemove={() => {
-                  const { [name]: _gone, ...rest } = workflows;
-                  change(rest, null);
-                  setName(Object.keys(rest)[0] ?? '');
-                }} />
-              </>
+              <p className="admin-field-hint">{t('admin.workflowBuilder.inspectorNone')}</p>
             )}
             {anchored.workflow.length > 0 && (
               <ul role="alert" className="admin-error" data-testid="wfb-workflow-errors">
@@ -562,24 +636,18 @@ const WorkflowBuilder: React.FC<WorkflowOptions & {
         </div>
       )}
 
-      {wf && (
+      {wf && previewable && (
         <section className="admin-wfb-preview" aria-labelledby="wfb-preview-title" data-testid="wfb-preview-panel">
           <h5 id="wfb-preview-title">{t('admin.workflowBuilder.previewTitle')}</h5>
-          <p className="admin-field-hint">{profileName ? t('admin.workflowBuilder.previewHelp') : t('admin.workflowBuilder.previewUnavailable')}</p>
+          <p className="admin-field-hint">{profileName ? t('admin.workflowBuilder.previewWhat') : t('admin.workflowBuilder.previewUnavailable')}</p>
           <div className="admin-filter-group">
             {sources.map((src) => (
               <label key={src}><span className="admin-field-label">{t('admin.workflowBuilder.previewValue', { source: src })}</span>
                 <input type="text" className="input" data-testid={`wfb-sample-${src}`} value={sample[src] ?? ''} onChange={(e) => setSample({ ...sample, [src]: e.target.value })} />
               </label>
             ))}
-            {paused.map(([step, offered]) => (
-              <label key={step}><span className="admin-field-label">{t('admin.workflowBuilder.previewEnding', { step })}</span>
-                <select className="select" data-testid={`wfb-ending-${step}`} value={endings[step] ?? 'success'}
-                  onChange={(e) => setEndings({ ...endings, [step]: e.target.value as Ending })}>
-                  {offered.map((o) => <option key={o} value={o}>{t(`admin.workflowBuilder.ending_${o}`)}</option>)}
-                </select>
-              </label>
-            ))}
+            {/* BEFORE A RUN, how each step that waits on someone ends; after one, the choice sits on the step in the result. */}
+            {!preview && paused.map(([step, offered]) => endingPicker(step, offered, `wfb-ending-${step}`))}
           </div>
           {previewError && (
             <div className="admin-error" role="alert" data-testid="wfb-preview-refused">
@@ -588,25 +656,43 @@ const WorkflowBuilder: React.FC<WorkflowOptions & {
             </div>
           )}
           {preview && (
-            <ol data-testid="wfb-preview-result">
-              {preview.steps.map((s, i) => {
-                const acts = preview.acts.filter((a) => a.step === s.step);
-                return (
-                  <li key={`${s.step}-${i}`}>
-                    <strong>{s.step}</strong>{' '}<span className="admin-badge">{s.outcome}</span>
-                    {acts.map((a, j) => (
-                      <span key={j} className="admin-wfb-act"> {t(`admin.workflowBuilder.act_${a.fallback ? 'fallback' : a.act}`, {
-                        template: a.template ?? '', to: a.to === 'room' || !a.to ? t('admin.workflowBuilder.to_room') : a.to.join(', '),
-                      })}</span>
-                    ))}
-                  </li>
-                );
-              })}
-              <li data-testid="wfb-preview-end">{preview.ended ? t('admin.workflowBuilder.previewEnded', { disposition: preview.ended }) : t('admin.workflowBuilder.previewWaits')}</li>
-            </ol>
+            <>
+              <ol className="admin-wfl-steps" data-testid="wfb-preview-result">
+                {preview.steps.map((s, i) => {
+                  const acts = preview.acts.filter((a) => a.step === s.step);
+                  const offered = paused.find(([step]) => step === s.step)?.[1];
+                  return (
+                    <li key={`${s.step}-${i}`} className="admin-wfl-step" data-testid={`wfb-preview-step-${i}`}>
+                      <div className="admin-wfl-step-head">
+                        <strong>{wf.states[s.step]?.label ?? s.step}</strong>
+                        <span className="admin-chip">{s.outcome}</span>
+                      </div>
+                      {acts.map((a, j) => {
+                        const text = a.act === 'send' || a.fallback ? previewText(a.template, a.values) : '';
+                        return (
+                          <div key={j} className="admin-wfl-row">
+                            <span className="admin-wfb-act">{t(`admin.workflowBuilder.act_${a.fallback ? 'fallback' : a.act}`, {
+                              template: a.template ?? '', to: a.to === 'room' || !a.to ? t('admin.workflowBuilder.to_room') : a.to.join(', '),
+                            })}</span>
+                            {text && <pre className="admin-welcome-preview" data-testid={`wfb-preview-text-${i}-${j}`}>{text}</pre>}
+                          </div>
+                        );
+                      })}
+                      {offered && endingPicker(s.step, offered, `wfb-ending-${s.step}`)}
+                    </li>
+                  );
+                })}
+                <li className="admin-wfl-step" data-testid="wfb-preview-end">{preview.ended ? t('admin.workflowBuilder.previewEnded', { disposition: preview.ended }) : t('admin.workflowBuilder.previewWaits')}</li>
+              </ol>
+              <div>
+                <button type="button" className="btn-secondary" data-testid="wfb-preview-again" disabled={!profileName || previewBusy} onClick={runPreview}>{t('admin.workflowBuilder.previewAgain')}</button>
+              </div>
+            </>
           )}
         </section>
       )}
+      {/* REMOVING THE WORKFLOW IS THE PAGE'S LAST ACTION, confirmed before anything is removed. */}
+      {wf && <RemoveWorkflow name={name} wf={wf} onRemove={removeShown} />}
     </div>
   );
 };

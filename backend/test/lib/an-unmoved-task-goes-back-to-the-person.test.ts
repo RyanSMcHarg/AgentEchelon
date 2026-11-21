@@ -1,5 +1,5 @@
 /**
- * IF THE ASSISTANT DID NOT MOVE IT, THE BALL GOES BACK (maintainer, 2026-09-03).
+ * IF THE ASSISTANT DID NOT MOVE IT, THE BALL GOES BACK.
  *
  * `maybeHandOver` gives a task to the ASSISTANT when a person replies at a step that awaits them, so
  * the turn that follows can act on it. That is meant to be momentary - hold it for the turn, advance

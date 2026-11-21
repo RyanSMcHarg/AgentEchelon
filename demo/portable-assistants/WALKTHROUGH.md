@@ -51,7 +51,7 @@ npm run template -- put premium ../demo/portable-assistants/templates/advisor-in
 npm run template -- put premium ../demo/portable-assistants/templates/advisor-invitation-sent.md --assistant advisor --activate
 ```
 
-**5. Create the outage alarm**, `AgentEchelon-demo-incident`, with a healthy baseline. It prints the alarm's ARN.
+**5. Create the outage alarm**, `Customer-API-availability`, with a healthy baseline. It is named for the service it watches, so the incident it opens is too, and its description says what the Customer API does for its users, which the incident and Ops's first look read. It prints the alarm's ARN.
 
 ```bash
 npm run demo:outage -- setup
@@ -577,7 +577,7 @@ The incident's workflows, `incident-triage` in the team conversation, `ops-room`
 
 **Do:** in the console, **Assistants**, Ops, **Edit** (or **Draft** while one exists), then **Processes**, the section beside **Workflows**. Choose **Edit** on Incident response. The wizard opens on **Phases and hand-offs**, its phases numbered in the order they run:
 
-- **Phase 1**, `incident-triage`, started when an AWS event reaches the team conversation, with its Triage stage due in 30 minutes.
+- **Phase 1**, `incident-triage`, started when an AWS event reaches the team conversation, with no stage of its own: it opens the incident conversation at once and tells the team where it is.
 - **Hand-off to ops-room**: a new `ops` conversation in this classification, opened by its `open` step, led by the on-call; the team conversation waits until it ends.
 - **Phases 2 to 3, in parallel**: phase 2, `ops-room`, with its stages, who answers each and their deadlines, and the metric Resolved within 4 hours; and beside it phase 3, `customer-messaging`, marked "Runs alongside ops-room; ops-room does not wait for it.", with the metric Initial customer notice missed its deadline.
 - **Hand-off to customer-messaging**: a new `customer-messaging` conversation in this classification, opened when triage recorded customers as impacted or a card ends as impacted, led by the account team lead; nothing waits, and the messages told each way are listed by what each says.

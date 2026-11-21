@@ -149,3 +149,74 @@ describe('a form on the card (ADR-067 WT50)', () => {
     expect(card?.fields).toEqual([{ name: 'reason', type: 'text', required: true }]);
   });
 });
+
+// A FINISHED TASK'S CARD STAYS FINISHED AFTER A RELOAD: the conversation draws it closed once its task is no longer among the
+// person's open items, so it never offers a choice the task service would refuse.
+describe('a card whose task is no longer open', () => {
+  it('is drawn finished, with no choices and no answer-by time', () => {
+    render(<TaskCard card={approval} channelArn={CH} choose={vi.fn()} now={() => NOW} closed />);
+    expect(screen.queryByRole('button')).toBeNull();
+    expect(screen.getByText('This task is already finished.')).toBeTruthy();
+    expect(screen.queryByText(/Answer by/)).toBeNull();
+  });
+});
+
+// AN APPROVAL NAMES THE VERSION IT APPROVES: the task's own versions, never a file found in the conversation.
+describe('a card that approves a document', () => {
+  const docCard = { ...approval, documents: true };
+  const draft = { fileKey: 'generated-docs/c/document-1.md', name: 'document-1.md', by: 'assistant:advisor' };
+  const edited = { fileKey: 'attachments/c/p1/2-notice.md', name: 'notice.md', by: 'p1' };
+
+  it('names the latest version, attaches an edited one, and approves exactly the version it shows', async () => {
+    const user = userEvent.setup();
+    const read = vi.fn().mockResolvedValue([draft]);
+    const attach = vi.fn().mockResolvedValue([draft, edited]);
+    const upload = vi.fn().mockResolvedValue({ fileKey: edited.fileKey, name: edited.name });
+    const choose = vi.fn().mockResolvedValue({ state: 'approved' });
+    render(<TaskCard card={docCard} channelArn={CH} choose={choose} now={() => NOW} documents={{ read, attach, upload }} />);
+    expect((await screen.findByTestId('task-card-approves')).textContent).toBe("Approves: document-1.md (the assistant's draft)");
+    await user.upload(screen.getByTestId('task-card-attach'), new File(['# Notice'], 'notice.md', { type: 'text/markdown' }));
+    expect(upload).toHaveBeenCalled();
+    expect(attach).toHaveBeenCalledWith(CH, docCard.id, edited.fileKey, edited.name);
+    expect((await screen.findByTestId('task-card-approves')).textContent).toBe('Approves: notice.md (your edited version)');
+    await user.click(screen.getByRole('button', { name: 'Approve' }));
+    expect(choose).toHaveBeenCalledWith(CH, docCard, 'approved', undefined, edited.fileKey);
+  });
+
+  it('a card that approves no document shows no versions', () => {
+    render(<TaskCard card={approval} channelArn={CH} choose={vi.fn()} now={() => NOW} documents={{ read: vi.fn(), attach: vi.fn(), upload: vi.fn() }} />);
+    expect(screen.queryByTestId('task-card-documents')).toBeNull();
+  });
+});
+
+describe('asking the assistant that drafted it to revise it', () => {
+  const docCard = { ...approval, documents: true };
+  const draft = { fileKey: 'generated-docs/c/document-1.md', name: 'document-1.md', by: 'assistant:advisor' };
+  const revised = { fileKey: 'generated-docs/c/document-2.md', name: 'document-2.md', by: 'assistant:advisor' };
+
+  it('sends the approver\'s instructions, says it was asked, and shows the revision once it arrives', async () => {
+    const user = userEvent.setup();
+    const read = vi.fn().mockResolvedValueOnce([draft]).mockResolvedValue([draft, revised]);
+    const revise = vi.fn().mockResolvedValue([]);
+    const { rerender } = render(<TaskCard card={docCard} channelArn={CH} choose={vi.fn()} now={() => NOW} refreshKey={1} documents={{ read, attach: vi.fn(), upload: vi.fn(), revise }} />);
+    await screen.findByTestId('task-card-approves');
+    await user.type(screen.getByTestId('task-card-revise-instructions'), 'Shorten it.');
+    await user.click(screen.getByTestId('task-card-revise'));
+    expect(revise).toHaveBeenCalledWith(CH, docCard.id, 'Shorten it.');
+    expect(await screen.findByTestId('task-card-revise-asked')).toBeTruthy();
+    // The revised file's message arrives in the conversation, and the card reads the versions again.
+    rerender(<TaskCard card={docCard} channelArn={CH} choose={vi.fn()} now={() => NOW} refreshKey={2} documents={{ read, attach: vi.fn(), upload: vi.fn(), revise }} />);
+    await vi.waitFor(() => expect(screen.getByTestId('task-card-approves').textContent).toBe("Approves: document-2.md (the assistant's draft)"));
+    expect(screen.queryByTestId('task-card-revise-asked')).toBeNull();
+  });
+});
+
+describe('an approval that cannot read its versions', () => {
+  it('is not offered, so nobody approves a version they did not see', async () => {
+    const read = vi.fn().mockRejectedValue(new Error('unreachable'));
+    render(<TaskCard card={{ ...approval, documents: true }} channelArn={CH} choose={vi.fn()} now={() => NOW} documents={{ read, attach: vi.fn(), upload: vi.fn() }} />);
+    await vi.waitFor(() => expect(screen.getByText('The versions could not be read just now.')).toBeTruthy());
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Decline' })).not.toBeDisabled();
+  });
+});

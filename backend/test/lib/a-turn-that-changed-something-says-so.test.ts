@@ -1,5 +1,5 @@
 /**
- * A TURN THAT CHANGED SOMETHING SAYS SO, AND DOES NOT INVITE A RETRY (maintainer, 2026-09-02).
+ * A TURN THAT CHANGED SOMETHING SAYS SO, AND DOES NOT INVITE A RETRY.
  *
  * When the model ends on a tool block with no text, the loop still has to say something. That line
  * has now been wrong in both directions:

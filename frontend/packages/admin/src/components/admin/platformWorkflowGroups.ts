@@ -5,7 +5,7 @@
 export const PLATFORM_WORKFLOW_GROUPS = [
   { id: 'queue', keys: ['queue_drain', 'queued_request', 'queued_clarification', 'queued_combination', 'work_still_wanted'] },
   { id: 'tasks', keys: ['action_item', 'place_item', 'approval', 'acknowledgement', 'form', 'meeting_action_item'] },
-  { id: 'conversation', keys: ['drift_offer', 'meeting_offer', 'incident_ownership', 'dashboard_refresh', 'customer_impact', 'customer_updates', 'final_notice'] },
+  { id: 'conversation', keys: ['drift_offer', 'meeting_offer', 'incident_ownership', 'dashboard_refresh', 'dashboard_runbook', 'customer_impact', 'customer_updates', 'final_notice'] },
 ] as const;
 
 export type PlatformWorkflowGroupId = (typeof PLATFORM_WORKFLOW_GROUPS)[number]['id'] | 'other';

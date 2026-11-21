@@ -894,7 +894,7 @@ describe('a runtime assistant is managed here while the directory says it is act
     expect(out.errors).toEqual(expect.arrayContaining([expect.stringMatching(/must carry its own intentPack/)]));
   });
 
-  // ── WHERE A NEW ASSISTANT'S FIRST DRAFT STARTS (owner decision, 2026-10-24) ──────────────────────────
+  // ── WHERE A NEW ASSISTANT'S FIRST DRAFT STARTS ──────────────────────────
   //
   // The create flow chooses the classification's defaults, a profile file, or a copy of another assistant, and
   // its own name and models are written over whichever it chose. A file or a copy is checked before the name is

@@ -27,6 +27,22 @@
 .ae-meeting-side .ae-meeting-chat.ae-meeting-chat--panel { width: auto; height: auto; flex: 1 1 auto; min-height: 0; border-left: none; border-top: none; }
 .ae-meeting-chat.ae-meeting-chat--panel[hidden] { display: none; }
 
+/* THE VIEW TOGGLES at the column's top: the roster, the chat, or both. */
+.ae-meeting-side-views { display: flex; gap: 4px; padding: 6px 8px; flex: none; border-bottom: 1px solid var(--divider, #E4E4E7); }
+.ae-meeting-side-view { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--divider, #E4E4E7); background: transparent; color: var(--text-secondary, #52525B); font: inherit; font-size: 13px; cursor: pointer; }
+.ae-meeting-side-view svg { width: 16px; height: 16px; }
+.ae-meeting-side-view--on { background: var(--surface-2, #F4F4F5); color: var(--text-primary, #09090B); border-color: var(--divider-strong, #8F8F99); }
+.ae-meeting-side-view:disabled { cursor: default; }
+.ae-meeting-side-view:focus-visible { outline: 2px solid var(--focus-ring, #7C3AED); outline-offset: 1px; }
+
+/* THE LINE BETWEEN THE ROSTER AND THE CHAT: a thin rule with a tall hit area, dragged up or down, focusable. */
+.ae-meeting-rowsplitter { flex: none; height: 9px; position: relative; z-index: 2; cursor: row-resize; touch-action: none; background: var(--surface-50, #FAFAFA); }
+.ae-meeting-rowsplitter::before { content: ''; position: absolute; left: 0; right: 0; top: 4px; height: 1px; background: var(--divider-strong, #8F8F99); }
+.ae-meeting-rowsplitter::after { content: ''; position: absolute; left: 50%; top: 2px; width: 28px; height: 5px; margin-left: -14px; border-radius: 3px; background: var(--divider-strong, #8F8F99); opacity: .6; }
+.ae-meeting-rowsplitter:hover::before, .ae-meeting-rowsplitter:focus-visible::before { height: 3px; margin-top: -1px; background: var(--focus-ring, #7C3AED); }
+.ae-meeting-rowsplitter:focus-visible { outline: none; }
+.ae-meeting-side-roster:has(+ .ae-meeting-rowsplitter) { border-bottom: none; }
+
 /* THE SPLITTER between the video and the column: a thin line with a wide hit area, focusable and moved by the arrows. */
 .ae-meeting-splitter {
   flex: none;

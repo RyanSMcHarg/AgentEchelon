@@ -23,7 +23,7 @@ flowchart TB
   CHAN["Channel custom resource:<br/>one RESTRICTED PRIVATE channel<br/>owned by the bot"]
   EMIT["Core alert sources:<br/>assistant error alerts, alarm notifier,<br/>membership audit, clean-copy batch.<br/>postAdminNotice"]
   BUS["Default EventBridge bus:<br/>source ae.alert"]
-  RULE["AdminAlertRule:<br/>alerts from this instance"]
+  RULE["AdminNotice-&lt;key&gt; rules:<br/>one per notice type, this instance"]
   POST["admin-alert-poster.ts<br/>deliverAdminNotice as the bot"]
   FAN["channel-notify.ts<br/>fanOutChannelNotification"]
   MEM["Human admins:<br/>in-app plus email"]
@@ -68,7 +68,7 @@ Three identities are kept distinct:
 - **Bearer contract.** `CreateAppInstanceBot` is an Identity API call and takes no bearer. `CreateChannel` takes the admin-agent bot as `ChimeBearer`. `CreateChannelMembership` takes the service-admin user: the one bearer that can add members on a freshly created channel and on an adopted one alike, where the bot holds neither membership nor moderator status until adoption grants them (a moderating bot can add members, as `lib/channel-creation.ts` does). `UpdateChannel` (the roster stamp) and `SendChannelMessage` (the alerts) take the admin-agent bot.
 - **Contracts consumed:** the admin-agent bot ARN and the service-admin ARN, both passed to the channel custom resource as environment variables at deploy time (`ADMIN_AGENT_BOT_ARN`, `ADMIN_BEARER_ARN`). The bot ARN is also published to SSM at `.../assistant/admin-agent/bot-arn`.
 - **Raising an alert.** Every admin alert, the membership audit's included, goes through `postAdminNotice` (`backend/lambda/src/lib/admin-notice.ts`): it writes a CloudWatch line, puts one `ae.alert` event on the default bus, never throws, and returns whether the bus accepted the event, so a caller can log the one it could not send. `alertEmitterWiring` (`backend/lib/stacks/agent-classification-common.ts`) stamps `ALERT_INSTANCE` on the function and grants `events:PutEvents` on the default bus conditioned on `events:source` equal to `ae.alert`; the caller holds no message send. The membership audit's `ADMIN_ARN_PARAM` names the service app-instance-admin, which it moderates as.
-- **Posting an alert.** `AdminAlertRule` in `AdminServices` matches `source: ae.alert` and `detail.instance` equal to this instance, and targets `AdminAlertPosterFunction` (`backend/lambda/src/admin-alert-poster.ts`) with two retries. The poster checks the source and instance again, posts the notice as the admin assistant with `deliverAdminNotice` (`backend/lambda/src/lib/admin-channel-post.ts`), and throws on a failed post so EventBridge retries it.
+- **Posting an alert.** One rule per notice type in `AdminServices` (`AdminNotice-<key>`, from the catalog `ADMIN_NOTICE_TYPES` in `backend/lambda/src/lib/admin-notice-types.ts`) matches `source: ae.alert`, the type's `detail-type` and `detail.instance` equal to this instance; a security notice's rule is always enabled, and an operational one is switched by an administrator in the console ([DESIGN-EVENT-TARGETS](../conversation/DESIGN-EVENT-TARGETS.md) section 12). Each targets `AdminAlertPosterFunction` (`backend/lambda/src/admin-alert-poster.ts`) with two retries. The poster checks the source and instance again, posts the notice as the admin assistant with `deliverAdminNotice` (`backend/lambda/src/lib/admin-channel-post.ts`), and throws on a failed post so EventBridge retries it.
 - **Notify trigger.** The fan-out honors `notify` metadata only from a `/bot/` sender, so a bot-sent message is the trusted trigger and a person's hand-crafted Metadata never reaches the fan-out.
 
 ## 4. Key flows and algorithms
@@ -170,7 +170,7 @@ The channel is part of the `admin` capability: a deployment that declares `admin
 | Question | Why it is open |
 |---|---|
 | Whether the admin assistant needs a persona and model now, or only a bot identity | Notifications use only the bot identity; a persona matters when it gains a conversational role, and the profile carries a default model either way |
-| One admin channel, or one per severity | One channel matches the one `AdminAlertRule`; per-severity or per-category channels are a later refinement (a rule per `DetailType`) and multiply the provisioning and the grants |
+| One admin channel, or one per severity | One channel, with a rule per notice type posting into it; per-severity or per-category channels are a later refinement and multiply the provisioning and the grants |
 | Admin roster upkeep | Admins are synced at provision and Update time, so an admin added between deploys is not a member until the next run. A hook on the group change could add them as it happens |
 | Host-owned admin authority | The admin assistant still owns the channel, and recipient resolution keys on the host's admin claim rather than the `admins` group |
 | Transports beyond email | The directive carries one transport selector per route (`notify.email` today), so a second transport is a selector and a sender on the same fan-out rather than a new trigger |

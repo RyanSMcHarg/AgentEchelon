@@ -738,7 +738,15 @@ export async function editDraft(
    * edit is held to it (`draftBasisError`): a draft saved since is refused, never merged over. The management API always
    * passes it.
    */
-  basedOn?: { configId: string | undefined },
+  basedOn?: {
+    configId: string | undefined;
+    /**
+     * THE ACTIVE VERSION THE EDITOR WAS SHOWING, on a first edit (no draft open). Present, the edit is held to it: a version
+     * activated since (an import, a rollback, another console) is refused `VERSION_CHANGED`, never written over with what an
+     * older page loaded (`versionBasisError`).
+     */
+    activeVersion?: number;
+  },
   /**
    * The classification's published guardrails. Present, a patched `guardrailId` is resolved the way import resolves
    * it (`resolveGuardrailSelection`): a catalog key is stored as the id it names, and a selection naming none is refused.
@@ -779,6 +787,12 @@ export async function editDraft(
   if (shapeErrors.length) throw new ProfileValidationError(shapeErrors);
   if (basedOn) {
     const refusal = draftBasisError(profileName, storedDraft?.configId ?? null, basedOn.configId);
+    if (refusal) throw refusal;
+  }
+  // A FIRST EDIT IS BUILT ON THE ACTIVE VERSION, AND THE DRAFT RECORDS WHICH, so its activation is held to it too.
+  const startedOn = storedDraft ? null : await activeVersionNumber(ssm, ssmRoot, profileName);
+  if (!storedDraft && basedOn?.activeVersion !== undefined) {
+    const refusal = versionBasisError(profileName, startedOn, basedOn.activeVersion);
     if (refusal) throw refusal;
   }
   // THE STORED GUARDRAIL IS THE ID APPLYGUARDRAIL IS CALLED WITH, so a key sent here is stored as its id, and a
@@ -858,7 +872,9 @@ export async function editDraft(
   // A STEP'S POINT FOLLOWS IT, and a removed step's point is dropped (`layoutFor`).
   const layout = layoutFor(patchedLayout === null ? undefined : patchedLayout ?? existing.layout, mergedBody.eventWorkflows, mergedBody.intentPack?.machines ?? null, mergedBody.intentWorkflows ?? null);
   // WHERE THE DRAFT WAS STARTED FROM rides every edit of it: envelope, never hashed (`DraftProvenance`).
-  const provenance = (storedDraft as { provenance?: DraftProvenance } | null)?.provenance;
+  const provenance: DraftProvenance | undefined = storedDraft
+    ? (storedDraft as { provenance?: DraftProvenance }).provenance
+    : startedOn !== null ? { basedOnVersion: startedOn } : undefined;
   const kept = patchedKept === null ? undefined : patchedKept ?? existing.keptWelcomeWorkflow;
   const def = { ...buildDefinition(profileName, mergedBody), ...(layout ? { layout } : {}), ...(kept ? { keptWelcomeWorkflow: kept } : {}), ...(provenance ? { provenance } : {}) };
   // The edit re-hashes, so it produces a NEW configId and therefore a new body key. That is correct and
@@ -1664,6 +1680,9 @@ export function pickupWarnings(body: ProfileDefinitionBody, turnQueueOn = proces
   return out;
 }
 
+/** The connector ids this deployment declares, as the stack names them (`DECLARED_CONNECTORS`): what a hand-off's `ref` may name. */
+export const declaredConnectors = (): string[] => (process.env.DECLARED_CONNECTORS ?? '').split(',').filter(Boolean);
+
 /**
  * WHAT A VERSION'S WORKFLOWS MAY RUN (W1, ADR-061). Each event selects its own workflow, the welcome on `assistant-joined`
  * by the room's conversation type, so a version declares only workflows an event selects (their shape and the one
@@ -1677,8 +1696,8 @@ export function welcomeWorkflowErrors(body: ProfileDefinitionBody, machines?: Re
   // CHECKED THROUGH THE VERSION'S VARIABLES, the lookup the router evaluates a step's condition with (`routerHeldVariables`).
   const errors: string[] = [
     ...versionEventWorkflowsErrors(body.eventWorkflows, { lookup: routerHeldVariables(body.variables).lookup, ...(machines ? { machines } : {}) }),
-    // THE PROCESSES THE VERSION DECLARES (SPEC-PROCESSES P1), checked against its workflows.
-    ...versionProcessesErrors(body.processes, body.eventWorkflows, body.intentWorkflows),
+    // THE PROCESSES THE VERSION DECLARES (SPEC-PROCESSES P1), checked against its workflows and the declared connectors.
+    ...versionProcessesErrors(body.processes, body.eventWorkflows, body.intentWorkflows, { connectors: declaredConnectors() }),
   ];
   const tools = new Set(body.tools ?? []);
   if (body.tools) {
@@ -1995,7 +2014,7 @@ async function consumeDraft(ssm: SSMClient, ssmRoot: string, profileName: string
  */
 export class DraftConflictError extends Error {
   constructor(
-    public readonly code: 'CONFIG_ID_REQUIRED' | 'DRAFT_CHANGED' | 'DRAFT_EXISTS',
+    public readonly code: 'CONFIG_ID_REQUIRED' | 'DRAFT_CHANGED' | 'DRAFT_EXISTS' | 'VERSION_CHANGED',
     public readonly configId: string | null,
     message: string,
   ) {
@@ -2058,6 +2077,28 @@ export function draftBasisError(profileName: string, stored: string | null, base
     return new DraftConflictError('DRAFT_CHANGED', stored, `the draft of '${profileName}' was saved again since it was read (now ${stored}); reload it and apply the change again`);
   }
   return null;
+}
+
+/**
+ * A WRITE HELD TO THE ACTIVE VERSION IT WAS BASED ON: refused `VERSION_CHANGED` when another version has been
+ * activated since, so an older view never replaces a newer version. Null when they agree, or when nothing is active.
+ */
+export function versionBasisError(profileName: string, active: number | null, basedOn: number | undefined): DraftConflictError | null {
+  if (active === null || basedOn === undefined || active === basedOn) return null;
+  return new DraftConflictError('VERSION_CHANGED', null,
+    `'${profileName}' is at version ${active} now, newer than version ${basedOn} this was based on; reload it and apply the change again`);
+}
+
+/**
+ * ACTIVATING A DRAFT IS HELD TO THE VERSION IT WAS STARTED FROM: a draft that records one, while a newer version
+ * has been activated since, is refused rather than replacing it. A draft with no recorded start (an import or a copy, which
+ * replace on purpose) is not held.
+ */
+export async function activationBasisError(ssm: SSMClient, ssmRoot: string, profileName: string, draft: ProfileDefinition): Promise<DraftConflictError | null> {
+  const basedOn = (draft as { provenance?: DraftProvenance }).provenance?.basedOnVersion;
+  if (typeof basedOn !== 'number') return null;
+  const refusal = versionBasisError(profileName, await activeVersionNumber(ssm, ssmRoot, profileName), basedOn);
+  return refusal ? new DraftConflictError('VERSION_CHANGED', draft.configId, refusal.message) : null;
 }
 
 /** What `discardDraft` did: the draft it removed, no draft at all, or a newer draft it kept. */

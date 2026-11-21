@@ -15,7 +15,8 @@ const SSM_ROOT = '/agent-echelon';
 
 /** A fake SSM that records writes into a param store and serves them back on GetParameter (with labels). */
 function fakeSsmStore() {
-  const params = new Map<string, { value: string; version: number; labels: Set<string> }>();
+  // `at` is the version each label is on, as SSM keeps it.
+  const params = new Map<string, { value: string; version: number; labels: Set<string>; at: Map<string, number> }>();
   const put = jest.fn();
   const label = jest.fn();
   const client = {
@@ -24,14 +25,14 @@ function fakeSsmStore() {
         const { Name, Value } = cmd.input as { Name: string; Value: string };
         const prev = params.get(Name);
         const version = (prev?.version ?? 0) + 1;
-        params.set(Name, { value: Value, version, labels: prev?.labels ?? new Set() });
+        params.set(Name, { value: Value, version, labels: prev?.labels ?? new Set(), at: prev?.at ?? new Map() });
         put(Name, Value);
         return { Version: version };
       }
       if (cmd instanceof LabelParameterVersionCommand) {
-        const { Name, Labels } = cmd.input as { Name: string; Labels: string[] };
+        const { Name, Labels, ParameterVersion } = cmd.input as { Name: string; Labels: string[]; ParameterVersion: number };
         const p = params.get(Name)!;
-        for (const l of Labels) p.labels.add(l);
+        for (const l of Labels) { p.labels.add(l); p.at.set(l, ParameterVersion); }
         label(Name, Labels);
         return {};
       }
@@ -44,7 +45,7 @@ function fakeSsmStore() {
         e.name = 'ParameterNotFound';
         throw e;
       }
-      return { Parameter: { Value: p.value } };
+      return { Parameter: { Value: p.value, Version: lbl ? p.at.get(lbl) ?? p.version : p.version } };
     }),
   };
   return { client: client as unknown as import('@aws-sdk/client-ssm').SSMClient, params, put, label };
@@ -67,7 +68,32 @@ describe('seed-profile-definitions P0', () => {
       const p = params.get(`${SSM_ROOT}/assistant/${r.profileName}/definition`)!;
       expect(p.labels.has('active')).toBe(true);
     }
-    expect(label).toHaveBeenCalledTimes(results.length);
+    // Each version the seed writes is labeled `seeded` and `active`.
+    expect(label).toHaveBeenCalledTimes(results.length * 2);
+  });
+
+  it('rewrites an assistant whose active version is still the seed\'s own', async () => {
+    const { client, params } = fakeSsmStore();
+    await seedAllProfileDefinitions(client, SSM_ROOT);
+    const again = await seedAllProfileDefinitions(client, SSM_ROOT);
+    expect(again.every((r) => r.version === 2 && r.labeled && !r.left)).toBe(true);
+    expect(params.get(`${SSM_ROOT}/assistant/advisor/definition`)!.at.get('active')).toBe(2);
+  });
+
+  it('DENY: leaves an assistant whose active version a team or an import advanced, writing nothing', async () => {
+    const { client, params, put } = fakeSsmStore();
+    await seedAllProfileDefinitions(client, SSM_ROOT);
+    // A TEAM ACTIVATES ITS OWN VERSION: a new version of the definition, labeled active and not seeded.
+    const name = `${SSM_ROOT}/assistant/advisor/definition`;
+    const p = params.get(name)!;
+    p.version += 1;
+    p.value = '{"team":true}';
+    p.at.set('active', p.version);
+    put.mockClear();
+    const again = await seedAllProfileDefinitions(client, SSM_ROOT);
+    expect(again.find((r) => r.profileName === 'advisor')).toEqual({ profileName: 'advisor', version: 2, labeled: false, left: true });
+    expect(put.mock.calls.map(([n]) => n)).not.toContain(name);
+    expect(params.get(name)!.value).toBe('{"team":true}');
   });
 
   it("includes a ROLE's assistant, which the classification-mapped set left out", async () => {

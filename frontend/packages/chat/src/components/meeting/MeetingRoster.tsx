@@ -135,9 +135,8 @@ function storedCollapsed(): boolean {
   try { return localStorage.getItem(COLLAPSED_KEY) === '1'; } catch { return false; }
 }
 
-/** The state a row's tag says: joined, left, removed, or never joined. */
-const stateKey = (p: RosterPerson): string =>
-  p.inMeeting ? 'meeting.roster.joined' : p.removed ? 'meeting.roster.removed' : p.left ? 'meeting.roster.left' : 'meeting.roster.notInMeeting';
+/** Why a person not in the meeting is not in it, where there is a why: removed by a host, or left. */
+const awayKey = (p: RosterPerson): string => (p.removed ? 'meeting.roster.removed' : 'meeting.roster.left');
 
 /** A member the roster can address in the chat. */
 type Addressable = Pick<ChannelMember, 'userArn' | 'name' | 'isBot'>;
@@ -305,7 +304,7 @@ export default function MeetingRoster() {
                   ))}
                   <span className="ae-meeting-roster-state">
                     {/* A PERSON NOT IN THE MEETING SAYS WHY WHERE THERE IS A WHY (left, removed): the list's heading says the rest. */}
-                    {(p.left || p.removed) && <span className="ae-meeting-roster-tag">{t(stateKey(p))}</span>}
+                    {(p.left || p.removed) && <span className="ae-meeting-roster-tag">{t(awayKey(p))}</span>}
                     {p.inMeeting && (
                       <>
                         <ActivityIndicators micOn={p.muted === false && !p.mutedByHost} speaking={p.speaking && p.muted === false} camera={p.camera} sharing={p.sharing} />

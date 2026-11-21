@@ -1,5 +1,5 @@
 /**
- * A MOVED ANSWER KEEPS ITS FIRST FEEDBACK (migration 080, owner 2026-10-21).
+ * A MOVED ANSWER KEEPS ITS FIRST FEEDBACK (migration 080).
  *
  * A placeholder whose answer moved to a message of its own declares `receipt` or `queue_ack` and pairs
  * with nothing, so `v_turn_latency` lost its anchor and the turn lost its time to first feedback, which

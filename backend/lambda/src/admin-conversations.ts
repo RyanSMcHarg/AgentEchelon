@@ -351,7 +351,7 @@ async function listMessages(archive: ArchiveReader, event: APIGatewayProxyEvent,
 const MAX_REASON_LENGTH = 500;
 
 /**
- * A READ OF A CONVERSATION IS IN THE ACCESS LOG BEFORE ITS CONTENT IS RETURNED (ADR-052, owner 2026-10-26).
+ * A READ OF A CONVERSATION IS IN THE ACCESS LOG BEFORE ITS CONTENT IS RETURNED (ADR-052).
  *
  * An admin's read arrives on a credential the exchange vended for one conversation, and the exchange
  * recorded it. A team member's read, and the de-identified copy, arrive on the console session itself, so

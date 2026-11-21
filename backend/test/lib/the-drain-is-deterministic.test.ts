@@ -49,7 +49,7 @@ describe('a reading the model refused to give still drains the queue', () => {
       { messageId: 'm1', content: 'Actually, keep it to one page.' },
     ]);
 
-    // NOT `new` EITHER, which is what this asserted (maintainer, 2026-09-03).
+    // NOT `new` EITHER, which is what this asserted.
     //
     // The rule in this test's own title is the reason: `new` is a claim about what the work IS, made
     // by a floor that understood nothing about the message. It opened a `queued_request` in

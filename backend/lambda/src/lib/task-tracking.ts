@@ -450,7 +450,7 @@ export interface Task {
   /**
    * THE ASSISTANT THIS CHAIN BELONGS TO, as a principal id. Written once at creation and never moved.
    *
-   * Distinct from `ownerId`, and both are needed (maintainer, 2026-08-14). The OWNER is whoever must act
+   * Distinct from `ownerId`, and both are needed. The OWNER is whoever must act
    * next and legitimately changes hands every time the machine crosses an `awaits` boundary; the
    * ASSISTANT is which assistant's work this is, and never changes. Collapsing them is what forced the
    * choice between two broken things: keep the assistant as owner and a task blocked on a person is
@@ -594,6 +594,10 @@ export interface WorkflowRunRef {
   movesTo?: string;
   /** The state a settling press moves the task to while the run has not reached its end (`confirmEnd`). */
   confirmEnd?: string;
+  /** Its card is kept at the top of the conversation (`pinned` on the step). */
+  pinned?: true;
+  /** The participant roles whose holders may decide it besides its assignee, and reopen it (`decidedBy` on the step). */
+  decidedBy?: string[];
   /** An intent's run only: the task its own step opened (`EventRunContext.runTaskId`); absent on that task itself. */
   runTaskId?: string;
   /** `task-reopened` only: the task that reopened, and which reopen. */
@@ -603,7 +607,7 @@ export interface WorkflowRunRef {
   /** A meeting's events only: the meeting the run is for. */
   meeting?: { meetingId: string };
   /** The run's process (SPEC-PROCESSES P2): its id, name, edition and the run's owner team, carried to the task's settlement. */
-  process?: { id: string; name: string; edition?: string; ownerTeam?: string };
+  process?: { id: string; name: string; edition?: string; ownerTeam?: string; received?: string };
   /** A `remind` deadline (WT21): how often, in minutes, and how many reminders in all. */
   remind?: { everyMinutes: number; times: number };
   /** A form's fields (WT50), which its card shows and its answers are held to. */
@@ -738,8 +742,15 @@ function generateTaskId(): string {
  */
 export const TASK_REF_COUNTER_ID = 'counter#taskRef';
 
+/**
+ * TASKS THE PLATFORM RUNS ON ITS OWN AND NOBODY WORKS ON: a run's runbook drawn on its dashboards. Never a conversation's
+ * open work (`getOpenTasksForConversation`, which an assistant's open-work hint, `/stop` and the open-work summary read),
+ * and never given a reference.
+ */
+export const UNLISTED_TASK_TYPES: ReadonlySet<string> = new Set(['dashboard_runbook']);
+
 /** Task types a person never answers by reference, so they do not consume a number. */
-const UNREFERENCED_TASK_TYPES = new Set(['queue_drain']);
+const UNREFERENCED_TASK_TYPES = new Set(['queue_drain', ...UNLISTED_TASK_TYPES]);
 
 /**
  * Allocate the next reference for a conversation, atomically.
@@ -940,7 +951,7 @@ export async function createTask(
     ...(opts?.dueBy ? { dueBy: opts.dueBy } : {}),
   };
 
-  // THE OWNER IS WHOEVER OWES THE CURRENT STEP (ADR-024 D1, owner 2026-08-14), and that is decided by the state
+  // THE OWNER IS WHOEVER OWES THE CURRENT STEP (ADR-024 D1), and that is decided by the state
   // the task STARTS in, not only by transitions later. `maybeHandOver` moves ownership when the machine
   // CROSSES an `awaits` boundary, which is right for every transition and silent about the start:
   // a machine whose INITIAL state awaits the user was born blocked on them and nothing crossed
@@ -1258,7 +1269,7 @@ async function queryActiveTask(
  *
  * Returns the task ID, which is what callers should carry from here on. "The active task" as an
  * implicit notion is exactly what let a resumed turn operate on whichever row a second lookup happened
- * to return (maintainer, 2026-08-14).
+ * to return.
  */
 export async function getActiveTaskForAssistant(
   assistantId: string,
@@ -1764,7 +1775,7 @@ export interface ConversationTask {
   createdAt: string;
   updatedAt: string;
   /**
-   * RELATIVE URGENCY, AND IT TRAVELS ON A PRIVATE ROW TOO (maintainer decision, 2026-09-01).
+   * RELATIVE URGENCY, AND IT TRAVELS ON A PRIVATE ROW TOO.
    *
    * Ordering is OCCUPANCY, not content: it says where this work sits against the rest of the list,
    * never what the work is. A private row is listed AS private and still takes its place, by the same
@@ -1779,7 +1790,7 @@ export interface ConversationTask {
    */
   priority?: TaskPriority;
   /**
-   * TRUE ON A ROW THE VIEWER MAY KNOW EXISTS BUT NOT READ (maintainer decision, 2026-08-23): a private
+   * TRUE ON A ROW THE VIEWER MAY KNOW EXISTS BUT NOT READ: a private
    * task is visible in THAT it exists and is occupying an assistant, and invisible in WHAT it is.
    * On such a row every describing field (`taskType`, `taskState`, `dueBy`) is absent - stripped at
    * read time, never trusted to the caller to withhold. Absent means the viewer sees the full row.
@@ -1809,7 +1820,7 @@ export async function getOpenTasksForConversation(
     /**
      * WHO IS ASKING, as an app-instance principal id. A private task's DETAILS are returned only to
      * its requester or to the assistant that owns it; every other viewer receives the row with its
-     * describing fields stripped and `private: true` (ADR-033, amended by the owner 2026-08-23:
+     * describing fields stripped and `private: true` (ADR-033:
      * existence is conversation-visible, details are not).
      *
      * OPTIONAL, AND THAT IS STILL THE SAFE DIRECTION: a caller that does not say who it is gets the
@@ -1851,13 +1862,12 @@ export async function getOpenTasksForConversation(
         ScanIndexForward: false, // newest first, by the index's sort key
         ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
       }));
-      all.push(...((result.Items as Task[] | undefined) ?? []));
+      all.push(...((result.Items as Task[] | undefined) ?? []).filter((t) => !UNLISTED_TASK_TYPES.has(t.taskType ?? '')));
       lastKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
     } while (lastKey && all.length < limit);
     // THE VISIBILITY FILTER, applied before the limit so a private task cannot displace a visible one
     // from a caller's page and make the list look shorter than it is.
-    // A PRIVATE TASK IS VISIBLE IN THAT IT EXISTS, INVISIBLE IN WHAT IT IS (maintainer decision,
-    // 2026-08-23; this replaces the earlier rule that hid the row outright). Hiding it entirely
+    // A PRIVATE TASK IS VISIBLE IN THAT IT EXISTS, INVISIBLE IN WHAT IT IS. Hiding it entirely
     // produced two live defects at once: the assistant it occupies looked idle to everyone else,
     // and the requester's own `/stop` - which reads this list through the same viewerless path -
     // could not find the work it was asked to stop, so "there's nothing in progress here" was said
@@ -1985,7 +1995,7 @@ export function buildConversationTasksHint(
     const due = t.dueBy ? `, due ${t.dueBy}` : '';
     // A REDACTED ROW SAYS SO, rather than masquerading as a "general" task. The viewer is entitled
     // to know the assistant is occupied and by private work; calling it anything more specific would
-    // be inventing detail the read deliberately stripped (maintainer decision, 2026-08-23).
+    // be inventing detail the read deliberately stripped.
     // PRIORITY TRAVELS ON EVERY ROW, the redacted one included: it is where the work sits, not what
     // the work is. A private row that carried no priority would have to be ranked around rather than
     // ranked, which is the position leak this was meant to avoid, pointing the other way.
@@ -2024,9 +2034,13 @@ Anyone in this conversation may ask about these. Only the holder can move one fo
  */
 export async function getActiveTasksForUser(
   personId: string,
-  opts: { limit?: number; admit?: (rows: UserTask[]) => Promise<UserTask[]> } = {},
+  opts: { limit?: number; admit?: (rows: UserTask[]) => Promise<UserTask[]>; strict?: boolean } = {},
 ): Promise<UserTask[]> {
-  if (!USER_TASKS_TABLE) return [];
+  // A STRICT READ (`/tasks/mine`) THROWS where it cannot read, so a person is never told they owe nothing by an outage.
+  if (!USER_TASKS_TABLE) {
+    if (opts.strict) throw new Error('USER_TASKS_TABLE is not configured');
+    return [];
+  }
 
   const limit = Math.min(Math.max(opts.limit ?? 10, 1), 25);
 
@@ -2041,7 +2055,7 @@ export async function getActiveTasksForUser(
   // Bounded by the same reasoning as `getAssigneeChannelTasks`: the partition is TTL-bounded, so the
   // full walk is bounded too, and a page cap stops early once enough ACTIVE rows are in hand.
   //
-  // Only the read is answered as "no rows" when it fails; what `opts.admit` throws is the caller's.
+  // Only the read is answered as "no rows" when it fails, unless the read is strict; what `opts.admit` throws is the caller's.
   const rows: UserTask[] = [];
   let lastKey: Record<string, unknown> | undefined;
   let pages = 0;
@@ -2062,6 +2076,7 @@ export async function getActiveTasksForUser(
       }));
     } catch (error) {
       console.error('Error getting cross-channel tasks for user:', error);
+      if (opts.strict) throw error;
       return [];
     }
     const page = (result.Items as UserTask[] | undefined) ?? [];
@@ -2173,6 +2188,86 @@ export const TERMINAL_TASK_STATUS: Partial<Record<TaskStatus, TerminalKind>> = {
  * note about it must never cost them the delivery. A failure here degrades to the behavior that
  * shipped before - an assistant that cannot see what it handed over.
  */
+/**
+ * A VERSION ITS APPROVER ATTACHED ON THE TASK'S CARD, appended to the task's `documents`, at most
+ * `MAX_TASK_DOCUMENTS`, only while the task is open. The task service checks the key is the approver's own before this.
+ */
+export async function appendTaskDocument(taskId: string, channelArn: string, doc: import('./task-documents.js').TaskDocument, max: number): Promise<boolean> {
+  if (!TASKS_TABLE) return false;
+  try {
+    await dynamoClient.send(new UpdateCommand({
+      TableName: TASKS_TABLE,
+      Key: { taskId, channelArn },
+      UpdateExpression: 'SET documents = list_append(if_not_exists(documents, :empty), :d), #updatedAt = :now',
+      ConditionExpression: 'attribute_exists(taskId) AND (attribute_not_exists(documents) OR size(documents) < :max)',
+      ExpressionAttributeNames: { '#updatedAt': 'updatedAt' },
+      ExpressionAttributeValues: { ':empty': [], ':d': [doc], ':now': new Date().toISOString(), ':max': max },
+    }));
+    return true;
+  } catch (err) {
+    console.warn('[task-tracking] a version could not be recorded', { err: (err as Error)?.name });
+    return false;
+  }
+}
+
+/** A REVISION ITS APPROVER ASKED FOR, recorded on the task while the drafting assistant writes it. */
+export async function setTaskRevision(taskId: string, channelArn: string, revision: import('./task-documents.js').TaskRevisionRequest | null): Promise<boolean> {
+  if (!TASKS_TABLE) return false;
+  try {
+    await dynamoClient.send(new UpdateCommand({
+      TableName: TASKS_TABLE,
+      Key: { taskId, channelArn },
+      UpdateExpression: revision ? 'SET revision = :r' : 'REMOVE revision',
+      ConditionExpression: 'attribute_exists(taskId)',
+      ...(revision ? { ExpressionAttributeValues: { ':r': revision } } : {}),
+    }));
+    return true;
+  } catch (err) {
+    console.warn('[task-tracking] a revision could not be recorded', { err: (err as Error)?.name });
+    return false;
+  }
+}
+
+/**
+ * A REVISION THAT WILL NOT LAND IS CLEARED, so the approver may ask again: only while the task still records that very revision
+ * (its number), so a later request is never cleared by an earlier one's failure.
+ */
+export async function clearTaskRevision(taskId: string, channelArn: string, n: number): Promise<boolean> {
+  if (!TASKS_TABLE) return false;
+  try {
+    await dynamoClient.send(new UpdateCommand({
+      TableName: TASKS_TABLE,
+      Key: { taskId, channelArn },
+      UpdateExpression: 'REMOVE revision',
+      ConditionExpression: 'revision.n = :n',
+      ExpressionAttributeValues: { ':n': n },
+    }));
+    return true;
+  } catch (err) {
+    if ((err as { name?: string })?.name !== 'ConditionalCheckFailedException') console.warn('[task-tracking] a revision could not be cleared', { err: (err as Error)?.name });
+    return false;
+  }
+}
+
+/** ONE RUN VALUE ON A TASK'S RUN, which the run carries on when the task settles (`approvedDocument`). */
+export async function setTaskRunValue(taskId: string, channelArn: string, key: string, value: string): Promise<boolean> {
+  if (!TASKS_TABLE) return false;
+  try {
+    await dynamoClient.send(new UpdateCommand({
+      TableName: TASKS_TABLE,
+      Key: { taskId, channelArn },
+      UpdateExpression: 'SET workflowRun.#values.#key = :v',
+      ConditionExpression: 'attribute_exists(workflowRun.#values)',
+      ExpressionAttributeNames: { '#values': 'values', '#key': key },
+      ExpressionAttributeValues: { ':v': value.slice(0, 500) },
+    }));
+    return true;
+  } catch (err) {
+    console.warn('[task-tracking] a run value could not be recorded', { err: (err as Error)?.name });
+    return false;
+  }
+}
+
 export async function recordTaskDelivery(
   taskId: string,
   channelArn: string,
@@ -2204,6 +2299,38 @@ export async function recordTaskDelivery(
  * request's task is this one: the run is recorded on it once, only while it is a `queued_request` or awaits its run, and
  * has none, so a redelivered naming finds the run already there and writes nothing. Null when the row is not such a task.
  */
+/**
+ * A REOPENED TASK TAKES THE RUN ITS REOPEN STARTED (`takes: 'reopened'`): its run reference is replaced, only while it still names
+ * the run it was reopened from, so a redelivered reopen run writes nothing twice and no other run's task is taken.
+ */
+export async function takeReopenedTask(
+  taskId: string, channelArn: string, fromRunKey: string, workflowRun: WorkflowRunRef, extra: { ttlSeconds?: number } = {},
+): Promise<Task | null> {
+  if (!TASKS_TABLE || !taskId || !channelArn || !fromRunKey || !workflowRun?.runKey) return null;
+  // THE TAKING RUN'S STEP DECIDES HOW LONG THE ROW IS KEPT, as on a task the step opened itself: the row outlives the step's
+  // deadline, so its firing and the settlement find it.
+  const ttlSeconds = extra.ttlSeconds ? Math.min(Math.max(60, extra.ttlSeconds), 45 * 24 * 3600) : undefined;
+  try {
+    const out = await dynamoClient.send(new UpdateCommand({
+      TableName: TASKS_TABLE,
+      Key: { taskId, channelArn },
+      ReturnValues: 'ALL_NEW',
+      UpdateExpression: `SET workflowRun = :run, updatedAt = :now${ttlSeconds ? ', #ttl = :ttl' : ''}`,
+      ConditionExpression: 'attribute_exists(taskId) AND workflowRun.runKey = :from',
+      ...(ttlSeconds ? { ExpressionAttributeNames: { '#ttl': 'ttl' } } : {}),
+      ExpressionAttributeValues: {
+        ':run': workflowRun, ':now': new Date().toISOString(), ':from': fromRunKey,
+        ...(ttlSeconds ? { ':ttl': Math.floor(Date.now() / 1000) + ttlSeconds } : {}),
+      },
+    }));
+    return (out.Attributes as Task | undefined) ?? null;
+  } catch (err) {
+    if ((err as { name?: string })?.name === 'ConditionalCheckFailedException') return null;
+    console.error('[task-tracking] a reopened task could not take its run', { taskId, message: (err as Error)?.message });
+    throw err;
+  }
+}
+
 export async function attachRequestRun(
   taskId: string, channelArn: string, workflowRun: WorkflowRunRef, extra: { dueBy?: string; ttlSeconds?: number } = {},
 ): Promise<Task | null> {
@@ -3133,6 +3260,13 @@ export async function advanceTaskStateTo(args: {
    * already held back by trust and call site. Absent, a declared condition does not hold.
    */
   conditionValues?: Record<string, import('./variables.js').VariableValue>;
+  /** A reopen pressed by a holder of one of the step's deciding roles (`decidedBy`), checked by the task service. */
+  reopenByDecider?: boolean;
+  /**
+   * A QUIET STEP'S MOVE (`isQuietStep`), which no turn's message carries: the task service closes the task where the move
+   * settles it and records the settlement in the archive. The row's move itself is the same as any other.
+   */
+  quiet?: true;
 }): Promise<AdvanceResult> {
   const { task, toState } = args;
   const machines = args.machines ?? DEFAULT_TASK_STATE_MACHINES;
@@ -3142,9 +3276,15 @@ export async function advanceTaskStateTo(args: {
 
   // WHO IS ASKING decides whether a declared reopen is available: only the model's call, on a turn
   // carrying the requester's message, may reopen a finished task (`reopens`, task-state-machines.ts).
+  // A STEP WITH DECIDERS IS MOVED BY A PRESS ONLY (`decidedBy`): its choices are role-checked decisions, so no assistant's turn
+  // takes one from what somebody wrote.
+  if (args.by === 'tool' && task.workflowRun?.decidedBy?.length) {
+    return { ok: false, error: 'illegal_transition', from: task.taskState, legal: [] };
+  }
   const authz = authorizeTransition(task.taskType, task.taskState, toState, machines, {
     by: args.by ?? 'tool',
     ...(args.conditionValues ? { conditionValues: args.conditionValues } : {}),
+    ...(args.reopenByDecider ? { reopenByDecider: true } : {}),
   });
   if (!authz.ok) {
     return { ok: false, error: authz.error, from: authz.from, legal: authz.legal };
@@ -3444,7 +3584,7 @@ export async function applyUserResponseToTask(args: {
 }
 
 /*
- * advanceDeliveredTaskToCompletion and its BFS walker were REMOVED here (maintainer decision 2026-08-18).
+ * advanceDeliveredTaskToCompletion and its BFS walker were REMOVED here.
  * They force-walked a task to its terminal state when the OUTPUT looked deliverable-shaped - a second
  * completion door beside the model's own advance_task_state, and it closed a task from
  * drafting_outline while the reply was still asking for outline approval. Completion now has one
@@ -3577,7 +3717,7 @@ export async function recordNoTransitionTurn(task: Task): Promise<number> {
       },
     });
   }
-  // ── THE BALL GOES BACK IF THE ASSISTANT DID NOT MOVE IT (maintainer, 2026-09-03) ──────────────────
+  // ── THE BALL GOES BACK IF THE ASSISTANT DID NOT MOVE IT ──────────────────
   //
   // `maybeHandOver` gives a task to the ASSISTANT when a person replies at an awaiting step, so the
   // turn that follows can act on it. That hand-over is meant to be momentary: the assistant holds it
@@ -3666,7 +3806,7 @@ export async function failTask(taskId: string, channelArn: string, error: string
 /**
  * Build task context string for system prompt.
  *
- * WHERE THE SUFFICIENCY RULE LIVES (maintainer, 2026-08-14). When the current step declares what it needs
+ * WHERE THE SUFFICIENCY RULE LIVES. When the current step declares what it needs
  * (`requires`), the person's message is reviewed against that list: everything there ⇒ advance and get
  * on with the work; something missing ⇒ ask for THAT, and only that, leaving the step where it is.
  *

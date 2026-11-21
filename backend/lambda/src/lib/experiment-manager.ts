@@ -1180,7 +1180,7 @@ export function validateAndSanitizeExperiment(
         'VARIANT_MODEL_KEY_REQUIRED',
       );
     }
-    // THE KEY MUST BE IN THE CATALOG (maintainer, 2026-08-10).
+    // THE KEY MUST BE IN THE CATALOG.
     //
     // Presence was checked and membership was not, and the failure is silent in the worst possible way.
     // At resolution `catalog[modelKey]` returns undefined for an unknown key, so no variant model is

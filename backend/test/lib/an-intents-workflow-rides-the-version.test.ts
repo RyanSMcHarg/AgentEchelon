@@ -90,7 +90,7 @@ afterAll(() => { delete process.env.PROFILE_BODY_BUCKET; });
 describe('the platform machines are one declaration', () => {
   it('is the queue, the work items and asking a person, and the queue stays its own subset', () => {
     expect([...PLATFORM_MACHINE_KEYS].sort()).toEqual([
-      ...PLATFORM_TASK_MACHINE_KEYS, 'action_item', 'place_item', 'approval', 'acknowledgement', 'incident_ownership', 'drift_offer', 'dashboard_refresh', 'form', 'meeting_offer', 'customer_impact', 'customer_updates', 'final_notice', 'meeting_action_item',
+      ...PLATFORM_TASK_MACHINE_KEYS, 'action_item', 'place_item', 'approval', 'acknowledgement', 'incident_ownership', 'drift_offer', 'dashboard_refresh', 'dashboard_runbook', 'form', 'meeting_offer', 'customer_impact', 'customer_updates', 'final_notice', 'meeting_action_item',
     ].sort());
     for (const k of PLATFORM_MACHINE_KEYS) expect(DEFAULT_TASK_STATE_MACHINES[k]).toBeDefined();
     // A workflow step may still open the work items and the asking machines; only the queue's own are closed to it.
@@ -310,7 +310,7 @@ describe('every reader resolves a task\'s machine through its version', () => {
 
   it('the router\'s task readers read the task\'s version, not the global set', () => {
     for (const site of [
-      'pickupReadiness(task, await resolveTaskMachines(task, { profileName: assistant.profile.name }), assistantId)',
+      'const machines = await resolveTaskMachines(task, { profileName: assistant.profile.name });',
       'const machines = await resolveTaskMachines(task, { profileName: profile.name });',
       'machines: await taskMachinesOf(answered),',
       'machines: await taskMachinesOf(mine),',

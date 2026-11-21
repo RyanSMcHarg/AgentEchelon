@@ -1,5 +1,5 @@
 /**
- * A TEAM MEMBER IS NAMED BY THEIR TEAM, NOT BY A ROLE LABEL (owner decision, 2026-10-23).
+ * A TEAM MEMBER IS NAMED BY THEIR TEAM, NOT BY A ROLE LABEL.
  *
  * What it proves: the console's identity line reads "Ops team, owner of the ops-premium assistant"; a team
  * owning several assistants picks one; a person in several teams picks the team with the shared selector

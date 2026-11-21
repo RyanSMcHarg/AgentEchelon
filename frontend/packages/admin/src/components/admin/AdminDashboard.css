@@ -3089,6 +3089,8 @@ legend.admin-field-label {
   flex-direction: column;
   gap: var(--space-4);
 }
+/* The workflows section only: wider than every other page (.admin-tab holds 1400px), still fluid to the window. */
+.admin-tab.admin-assistant-page-wide { max-width: min(1680px, 100%); }
 .admin-assistant-header {
   display: flex;
   flex-wrap: wrap;
@@ -3533,7 +3535,8 @@ legend.admin-field-label {
   padding-left: var(--space-3, 12px);
 }
 
-/* WHAT STARTS A WORKFLOW: a stacked form, each trigger a card naming its event, resource, state and rule. */
+/* WHAT STARTS A WORKFLOW: one line per trigger and a stacked form, fluid to the column it sits in. A fieldset sizes to its
+   widest child unless told otherwise, so min-width: 0 keeps a long option from pushing it past the column. */
 .admin-event-trigger {
   display: flex;
   flex-direction: column;
@@ -3542,8 +3545,18 @@ legend.admin-field-label {
   border: 1px solid var(--border-subtle, var(--zinc-200, #e4e4e7));
   border-radius: var(--radius-md, 8px);
   padding: var(--space-4);
-  max-width: 720px;
+  min-width: 0;
+  max-width: 100%;
 }
+.admin-event-trigger .admin-event-trigger { border: 0; padding: 0; }
+.admin-event-trigger .admin-check { flex-wrap: wrap; max-width: 100%; }
+/* A list, a type or a key in the trigger form: as wide as its column allows, never wider. */
+.admin-event-trigger-select {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+.admin-event-trigger-row .admin-event-trigger-select { width: auto; flex: 1 1 12rem; }
 .admin-event-trigger-list {
   list-style: none;
   margin: 0;
@@ -3562,8 +3575,10 @@ legend.admin-field-label {
 }
 .admin-event-trigger-row {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-2);
   align-items: center;
+  min-width: 0;
 }
 .admin-event-trigger-row .input { flex: 1; }
 .admin-event-trigger-pattern {

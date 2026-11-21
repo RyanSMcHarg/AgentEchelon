@@ -1,5 +1,5 @@
 /**
- * A FURTHER TRIAGE PASS IS NOT A REDELIVERY OF THE ONE THAT SPAWNED IT (maintainer, 2026-09-02).
+ * A FURTHER TRIAGE PASS IS NOT A REDELIVERY OF THE ONE THAT SPAWNED IT.
  *
  * The re-read in DESIGN 2.3.3 fired correctly on the deployment and was then thrown away every
  * single time, because the pass it dispatched was indistinguishable from a duplicate delivery of the
@@ -158,7 +158,7 @@ describe('the processor claims the delivery key, and the re-dispatch keeps the t
 });
 
 /**
- * THE ARRIVAL ID MUST FIT WHAT A READER ACCEPTS (maintainer, 2026-09-02).
+ * THE ARRIVAL ID MUST FIT WHAT A READER ACCEPTS.
  *
  * Built by interpolation this ran to 74 characters against a 64-character bound, so the marker never
  * matched, the placeholder mapping was never written, and every triage turn polled ~7s for a mapping
@@ -216,7 +216,7 @@ describe('the arrival triage id fits the marker bound', () => {
 });
 
 /**
- * AND THE HANDOVER ID, WHICH HAD THE SAME DEFECT AND COMPOUNDED IT (maintainer, 2026-09-02).
+ * AND THE HANDOVER ID, WHICH HAD THE SAME DEFECT AND COMPOUNDED IT.
  *
  * `triage-handover-${correlationId}` re-prefixed the id it was handed, so a handover from an arrival
  * reading ran to roughly 90 characters and a chain grew by 16 per link. Every one was unreadable as a

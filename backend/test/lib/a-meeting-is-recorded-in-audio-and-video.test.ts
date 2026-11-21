@@ -1,5 +1,5 @@
 /**
- * A MEETING'S AUDIO AND VIDEO RECORDING (SPEC-ASSISTANT-MEETINGS FR70; owner decision 2026-11-12).
+ * A MEETING'S AUDIO AND VIDEO RECORDING (SPEC-ASSISTANT-MEETINGS FR70).
  *
  *  - recording mode starts an Amazon Chime SDK media capture into the meeting conversation's recording family, with the
  *    guide's composited settings; captions-only mode does not, and a deployment without `meetingMediaRecording` never does;
@@ -361,9 +361,9 @@ describe('the ended card carries the recording', () => {
     }
   });
 
-  it('the recording notice says audio and video are kept', () => {
+  it('the recording notice says only that the meeting is being recorded', () => {
     const r = renderMessageTemplate(shippedMessageTemplate('meeting-recording-started-media'), {}, { sections: ['chat'] });
-    expect(r.ok && r.sections.chat).toMatch(/audio and video/);
+    expect(r.ok && r.sections.chat).toBe('This meeting is being recorded.');
   });
 });
 

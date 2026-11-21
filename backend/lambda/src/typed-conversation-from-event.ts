@@ -73,8 +73,10 @@
  * invocation that fails outright (a timeout) is kept in the rule's dead-letter queue.
  */
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
-import { addInvitedMember, channelStands, completeTeamRoom, createConversationFromEvent, requireServiceAdmin } from './lib/channel-creation.js';
-import { continueEventRunThroughRouter, nameEventThroughRouter, personJoinedThroughRouter, type EventContinuation } from './lib/say-through-router.js';
+import { CONVERSATION_TYPE_TAG, GENERATION_TAG, addInvitedMember, channelStands, completeTeamRoom, createConversationFromEvent, deleteArchivedPatternRoom, patternChannelId, requireServiceAdmin } from './lib/channel-creation.js';
+import { claimPatternCreation, resetPatternRoomContext } from './lib/channel-context-client.js';
+import { retryWhileConflict } from './lib/transient-retry.js';
+import { continueEventRunThroughRouter, handWatchEventBack, nameEventThroughRouter, personJoinedThroughRouter, type EventContinuation } from './lib/say-through-router.js';
 import { resolveRouterArn } from './lib/router-arn.js';
 import { teamRoomChannelId } from './lib/event-triggers.js';
 import { conversationRef } from './lib/notify-directive.js';
@@ -92,6 +94,8 @@ import {
   getConversationTypeConfig,
   membershipSourceFor,
   typeAdmitsIssuers,
+  isPatternType,
+  MAX_PATTERN_RESOLVED,
 } from '../../lib/config/conversation-types.js';
 import { defaultDirectory, resolveAllowedSet } from './lib/membership-source.js';
 import type { Classification } from '../../lib/config/model-strategy.js';
@@ -163,6 +167,16 @@ export interface TypedConversationEventDetail {
   forRole?: string;
   /** This is the type's one team room: its id and tag follow the convention, and an existing room is the answer (WT121). */
   teamRoom?: boolean;
+  /**
+   * A PATTERN CONVERSATION (DESIGN-EVENT-TARGETS 11.2), asked for by the router for a pattern trigger's event: the value the type's
+   * pattern resolved to, and the policy's daily cap on the conversations the type creates. The id is derived here, from this
+   * creator's own classification, never taken from the caller.
+   */
+  patternRoom?: {
+    resolved: string; capPerDay: number;
+    /** The router's event, handed back to it once the conversation stands, so it runs the workflow there (`aeWatchEvent`). */
+    handBack?: unknown;
+  };
   /** One line describing what happened, carried into the new conversation as its issue. */
   summary?: string;
   /**
@@ -221,12 +235,19 @@ export async function typeAgents(typeKey: string): Promise<ResolvedAgent[]> {
   return [...required, ...optional];
 }
 
+/** A STANDING CONVERSATION'S ID: its type's team room, or the conversation its pattern names for this event. */
+function standingChannelId(detail: Pick<TypedConversationEventDetail, 'conversationType' | 'patternRoom'>): string {
+  return detail.patternRoom
+    ? patternChannelId(DEPLOYED_CLASSIFICATION, detail.conversationType, detail.patternRoom.resolved)
+    : teamRoomChannelId(detail.conversationType, DEPLOYED_CLASSIFICATION);
+}
+
 /**
  * COMPLETE A STANDING TEAM ROOM WITH NO LEAD: its primary, the assistants and people its type names, added as a creation adds
  * them. A room that does not stand is not created here, and the lead's refusal (`leadErr`) is the answer.
  */
-async function completeTeamRoomWithoutLead(typeKey: string, leadErr: unknown): Promise<void> {
-  const channelArn = `${APP_INSTANCE_ARN}/channel/${teamRoomChannelId(typeKey, DEPLOYED_CLASSIFICATION)}`;
+async function completeTeamRoomWithoutLead(typeKey: string, leadErr: unknown, channelId = teamRoomChannelId(typeKey, DEPLOYED_CLASSIFICATION)): Promise<void> {
+  const channelArn = `${APP_INSTANCE_ARN}/channel/${channelId}`;
   const bearerArn = requireServiceAdmin(await resolveServiceAdminBearer());
   if (!(await channelStands(channelArn, bearerArn))) throw leadErr;
   const primary = await resolvePrimary();
@@ -242,6 +263,31 @@ async function completeTeamRoomWithoutLead(typeKey: string, leadErr: unknown): P
   });
   console.log('[typed-conversation] the team room stands; completed without a lead, whose role has no single holder', { conversationType: typeKey });
 }
+
+/**
+ * A PATTERN CONVERSATION WHILE ITS LEAD ROLE HAS NO SINGLE HOLDER: one that stands, of this type at this classification and not
+ * archived, needs nothing created, so the router's event is handed back to run there, as a reused one's is. One that would
+ * have to be created, or recreated from an archive, needs its lead, and the lead's refusal (`leadErr`) is the answer.
+ */
+async function handBackStandingPatternRoom(detail: TypedConversationEventDetail, leadErr: unknown): Promise<void> {
+  if (!detail.patternRoom || !isPatternType(detail.conversationType)) throw leadErr;
+  const channelArn = `${APP_INSTANCE_ARN}/channel/${standingChannelId(detail)}`;
+  const admin = requireServiceAdmin(await resolveServiceAdminBearer());
+  if (!(await channelStands(channelArn, admin))) throw leadErr;
+  const tags = await readChannelTags(messagingClient, channelArn);
+  if (tags.classification !== DEPLOYED_CLASSIFICATION || tags[CONVERSATION_TYPE_TAG] !== detail.conversationType) {
+    console.error('[typed-conversation][SecurityEvent] refused: the conversation at a pattern id is another classification\'s or type\'s', { channelArn });
+    throw new Error('the conversation at this pattern id is not this type\'s at this classification; refusing');
+  }
+  if (isArchived(tags)) throw leadErr;
+  if (detail.patternRoom.handBack && typeof detail.patternRoom.handBack === 'object') {
+    await handWatchEventBack({ ...(detail.patternRoom.handBack as Record<string, unknown>), handedBack: 1 });
+  }
+  console.log('[typed-conversation] the pattern conversation stands; its event is handed back though its lead role has no single holder', { conversationType: detail.conversationType });
+}
+
+/** The first pause before a recreated pattern conversation's create is tried again while its deleted id is still held. */
+export const RECREATE_CONFLICT_PAUSE_MS = 1000;
 
 /** Hand the run that asked for this conversation back to its router. A hand-back that fails leaves the room standing. */
 async function handBackRun(run: Omit<EventContinuation, 'outcome'>, outcome: string, values: Record<string, string>): Promise<void> {
@@ -773,13 +819,14 @@ export const handler = async (
     // completing does not, so an attach is never refused because the on-call is changing hands.
     const forUserArn = detail.forUserArn || (detail.forRole
       ? await soleHolderOf(detail.conversationType, detail.forRole).catch(async (err) => {
-        if (!detail.teamRoom) throw err;
-        await completeTeamRoomWithoutLead(detail.conversationType, err);
+        if (!detail.teamRoom && !detail.patternRoom) throw err;
+        if (detail.patternRoom) await handBackStandingPatternRoom(detail, err);
+        else await completeTeamRoomWithoutLead(detail.conversationType, err, standingChannelId(detail));
         return null;
       })
       : await personNamed(detail.forPerson));
     if (forUserArn === null) {
-      const channelId = teamRoomChannelId(detail.conversationType, DEPLOYED_CLASSIFICATION);
+      const channelId = standingChannelId(detail);
       return { ok: true, reused: true, channelArn: `${APP_INSTANCE_ARN}/channel/${channelId}`, channelId, conversationType: detail.conversationType };
     }
     if (!forUserArn) throw new Error('the person this event names resolves to nobody in the directory');
@@ -789,6 +836,38 @@ export const handler = async (
     }
 
     const typeKey = detail.conversationType;
+    // A PATTERN CONVERSATION IS OF A PATTERN TYPE ONLY, at this creator's classification. One that stands is reused if it is
+    // this type's at this classification and not archived; an archived one is deleted and created again at the same id, its
+    // generation one more; a new one takes one of the day's creations, or nothing is created.
+    let patternGeneration = 1;
+    if (detail.patternRoom) {
+      if (!isPatternType(typeKey)) throw new Error(`"${typeKey}" names no conversation pattern; refusing`);
+      if (!/^[A-Za-z0-9:._-]+$/.test(detail.patternRoom.resolved) || detail.patternRoom.resolved.length > MAX_PATTERN_RESOLVED) throw new Error('detail.patternRoom.resolved is outside the id alphabet or its bound');
+      const channelArn = `${APP_INSTANCE_ARN}/channel/${standingChannelId(detail)}`;
+      const admin = requireServiceAdmin(await resolveServiceAdminBearer());
+      const stands = await channelStands(channelArn, admin);
+      let create = !stands;
+      if (stands) {
+        const tags = await readChannelTags(messagingClient, channelArn);
+        if (tags.classification !== DEPLOYED_CLASSIFICATION || tags[CONVERSATION_TYPE_TAG] !== typeKey) {
+          console.error('[typed-conversation][SecurityEvent] refused: the conversation at a pattern id is another classification\'s or type\'s', { channelArn });
+          throw new Error('the conversation at this pattern id is not this type\'s at this classification; refusing');
+        }
+        if (isArchived(tags)) {
+          const archivedGeneration = Number(tags[GENERATION_TAG]) || 1;
+          patternGeneration = archivedGeneration + 1;
+          // ITS ROW IS RESET FIRST, so the next generation inherits none of this one's role holdings, identities or watches,
+          // and a reset that fails deletes nothing: the next event finds the archived conversation and tries again.
+          await resetPatternRoomContext(channelArn, archivedGeneration);
+          await deleteArchivedPatternRoom(channelArn, admin);
+          create = true;
+          console.log('[typed-conversation] an archived pattern conversation is created again at its id', { conversationType: typeKey, generation: patternGeneration });
+        }
+      }
+      if (create && !(await claimPatternCreation(DEPLOYED_CLASSIFICATION, typeKey, detail.patternRoom.capPerDay))) {
+        throw new Error(`"${typeKey}" has created as many conversations today as its policy allows; nothing is created`);
+      }
+    }
     if (!CONVERSATION_TYPES[typeKey]) {
       throw new Error(`unknown conversation type "${typeKey}"`);
     }
@@ -933,8 +1012,9 @@ export const handler = async (
     const { name, subject } = await openedRoomNaming(typeKey, detail, watchedAlarm, primary.assistant);
     const creatorBearerArn = await resolveServiceAdminBearer();
 
-    const created = await createConversationFromEvent({
+    const createInput: Parameters<typeof createConversationFromEvent>[0] = {
       ...(detail.teamRoom ? { teamRoom: true } : {}),
+      ...(detail.patternRoom ? { patternRoom: { channelId: standingChannelId(detail), generation: patternGeneration } } : {}),
       appInstanceArn: APP_INSTANCE_ARN,
       botArn: bearerArn,
       userArn: forUserArn,
@@ -965,11 +1045,19 @@ export const handler = async (
       ...(roleModerators.length ? { roleModerators } : {}),
       ...(watchedAlarm ? { watchedAlarm } : {}),
       ...(ref ? { watchedRefs: [refKey(ref.kind, ref.id)] } : {}),
-    }).catch(async (err) => {
+    };
+    // A RECREATED PATTERN CONVERSATION'S DELETE MAY STILL BE IN FLIGHT, holding its id: the create is tried again, with a growing
+    // pause, while the id is held. The day's creation and the generation were taken once, before the delete, and are not again.
+    const recreating = !!detail.patternRoom && patternGeneration > 1;
+    const created = await (recreating
+      ? retryWhileConflict(() => createConversationFromEvent(createInput), RECREATE_CONFLICT_PAUSE_MS)
+      : createConversationFromEvent(createInput)).catch(async (err) => {
       // THE TEAM ROOM ALREADY STANDS: its id is fixed, so it is the answer, completed with the members a creation adds, so
       // a creation that stopped part way never leaves an empty room behind. A completion that fails reaches the catch below.
-      if (!detail.teamRoom || (err as { name?: string })?.name !== 'ConflictException') throw err;
-      const channelId = teamRoomChannelId(typeKey, DEPLOYED_CLASSIFICATION);
+      if ((!detail.teamRoom && !detail.patternRoom) || (err as { name?: string })?.name !== 'ConflictException') throw err;
+      // A RECREATION WHOSE ID STAYED HELD through every attempt: its id is not the standing room, so nothing is reused.
+      if (recreating) throw new Error('the archived conversation at this pattern id is still being deleted; the event is delivered again');
+      const channelId = standingChannelId(detail);
       const channelArn = `${APP_INSTANCE_ARN}/channel/${channelId}`;
       await completeTeamRoom({
         channelArn, primaryBotArn: bearerArn, leadArn: forUserArn, memberArns: humans,
@@ -978,6 +1066,11 @@ export const handler = async (
       });
       return { reused: true as const, channelArn, channelId };
     });
+    // THE ROUTER'S EVENT GOES BACK TO IT once the pattern conversation stands, marked as handed back, so it is run there once and a
+    // conversation that still does not stand is never asked for again.
+    if (detail.patternRoom?.handBack && typeof detail.patternRoom.handBack === 'object') {
+      await handWatchEventBack({ ...(detail.patternRoom.handBack as Record<string, unknown>), handedBack: 1 });
+    }
     if ('reused' in created) {
       console.log('[typed-conversation] the team room stands; completed and reused', { conversationType: typeKey });
       return { ok: true, reused: true, channelArn: created.channelArn, channelId: created.channelId, conversationType: typeKey };

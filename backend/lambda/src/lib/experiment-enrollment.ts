@@ -11,8 +11,8 @@
  * not matter which turn evaluates it: the first turn after creation and a turn an hour later reach the
  * same answer, and the pin only freezes it against later edits to the experiment. A conversation created
  * before the arm is never enrolled. The pin holds only while the experiment stays active: a pause, an end
- * or a passed end date releases the conversation to the live active version (`enrollmentHolds`, owner
- * 2026-10-15), and a resume enrolls only conversations created after it.
+ * or a passed end date releases the conversation to the live active version (`enrollmentHolds`),
+ * and a resume enrolls only conversations created after it.
  *
  * Recorded on the context row rather than the battle config row, because a battle config row's
  * existence is what its readers take to mean a battle is enabled, and the context row is the store every

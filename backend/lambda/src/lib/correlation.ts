@@ -194,7 +194,7 @@ export function correlationMarkerOf(content: string): string | null {
  * it so a redelivery of the same notice builds the same id and stays idempotent, while a notice whose
  * depth moved builds a different one and correctly loses to the reading already in flight.
  *
- * FITTED, BECAUSE IT IS ALSO A PLACEHOLDER MARKER AND WAS OVERFLOWING IT (maintainer, 2026-09-02). Built
+ * FITTED, BECAUSE IT IS ALSO A PLACEHOLDER MARKER AND WAS OVERFLOWING IT. Built
  * inline this read `arrival-${MessageId}-${depth}`, and an Amazon Chime SDK message id is opaque and
  * commonly 64 characters, which made the id 74 - ten over what a reader accepts. The consequences
  * were invisible because everything still worked, slowly:
@@ -269,7 +269,7 @@ export function stopEvaluationCorrelationId(correlationId: string): string {
   return `${fitSegment(correlationId, Math.max(0, CORRELATION_ID_MAX_LENGTH - suffix.length))}${suffix}`;
 }
 /**
- * THE KEY THE DEDUP GUARD CLAIMS, which is NOT the turn's correlation id (maintainer, 2026-09-02).
+ * THE KEY THE DEDUP GUARD CLAIMS, which is NOT the turn's correlation id.
  *
  * Two different questions had been sharing one string, and the collision made a bounded loop
  * unable to take its second iteration.

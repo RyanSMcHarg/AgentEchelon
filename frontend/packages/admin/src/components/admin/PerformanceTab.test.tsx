@@ -225,3 +225,17 @@ describe('the overview', () => {
     expect(screen.queryByText('LATENCY-ALL')).toBeNull();
   });
 });
+
+describe('an intent with nothing to show', () => {
+  it('opened on an intent with no turns in the period, or one the data never names, says so and leads back to the overview', () => {
+    for (const key of ['dashboard_runbook', 'no_such_intent']) {
+      const { unmount } = render(<Harness initial={{ view: 'intent', key } as PerfView} />);
+      expect(screen.getByTestId('perf-intent-empty')).toHaveTextContent(`No turns for ${key} in this period.`);
+      expect(screen.queryByRole('region', { name: /flow/i })).toBeNull();
+      fireEvent.click(screen.getByTestId('perf-intent-empty-back'));
+      expect(screen.queryByTestId('perf-intent-empty')).toBeNull();
+      expect(screen.getByRole('region', { name: /flow/i })).toHaveTextContent('report_request');
+      unmount();
+    }
+  });
+});

@@ -32,7 +32,7 @@ describe('a run carries its process on every record that continues it', () => {
     expect(router).toMatch(/run\.process \? \{ process: run\.process \}/);
     expect(router).toMatch(/const runProc = runProcessOf\(req\.process\);/);
     expect(src('assistant-async-processor.ts')).toMatch(/req\.process \? \{ process: req\.process \}/);
-    expect(src('lib/task-tracking.ts')).toMatch(/process\?: \{ id: string; name: string; edition\?: string; ownerTeam\?: string \}/);
+    expect(src('lib/task-tracking.ts')).toMatch(/process\?: \{ id: string; name: string; edition\?: string; ownerTeam\?: string; received\?: string \}/);
   });
 });
 

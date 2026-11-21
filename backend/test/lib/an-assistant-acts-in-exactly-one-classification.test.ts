@@ -5,8 +5,8 @@
  * That is correct for a person, whose reach is the grant set their classification declares - a premium
  * user speaking in a basic room is ordinary where premium declares basic - and it was applied unchanged to the assistant roles, where it is wrong. Every
  * classification has its own assistant and a channel carries only its matched one, so an assistant
- * reaching any other classification was reach nothing needed. ADR-042 is the record; the owner stated the rule on
- * 2026-09-13 and what followed was identity tagging rather than IAM pinning.
+ * reaching any other classification was reach nothing needed. ADR-042 is the record, and the
+ * rule is held by identity tagging rather than IAM pinning.
  *
  * ── WHY BOTH HALVES ARE IN ONE FILE ─────────────────────────────────────────────────────────────
  *

@@ -156,7 +156,11 @@ describe('the pickup is an ordinary task turn (one path)', () => {
   const ordinaryTask = router.slice(router.indexOf('const [dispatched] = await Promise.all([invokeAsync(asyncProcessorArn, {'), router.indexOf('if (dispatched) lockToRelease = null;'));
 
   it('the processor has no branch of its own for it: the turn runs the ordinary pipeline, so delivery, step actions, splitting and attribution are the ordinary turn\'s', () => {
-    expect(processor).not.toMatch(/event\.taskPickup/);
+    // The one pickup the processor tells apart is a quiet step (`isQuietStep`), which runs its action and returns before
+    // the ordinary pipeline; every other pickup is the ordinary turn.
+    const quiet = processor.slice(processor.indexOf('// ── A QUIET STEP TAKEN UP'), processor.indexOf('let imageInput: BedrockImageInput | undefined;'));
+    expect([...processor.matchAll(/event\.taskPickup/g)].length).toBe([...quiet.matchAll(/event\.taskPickup/g)].length);
+    expect(quiet).toContain('isQuietStep(');
     // The task loop the ordinary path builds from the dispatch's task id: what runs a delivering step's document
     // (`declaredDocument`) and a newly entered state's declared action (`runStepActions`).
     expect(processor).toMatch(/const taskContext = await buildTaskLoopContext\(\{\n\s+taskId: event\.taskId,\n\s+taskType: event\.taskType,/);

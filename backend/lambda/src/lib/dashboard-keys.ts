@@ -35,6 +35,15 @@ export function dashboardKey(classification: string, conversationId: string, mod
   return `${dashboardPrefix(classification)}${conversationId}/${OBJECT[mode]}`;
 }
 
+/**
+ * THE RUNBOOK'S PROGRESS, beside the dashboard it is drawn into (section 8): written by the same publisher in the same
+ * session, read back by it on every publish, and never read by a member or served by the page distribution.
+ */
+export function runbookKey(classification: string, conversationId: string): string | null {
+  if (!CLASSIFICATION.test(classification) || !CONVERSATION_ID.test(conversationId)) return null;
+  return `${dashboardPrefix(classification)}${conversationId}/runbook.json`;
+}
+
 /** The page's address on the dashboard distribution, or null when it names no page. */
 export function dashboardPageUrl(domain: string, classification: string, conversationId: string): string | null {
   const key = domain ? dashboardKey(classification, conversationId, 'page') : null;

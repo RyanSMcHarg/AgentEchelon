@@ -218,6 +218,10 @@ const CONTROLLED: Record<string, Controlled> = {
       + '`postAdminNotice`.',
     sites: {
       'backend/lambda/src/lib/admin-notice.ts': 'THE alert raiser.',
+      'backend/lambda/src/router-agent-handler.ts':
+        'NOT AN ALERT: the one publisher of a process hand-off (`putHandoff`, DESIGN-PROCESSES section 12), on the process '
+        + 'event bus under this classification\'s own `ae.process.<classification>` source, which the bus policy admits from '
+        + 'this classification\'s router role alone and no alert rule matches.',
       'backend/lambda/src/lib/connectors/events.ts':
         'NOT AN ALERT: the one publisher of received vendor events (`ae.connector`), a different source the alert '
         + 'rule never matches, granted `events:PutEvents` for that source alone. A connector raises an alert '

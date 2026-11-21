@@ -290,8 +290,7 @@ interface MessageRecord {
    */
   turn_kind: string | null;
   /**
-   * THE QUEUED MESSAGES THIS ANSWER ADDRESSES, declared by the turn that folded them in (ADR-033
-   * amendment, owner 2026-09-15).
+   * THE QUEUED MESSAGES THIS ANSWER ADDRESSES, declared by the turn that folded them in (ADR-033).
    *
    * Empty on every ordinary answer, which is almost all of them. A non-empty list means the person
    * sent these while the assistant was busy, the reading marked them as amending the work in flight,
@@ -1143,7 +1142,7 @@ async function transformEvent(
     // moves on a classification change, so reading their groups or their identity tag here would answer what
     // they hold today and file it against a turn from last month.
     user_clearance: analytics.userClearance || null,
-    // ── DECLARED OR NULL. NEVER GUESSED (owner direction, 2026-09-13) ──────────────────────────
+    // ── DECLARED OR NULL. NEVER GUESSED ──────────────────────────
     //
     // This used to fall back to `extractAgentType(senderArn)`, which matched substrings in the bot
     // ARN - 'admin' meant premium, 'auth' meant standard - and returned null when none hit. That is
@@ -1272,7 +1271,7 @@ async function transformEvent(
  * Insert message records into unified messages table
  */
 async function insertMessageRecords(records: MessageRecord[]): Promise<number> {
-  // ── THE ROOM AND THE RESPONDER DISAGREED, AND SOMEBODY SHOULD LOOK (owner direction, 2026-09-13) ──
+  // ── THE ROOM AND THE RESPONDER DISAGREED, AND SOMEBODY SHOULD LOOK ──
   //
   // `agent_type` is the ASSISTANT that answered - one classification, its own, always. The ROOM's
   // classification is compared from `channel_classification`, the isolation projection written from
@@ -1331,7 +1330,7 @@ async function insertMessageRecords(records: MessageRecord[]): Promise<number> {
       servesClassification: servingClassification ?? '(undeclared assistant)',
       channelIs: room,
     };
-    // ANY DISAGREEMENT IS A DEFECT. NOT ONE DIRECTION (owner direction, 2026-09-13) ────────────────
+    // ANY DISAGREEMENT IS A DEFECT. NOT ONE DIRECTION ────────────────
     //
     // An assistant is ASSIGNED exactly one classification and a channel has exactly one. An exchange
     // is therefore between parties that MATCH, and a participant who does not hold the channel's

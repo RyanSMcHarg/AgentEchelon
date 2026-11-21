@@ -11,7 +11,7 @@
  * model's input, and the session's `dashboard` edge allows only `dashboards/<its classification>/`, so a turn cannot
  * write another conversation's dashboard even by asking.
  */
-import { S3Client, PutObjectCommand, HeadObjectCommand, CopyObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, HeadObjectCommand, CopyObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { DescribeChannelCommand, UpdateChannelMessageCommand, type ChimeSDKMessagingClient } from '@aws-sdk/client-chime-sdk-messaging';
 import type { AwsCredentialIdentity } from '@aws-sdk/types';
 import { readDashboardData } from './dashboard-data.js';
@@ -19,12 +19,33 @@ import { renderDashboardFragment, renderDashboardPage, type DashboardLabels } fr
 import { templateLine, type VersionWords } from './message-lines.js';
 import { botMessageMetadata } from './bot-message-attribution.js';
 import { sendChannelMessage } from './chime/send.js';
-import { conversationIdOf, dashboardKey, type DashboardMode } from './dashboard-keys.js';
+import { conversationIdOf, dashboardKey, runbookKey, type DashboardMode } from './dashboard-keys.js';
+import { toolOfferedToRole } from './tool-registry.js';
+import { isRunbookProgress, runbookNow, runbookStanding, MAX_PINNED_PEOPLE, MAX_PINNED_TEXT, type RunbookProgress } from './runbook-progress.js';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 
 export const DASHBOARD_TOOL = 'publish_dashboard';
 export const DASHBOARD_PAGE_TOOL = 'publish_dashboard_page';
+
+/** The intent an assistant advertises to be given a run's runbook to draw (DESIGN-CONVERSATION-DASHBOARDS section 8.1). */
+export const DASHBOARD_RUNBOOK_INTENT = 'dashboard_runbook';
+
+/**
+ * WHETHER AN ASSISTANT IS GIVEN A RUN'S RUNBOOK TO DRAW (section 8.1), from what it declares, with no model call: its role is
+ * one the dashboard tool is offered to, its served version's tool allowlist is absent or lists the tool, and it advertises
+ * the `dashboard_runbook` intent. `unadvertised` is the one refusal said aloud, once per run: the assistant could draw it
+ * and has not consented.
+ */
+export function runbookConsent(args: {
+  role: string;
+  versionTools: readonly string[] | undefined;
+  advertised: readonly string[];
+}): 'consents' | 'no-tool' | 'unadvertised' {
+  if (!toolOfferedToRole(DASHBOARD_TOOL, args.role)) return 'no-tool';
+  if (args.versionTools && !args.versionTools.includes(DASHBOARD_TOOL)) return 'no-tool';
+  return args.advertised.includes(DASHBOARD_RUNBOOK_INTENT) ? 'consents' : 'unadvertised';
+}
 
 /** Every word the dashboard shows, from the assistant's `dashboard` template. */
 export function dashboardLabels(words: VersionWords | undefined, time: string, conversation = ''): DashboardLabels {
@@ -34,6 +55,15 @@ export function dashboardLabels(words: VersionWords | undefined, time: string, c
     title: l('title') || l('titleUnnamed'), about: l('about'), deployment: l('deployment'), updated: l('updated'), related: l('related'), stateAlarm: l('stateAlarm'), stateOk: l('stateOk'), stateInsufficient: l('stateInsufficient'),
     threshold: l('threshold'), invocations: l('invocations'), errors: l('errors'), throttles: l('throttles'), durationMs: l('durationMs'),
     noData: l('noData'), unavailable: l('unavailable'), values: l('values'), time: l('time'), stateUnread: l('stateUnread'),
+    runbook: l('runbook'), runbookAbout: l('runbookAbout'), heldBy: l('heldBy'), openCard: l('openCard'),
+    // A STEP'S TIMES, worded by the template with each step's own values.
+    stepTimes: (started: string, settled?: string) => templateLine('dashboard', words, {
+      section: settled ? 'label.stepTimes' : 'label.stepSince', values: { time, conversation, started, settled: settled ?? '' },
+    }),
+    status: {
+      'not-started': l('statusNotStarted'), 'in-progress': l('statusInProgress'), waiting: l('statusWaiting'), done: l('statusDone'),
+      skipped: l('statusSkipped'), 'timed-out': l('statusTimedOut'), failed: l('statusFailed'),
+    },
   };
 }
 
@@ -44,6 +74,16 @@ export interface DashboardMessageMetadata {
   classification: string;
   updatedAt: string;
   state?: 'ALARM' | 'OK' | 'INSUFFICIENT_DATA';
+  /**
+   * WHAT THE CONVERSATION PINS AT ITS TOP: the step its run is on now, and who holds its roles. Declared words
+   * and members' names only, clipped, so the message stays within the service's Metadata limit.
+   */
+  now?: { label: string; status: string; holder?: string };
+  people?: Array<{ role: string; name: string }>;
+  /** Where the conversation stands, from its pinned step. */
+  standing?: 'open' | 'resolved' | 'ended';
+  /** Who may decide the pinned step and its choices now: the band offers them to those people (`decidedBy`). */
+  decide?: { taskId: string; state: string; choices: string[]; by: string[]; reopen?: true };
 }
 
 export interface PublishDashboardDeps {
@@ -51,6 +91,13 @@ export interface PublishDashboardDeps {
   messaging: Pick<ChimeSDKMessagingClient, 'send'>;
   read?: typeof readDashboardData;
   now?: () => number;
+}
+
+/** The pinned step's decision as the message carries it: ids and declared state names, clipped to the Metadata limit. */
+function decideOf(runbook: RunbookProgress | undefined): DashboardMessageMetadata['decide'] {
+  const d = runbook?.decide;
+  if (!d?.taskId || !d.state || !d.choices?.length || !d.by?.length) return undefined;
+  return { taskId: d.taskId.slice(0, 128), state: d.state.slice(0, 64), choices: d.choices.slice(0, 4).map((c) => c.slice(0, 64)), by: d.by.slice(0, 16).map((p) => p.slice(0, 64)), ...(d.reopen ? { reopen: true as const } : {}) };
 }
 
 export async function publishDashboard(args: {
@@ -65,6 +112,10 @@ export async function publishDashboard(args: {
   words?: VersionWords;
   /** The conversation's language, which the page is tagged with and its numbers are written in. */
   language?: string;
+  /** The run's progress as the router read it (section 8), stored beside the dashboard unless a newer one already is. */
+  runbook?: RunbookProgress;
+  /** A refresh, not a publish: where this dashboard has not been published yet, nothing is drawn or posted. */
+  onlyIfPublished?: boolean;
 }, deps: PublishDashboardDeps): Promise<Record<string, unknown>> {
   const conversationId = conversationIdOf(args.channelArn);
   const key = dashboardKey(args.classification, conversationId, args.mode);
@@ -73,12 +124,13 @@ export async function publishDashboard(args: {
   }
   const now = deps.now?.() ?? Date.now();
   const s3 = deps.s3 ?? new S3Client({ region: AWS_REGION, credentials: args.credentials });
-  // THE ONE MESSAGE, read from the object's own metadata, so a refresh updates it rather than posting another. Read beside the
-  // telemetry, which it does not depend on.
-  const [data, previous] = await Promise.all([
-    (deps.read ?? readDashboardData)(args.credentials, { ...(args.watchedAlarm ? { watchedAlarm: args.watchedAlarm } : {}), now: () => now }),
-    s3.send(new HeadObjectCommand({ Bucket: args.bucket, Key: key })).then((h) => h.Metadata?.['message-id']).catch(() => undefined),
-  ]);
+  // THE RUNBOOK DRAWN IS THE NEWEST ONE READ: what this call carries where it is newer than the stored one, which it then
+  // replaces, else the stored one, so a publish for the alarm keeps the runbook section and an older read never wins.
+  const runbook = await currentRunbook(s3, args.bucket, runbookKey(args.classification, conversationId), args.runbook);
+  // THE ONE MESSAGE, read from the object's own metadata, so a refresh updates it rather than posting another.
+  const previous = await s3.send(new HeadObjectCommand({ Bucket: args.bucket, Key: key })).then((h) => h.Metadata?.['message-id']).catch(() => undefined);
+  if (args.onlyIfPublished && !previous) return { published: false, reason: 'not-published' };
+  const data = await (deps.read ?? readDashboardData)(args.credentials, { ...(args.watchedAlarm ? { watchedAlarm: args.watchedAlarm } : {}), now: () => now });
   if (!data) return { published: false, unavailable: 'The telemetry could not be read as this assistant. Say so plainly.' };
   const time = new Date(now).toISOString().slice(11, 16);
   // THE CONVERSATION'S NAME, read as the assistant, which is a member: the dashboard's title says which conversation it is.
@@ -89,8 +141,13 @@ export async function publishDashboard(args: {
   const state = data.alarm?.state;
   // NO ALARM READING IS SAID AS ONE, never as the dashboard's title standing in for a state.
   const stateWord = labels[state === 'ALARM' ? 'stateAlarm' : state === 'OK' ? 'stateOk' : state === 'INSUFFICIENT_DATA' ? 'stateInsufficient' : 'stateUnread'] || templateLine('dashboard', undefined, { section: 'label.stateUnread' });
+  const onNow = runbookNow(runbook);
+  const people = (runbook?.people ?? []).slice(0, MAX_PINNED_PEOPLE).map((p) => ({ role: p.role.slice(0, 40), name: p.name.slice(0, MAX_PINNED_TEXT) }));
   const metadata: DashboardMessageMetadata = {
     kind: args.mode, conversationId, classification: args.classification, updatedAt: data.readAt, ...(state ? { state } : {}),
+    ...(onNow ? { now: onNow } : {}), ...(people.length ? { people } : {}),
+    ...(runbookStanding(runbook) ? { standing: runbookStanding(runbook) } : {}),
+    ...(decideOf(runbook) ? { decide: decideOf(runbook) } : {}),
   };
   const content = encodeURIComponent(templateLine('dashboard', args.words, { values: { state: stateWord, time } }));
   // A NOTIFICATION, NOT AN ANSWER: the client counts no reply from it and the archive no response, as for a workflow's sends.
@@ -98,8 +155,8 @@ export async function publishDashboard(args: {
 
   // WHAT A MEMBER READS: the rendered dashboard, and nothing the reader does not draw.
   const body = args.mode === 'snapshot'
-    ? JSON.stringify({ version: 1, ...metadata, html: renderDashboardFragment(data, labels, args.language) })
-    : renderDashboardPage(data, labels, args.language);
+    ? JSON.stringify({ version: 1, ...metadata, html: renderDashboardFragment(data, labels, args.language, { ...(runbook ? { runbook } : {}), linkConversation: conversationId }) })
+    : renderDashboardPage(data, labels, args.language, runbook ? { runbook } : {});
   const contentType = args.mode === 'snapshot' ? 'application/json' : 'text/html; charset=utf-8';
   // WRITTEN BEFORE THE MESSAGE IS POSTED OR UPDATED, so a member whose client reads on that message finds this dashboard there.
   await s3.send(new PutObjectCommand({
@@ -128,4 +185,51 @@ export async function publishDashboard(args: {
     }
   }
   return { published: true, kind: args.mode, updatedAt: data.readAt, ...(state ? { alarmState: state } : {}), ...(data.metricsUnavailable ? { metricsUnavailable: true } : {}) };
+}
+
+/**
+ * THE RUNBOOK TO DRAW, AND THE STORED ONE KEPT CURRENT. Never throws: a runbook that cannot be read or written leaves the
+ * dashboard without its section, never without its telemetry.
+ */
+async function currentRunbook(s3: S3Client, bucket: string, key: string | null, given: RunbookProgress | undefined): Promise<RunbookProgress | undefined> {
+  if (!key) return given;
+  const stored = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }))
+    .then(async (o) => { const v: unknown = JSON.parse(await o.Body!.transformToString()); return isRunbookProgress(v) ? v : undefined; })
+    .catch(() => undefined);
+  if (!given || (stored && stored.asOf >= given.asOf)) return stored ?? given;
+  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: JSON.stringify(given), ContentType: 'application/json', CacheControl: 'no-store' }))
+    .catch((err) => console.warn('[dashboard] the runbook could not be stored', { err: (err as Error)?.name }));
+  return given;
+}
+
+/**
+ * A RUN'S STEP MOVED (section 8.1): each of the conversation's dashboards already published is drawn again with the runbook,
+ * and its one message updated in place. Run as the declared action of the platform's quiet `dashboard_runbook` step, so no
+ * model and no chat line; a conversation with no dashboard yet only has the runbook stored, which its first publish draws.
+ */
+export async function refreshDashboardRunbook(
+  args: Omit<Parameters<typeof publishDashboard>[0], 'mode' | 'onlyIfPublished'> & { runbook: RunbookProgress; modes: DashboardMode[] },
+  deps: PublishDashboardDeps,
+): Promise<Array<Record<string, unknown>>> {
+  // NOTHING THE SECTION SHOWS CHANGED, NOTHING IS DRAWN: a run claims several steps per move (a step, its going on, its end),
+  // and redrawing for each updated the dashboard message every few seconds, which re-rendered every member's conversation.
+  const key = runbookKey(args.classification, conversationIdOf(args.channelArn));
+  if (key && args.credentials && args.bucket) {
+    const s3 = deps.s3 ?? new S3Client({ region: AWS_REGION, credentials: args.credentials });
+    const stored = await s3.send(new GetObjectCommand({ Bucket: args.bucket, Key: key }))
+      .then(async (o) => { const v: unknown = JSON.parse(await o.Body!.transformToString()); return isRunbookProgress(v) ? v : undefined; })
+      .catch(() => undefined);
+    // AN OLDER READ NEVER DRAWS: two refreshes taken up out of order leave the newer one standing.
+    if (stored && stored.asOf >= args.runbook.asOf) return [{ published: false, reason: 'not-newer' }];
+    if (stored && stored.workflow === args.runbook.workflow && JSON.stringify(stored.steps) === JSON.stringify(args.runbook.steps)
+      && JSON.stringify(stored.people ?? []) === JSON.stringify(args.runbook.people ?? [])
+      && JSON.stringify(stored.decide ?? null) === JSON.stringify(args.runbook.decide ?? null)) {
+      return [{ published: false, reason: 'unchanged' }];
+    }
+  }
+  const out: Array<Record<string, unknown>> = [];
+  for (const mode of args.modes) {
+    out.push(await publishDashboard({ ...args, mode, onlyIfPublished: true }, deps).catch((err) => ({ published: false, error: (err as Error)?.name })));
+  }
+  return out;
 }

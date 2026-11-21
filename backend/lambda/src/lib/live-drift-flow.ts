@@ -492,7 +492,7 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
     return null;
   }
 
-  // A BATTLE BLOCKS THE ACTION, NOT THE DETECTION (maintainer, 2026-08-13).
+  // A BATTLE BLOCKS THE ACTION, NOT THE DETECTION.
   //
   // This used to return null the moment the channel had Battle Mode on, which is why a user who
   // pivoted mid-duel got nothing at all: no suggestion, and no reason for its absence. Silence reads

@@ -7,8 +7,9 @@
  * transcription notices and the ended card land there. It is never a separate store.
  *
  * - The header's Chat button opens and closes it, as does T while focus is not in a field.
- * - It sits beneath the meeting's roster in the right column, with a header of its own, so closing the chat never takes
- *   the roster with it; the column is resized from a splitter, and its width is remembered in this browser.
+ * - It sits beneath the meeting's roster in the right column. Two toggles at the column's top show the roster, the chat or
+ *   both; the line between them is dragged to give either more room; the column is resized from a splitter at its edge.
+ *   The width and the split are remembered in this browser.
  * - While it is closed, the button counts what arrived since it closed, other people's and assistants' messages alike;
  *   opening it clears the count.
  * - Closed, it stays mounted and hidden, so the composer's draft and the thread's place survive; the open state belongs
@@ -37,6 +38,9 @@ interface MeetingChatState {
   /** The pane chosen on a phone-width screen; `paneShown` says which is on screen. */
   pane: MeetingPane;
   setPane: (pane: MeetingPane) => void;
+  /** The roster is shown in the right column at a wider width. */
+  rosterOpen: boolean;
+  setRosterOpen: (open: boolean) => void;
 }
 
 const MeetingChatContext = createContext<MeetingChatState | null>(null);
@@ -65,6 +69,7 @@ export function MeetingChatProvider({ children, initiallyOpen = true }: { childr
   const { userArn: viewerArn } = useAwsClient();
   const narrow = useNarrowWindow();
   const [panelOpen, setPanelOpen] = useState(initiallyOpen);
+  const [rosterOpen, setRosterOpen] = useState(true);
   const [pane, setPaneState] = useState<MeetingPane>('video');
   // ON A PHONE-WIDTH SCREEN, opening the chat shows its pane and closing it returns to the video, so whatever opens the
   // chat (the roster addressing a member, the T key) works the same at either width.
@@ -120,7 +125,7 @@ export function MeetingChatProvider({ children, initiallyOpen = true }: { childr
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  const value = useMemo(() => ({ open, setOpen, unread, narrow, pane, setPane }), [open, setOpen, unread, narrow, pane, setPane]);
+  const value = useMemo(() => ({ open, setOpen, unread, narrow, pane, setPane, rosterOpen, setRosterOpen }), [open, setOpen, unread, narrow, pane, setPane, rosterOpen]);
   return <MeetingChatContext.Provider value={value}>{children}</MeetingChatContext.Provider>;
 }
 
@@ -239,63 +244,170 @@ function SideSplitter({ width, onWidth, onSettle }: {
   );
 }
 
+/** THE ROSTER'S SHARE OF THE COLUMN while the chat shows beneath it, remembered per viewer in this browser, within bounds. */
+const SPLIT_KEY = 'ae.meeting.rosterShare';
+const SPLIT_MIN = 0.15;
+const SPLIT_MAX = 0.85;
+const SPLIT_DEFAULT = 0.4;
+const SPLIT_STEP = 0.05;
+const clampSplit = (v: number) => Math.round(Math.min(SPLIT_MAX, Math.max(SPLIT_MIN, v)) * 100) / 100;
+function storedSplit(): number {
+  try {
+    const v = Number(localStorage.getItem(SPLIT_KEY));
+    return Number.isFinite(v) && v > 0 ? clampSplit(v) : SPLIT_DEFAULT;
+  } catch {
+    return SPLIT_DEFAULT;
+  }
+}
+function keepSplit(v: number): void {
+  try { localStorage.setItem(SPLIT_KEY, String(v)); } catch { /* the split lasts this window only */ }
+}
+
 /**
- * THE RIGHT COLUMN: the meeting's roster at its top, with its own header, then the meeting's chat as a panel of its own,
- * its header naming the conversation and closing the chat. Closing the chat leaves the roster; with no roster, the
- * column closes with the chat and the stage takes the whole width. The column is resized from the splitter at its edge.
+ * THE LINE BETWEEN THE ROSTER AND THE CHAT: dragged up or down with a pointer, or moved with the arrow keys (Home and End for
+ * the least and most room for the roster), within bounds; the split is remembered in this browser.
+ */
+function RosterChatSplitter({ share, column, onShare, onSettle }: {
+  share: number;
+  column: () => HTMLElement | null;
+  onShare: (v: number) => void;
+  onSettle: (v: number) => void;
+}) {
+  const { t } = useTranslation();
+  const drag = useRef<{ top: number; height: number; last: number } | null>(null);
+  const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const rect = column()?.getBoundingClientRect();
+    if (!rect || rect.height <= 0) return;
+    drag.current = { top: rect.top, height: rect.height, last: share };
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* the drag follows the element */ }
+    e.preventDefault();
+  };
+  const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!drag.current) return;
+    drag.current.last = clampSplit((e.clientY - drag.current.top) / drag.current.height);
+    onShare(drag.current.last);
+  };
+  const onPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!drag.current) return;
+    onSettle(drag.current.last);
+    drag.current = null;
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* released with the pointer */ }
+  };
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const next = e.key === 'ArrowDown' ? share + SPLIT_STEP
+      : e.key === 'ArrowUp' ? share - SPLIT_STEP
+        : e.key === 'Home' ? SPLIT_MIN
+          : e.key === 'End' ? SPLIT_MAX : null;
+    if (next === null) return;
+    e.preventDefault();
+    onShare(clampSplit(next));
+    onSettle(clampSplit(next));
+  };
+  return (
+    <div
+      className="ae-meeting-rowsplitter"
+      role="separator"
+      aria-orientation="horizontal"
+      aria-label={t('meeting.side.split')}
+      title={t('meeting.side.split')}
+      aria-valuemin={Math.round(SPLIT_MIN * 100)}
+      aria-valuemax={Math.round(SPLIT_MAX * 100)}
+      aria-valuenow={Math.round(share * 100)}
+      tabIndex={0}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+      onKeyDown={onKeyDown}
+      data-testid="meeting-roster-chat-splitter"
+    />
+  );
+}
+
+/**
+ * THE RIGHT COLUMN: two toggles at its top show the meeting's roster, its chat, or both (one always stays on), the roster
+ * above the chat with a line between them that gives either more room. With neither, the column closes and the stage takes
+ * the whole width; the header's Chat button opens the chat again. The column is resized from the splitter at its edge.
  */
 export function MeetingChatPanel({ children, roster }: { children: ReactNode; roster?: ReactNode }) {
   const { t } = useTranslation();
   const chat = useContext(MeetingChatContext);
-  // The header names the conversation the panel holds: the meeting's own.
-  const { activeConversation } = useConversations();
   const [width, setWidth] = useState(storedSideWidth);
+  const [share, setShare] = useState(storedSplit);
+  const columnRef = useRef<HTMLElement | null>(null);
 
   if (!chat) return <aside className="ae-meeting-chat">{roster}{children}</aside>;
   // ON A PHONE-WIDTH SCREEN the column holds whichever of the roster and the chat is the pane shown, and no splitter.
   const shown = chat.narrow ? paneShown(chat.pane, meetingPanes({ people: !!roster, chat: !!children })) : null;
-  const columnShown = shown ? shown !== 'video' : chat.open || !!roster;
-  const rosterShown = shown ? shown === 'people' : true;
+  const rosterShown = shown ? shown === 'people' : !!roster && chat.rosterOpen;
+  const chatShown = shown ? shown === 'chat' : chat.open;
+  const columnShown = shown ? shown !== 'video' : rosterShown || chatShown;
+  const both = !shown && rosterShown && chatShown;
   const tabpanel = (pane: MeetingPane) => (shown ? { role: 'tabpanel', 'aria-labelledby': paneTabId(pane) } : {});
   return (
     <>
       {columnShown && !shown && <SideSplitter width={width} onWidth={setWidth} onSettle={keepSideWidth} />}
       <aside
         id="ae-meeting-side"
+        ref={columnRef}
         className={`ae-meeting-side${shown ? ' ae-meeting-side--pane' : ''}`}
         hidden={!columnShown}
         style={{ '--ae-meeting-side-width': `${width}px` } as CSSProperties}
         data-testid="meeting-side"
       >
+        {!shown && roster && (
+          <div className="ae-meeting-side-views" role="group" aria-label={t('meeting.side.views')} data-testid="meeting-side-views">
+            <button
+              type="button"
+              className={`ae-meeting-side-view${rosterShown ? ' ae-meeting-side-view--on' : ''}`}
+              aria-pressed={rosterShown}
+              // ONE VIEW ALWAYS STAYS ON from here, so the column never closes under the person's hand.
+              disabled={rosterShown && !chatShown}
+              onClick={() => chat.setRosterOpen(!rosterShown)}
+              data-testid="meeting-side-view-people"
+            >
+              <IconPeople /><span>{t('meeting.panes.people')}</span>
+            </button>
+            <button
+              type="button"
+              className={`ae-meeting-side-view${chatShown ? ' ae-meeting-side-view--on' : ''}`}
+              aria-pressed={chatShown}
+              aria-controls="ae-meeting-chat-panel"
+              disabled={chatShown && !rosterShown}
+              onClick={() => chat.setOpen(!chatShown)}
+              data-testid="meeting-side-view-chat"
+            >
+              <IconChat /><span>{t('meeting.panes.chat')}</span>
+              {/* WHAT ARRIVED WHILE THE CHAT WAS HIDDEN, counted on its toggle, which is the one way to show it at this width. */}
+              {!chatShown && chat.unread > 0 && (
+                <span className="ae-meeting-chat-unread" data-testid="meeting-side-view-unread">
+                  <span aria-hidden="true">{chat.unread > 99 ? '99+' : chat.unread}</span>
+                  <span className="ae-meeting-visually-hidden">{t('meeting.chat.unread', { count: chat.unread })}</span>
+                </span>
+              )}
+            </button>
+          </div>
+        )}
         {roster && (
-          <div id={PANE_IDS.people} className="ae-meeting-side-roster" hidden={!rosterShown} {...tabpanel('people')}>
+          <div
+            id={PANE_IDS.people}
+            className="ae-meeting-side-roster"
+            hidden={!rosterShown}
+            style={both ? { flex: `0 0 ${share * 100}%`, maxHeight: 'none' } : undefined}
+            {...tabpanel('people')}
+          >
             {roster}
           </div>
         )}
+        {both && <RosterChatSplitter share={share} column={() => columnRef.current} onShare={setShare} onSettle={keepSplit} />}
         <section
           id="ae-meeting-chat-panel"
           className="ae-meeting-chat ae-meeting-chat--panel"
           aria-label={t('meeting.chat.title')}
-          hidden={!chat.open}
+          hidden={!chatShown}
           data-testid="meeting-chat-panel"
           {...tabpanel('chat')}
         >
-          <div className="ae-meeting-chat-panel-header">
-            <div className="ae-meeting-chat-panel-heading">
-              <h2>{t('meeting.chat.title')}</h2>
-              {activeConversation?.title && (
-                <span className="ae-meeting-chat-panel-conversation" data-testid="meeting-chat-conversation" title={activeConversation.title}>
-                  {activeConversation.title}
-                </span>
-              )}
-            </div>
-            <button type="button" className="ae-meeting-chat-panel-close" onClick={() => chat.setOpen(false)} aria-label={t('meeting.chat.hide')} title={t('meeting.chat.hide')}>
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-                <line x1="18" y1="6" x2="6" y2="18" />
-                <line x1="6" y1="6" x2="18" y2="18" />
-              </svg>
-            </button>
-          </div>
           <div className="ae-meeting-chat-panel-body">{children}</div>
         </section>
       </aside>

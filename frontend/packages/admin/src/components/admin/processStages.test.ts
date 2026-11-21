@@ -1,7 +1,7 @@
 /**
  * A PROCESS'S STAGES, IN RUN ORDER, WITH THEIR TIMES (SPEC-PROCESSES P9; DESIGN-PROCESSES section 6).
  *
- * What it proves, on the shipped incident workflows: a stage is a step its workflow labels, shown under that label and tied to
+ * What it proves, on incident workflows that triage in the team conversation first (a fixture built on the shipped ones): a stage is a step its workflow labels, shown under that label and tied to
  * its workflow; internal moves (`open`, `hold`, the room's opening) are never stages, and a step the workflow does not declare
  * (a reminder) never ends one; a stage runs from its step's first message to the run's next labeled step, or the run's end, so
  * an unlabeled step (a send that only tells the room, an `open`, a wait) is the stage's own and never cuts it short,

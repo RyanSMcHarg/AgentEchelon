@@ -19,13 +19,30 @@ import { createHash } from 'crypto';
 import { createTask } from './task-store.js';
 import { DeliveryOption } from './delivery-options.js';
 import { DEFAULT_TASK_STATE_MACHINES } from './task-state-machines.js';
-import { isEventTaskMachine } from './event-workflow.js';
+import { DASHBOARD_RUNBOOK_RUN, isEventTaskMachine } from './event-workflow.js';
+import type { RunbookProgress } from './runbook-progress.js';
 import { principalIdFromArn } from './person-arn.js';
 import type { Task } from './task-tracking.js';
 
 /** The task's id for one step of one run: the same on every turn the processor runs for that step. */
 export function eventTaskId(runKey: string, step: string): string {
   return `evt-${createHash('sha256').update(`${runKey}#${step}`).digest('hex').slice(0, 24)}`;
+}
+
+/** The run key a run's runbook refreshes are opened under: the platform's run, never the run's own (section 8.1). */
+export function runbookRefreshRunKey(runKey: string): string {
+  return `${DASHBOARD_RUNBOOK_RUN}#${runKey}`;
+}
+
+/**
+ * THE REFRESH TASK'S ID IS THE PROGRESS IT CARRIES (section 8.1), less the time it was read, and the moves that drew it: the
+ * run's step claims won since its last refresh (`moves`), each won once. A redelivered event wins no claim and draws nothing;
+ * a later move that returns the section to a state it showed before is a new move, so it names a new task and is drawn.
+ */
+export function runbookRefreshTaskId(runKey: string, runbook: RunbookProgress, moves: readonly string[] = []): string {
+  const { asOf: _asOf, ...shown } = runbook;
+  const drawn = JSON.stringify({ shown, ...(moves.length ? { moves: [...moves].sort() } : {}) });
+  return eventTaskId(runbookRefreshRunKey(runKey), createHash('sha256').update(drawn).digest('hex').slice(0, 24));
 }
 
 export interface OpenedEventTask {

@@ -530,7 +530,8 @@ describe('steps after an agent step (ADR-061 decision 5)', () => {
   it('only the invocation that won the step hands the run back, and the router recomputes the run key', () => {
     const processor = read('assistant-async-processor.ts');
     const branch = processor.slice(processor.indexOf('if (event.eventStep) {'), processor.indexOf('if (event.welcomePrompt) {'));
-    expect(branch).toMatch(/await run\.settled;[\s\S]{0,2200}if \(run\.won\) await handBack\(run\.outcome\);/);
+    // A REVISION THE APPROVER ASKED FOR IS DELIVERED AS A VERSION, and hands nothing back: the run waits on the approval.
+    expect(branch).toMatch(/await run\.settled;[\s\S]{0,3600}if \(run\.won && !revising\) await handBack\(run\.outcome\);/);
     expect(branch).toMatch(/const handBack = async \(outcome: string\) => continueEventRunThroughRouter\(/);
     expect(branch).toMatch(/eventRun: \{\s*runKey: req\.runKey, transitions:/);
     const router = read('router-agent-handler.ts');

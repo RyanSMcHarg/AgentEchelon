@@ -44,7 +44,7 @@
  * So a holder here means BUSY, with no second-guessing: released by the turn ending, or by the
  * platform saying the invocation running it did not.
  *
- * THERE IS NO EXPIRY ON THIS RECORD, and that is deliberate (maintainer, 2026-08-28). A drain now spans
+ * THERE IS NO EXPIRY ON THIS RECORD, and that is deliberate. A drain now spans
  * the time a person takes to answer a question the assistant asked, so an expiry would delete a queue
  * somebody was told was waiting and leave them with nothing done and no explanation. That is a
  * certainty on any conversation somebody steps away from, which is worse than the stranding it bounded.
@@ -540,7 +540,7 @@ export async function clearQueue(args: {
         // conversation and was silently inert forever after.
         // AND THE DRAIN TASK'S IDENTITY, because the drain is over when the queue is.
         //
-        // THIS BRANCH AND NOT THE OTHER ONE, and that asymmetry is the owner's rule (2026-09-03):
+        // THIS BRANCH AND NOT THE OTHER ONE, and that asymmetry is the rule:
         // one drain per QUEUE, not per pass. A pass ends at either branch - the claim and the stage
         // reset at both, because the next pass is a new reading. The DRAIN spans them: a remainder is
         // the same queue still being worked, so its task carries across, and only an empty queue
@@ -1161,7 +1161,7 @@ export interface PendingSplitOffer {
    * A queue is the CONVERSATION's, not one member's: it holds whatever arrived while the assistant
    * was working, from whoever sent it, and the subjects read out of it belong to all of them. This
    * was a single id taken from whoever happened to trigger the drain, and both halves of that
-   * dropped work (maintainer, 2026-09-05).
+   * dropped work.
    *
    * It cost the whole offer when that one id could not be derived - `savePendingSplit` refused an
    * offer with no `offeredTo`, so every subject belonging to everybody was discarded because one
@@ -1726,7 +1726,7 @@ export async function clearAmendments(args: {
 }
 
 /**
- * PUT AN AMENDMENT BACK ON THE QUEUE, PENDING PRIORITISATION (maintainer, 2026-09-01).
+ * PUT AN AMENDMENT BACK ON THE QUEUE, PENDING PRIORITISATION.
  *
  * An amendment is recorded for the running turn to fold in, and the fold is the only thing that ever
  * took one off again. So an amendment the fold could not reach - recorded after the turn passed its
@@ -2416,7 +2416,7 @@ export async function releaseTriage(args: {
 }
 
 /**
- * OPEN THE DRAIN'S TASK, OR FIND THE ONE ALREADY OPEN (maintainer, 2026-09-03).
+ * OPEN THE DRAIN'S TASK, OR FIND THE ONE ALREADY OPEN.
  *
  * Working a queue is a task: it has states, legal moves between them, a step that awaits a person,
  * and a point at which it is over. What it needed and did not have was an IDENTITY that survives a

@@ -1,5 +1,5 @@
 /**
- * A STEP SAYS WHAT IT NEEDS, AND AN ANSWER IS CHECKED AGAINST IT (maintainer, 2026-08-14).
+ * A STEP SAYS WHAT IT NEEDS, AND AN ANSWER IS CHECKED AGAINST IT.
  *
  * The rule: review the person's message against what the step needs; everything there, move the
  * workflow on; something missing, ask for that and only that.

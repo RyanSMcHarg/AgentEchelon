@@ -16,10 +16,32 @@ export interface DashboardOnMessage {
   conversationId: string;
   updatedAt: string;
   state?: 'ALARM' | 'OK' | 'INSUFFICIENT_DATA';
+  /** The step the conversation's run is on now: its label, its status and who holds it. */
+  now?: { label: string; status: string; holder?: string };
+  /** Who holds the conversation's roles: its on-call, secondary and lead, by role key. */
+  people?: Array<{ role: string; name: string }>;
+  /** Where the conversation stands, from its pinned step. */
+  standing?: 'open' | 'resolved' | 'ended';
+  /** Who may decide the pinned step and its choices now. */
+  decide?: { taskId: string; state: string; choices: string[]; by: string[]; reopen?: boolean };
 }
+
+/** A short line of text from Metadata, or '' (drawn as text, never as markup). */
+const line = (v: unknown, max = 60): string => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+const STATUSES = new Set(['not-started', 'in-progress', 'waiting', 'done', 'skipped', 'timed-out', 'failed']);
 
 /** A conversation id, by the backend's rule: `CONVERSATION_ID` in `backend/lambda/src/lib/dashboard-keys.ts`. */
 const CONVERSATION_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** The pinned step's decision, where the message carries a well-formed one. */
+function decideOf(v: unknown): DashboardOnMessage['decide'] {
+  const d = v as Record<string, unknown> | undefined;
+  const strs = (x: unknown) => Array.isArray(x) && x.every((s) => typeof s === 'string' && s.length > 0 && s.length <= 128) ? x as string[] : undefined;
+  const choices = strs(d?.choices)?.slice(0, 4);
+  const by = strs(d?.by)?.slice(0, 16);
+  if (!d || typeof d.taskId !== 'string' || typeof d.state !== 'string' || !choices?.length || !by?.length) return undefined;
+  return { taskId: d.taskId, state: d.state, choices, by, ...(d.reopen === true ? { reopen: true } : {}) };
+}
 
 export function dashboardFromMetadata(metadata: Record<string, unknown>, senderArn: string): DashboardOnMessage | undefined {
   const raw = metadata.dashboard as Record<string, unknown> | undefined;
@@ -30,7 +52,19 @@ export function dashboardFromMetadata(metadata: Record<string, unknown>, senderA
   const conversationId = typeof raw.conversationId === 'string' && CONVERSATION_ID.test(raw.conversationId) ? raw.conversationId : '';
   const updatedAt = typeof raw.updatedAt === 'string' && !Number.isNaN(Date.parse(raw.updatedAt)) ? raw.updatedAt : '';
   const state = raw.state === 'ALARM' || raw.state === 'OK' || raw.state === 'INSUFFICIENT_DATA' ? raw.state : undefined;
-  return kind && conversationId && updatedAt ? { kind, conversationId, updatedAt, ...(state ? { state } : {}) } : undefined;
+  const nowRaw = raw.now as Record<string, unknown> | undefined;
+  const now = nowRaw && typeof nowRaw === 'object' && line(nowRaw.label) && STATUSES.has(String(nowRaw.status))
+    ? { label: line(nowRaw.label), status: String(nowRaw.status), ...(line(nowRaw.holder) ? { holder: line(nowRaw.holder) } : {}) }
+    : undefined;
+  const people = Array.isArray(raw.people)
+    ? (raw.people as Array<Record<string, unknown>>).slice(0, 4)
+      .map((p) => ({ role: line(p?.role, 40), name: line(p?.name) })).filter((p) => p.role && p.name)
+    : [];
+  return kind && conversationId && updatedAt
+    ? { kind, conversationId, updatedAt, ...(state ? { state } : {}), ...(now ? { now } : {}), ...(people.length ? { people } : {}),
+      ...(raw.standing === 'open' || raw.standing === 'resolved' || raw.standing === 'ended' ? { standing: raw.standing } : {}),
+      ...(decideOf(raw.decide) ? { decide: decideOf(raw.decide) } : {}) }
+    : undefined;
 }
 
 /** A refusal the server named, shown in the client's own words. */
@@ -150,9 +184,14 @@ export async function dashboardPageLink(conversationId: string): Promise<string>
   return body.url;
 }
 
-/** The sandboxed document the in-app view shows: the fragment, under a policy that loads and runs nothing. */
-export function dashboardDocument(html: string, lang: string): string {
+/**
+ * The sandboxed document the in-app view shows: the fragment, under a policy that loads and runs nothing. Its links (a
+ * runbook step's card, DESIGN-CONVERSATION-DASHBOARDS section 8) are relative to the app, given as `appBase`, and open
+ * in a new tab of the app, never in the frame.
+ */
+export function dashboardDocument(html: string, lang: string, appBase?: string): string {
   const csp = "default-src 'none'; style-src 'unsafe-inline'; img-src data:";
+  const base = appBase && /^https?:\/\//.test(appBase) ? `<base href="${appBase.replace(/"/g, '%22')}" target="_blank">` : '';
   return `<!doctype html><html lang="${lang.replace(/[^A-Za-z-]/g, '') || 'en'}"><head><meta charset="utf-8">`
-    + `<meta http-equiv="Content-Security-Policy" content="${csp}"><style>html,body{margin:0}</style></head><body>${html}</body></html>`;
+    + `<meta http-equiv="Content-Security-Policy" content="${csp}">${base}<style>html,body{margin:0}</style></head><body>${html}</body></html>`;
 }

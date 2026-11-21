@@ -3068,8 +3068,8 @@ async function getUnpairedBotMessages(
 /**
  * THE TURNS THAT ARE NOT ANSWERS, COUNTED AS THEMSELVES RATHER THAN MISSING FROM EVERYTHING.
  *
- * Owner direction, 2026-09-11: "Drift can be excluded from normal responses, but should still be
- * tracked in analytics and filterable / separately viewable like readings."
+ * Drift is excluded from normal responses, and is still tracked in analytics and filterable and separately
+ * viewable, like readings.
  *
  * CHECKING THAT PRECEDENT FOUND IT DID NOT EXIST. A reading was excluded and diagnosable, which is
  * not the same as tracked and viewable: `turn_kind` was a JSON extraction, exactly one query
@@ -6477,7 +6477,7 @@ async function getLatencyMetrics(
        -- nothing to AVG or PERCENTILE_CONT either way - but the counts beside them are now honest
        -- about what they are averaging over.
        --
-       -- ── THE POPULATION IS ASSISTANT TURNS, AND ONLY THOSE (owner direction, 2026-09-13) ────────
+       -- ── THE POPULATION IS ASSISTANT TURNS, AND ONLY THOSE ────────
        --
        -- "All assistant exchanges must be caught and any non assistant exchanges should be excluded."
        -- Until this clause, the population was every bot-authored CREATE - so deferral notices,
@@ -6789,7 +6789,7 @@ async function getModelEffectiveness(
        -- experiment results and both battle queries. This query was the one that did not, which is
        -- the shape a convention fails in: not by being argued away, by being missed once.
        AND e.queued_as IS NULL
-       -- ── THESE ROWS STAY IN. EXCLUDING THEM WAS THE MISTAKE (owner correction, 2026-09-14) ─────
+       -- ── THESE ROWS STAY IN. EXCLUDING THEM WAS THE MISTAKE ─────
        --
        -- 151 of 797 exchanges over 30 days grouped as model 'unknown' / intent 'unknown', and a
        -- population filter was added here to drop them - greetings, drift notices and split

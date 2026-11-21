@@ -1,5 +1,5 @@
 /**
- * The question a declined drift offer held (SPEC-DRIFT-CONVERGENCE, owner 2026-10-14).
+ * The question a declined drift offer held (SPEC-DRIFT-CONVERGENCE).
  *
  * When drift fires, the offer to move the subject is that turn's whole reply, so the person's question goes
  * unanswered. Declining keeps the subject here, and the declining turn must answer the question the offer

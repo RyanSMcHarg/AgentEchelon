@@ -61,7 +61,7 @@ import {
   getTaskPlaceholder,
 } from './lib/delivery-options.js';
 // TASKS GO THROUGH THE STORE SEAM, not the table. Same signatures; the boundary is inside.
-import { createTask, getTask, attachRequestRun, requesterMovableTask, advanceAsAssignee } from './lib/task-store.js';
+import { abandonRevision, createTask, getTask, attachRequestRun, takeReopenedTask, requesterMovableTask, advanceAsAssignee } from './lib/task-store.js';
 import { isPrivateVisibility } from './lib/task-visibility.js';
 // THE SEAM, NOT THE TABLE, for every task read on this path (ADR-033). What stays imported from
 // `task-tracking` below is pure: an id derivation, a window constant, a TTL, and types - none of
@@ -99,7 +99,7 @@ import { resolveChannelSize } from './lib/channel-size.js';
 import { readAdvertisement, roommatesInConversation, type Roommate } from './lib/assistant-advertisement.js';
 import { whoIsHereFrom, rosterForDispatch, type ReadRoster } from './lib/who-is-here.js';
 import { decideDelegation, intentKeptHere, parseDelegationKey, withRoommateCategories } from './lib/delegation.js';
-import { liveAssistantsForClassification } from './lib/default-agents.js';
+import { liveAssistantsByHandleOrThrow, liveAssistantsForClassification } from './lib/default-agents.js';
 import { isAccessDenial, recordClassificationBoundaryRefusal } from './lib/access-denial.js';
 // The bypass tokens, shared with the channel flow so the two sides cannot disagree about what one is.
 // The private prefix. A separate module from the bypasses on purpose: `.` is routed by Amazon Chime
@@ -123,10 +123,14 @@ import { assembleHostGrounding } from './lib/host-grounding.js';
 import { defaultDirectory } from './lib/membership-source.js';
 import { conversationRef, meetingRef, notifyDirective, withinMetadataCap } from './lib/notify-directive.js';
 import { EVENT_RULE_TAG_PREFIX, TEAM_ROOM_TAG, TRIGGER_RULE_ID, WATCH_TAG, eventTriggerWindow } from './lib/event-triggers.js';
+import { CONVERSATION_TYPES as PATTERN_TYPES, CONNECTOR_FACT_SOURCE, NAMED_WATCH_KIND, PATTERN_WATCH_KIND, PROCESS_WATCH_KIND, MAX_PATTERN_RESOLVED, isPatternType, patternVariables, resolveConversationPattern } from '../../lib/config/conversation-types.js';
+import { connectorRecordConfirms } from './lib/connector-fact-record.js';
+import { CONVERSATION_TYPE_TAG, patternChannelId } from './lib/channel-creation.js';
+import { isArchived } from './lib/channel-classification.js';
 import { identifierWords } from './lib/conversation-name.js';
-import { EventBridgeClient, ListTagsForResourceCommand as ListRuleTagsCommand } from '@aws-sdk/client-eventbridge';
+import { EventBridgeClient, ListTagsForResourceCommand as ListRuleTagsCommand, PutEventsCommand } from '@aws-sdk/client-eventbridge';
 import { refId, refKey } from '../../lib/config/event-openers.js';
-import { eventTypeAllowed, readEventPolicy } from './lib/event-policy.js';
+import { DEV_EVENT_POLICY, eventTypeAllowed, readEventPolicy } from './lib/event-policy.js';
 // SPEC-CAPABILITY-PROFILES: the single interpreter of classification tags + group clearance.
 // Replaces the local CLASSIFICATION_RANK / CLEARANCE_GROUPS / minRank / isAdvancedClassification / classificationScope constants.
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
@@ -137,7 +141,7 @@ import type { AssistantProfile } from '../../lib/config/profiles.js';
 import { classificationEnvName } from './lib/classification-env.js';
 import { CLASSIFICATION_TAG, conversationClosedTo, readChannelClassificationTag, readChannelTags } from './lib/channel-classification.js';
 import { primaryAssistantOf } from './lib/conversation-primary.js';
-import { workflowOwnerOf, type WorkflowOwner, type WorkflowOwnerRefused } from './lib/workflow-owner.js';
+import { declaredHolderOfRole, workflowOwnerOf, workflowOwnerRoleOf, type WorkflowOwner, type WorkflowOwnerRefused } from './lib/workflow-owner.js';
 // The handler stays non-VPC (ADR-013). It reaches the VPC-attached data-plane Lambda only for drift
 // detection; retrieval runs in the async processor (lib/turn-grounding.ts).
 import { resolveExperimentModel, resolveClassificationExperiment, resolveBattleTreatment, resolveEnrollment, countsTowardExperiment, experimentArmOf, resolveTaskArm } from './lib/experiment-manager.js';
@@ -216,7 +220,7 @@ import {
 import { runNaturalKey } from './lib/event-natural-key.js';
 import { DEFAULT_TASK_REMINDERS, MAX_TASK_DEADLINE_MINUTES, MIN_TASK_DEADLINE_MINUTES, TASK_STEP_OUTCOMES, assignedTemplateFor, workerAssistantRole, type TaskStep } from './lib/task-step.js';
 import { asRun, canonicalIntentWorkflow, intentRunKey, intentTaskStep } from './lib/intent-workflow.js';
-import { eventTaskId } from './lib/event-task.js';
+import { eventTaskId, runbookRefreshRunKey, runbookRefreshTaskId } from './lib/event-task.js';
 import {
   MEETING_ACTION_ITEM_MACHINE, MEETING_SUMMARY_RUN, actionItemHolder, actionItemStep, dueAtOf, fitSummaryCard, meetingSummaryCorrelationId,
   meetingSummaryRunKey, planActionItems, readMeetingSummaryWritten, type StoredMeetingSummary, type SummaryCardParts,
@@ -228,6 +232,10 @@ import { parseTranscriptKey, transcriptLink } from './lib/meeting-transcript.js'
 import { meetingMediaRecordingEnabled, recordingCardValues } from './lib/meeting-recording.js';
 import { MEETING_TIMEOUT_TEMPLATES, MEETING_WATCH_MINUTES, meetingMaxMinutes, meetingWatchDecision } from './lib/meeting-watch.js';
 import { ALONGSIDE_RELEASED, JOIN_PART, type RunProcess, customerImpactOf, isCustomerImpact, joinedSteps, openedLinkValue, processOfWorkflow, runProcessOf } from './lib/event-workflow.js';
+import {
+  HANDOFF_REFUSED, HANDOFF_SENT, PROCESS_SOURCE_PREFIX, handoffDetail, handoffDetailType, processSource, processWatchId, receivedHandoffRefusal, receivedHandoffValues,
+  type AttachedHandoff, type HandoffOutcome, type HandoffStep,
+} from './lib/event-workflow.js';
 import { writeMessageAnalytics } from './lib/message-analytics.js';
 import { taskOutcomeOf } from './lib/task-step.js';
 import type { ChimeSDKIdentityClient } from '@aws-sdk/client-chime-sdk-identity';
@@ -248,6 +256,11 @@ import { renderPromptTemplate } from './lib/message-template.js';
 import { taskHasBeenGivenATurn } from './lib/task-state-machines.js';
 import type { Task } from './lib/task-tracking.js';
 import { openWorkflowTask } from './lib/task-store.js';
+import { DASHBOARD_RUNBOOK_RUN, PLATFORM_RUN_NAMES } from './lib/event-workflow.js';
+import { DASHBOARD_RUNBOOK_MACHINE, isQuietStep } from './lib/task-state-machines.js';
+import { DASHBOARD_RUNBOOK_INTENT, DASHBOARD_TOOL, runbookConsent } from './lib/dashboard-tool.js';
+import { toolRolesOf } from './lib/tool-registry.js';
+import type { RunbookProgress } from './lib/runbook-progress.js';
 import type { TaskAssignee, WorkflowRunRef } from './lib/task-tracking.js';
 import type { TaskNaming } from './lib/say-through-router.js';
 import { holdersByRole, hostRoleHoldings, rolesOfPerson, withHostHoldings } from './lib/participant-roles.js';
@@ -257,6 +270,9 @@ import { CloudWatchClient, DescribeAlarmsCommand } from '@aws-sdk/client-cloudwa
 import { PARTICIPANT_ROLE_AUDIENCE_CAP, groupSourcedRoles, hostSourcedRoles, participantRoleOf, participantRolesOf, roleSaidInRoom } from '../../lib/config/participant-roles.js';
 import { claimEventRun, claimEventStep, recordEventGreeting } from './lib/task-store.js';
 import { eventDispatchId } from './lib/event-dispatch-id.js';
+import { decisionOf, labeledSteps, runbookClaimNames, runbookOf, MAX_PINNED_PEOPLE, MAX_PINNED_TEXT } from './lib/runbook-progress.js';
+import { draftingOf, latestDocument, type TaskRevisionRequest } from './lib/task-documents.js';
+import { stripMessageMarkers } from './lib/message-markers.js';
 import type { ConversationOpenedNaming, EventContinuation, InvitationSentNaming, PersonJoinedNaming } from './lib/say-through-router.js';
 import { INVITATION_KEY, everyInvitation, pendingInvitation, type InvitationRecord } from './lib/invitations.js';
 import {
@@ -297,7 +313,7 @@ import {
 } from './lib/welcome-orientation.js';
 import { recordWelcomeConfigDefect, welcomeConfigDefects } from './lib/welcome-metrics.js';
 import {
-  getParticipantContext, getChannelContext, putChannelContext, advanceOnboardingIntake, startOnboardingIntake, alarmWatchOf, refWatchOf,
+  getParticipantContext, getChannelContext, putChannelContext, advanceOnboardingIntake, startOnboardingIntake, alarmWatchOf, refWatchOf, claimRefWatch,
   claimRoomNaming, releaseRoomNaming, markRoomNamed, roomNamingOf, ROOM_NAMING_LEASE_MS, recordEndedMeetingCard, recordMeetingFact, readChannelContext, releaseActiveMeeting,
 } from './lib/channel-context-client.js';
 import { durationMinutes, endedAt, isMeetingId, readLifecycleHandoff } from './lib/meeting-lifecycle.js';
@@ -351,6 +367,8 @@ import { parseChannelMetadata } from './lib/chime/channel-meta.js';
 import { recentChannelMessages, decodeContent } from './lib/chime/history.js';
 import { loadProfileRegistry } from '../../lib/profile-registry';
 
+/** The machines of the runs the platform makes itself (`PLATFORM_RUN_NAMES`), whose tasks no workflow run waits on. */
+const PLATFORM_RUN_MACHINES: readonly string[] = Object.freeze([DASHBOARD_RUNBOOK_MACHINE, MEETING_ACTION_ITEM_MACHINE]);
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
@@ -1622,7 +1640,7 @@ export interface TurnRequest {
   /**
    * THIS TURN ARRIVED BY HANDOVER, and names the assistant that passed it on (a principal id).
    *
-   * Routing follows the TASK, never who the message was addressed to (maintainer, 2026-08-14). A person can
+   * Routing follows the TASK, never who the message was addressed to. A person can
    * answer work in the channel without addressing anyone, or address the wrong assistant - the same
    * case either way - so the assistant that RECEIVES the message is not necessarily the one whose
    * chain it answers. The receiver resolves the task, finds an `assistantId` that is not its own, and
@@ -2146,7 +2164,7 @@ async function owningAssistantDisplayName(owningBotArn: string): Promise<string>
 /**
  * A person's message answers work a DIFFERENT assistant owns, so give it to that assistant.
  *
- * ROUTING FOLLOWS THE TASK, NEVER THE TARGET (maintainer, 2026-08-14). Whether the person addressed nobody
+ * ROUTING FOLLOWS THE TASK, NEVER THE TARGET. Whether the person addressed nobody
  * or addressed the wrong assistant is the same case, because targeting is a DELIVERY concern the client
  * already settled at send - it says who sees the message, not what the message is about. What it is
  * about is answerable from the task alone: the chain names its `assistantId`, and that assistant is the
@@ -2916,6 +2934,75 @@ async function recordConversationProcess(channelArn: string, proc: RunProcess): 
   }
 }
 
+/**
+ * THE BUS A HAND-OFF IS PUT ON (DESIGN-PROCESSES section 12), the one seam that names it: the deployment's process event bus,
+ * named to this router by its stack (`PROCESS_EVENT_BUS`). Unnamed, no hand-off is put: the step is refused and says so.
+ */
+export function processEventBus(): string | undefined {
+  return process.env.PROCESS_EVENT_BUS || undefined;
+}
+
+/**
+ * PUT A HAND-OFF (SPEC-PROCESSES P4, P5; DESIGN-PROCESSES sections 4 and 12): checked against the declaration on the run's own
+ * version before the put, every value of its declared type, and put on this classification's own source on the process event bus
+ * (`processEventBus`). A refusal is logged by process, hand-off and step, never with a value.
+ */
+export async function putHandoff(def: HandoffStep, ctx: EventRunContext, who: Pick<WorkflowRunner, 'version'>, step: string, client?: Pick<EventBridgeClient, 'send'>): Promise<HandoffOutcome> {
+  const declared = who.version?.processes?.[def.process]?.handoffs?.[def.name];
+  const out = handoffDetail({ step: def, declared, values: ctx.values, process: ctx.process, instance: process.env.ALERT_INSTANCE ?? '' });
+  if ('refused' in out) {
+    console.warn('[Router][handoff] refused before the put', { process: def.process, handoff: def.name, step, reason: out.refused });
+    return HANDOFF_REFUSED;
+  }
+  const bus = processEventBus();
+  if (!bus) {
+    console.warn('[Router][handoff] refused: this deployment names no process event bus', { process: def.process, handoff: def.name, step });
+    return HANDOFF_REFUSED;
+  }
+  const eb = client ?? (eventbridge = eventbridge ?? new EventBridgeClient({}));
+  const res = await eb.send(new PutEventsCommand({ Entries: [{
+    EventBusName: bus, Source: processSource(STATIC_CLASSIFICATION), DetailType: handoffDetailType(def.process, def.name), Detail: JSON.stringify(out.detail),
+  }] })).catch((err: unknown) => { console.warn('[Router][handoff] the put was refused', { process: def.process, handoff: def.name, step, err: (err as Error)?.name }); return undefined; });
+  return res && !res.FailedEntryCount ? HANDOFF_SENT : HANDOFF_REFUSED;
+}
+
+/**
+ * THE `process` WATCH (DESIGN-PROCESSES sections 3 and 12; WT124 unchanged): the key `<process>.<process id>` on this
+ * conversation's row and its watch item at this classification, the first live conversation keeping it. Never fails the run: a
+ * watch not written leaves an answered hand-off with no conversation, which analytics shows as sent and not received.
+ */
+async function watchProcess(channelArn: string, proc: RunProcess): Promise<void> {
+  const id = processWatchId(proc.name, proc.id);
+  const ref = refKey(PROCESS_WATCH_KIND, id);
+  try {
+    const row = await readChannelContext(channelArn, { consistent: true });
+    if (!row?.watchedRefs?.includes(ref)) await putChannelContext(channelArn, { watchedRefs: [...(row?.watchedRefs ?? []), ref] });
+    await claimRefWatch(refWatchKey(STATIC_CLASSIFICATION, PROCESS_WATCH_KIND, id), { room: channelArn, classification: STATIC_CLASSIFICATION }, async () => false);
+  } catch (err) {
+    console.warn('[Router][process] the conversation could not watch its process', { err: (err as Error)?.name });
+  }
+}
+
+/**
+ * A RECEIVED HAND-OFF (SPEC-PROCESSES P5 to P7; DESIGN-PROCESSES section 4.3), checked against the declaration the receiving
+ * team attached, which the rule's fixed input records, before any run starts: the run it starts takes the process id from
+ * the event and its fields as values (`event:<field>`). The input is the trigger service's, and only a rule invokes the relay.
+ * An event on a process source whose rule records no hand-off starts nothing: a process source is received only as a hand-off.
+ */
+export function receivedHandoff(raw: unknown, source: string, detailType: string): { process: RunProcess; values: Record<string, string> } | { refused: string } | undefined {
+  if (raw === undefined) return source.startsWith(PROCESS_SOURCE_PREFIX) ? { refused: 'the rule records no hand-off' } : undefined;
+  const h = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+  const a = h.attached && typeof h.attached === 'object' ? h.attached as Record<string, unknown> : {};
+  if (typeof a.source !== 'string' || typeof a.detailType !== 'string' || !a.fields || typeof a.fields !== 'object') return { refused: 'the rule records no hand-off' };
+  const attached = a as unknown as AttachedHandoff;
+  const why = receivedHandoffRefusal(attached, { source, detailType, processId: h.processId, process: h.process, handoff: h.handoff, fields: h.fields });
+  if (why) return { refused: why };
+  return {
+    process: { id: h.processId as string, name: h.process as string, received: `${h.process as string}.${h.handoff as string}` },
+    values: receivedHandoffValues(h.fields as Record<string, unknown>, attached),
+  };
+}
+
 /** A run's process as its run-end fact records it (SPEC-PROCESSES P8). */
 function processFactFields(proc: RunProcess | undefined): { processId?: string; process?: string; processEdition?: string; ownerTeam?: string } {
   return proc ? { processId: proc.id, process: proc.name, ...(proc.edition ? { processEdition: proc.edition } : {}), ...(proc.ownerTeam ? { ownerTeam: proc.ownerTeam } : {}) } : {};
@@ -2967,11 +3054,16 @@ async function runWorkflowFor(
   const runKey = eventRunKey(ctx.event, naturalKey, who.assistant);
   const proc = await runProcessFor(ctx, who, name, runKey);
   if (proc) ctx = { ...ctx, process: proc };
+  // A CONVERSATION A PROCESS OPENED, OR ONE A HAND-OFF'S PATTERN NAMES FOR ITS PROCESS, WATCHES THE PROCESS (DESIGN-PROCESSES sections
+  // 3 and 12), so a hand-off answered to this classification reaches it. A team conversation serves every process and watches none.
+  if (proc && (ctx.event === 'conversation-opened' || (proc.received && isPatternType(held.conversationType)))) await watchProcess(ctx.channelArn, proc);
   const roles = await participantRolesForRun(name, wf, ctx, who, held);
   const withRoles: EventRunContext = roles.roles ? { ...ctx, roles: roles.roles, roleSaidInRoom: roles.saidInRoom, ...(roles.deciding ? { decidingRoles: roles.deciding } : {}), ...(roles.conversationType ? { conversationType: roles.conversationType } : {}) } : ctx;
   const heldNow: RouterGateHeld = { ...held, ...(roles.members ? { members: roles.members } : {}), ...(roles.conversationType ? { conversationType: roles.conversationType } : {}) };
   const gated: EventRunContext = { ...withRoles, gate: await routerGate(wf, withRoles, who.variables, heldNow) };
-  const result = await runEventWorkflow(name, wf, gated, eventRunDeps(name, gated, who, runKey, heldNow.members, held.invitationReason, held.invitationRole, held.invitationPrompt));
+  const deps = withRunbook(eventRunDeps(name, gated, who, runKey, heldNow.members, held.invitationReason, held.invitationRole, held.invitationPrompt), wf, name, gated, who, runKey);
+  const result = await runEventWorkflow(name, wf, gated, deps);
+  await deps.flushRunbook();
   return { ran: result.ran, steps: result.steps };
 }
 
@@ -3172,6 +3264,133 @@ function stepRoles(def: AgentStep, ctx: EventRunContext): Record<string, string[
 }
 
 /** What a run of this router needs: its claims, mentions, sends and the hand-off to the processor. */
+/**
+ * A RUN'S RUNBOOK SECTION FOLLOWS ITS STEPS (DESIGN-CONVERSATION-DASHBOARDS section 8.1). A claim of a labelled step (reached,
+ * gone on from, moved on from) or of the run's end marks the runbook moved; `flush`, awaited once the engine returns, reads
+ * where the run stands from its own record and opens one quiet `dashboard_runbook` task for the conversation's dashboard
+ * holder (`dashboardHolder`), carrying the progress. Its declared action draws the conversation's dashboards again, with no
+ * model call and no chat line. The task is the platform's (`DASHBOARD_RUNBOOK_RUN`), so its settlement continues no run and
+ * the run's end leaves it alone; its id is the progress itself, so a state already drawn opens nothing. A run with no
+ * labelled step, or a room with no holder, opens nothing. Never throws: the runbook is a view of the run, and the run never
+ * waits on it.
+ */
+/** The step a run's claim is for: its prefix (`after#`, `moved#`) and any suffix after the step (`#<releasedBy>`, `#<part>`) dropped. */
+export function runbookStepOfClaim(claim: string): string {
+  return claim.replace(/^(after|moved)#/, '').split('#')[0];
+}
+
+function withRunbook(deps: EventRunDeps, wf: EventWorkflow, name: string, ctx: EventRunContext, who: WorkflowRunner, runKey: string): EventRunDeps & { flushRunbook: () => Promise<void> } {
+  const labeled = labeledSteps(wf);
+  if (!labeled.length) return { ...deps, flushRunbook: async () => undefined };
+  const marks = new Set(labeled);
+  let moved = false;
+  // THE CLAIMS THAT MOVED THE RUN SINCE ITS LAST REFRESH, each won once, which name the refresh they draw.
+  let moves: string[] = [];
+  // THE STEP A CLAIM IS FOR: a continuation (`after#<step>`), a move (`moved#<step>`), and either one's suffix (an alongside
+  // release, `after#<step>#<releasedBy>`, or a join's part), so every way a labeled step moves redraws the runbook.
+  const baseOf = (claim: string) => runbookStepOfClaim(claim);
+  return {
+    ...deps,
+    claimStep: async (step, outcome) => {
+      const won = await deps.claimStep(step, outcome);
+      if (won && (step === RUN_END_CLAIM || marks.has(baseOf(step)))) { moved = true; moves.push(`${step}=${outcome}`); }
+      return won;
+    },
+    flushRunbook: async () => {
+      if (!moved) return;
+      moved = false;
+      const drawnBy = moves;
+      moves = [];
+      try {
+        const holder = await dashboardHolder(ctx.channelArn, who, runKey);
+        if (!holder) return;
+        const claims = await readEventSteps({ runKey, channelArn: ctx.channelArn, steps: runbookClaimNames(labeled) });
+        if (!claims) return;
+        const tasks: Record<string, Task> = {};
+        const holders: Record<string, string> = {};
+        await Promise.all(labeled.filter((st) => wf.states[st]?.task && claims[st] !== undefined).map(async (st) => {
+          // A STEP THAT TOOK A REOPENED TASK reads that task, which keeps the id the run that opened it gave it.
+          const id = wf.states[st]?.task?.takes === 'reopened' && ctx.reopened?.taskId ? ctx.reopened.taskId : eventTaskId(runKey, st);
+          const task = await getTask(id, ctx.channelArn, { consistent: true }).catch(() => null);
+          if (!task) return;
+          tasks[st] = task;
+          if (task.assigneeType === 'user' && task.assigneeId) {
+            const n = await resolveUserName(userArnFor(appInstanceArnOf(ctx.channelArn) ?? '', task.assigneeId)).catch(() => 'there');
+            if (n && n !== 'there') holders[st] = n;
+          }
+        }));
+        // WHO HOLDS THE CONVERSATION'S ROLES NOW, from its own record (the run's `roles`), named as members are named.
+        const people: Array<{ role: string; name: string }> = [];
+        for (const [role, arns] of Object.entries(ctx.roles ?? {})) {
+          const arn = arns.find((a) => isPersonArn(a));
+          if (!arn || people.length >= MAX_PINNED_PEOPLE) continue;
+          const n = await resolveUserName(arn).catch(() => 'there');
+          if (n && n !== 'there') people.push({ role, name: n.slice(0, MAX_PINNED_TEXT) });
+        }
+        // WHO MAY DECIDE THE PINNED STEP (`decidedBy`), by person id from the run's own role record, and the choices its task
+        // offers now: the band shows them to those people, and the task service holds every press to the same roles again.
+        const decide = decisionOf(wf, tasks, ctx.roles, (t) => machinesForTask(t));
+        const runbook = { ...runbookOf({ workflow: name, wf, claims, tasks, holders, machinesOf: (t) => machinesForTask(t), now: Date.now() }), ...(people.length ? { people } : {}), ...(decide ? { decide } : {}) };
+        await openRunbookRefresh(ctx.channelArn, runKey, ctx.event, holder, runbook, drawnBy);
+      } catch (err) {
+        console.warn('[Router][event-workflow] the runbook could not be refreshed; the run is unaffected', { workflow: name, errName: (err as Error)?.name });
+      }
+    },
+  };
+}
+
+/**
+ * WHERE A RUNBOOK IS DRAWN (section 8.1): the run's own assistant where it consents, else the room's one live assistant of a
+ * role the dashboard tool names that consents. An assistant consents when its role is one the tool is offered to, its served
+ * version's tool allowlist offers the tool, and it advertises the `dashboard_runbook` intent; all three are read with no
+ * model call. Where the only obstacle is an unadvertised intent, nothing is opened and that is said once per run.
+ */
+const runbookUnadvertised = new Set<string>();
+async function dashboardHolder(channelArn: string, who: WorkflowRunner, runKey: string): Promise<{ botArn: string; assistant: string } | undefined> {
+  let unadvertised = false;
+  const consents = async (botArn: string, assistant: string, version?: WorkflowRunner['version']): Promise<boolean> => {
+    const role = roleByBotArn.get(botArn) || (botArn === who.botArn ? ASSISTANT_ROLE : '');
+    if (!assistant || runbookConsent({ role, versionTools: undefined, advertised: [DASHBOARD_RUNBOOK_INTENT] }) === 'no-tool') return false;
+    const served = version ?? (await servedWelcomeVersion(assistant, channelArn).catch(() => undefined))?.version;
+    if (!served) return false;
+    const ad = await readAdvertisement(assistant).catch(() => null);
+    const consent = runbookConsent({ role, versionTools: served.tools, advertised: (ad?.intents ?? []).map((i) => i.key) });
+    if (consent === 'unadvertised') unadvertised = true;
+    return consent === 'consents';
+  };
+  try {
+    await loadAssistantIndex();
+    if (await consents(who.botArn, who.assistant, who.version)) return { botArn: who.botArn, assistant: who.assistant };
+    for (const role of toolRolesOf(DASHBOARD_TOOL) ?? []) {
+      const held = await roleHolder(role, channelArn, who.botArn);
+      if (!held || held === 'ambiguous' || held.botArn === who.botArn || !held.assistant) continue;
+      if (await consents(held.botArn, held.assistant)) return { botArn: held.botArn, assistant: held.assistant };
+    }
+  } catch (err) {
+    console.warn('[Router][event-workflow] the dashboard holder could not be read; the runbook is not drawn', { errName: (err as Error)?.name });
+    return undefined;
+  }
+  if (unadvertised && !runbookUnadvertised.has(runKey)) {
+    if (runbookUnadvertised.size > 500) runbookUnadvertised.clear();
+    runbookUnadvertised.add(runKey);
+    console.log('[Router][event-workflow] the assistant that would draw this run\'s runbook advertises no dashboard_runbook intent; the runbook is not drawn', { runKey });
+  }
+  return undefined;
+}
+
+/** One quiet `dashboard_runbook` task for the holder, carrying the progress (section 8.1). Best-effort. */
+async function openRunbookRefresh(channelArn: string, runKey: string, event: string, holder: { botArn: string }, runbook: RunbookProgress, moves: readonly string[] = []): Promise<void> {
+  const holderId = principalIdFromArn(holder.botArn);
+  const opened = await openWorkflowTask({
+    channelArn, taskId: runbookRefreshTaskId(runKey, runbook, moves), machine: DASHBOARD_RUNBOOK_MACHINE,
+    keepForSeconds: 3600,
+    worker: { id: holderId, type: 'assistant' }, assistantId: holderId,
+    workflowRun: { runKey: runbookRefreshRunKey(runKey), workflow: DASHBOARD_RUNBOOK_RUN, step: 'refresh', event, botArn: holder.botArn, values: {} },
+    details: { runbook: JSON.stringify(runbook) },
+  });
+  if (!opened) console.warn('[Router][event-workflow] the runbook refresh could not be opened; the run is unaffected', { runKey });
+}
+
 export function eventRunDeps(
   name: string, ctx: EventRunContext,
   who: WorkflowRunner,
@@ -3373,11 +3592,15 @@ export function eventRunDeps(
     readClaims: (names) => readEventSteps({ runKey, channelArn: ctx.channelArn, steps: names }),
     // A RUN A TASK ENDED MID-WAY (`endsRun`) IS ASKED ABOUT FROM ITS OWN END CLAIM, through the task service.
     hasEnded: async () => (await readEventSteps({ runKey, channelArn: ctx.channelArn, steps: [RUN_END_CLAIM] }))?.[RUN_END_CLAIM] !== undefined,
+    // A HAND-OFF TO ANOTHER TEAM (SPEC-PROCESSES P4), on this classification's own process source.
+    handoff: (step, def) => putHandoff(def, ctx, who, step),
     // ONE ARCHIVE FACT PER RUN'S END (WT62), put by the task service, the one holder of the stream's grant.
     ended: async (disposition, steps, ending) => {
       const origin = edition.origin;
+      // A RUN A HAND-OFF STARTED NAMES IT AS ITS TRIGGER (`handoff:<process>.<name>`), which analytics counts as received.
+      const trigger = ctx.process?.received ? `handoff:${ctx.process.received}` : ctx.event;
       await recordRunEnded({
-        channelArn: ctx.channelArn, runKey, workflow: name, trigger: ctx.event, disposition, steps,
+        channelArn: ctx.channelArn, runKey, workflow: name, trigger, disposition, steps,
         ...(origin ? { originConfigId: origin.configId } : {}),
         ...(ctx.requester ? { personId: personIdFromArn(ctx.requester) } : {}),
         ...processFactFields(ctx.process),
@@ -3764,6 +3987,7 @@ async function askAnother(args: {
         // proposal card the asked turn makes is addressed to, so the incident's lead confirms adding its account teams.
         ...(args.requesterArn ? { for: args.requesterArn } : {}),
         run: { runKey: intentRunKey(correlation, taker.assistant), ...(origin ? { origin } : {}), trigger: ASKED_BY_ASSISTANT },
+        ...(def.deliver === 'file' ? { deliver: 'file' as const } : {}),
       },
     });
     return dispatched ? 'opened' : 'failed';
@@ -4132,11 +4356,32 @@ async function openWorkflowTaskStep(args: {
       ...(def.continue === 'alongside' && args.joined ? { joined: true as const } : {}),
       // ITS SETTLEMENT ENDS THE RUN WHERE IT STANDS (`endsRun`), confirmed first where the run is mid-way (`confirmEnd`).
       ...(def.continue === 'alongside' && def.endsRun ? { endsRun: true as const, ...(def.movesTo ? { movesTo: def.movesTo } : {}), ...(def.confirmEnd ? { confirmEnd: def.confirmEnd } : {}) } : {}),
+      ...(def.pinned ? { pinned: true as const } : {}),
+      ...(def.decidedBy?.length ? { decidedBy: [...def.decidedBy] } : {}),
       ...(deadline.remind ? { remind: deadline.remind } : {}),
       ...(def.fields?.length ? { fields: def.fields } : {}),
     };
     // THE RUN'S VERSION'S OWN MACHINE (ADR-067 stage 2, WT17): the task opens on it and carries it, so a card press, a
     // deadline and the continuation move the task on the steps it opened on, whatever the version serves next.
+    // THE STEP TAKES THE TASK WHOSE REOPEN STARTED THIS RUN (`takes: 'reopened'`), of the step's machine: its run reference
+    // becomes this run's, so its next ending continues here. A redelivered run finds it taken already.
+    if (def.takes === 'reopened') {
+      const prior = ctx.reopened?.taskId ? await getTask(ctx.reopened.taskId, ctx.channelArn, { consistent: true }).catch(() => null) : null;
+      if (!prior?.workflowRun?.runKey || prior.taskType !== def.machine) return 'failed';
+      if (prior.workflowRun.runKey === args.runKey) return 'opened';
+      // THE TAKEN TASK KEEPS THIS STEP'S DEADLINE AS AN OPENED ONE DOES: its row is kept past it, and its end is scheduled.
+      const taken = await takeReopenedTask({
+        taskId: prior.taskId, channelArn: ctx.channelArn, fromRunKey: prior.workflowRun.runKey, workflowRun: workflowRun as unknown as Record<string, unknown>,
+        ...(kind !== 'timeout' ? { ttlSeconds: 45 * 24 * 3600 } : deadlineAt !== undefined ? { ttlSeconds: Math.ceil((deadlineAt - Date.now()) / 1000) + 7 * 24 * 3600 } : {}),
+      });
+      if (taken) {
+        if (deadlineAt !== undefined) await scheduleTaskDeadline(ctx.channelArn, prior.taskId, deadlineAt);
+        if (kind === 'remind' && dueAt !== undefined) await scheduleTaskReminder(ctx.channelArn, prior.taskId, 1, dueAt);
+        return 'opened';
+      }
+      const now = await getTask(prior.taskId, ctx.channelArn, { consistent: true }).catch(() => null);
+      return now?.workflowRun?.runKey === args.runKey ? 'opened' : 'failed';
+    }
     const machineDef = versionDeclaredMachines(machineVersion?.intentPack)?.[def.machine];
     const originConfigId = originConfigIdOf(machineVersion);
     // THE CONVERSATION THAT OPENED THIS ONE, where a workflow did: read from this conversation's own parent link, so the
@@ -4206,9 +4451,42 @@ async function openWorkflowTaskStep(args: {
  * settled task a run waits on continues that run, once, on the edge its ending chose; a task now an assistant's to take
  * up is taken up where that assistant is idle (`handleTaskReady`).
  */
+/**
+ * A REVISION ITS APPROVER ASKED FOR: the assistant that drafted the task's document, by the role it drafted
+ * in, is asked for the same intent with the approver's instructions; the processor reads the latest version's text, delivers
+ * the revision as a file, and records it as this task's next version. The run, waiting on the approval, is not moved on.
+ */
+async function handleRevisionRequest(task: Task): Promise<{ ran: boolean; reason?: string }> {
+  const t = task as Task & { documents?: unknown; revision?: TaskRevisionRequest };
+  const run = t.workflowRun;
+  const drafting = draftingOf(t);
+  const latest = latestDocument(t);
+  if (!t.revision) return { ran: false, reason: 'nothing to revise' };
+  // A REVISION THAT CANNOT BE ASKED FOR IS CLEARED, so the approver may ask again rather than wait on one nobody writes.
+  const n = t.revision.n;
+  const abandon = async (reason: string) => {
+    await abandonRevision({ taskId: t.taskId, channelArn: t.channelArn, n }).catch(() => undefined);
+    return { ran: false, reason };
+  };
+  if (!run || !drafting?.role || !drafting.intent || !latest) return abandon('nothing to revise');
+  const holder = await roleHolder(drafting.role, t.channelArn, run.botArn);
+  if (!holder || holder === 'ambiguous') return abandon('no assistant holds the drafting role here');
+  const ask = templateLine('document-revise-ask', undefined, { values: { instructions: t.revision.instructions, name: latest.name } });
+  const dispatched = await dispatchEventAgentStep({
+    runKey: run.runKey, workflow: run.workflow, step: `revise-${t.taskId}-${t.revision.n}`, event: run.event as WorkflowEvent,
+    channelArn: t.channelArn, botArn: holder.botArn, values: run.values ?? {}, transitions: [],
+    asked: {
+      intent: drafting.intent, ask, askerBotArn: run.botArn, to: [],
+      run: { runKey: intentRunKey(`revise-${t.taskId}-${t.revision.n}`, holder.assistant ?? drafting.by.replace(/^assistant:/, '')), trigger: ASKED_BY_ASSISTANT },
+      deliver: 'file', revisionOf: { taskId: t.taskId, fileKey: latest.fileKey, name: latest.name },
+    },
+  });
+  return dispatched ? { ran: true } : abandon('the drafting turn could not be dispatched');
+}
+
 export async function handleTaskNaming(raw: unknown): Promise<{ ran: boolean; reason?: string; moved?: boolean; moveFailed?: boolean }> {
   const r = raw as Partial<TaskNaming> | null;
-  if (!r || (r.kind !== 'settled' && r.kind !== 'ready' && r.kind !== 'entered' && r.kind !== 'reopened' && r.kind !== 'notice' && r.kind !== 'request') || typeof r.channelArn !== 'string' || !r.channelArn.includes('/channel/') || typeof r.taskId !== 'string' || !r.taskId) {
+  if (!r || (r.kind !== 'settled' && r.kind !== 'ready' && r.kind !== 'entered' && r.kind !== 'reopened' && r.kind !== 'notice' && r.kind !== 'request' && r.kind !== 'revise') || typeof r.channelArn !== 'string' || !r.channelArn.includes('/channel/') || typeof r.taskId !== 'string' || !r.taskId) {
     return { ran: false, reason: 'malformed' };
   }
   if ((await resolveChannelClassificationTag(r.channelArn)) !== STATIC_CLASSIFICATION) return { ran: false, reason: 'not this classification' };
@@ -4219,6 +4497,7 @@ export async function handleTaskNaming(raw: unknown): Promise<{ ran: boolean; re
   if (r.kind === 'reopened') return handleTaskReopened(task);
   if (r.kind === 'notice') return handleStateNotice(task);
   if (r.kind === 'request') return handleRequestAwaitingRun(task);
+  if (r.kind === 'revise') return handleRevisionRequest(task);
   const machines = machinesForTask(task);
   const initial = task.taskType ? machines[task.taskType]?.initial : undefined;
   const settledMachine = machines[task.taskType ?? ''];
@@ -4236,7 +4515,8 @@ export async function handleTaskNaming(raw: unknown): Promise<{ ran: boolean; re
     return r.kind === 'settled' ? settlementOutcome(task, machines) : undefined;
   };
   // A MEETING'S ACTION ITEM (FR67) belongs to the meeting's summary, which is no workflow, so its settlement continues no run.
-  const own = task.workflowRun?.workflow === MEETING_SUMMARY_RUN ? undefined : task.workflowRun;
+  // A RUNBOOK REFRESH (section 8.1) is the platform's too: its settlement continues no run.
+  const own = PLATFORM_RUN_NAMES.includes(task.workflowRun?.workflow ?? '') ? undefined : task.workflowRun;
   const ownOutcome = outcomeFor(own);
   // OWNERSHIP IS NEVER BROKEN (WT118): the run that asked for this work is continued on how it ended, and handed nothing it
   // recorded, which is the owning assistant's to share.
@@ -4330,7 +4610,7 @@ async function meetJoin(taskId: string, channelArn: string, outcome: string): Pr
 }
 
 /**
- * A TASK THAT ENDS ITS RUN SETTLED WHILE THE RUN WAS MID-WAY (`endsRun`, owner decision 2026-11-14): the run ends now, on its
+ * A TASK THAT ENDS ITS RUN SETTLED WHILE THE RUN WAS MID-WAY (`endsRun`): the run ends now, on its
  * success terminal, through the continuation path every run takes (its key checked, its end claimed once, its one archive
  * fact, WT62), and its end tells the conversation that opened this one how it ended, which is how the task ended
  * (`runEnding`). Its end claimed, the run's open tasks are cancelled with the run's end as their reason, so none is left
@@ -4356,7 +4636,8 @@ async function endRunWhereItStands(run: WorkflowRunRef, channelArn: string, task
  * went on alongside (the investigation), and the run goes on at `movesTo`, once, through the continuation path every run takes.
  */
 async function moveRunOn(run: WorkflowRunRef, channelArn: string, taskId: string, outcome: string): Promise<{ ran: boolean; reason?: string }> {
-  for (const id of (await workflowTasksOf(channelArn).catch(() => [])) ?? []) {
+  // ONLY A WORKFLOW RUN'S OWN TASKS ARE READ: a runbook refresh and a meeting's action item are the platform's, and no run waits on them.
+  for (const id of (await workflowTasksOf(channelArn, { skipMachines: PLATFORM_RUN_MACHINES }).catch(() => [])) ?? []) {
     const r = (await getTask(id, channelArn).catch(() => null))?.workflowRun;
     if (r?.runKey === run.runKey && !r.holdsEnd && r.step) await claimEventStep({ runKey: run.runKey, channelArn, step: continuationClaim(r.step), outcome: 'moved' }).catch(() => false);
   }
@@ -4422,6 +4703,11 @@ async function tellOpener(childArn: string, ending: ChildEnding): Promise<void> 
   }
 }
 
+/** Whether the task rests in a quiet step (`isQuietStep`): taken up with nothing posted and no turn lock held. */
+export function quietPickup(task: Pick<Task, 'taskType' | 'taskState'>, machines: Record<string, TaskStateMachine>): boolean {
+  return isQuietStep(machines[task.taskType ?? '']?.states?.[task.taskState ?? '']);
+}
+
 /**
  * A TASK NAMED READY FOR AN ASSISTANT (ADR-063 decision 5, the second event): the work became the assistant's while it may
  * hold no lock here. Checked from the row: the assignee is a live assistant of this classification and the task is ready
@@ -4436,8 +4722,11 @@ async function handleTaskReady(task: Task): Promise<{ ran: boolean; reason?: str
   const botArn = botArnFor(instance, assistantId);
   const assistant = await assistantOfBot(botArn, STATIC_CLASSIFICATION, await getBotArn());
   if (assistant.decision === 'decline') return { ran: false, reason: assistant.reason };
-  if (!pickupReadiness(task, await resolveTaskMachines(task, { profileName: assistant.profile.name }), assistantId).ready) return { ran: false, reason: 'not ready' };
+  const machines = await resolveTaskMachines(task, { profileName: assistant.profile.name });
+  if (!pickupReadiness(task, machines, assistantId).ready) return { ran: false, reason: 'not ready' };
   const correlationId = pickupCorrelationId(task);
+  // A QUIET STEP SPEAKS NO TURN (section 8.1 of DESIGN-CONVERSATION-DASHBOARDS): it is taken up at once, holding no turn lock.
+  if (quietPickup(task, machines)) return dispatchTaskPickup(task, botArn, assistant.profile, correlationId, { quiet: true });
   if (!turnQueueEnabled()) {
     if (taskHasBeenGivenATurn(task)) return { ran: false, reason: 'the turn queue is off; a later step waits for a message' };
     return dispatchTaskPickup(task, botArn, assistant.profile, correlationId);
@@ -4469,9 +4758,15 @@ export async function handleTaskPickup(raw: unknown): Promise<{ ran: boolean; re
   const assistant = await assistantOfBot(botArn, STATIC_CLASSIFICATION, await getBotArn());
   if (assistant.decision === 'decline') { await release(); return { ran: false, reason: assistant.reason }; }
   const task = await getTask(str(r?.taskId), channelArn);
-  if (!task || !pickupReadiness(task, await resolveTaskMachines(task, { profileName: assistant.profile.name }), responderId).ready || pickupCorrelationId(task) !== correlationId) {
+  const machines = task ? await resolveTaskMachines(task, { profileName: assistant.profile.name }) : {};
+  if (!task || !pickupReadiness(task, machines, responderId).ready || pickupCorrelationId(task) !== correlationId) {
     await release();
     return { ran: false, reason: 'the task is no longer ready for this assistant' };
+  }
+  // A QUIET STEP HOLDS NO TURN LOCK: the one handed to it is given back, and the step is run without it.
+  if (quietPickup(task, machines)) {
+    await release();
+    return dispatchTaskPickup(task, botArn, assistant.profile, correlationId, { quiet: true });
   }
   const out = await dispatchTaskPickup(task, botArn, assistant.profile, correlationId);
   if (!out.ran) await release();
@@ -4517,8 +4812,11 @@ export async function pickupArmFields(task: Pick<Task, 'experimentArm' | 'create
  * the turn's attribution, declared `task_step` (`declaredTurnKind`). The line that starts the turn is the assistant's
  * `task-pickup` prompt template, and nobody's message is answered. A private task's acknowledgment and answer are its
  * owner's alone.
+ *
+ * A QUIET STEP (`quiet`, `isQuietStep`) is taken up the same way with nothing posted: it answers nobody, so it has no
+ * acknowledgment and no audience, and the processor runs its declared action and ends the turn there.
  */
-async function dispatchTaskPickup(task: Task, botArn: string, profile: { name: string; rateLimitPerHour?: number }, correlationId: string): Promise<{ ran: boolean; reason?: string }> {
+async function dispatchTaskPickup(task: Task, botArn: string, profile: { name: string; rateLimitPerHour?: number }, correlationId: string, opts: { quiet?: boolean } = {}): Promise<{ ran: boolean; reason?: string }> {
   const budget = pickupBudget(task);
   const gate = await evaluateAbuseGate({
     personId: budget === 'machineWritten' ? '' : budget.owner,
@@ -4540,30 +4838,32 @@ async function dispatchTaskPickup(task: Task, botArn: string, profile: { name: s
   if (!claim.claimed) return { ran: false, reason: `not taken up (${claim.reason})` };
   const instance = appInstanceArnOf(task.channelArn);
   const ownerArn = instance && task.ownerPersonId ? userArnFor(instance, task.ownerPersonId) : '';
-  const privately = isPrivateVisibility(task.visibility);
+  const privately = !opts.quiet && isPrivateVisibility(task.visibility);
   if (privately && !ownerArn) return { ran: false, reason: 'a private task with no owner has nobody to answer' };
-  const machines = await resolveTaskMachines(task, { profileName: profile.name });
-  const placeholder = getTaskPlaceholder(DeliveryOption.TASK_MULTI_STEP, task.taskType, task.taskState, {
-    words: await wordsOf(profile.name, { channelArn: task.channelArn }), declared: machines[task.taskType]?.states?.[task.taskState]?.placeholder,
-  });
   let placeholderMessageId = '';
-  try {
-    // ONE MESSAGE BY CONSTRUCTION: a placeholder, short platform text the answer later replaces in place.
-    const sent = await speakingAs({ botArn, channelArn: task.channelArn, purpose: 'pickup' }, () => sendChannelMessage(chimeClient, {
-      ChannelArn: task.channelArn,
-      // DECLARED A TASK STEP from its first message, as a join recap declares itself, so it pairs with nothing.
-      Content: withTurnDeclaration(`${placeholder} <!--corr:${correlationId}-->`, { kind: 'task_step' }),
-      Type: ChannelMessageType.STANDARD,
-      Persistence: ChannelMessagePersistenceType.PERSISTENT,
-      ChimeBearer: botArn,
-      Metadata: botMessageMetadata({ agentType: profile.name, classification: STATIC_CLASSIFICATION }, privately ? { targetedSender: ownerArn } : undefined),
-      ...(privately ? { Target: [{ MemberArn: ownerArn }] } : {}),
-    }));
-    placeholderMessageId = sent.MessageId ?? '';
-    if (placeholderMessageId) await claimPlaceholderMapping(correlationId, placeholderMessageId).catch(() => undefined);
-  } catch (err) {
-    console.warn('[Router][pickup] the acknowledgment could not be posted; the step is not taken up', { errName: (err as Error)?.name });
-    return { ran: false, reason: 'acknowledgment' };
+  if (!opts.quiet) {
+    const machines = await resolveTaskMachines(task, { profileName: profile.name });
+    const placeholder = getTaskPlaceholder(DeliveryOption.TASK_MULTI_STEP, task.taskType, task.taskState, {
+      words: await wordsOf(profile.name, { channelArn: task.channelArn }), declared: machines[task.taskType]?.states?.[task.taskState]?.placeholder,
+    });
+    try {
+      // ONE MESSAGE BY CONSTRUCTION: a placeholder, short platform text the answer later replaces in place.
+      const sent = await speakingAs({ botArn, channelArn: task.channelArn, purpose: 'pickup' }, () => sendChannelMessage(chimeClient, {
+        ChannelArn: task.channelArn,
+        // DECLARED A TASK STEP from its first message, as a join recap declares itself, so it pairs with nothing.
+        Content: withTurnDeclaration(`${placeholder} <!--corr:${correlationId}-->`, { kind: 'task_step' }),
+        Type: ChannelMessageType.STANDARD,
+        Persistence: ChannelMessagePersistenceType.PERSISTENT,
+        ChimeBearer: botArn,
+        Metadata: botMessageMetadata({ agentType: profile.name, classification: STATIC_CLASSIFICATION }, privately ? { targetedSender: ownerArn } : undefined),
+        ...(privately ? { Target: [{ MemberArn: ownerArn }] } : {}),
+      }));
+      placeholderMessageId = sent.MessageId ?? '';
+      if (placeholderMessageId) await claimPlaceholderMapping(correlationId, placeholderMessageId).catch(() => undefined);
+    } catch (err) {
+      console.warn('[Router][pickup] the acknowledgment could not be posted; the step is not taken up', { errName: (err as Error)?.name });
+      return { ran: false, reason: 'acknowledgment' };
+    }
   }
   const handed = await invokeAsync(processorArn, {
     channelArn: task.channelArn,
@@ -4618,7 +4918,7 @@ export async function handleEventContinuation(req: EventContinuation, opts: { se
   // AN AGENT STEP THE PROCESSOR COMPLETED, A TASK STEP WHOSE TASK SETTLED, OR A WAIT THAT CAME DUE (WT20).
   if (!wf || wf.on !== req.event || !continuableStep(wf, str(req.step))) return refuse('no such agent, task, wait, open or held end step');
   const person = (v: unknown) => (typeof v === 'string' && v.includes('/user/') ? v : undefined);
-  // A RUN ITS TRIGGER STARTED FINISHES (owner decision, 2026-11-15): whether the alarm, rule or watched key that started it is
+  // A RUN ITS TRIGGER STARTED FINISHES: whether the alarm, rule or watched key that started it is
   // still attached is checked before a run starts, never on its continuation, so detaching a trigger stops new runs and an
   // open incident still reaches its end and tells the conversation that opened it. The continuation is still claimed
   // once on a run key recomputed here, so nothing continues a run that never started.
@@ -4680,7 +4980,8 @@ export async function handleEventContinuation(req: EventContinuation, opts: { se
   const ctx: EventRunContext = { ...withRoles, gate: await routerGate(wf, withRoles, served?.version.variables, { ...held, ...(roles.members ? { members: roles.members } : {}), ...(roles.conversationType ? { conversationType: roles.conversationType } : {}) }) };
   const transitions: EventTransition[] = (Array.isArray(req.transitions) ? req.transitions : [])
     .filter((t) => t && typeof t.step === 'string' && typeof t.outcome === 'string').slice(-34); // A run's 32 steps and the marks a continuation adds (WT129).
-  const deps = eventRunDeps(str(req.workflow), ctx, runnerOf(botArn, assistant.profile.name, served), runKey, undefined, invitationReason, invitationRole, held.invitationPrompt);
+  const runner = runnerOf(botArn, assistant.profile.name, served);
+  const deps = withRunbook(eventRunDeps(str(req.workflow), ctx, runner, runKey, undefined, invitationReason, invitationRole, held.invitationPrompt), wf, str(req.workflow), ctx, runner, runKey);
   // A RESOLVE THAT MOVES THE RUN ON (O15): only the step that declares it, to the step it names, and once.
   const moving = opts.moveTo && wf.states[str(req.step)]?.task?.movesTo === opts.moveTo ? opts.moveTo : undefined;
   const out = moving
@@ -4691,6 +4992,7 @@ export async function handleEventContinuation(req: EventContinuation, opts: { se
       deps,
       // THE MACHINES ITS CONDITIONS READ ARE ITS VERSION'S (ADR-067 stage 2), so `task:state` names a state that version declares.
       served?.version ? machinesForVersion(served.version) : taskStateMachines());
+  await deps.flushRunbook();
   // WHETHER A MOVE IT TOOK STOOD, from its own steps, which the answer to an offer reports to the person (WT90). A run that
   // waits before its move has failed nothing: the move is still to come.
   const moves = out.steps.filter((st) => wf.states[st.step]?.open?.mode === 'move');
@@ -4751,9 +5053,11 @@ export async function handleIntentContinuation(req: EventContinuation, opts: { s
   const ctx: EventRunContext = { ...withRoles, gate: await routerGate(wf, withRoles, served?.version.variables, { ...(roles.members ? { members: roles.members } : {}), ...(roles.conversationType ? { conversationType: roles.conversationType } : {}) }) };
   const transitions: EventTransition[] = (Array.isArray(req.transitions) ? req.transitions : [])
     .filter((t) => t && typeof t.step === 'string' && typeof t.outcome === 'string').slice(-34); // A run's 32 steps and the marks a continuation adds (WT129).
+  const deps = withRunbook(eventRunDeps(str(req.workflow), ctx, who, runKey, roles.members), wf, str(req.workflow), ctx, who, runKey);
   const out = await continueAfter(str(req.workflow), wf, ctx, { step: str(req.step), outcome: str(req.outcome), transitions, ...(opts.settledMachine ? { machine: opts.settledMachine } : {}) },
-    eventRunDeps(str(req.workflow), ctx, who, runKey, roles.members),
+    deps,
     served?.version ? machinesForVersion(served.version) : taskStateMachines());
+  await deps.flushRunbook();
   return { ran: out.ran };
 }
 
@@ -4866,11 +5170,22 @@ async function handleTaskReopened(task: Task): Promise<{ ran: boolean; reason?: 
   const assistant = await assistantOfBot(botArn, STATIC_CLASSIFICATION, await getBotArn());
   if (assistant.decision === 'decline') return { ran: false, reason: assistant.reason };
   const served = await servedWelcomeVersion(assistant.profile.name, task.channelArn).catch(() => undefined);
-  const declared = declaredWorkflowOn(served?.version.eventWorkflows, 'task-reopened');
+  const declared = declaredWorkflowOn(served?.version.eventWorkflows, 'task-reopened', task.taskType);
   if (!declared) return { ran: false, reason: 'no workflow' };
+  // THE RUN THAT HOLDS THE REOPENED TASK IS SUPERSEDED, whichever step took it: the incident's own run, whose resolve moved it
+  // on (`endsRun`), or an earlier reopen's run, whose step took the task. It ends now, so nothing it went on to (a review) goes
+  // on, and its open tasks are cancelled except those it went on alongside (an investigation) and this task, which the reopen
+  // run then takes (`takes: 'reopened'`), its next ending going on from there.
+  const from = task.workflowRun;
+  if (from?.runKey) {
+    const ended = await claimEventStep({ runKey: from.runKey, channelArn: task.channelArn, step: RUN_END_CLAIM, outcome: 'reopened' }).catch(() => false);
+    const cancelled = await endRunTasks(task.channelArn, from.runKey, { keepAlongside: true, keepTaskId: task.taskId });
+    console.log('[Router][event-workflow] a reopen ended what its run went on to', { workflow: from.workflow, endClaimed: ended, cancelled: cancelled?.length ?? null });
+  }
   const requester = task.userArn?.includes('/user/') ? task.userArn : undefined;
   const ctx: EventRunContext = {
-    event: 'task-reopened', channelArn: task.channelArn, values: {},
+    // THE REOPEN RUN SAYS WHAT ITS TASK'S RUN SAID (its label, where it was opened from), from that run's own values.
+    event: 'task-reopened', channelArn: task.channelArn, values: { ...(from?.values ?? {}) },
     ...(requester ? { eventPerson: requester, requester } : {}),
     privateRun: isPrivateVisibility(task.visibility),
     reopened: { taskId: task.taskId, n },
@@ -4972,7 +5287,7 @@ async function startIntentRun(args: {
     const inProcess: EventRunContext = proc ? { ...base, process: proc } : base;
     const withRoles: EventRunContext = roles.roles ? { ...inProcess, roles: roles.roles, roleSaidInRoom: roles.saidInRoom, ...(roles.deciding ? { decidingRoles: roles.deciding } : {}), ...(roles.conversationType ? { conversationType: roles.conversationType } : {}) } : inProcess;
     const gated: EventRunContext = { ...withRoles, gate: await routerGate(wf, withRoles, who.variables, { ...(roles.members ? { members: roles.members } : {}), ...(roles.conversationType ? { conversationType: roles.conversationType } : {}) }) };
-    const deps = eventRunDeps(args.intent, gated, who, runKey, roles.members);
+    const deps = withRunbook(eventRunDeps(args.intent, gated, who, runKey, roles.members), wf, args.intent, gated, who, runKey);
     const ownStep = intentTaskStep(declared, args.intent);
     let opened: Task | undefined;
     await runEventWorkflow(args.intent, wf, gated, {
@@ -5006,6 +5321,7 @@ async function startIntentRun(args: {
         return 'opened';
       },
     });
+    await deps.flushRunbook();
     return opened;
   } catch (err) {
     console.warn('[Router][intent-run] the request\'s workflow could not start; its task opens as today', { intent: args.intent, errName: (err as Error)?.name });
@@ -5837,13 +6153,16 @@ async function conversationWatches(channelArn: string, alarmName: string): Promi
 let cloudwatch: CloudWatchClient | null = null;
 
 /** What an alarm watches, as CloudWatch reports it: its metric, its threshold and the latest value it evaluated. */
-interface AlarmFacts { alarmMetric?: string; alarmThreshold?: string; alarmLatest?: string }
+interface AlarmFacts { alarmMetric?: string; alarmThreshold?: string; alarmLatest?: string; serviceAbout?: string }
+
+/** The longest alarm description an incident carries, in characters. */
+const MAX_SERVICE_ABOUT = 600;
 
 /**
  * THE ALARM'S FACTS, from the structured fields of its own record, never from its reason's prose: the metric's name, the
  * threshold, and the most recent datapoint the alarm evaluated (`StateReasonData.evaluatedDatapoints`, by timestamp).
  */
-function alarmFactsOf(alarm: { MetricName?: string; Threshold?: number; StateReasonData?: string }): AlarmFacts {
+function alarmFactsOf(alarm: { MetricName?: string; Threshold?: number; StateReasonData?: string; AlarmDescription?: string }): AlarmFacts {
   const num = (n: unknown) => (typeof n === 'number' && Number.isFinite(n) ? String(Math.round(n * 100) / 100) : undefined);
   let latest: string | undefined;
   try {
@@ -5855,7 +6174,15 @@ function alarmFactsOf(alarm: { MetricName?: string; Threshold?: number; StateRea
     ...(alarm.MetricName ? { alarmMetric: alarm.MetricName.slice(0, 100) } : {}),
     ...(num(alarm.Threshold) ? { alarmThreshold: num(alarm.Threshold) } : {}),
     ...(latest ? { alarmLatest: latest } : {}),
+    // WHAT THE SERVICE DOES FOR ITS USERS, as the alarm's owner described it in CloudWatch: one line, markers removed, clipped.
+    // Said to the team as written, never decided from.
+    ...(serviceAboutOf(alarm.AlarmDescription) ? { serviceAbout: serviceAboutOf(alarm.AlarmDescription) } : {}),
   };
+}
+
+/** An alarm's description as one line an incident may carry: markers removed, whitespace folded, clipped. */
+function serviceAboutOf(description: string | undefined): string {
+  return stripMessageMarkers(String(description ?? '')).replace(/\s+/g, ' ').trim().slice(0, MAX_SERVICE_ABOUT);
 }
 
 /**
@@ -5897,7 +6224,7 @@ async function alarmStateNow(alarmName: string, opts: { strict?: boolean } = {})
  */
 export async function handleAlarmStateChanged(
   raw: unknown,
-  deps: { stateNow?: typeof alarmStateNow; watch?: typeof alarmWatchOf; watches?: typeof conversationWatches } = {},
+  deps: { stateNow?: typeof alarmStateNow; watch?: typeof alarmWatchOf; watches?: typeof conversationWatches; roomTags?: typeof standingRoomTags } = {},
 ): Promise<{ ran: boolean; reason?: string }> {
   const refuse = (reason: string) => {
     console.warn('[Router][alarm] the alarm change starts nothing here', { reason, classification: STATIC_CLASSIFICATION });
@@ -5914,7 +6241,10 @@ export async function handleAlarmStateChanged(
   const channelArn = watch.room;
   const watching = await (deps.watches ?? conversationWatches)(channelArn, alarmName);
   if (!watching) return refuse('the conversation does not watch the alarm at this classification');
-  const closed = roomRefusal(await readChannelTags(chimeClient, channelArn));
+  // A WATCHING CONVERSATION THAT WAS DELETED is gone, not unreadable: the change is refused once rather than delivered again.
+  const roomTags = await (deps.roomTags ?? standingRoomTags)(channelArn);
+  if (!roomTags) return refuse('the conversation that watches the alarm is gone');
+  const closed = roomRefusal(roomTags);
   if (closed) return refuse(closed);
   const now = await (deps.stateNow ?? alarmStateNow)(alarmName, { strict: true });
   if (!now) return refuse('the alarm names no alarm');
@@ -7001,7 +7331,10 @@ export function waitHoldsChildOpen(read: { ended?: unknown } | 'none' | 'unread'
  * opened them (`openedFrom`), which name the resource. A conversation whose end record cannot be read counts as open. Null
  * when the row or the tasks cannot be read, so a limit is never passed on a short count.
  */
-export async function openIncidents(channelArn: string, type: string | undefined): Promise<OpenIncident[] | null> {
+export async function openIncidents(
+  channelArn: string, type: string | undefined,
+  deps: { roomTags?: (channelArn: string) => Promise<Record<string, string | undefined> | null> } = {},
+): Promise<OpenIncident[] | null> {
   const [row, tasks] = await Promise.all([readChannelContext(channelArn, { consistent: true }).catch(() => undefined), openTasksOpenedFrom(channelArn, 'incident_ownership')]);
   if (row === undefined || !tasks) return null;
   const out = new Map<string, OpenIncident>();
@@ -7022,6 +7355,9 @@ export async function openIncidents(channelArn: string, type: string | undefined
         .then((c) => (c ? c[continuationClaim(held.step)] !== undefined : 'unread' as const), () => 'unread' as const)
       : false;
     if (!waitHoldsChildOpen(record, wentOn)) return;
+    // A CHILD THAT WAS DELETED IS ENDED, whatever wait its parent's run still holds on it; one whose tags cannot be read counts
+    // as open, so the cap never opens on a failure.
+    if (await (deps.roomTags ?? standingRoomTags)(child).then((t) => t === null, () => false)) return;
     const values = (record === 'unread' || record === 'none' ? undefined : record.values) as Record<string, unknown> | undefined;
     out.set(child, { conversation: child, ...(typeof values?.resource === 'string' ? { resource: values.resource } : {}) });
   }));
@@ -7036,6 +7372,71 @@ async function tellIncident(task: Task, botArn: string, assistant: string, label
     channelArn: task.channelArn, botArn, assistant, workflow: run.workflow, event: run.event as WorkflowEvent, step: 'repeated', template: 'incident-event-repeated',
     values: { label }, to: [], runKey: run.runKey, transitions: [], process: run.process,
   }).catch(() => false);
+}
+
+/**
+ * ASK THIS CLASSIFICATION'S CREATOR FOR THE CONVERSATION A TYPE'S PATTERN NAMES (DESIGN-EVENT-TARGETS 11.2), asynchronously: it
+ * derives the id, reuses a standing one of this type, recreates an archived one and holds the day's cap, then hands the event back
+ * to this router, which runs it there. True once asked; a refusal is the creator's to log.
+ */
+export async function openPatternConversation(typeKey: string, resolved: string, capPerDay: number, forUserArn: string | undefined, handBack: unknown): Promise<boolean> {
+  const creator = process.env.TYPED_CREATOR_NAME;
+  if (!creator) return false;
+  // A PATTERN THAT NAMES A PERSON is that person's conversation, opened for them; any other is led by the type's lead role.
+  const forRole = forUserArn ? undefined : groupSourcedRoles((k) => k === typeKey).find((r) => r.decl.holders === 'one')?.role;
+  // NOBODY TO OPEN IT FOR, no person and no one-holder lead role: the creator would refuse every time, so nothing is asked.
+  if (!forUserArn && !forRole) {
+    console.warn('[Router][watch-event] a pattern conversation names nobody to open it for; nothing is asked', { conversationType: typeKey });
+    return false;
+  }
+  await lambdaClient.send(new InvokeCommand({
+    FunctionName: creator, InvocationType: InvocationType.Event,
+    Payload: Buffer.from(JSON.stringify({ detail: { conversationType: typeKey, ...(forUserArn ? { forUserArn } : forRole ? { forRole } : {}), patternRoom: { resolved, capPerDay, handBack } } })),
+  }));
+  return true;
+}
+
+/**
+ * WHY A PATTERN CONVERSATION'S EVENT COULD NOT RUN, checked before its conversation is asked for, or undefined: the assistant
+ * that would own its workflow (the one the trigger was attached for, else the holder of the type's owner role, else this
+ * classification's primary) is live here, and the version it serves declares the workflow on `event-received` for this type.
+ * A conversation that stands is checked again, with its members, when the event runs there.
+ */
+export async function patternRunRefusal(binding: { workflow: string; type: string; assistant?: string }, channelArn: string): Promise<string | undefined> {
+  const assistants = await liveAssistantsByHandleOrThrow(STATIC_CLASSIFICATION);
+  let botArn: string;
+  if (binding.assistant !== undefined) {
+    const named = assistants.get(binding.assistant)?.botArn;
+    if (!named) return 'the assistant the trigger was attached for is not a live assistant of this classification';
+    botArn = named;
+  } else {
+    const role = workflowOwnerRoleOf(binding.type);
+    const holder = role ? declaredHolderOfRole(assistants, role) : undefined;
+    if (holder === 'ambiguous') return `more than one assistant holds the ${role} role that owns this type's workflows`;
+    botArn = holder?.botArn ?? await getBotArn();
+  }
+  const assistant = await assistantOfBot(botArn, STATIC_CLASSIFICATION, await getBotArn());
+  if (assistant.decision === 'decline') return assistant.reason;
+  const served = await servedWelcomeVersion(assistant.profile.name, channelArn);
+  const wf = workflowFor(served?.version.eventWorkflows, binding.workflow);
+  if (!wf || wf.on !== 'event-received') return 'no such workflow';
+  if (!wf.types?.includes(binding.type)) return 'the workflow runs in another type of conversation';
+  return undefined;
+}
+
+/**
+ * A CONVERSATION'S TAGS, OR NULL WHERE IT IS GONE: a deleted conversation answers this classification's tag read with NotFound,
+ * or with Forbidden where the grant's tag condition has no tags left to match, and either way nothing here may act in it. A read
+ * that fails for any other reason throws, so the event is delivered again.
+ */
+export async function standingRoomTags(channelArn: string): Promise<Record<string, string | undefined> | null> {
+  try {
+    return await readChannelTags(chimeClient, channelArn);
+  } catch (err) {
+    const name = (err as { name?: string })?.name;
+    if (name === 'NotFoundException' || name === 'ResourceNotFoundException' || name === 'ForbiddenException') return null;
+    throw err;
+  }
 }
 
 /** The refusal an owning assistant that is not a member of the room is answered with (`workflowOwnerOf`). */
@@ -7092,6 +7493,9 @@ export async function handleRuleEvent(raw: unknown): Promise<{ ran: boolean; rea
   // before the attach recorded one names none, and the room's type or primary owns its run.
   const attachedBy = r.assistant === undefined ? undefined : str(r.assistant, 64);
   if (!/^[a-f0-9]{12}$/.test(rule) || !channelArn || !workflow || window === undefined) return refuse('malformed');
+  // THE TRIGGER AN EDIT REPLACED, fixed in the rule's input by the attach as the workflow is: the run is keyed by that rule, so
+  // one event both rules match while the edit swaps them starts one run. The rule itself is what every check below reads.
+  const runRule = /^[a-f0-9]{12}$/.test(str(r.supersedes)) ? str(r.supersedes) : rule;
   // A READ THAT FAILS THROWS, so the event is delivered again; a refusal is only what a record answered.
   const tags = await readChannelTags(chimeClient, channelArn);
   const closed = roomRefusal(tags, 'room');
@@ -7126,6 +7530,9 @@ export async function handleRuleEvent(raw: unknown): Promise<{ ran: boolean; rea
   // and one dated ahead of now starts nothing either.
   const age = eventAgeRefusal(str(r.at), policy.maxEventAgeSeconds);
   if (age) return refuse(age);
+  // A HAND-OFF FROM ANOTHER TEAM, checked against the declaration recorded at attach before any run (SPEC-PROCESSES P6, P7).
+  const received = receivedHandoff(r.handoff, source, detailType);
+  if (received && 'refused' in received) return refuse(received.refused);
   // THE ROOM'S OPEN INCIDENTS, read from their tasks, the one record of what is open: one for this resource takes the event
   // and opens nothing; as many as the policy allows open nothing until one is resolved.
   const opens = Object.values(wf.states).find((s) => s.open)?.open?.type;
@@ -7142,9 +7549,11 @@ export async function handleRuleEvent(raw: unknown): Promise<{ ran: boolean; rea
   const isAlarm = !!named && resource.includes(':alarm:');
   const facts = isAlarm ? (await alarmStateNow(named))?.facts ?? {} : {};
   return runWorkflowFor(workflow, wf, {
-    event: 'event-received', channelArn, ruleEvent: { rule, window },
+    // A HAND-OFF'S RUN IS KEYED BY ITS PROCESS, so two processes' hand-offs in one window are two runs.
+    event: 'event-received', channelArn, ruleEvent: { rule: runRule, window, ...(received ? { watch: { kind: PROCESS_WATCH_KIND, key: processWatchId(received.process.name, received.process.id) } } : {}) },
+    ...(received ? { process: received.process } : {}),
     // An alarm names the room in words (`identifierWords`); `resource` keeps the alarm's own name for every match.
-    values: { source, detailType, resource, label: (isAlarm ? identifierWords(named) : named) || detailType, ...facts, ...incidentFactsOfEvent(str(r.at), resource) },
+    values: { ...(received?.values ?? {}), source, detailType, resource, label: (isAlarm ? identifierWords(named) : named) || detailType, ...facts, ...incidentFactsOfEvent(str(r.at), resource) },
   }, runnerOf(owner.botArn, assistant.profile.name, served), { conversationType: roomType });
 }
 
@@ -7160,10 +7569,13 @@ export async function handleRuleEvent(raw: unknown): Promise<{ ran: boolean; rea
 type WatchBinding = { workflow: string; type: string; kind: string; source: string; detailType: string; assistant?: string };
 let eventbridge: EventBridgeClient | null = null;
 const watchBindings = new Map<string, WatchBinding | null>();
-export async function watchBindingOf(rule: string): Promise<WatchBinding | null> {
+export async function watchBindingOf(rule: string, source = ''): Promise<WatchBinding | null> {
   const prefix = process.env.WATCH_RULE_ARN_PREFIX ?? '';
   if (!prefix || !TRIGGER_RULE_ID.test(rule)) return null;
-  const arn = `${prefix}${rule}`;
+  // A HAND-OFF'S WATCH RULE IS ON THE PROCESS EVENT BUS (DESIGN-PROCESSES section 12), whose rule ARNs name the bus.
+  const bus = source.startsWith(PROCESS_SOURCE_PREFIX) ? processEventBus() : undefined;
+  if (source.startsWith(PROCESS_SOURCE_PREFIX) && !bus) return null;
+  const arn = bus ? `${prefix.replace(':rule/', `:rule/${bus}/`)}${rule}` : `${prefix}${rule}`;
   if (watchBindings.has(arn)) return watchBindings.get(arn) ?? null;
   eventbridge = eventbridge ?? new EventBridgeClient({});
   let res: { Tags?: Array<{ Key?: string; Value?: string }> };
@@ -7207,7 +7619,11 @@ export async function conversationWatchesRef(
  */
 export async function handleWatchEvent(
   raw: unknown,
-  deps: { binding?: typeof watchBindingOf; watches?: typeof conversationWatchesRef; watchOf?: typeof refWatchOf } = {},
+  deps: {
+    binding?: typeof watchBindingOf; watches?: typeof conversationWatchesRef; watchOf?: typeof refWatchOf; openPattern?: typeof openPatternConversation;
+    confirms?: typeof connectorRecordConfirms; roomTags?: (channelArn: string) => Promise<Record<string, string | undefined> | null>;
+    patternRuns?: typeof patternRunRefusal;
+  } = {},
 ): Promise<{ ran: boolean; reason?: string }> {
   const refuse = (reason: string) => {
     console.warn('[Router][watch-event] the event starts nothing here', { reason, classification: STATIC_CLASSIFICATION });
@@ -7218,18 +7634,89 @@ export async function handleWatchEvent(
   const rule = str(r.rule);
   const window = eventTriggerWindow(r.at);
   if (!TRIGGER_RULE_ID.test(rule) || window === undefined) return refuse('malformed');
-  const key = refId(r.key);
-  if (!key) return refuse('the event names no key');
-  const binding = await (deps.binding ?? watchBindingOf)(rule);
-  if (!binding) return refuse('not a watch rule of this classification');
   const source = str(r.source, 128);
   const detailType = str(r.detailType, 128);
+  const binding = await (deps.binding ?? watchBindingOf)(rule, source);
+  if (!binding) return refuse('not a watch rule of this classification');
   if (source !== binding.source || detailType !== binding.detailType) return refuse('the event is not the rule\'s event type');
-  const watch = await (deps.watchOf ?? refWatchOf)(refWatchKey(STATIC_CLASSIFICATION, binding.kind, key), { strict: true });
-  if (!watch || watch.classification !== STATIC_CLASSIFICATION) return refuse('no conversation watches the key');
-  const channelArn = watch.room;
-  if (!(await (deps.watches ?? conversationWatchesRef)(channelArn, binding.kind, key, binding.type, watch))) return refuse('the conversation does not watch the key');
-  const closed = roomRefusal(await readChannelTags(chimeClient, channelArn), 'room');
+  // A HAND-OFF FROM ANOTHER TEAM, checked against the declaration recorded at attach before any lookup or creation (SPEC-PROCESSES
+  // P6, P7). The `process` kind is received only as a hand-off, and is keyed by the process and its id, so a hand-off of another
+  // process reaches no conversation of this one.
+  const received = receivedHandoff(r.handoff, source, detailType) ?? (binding.kind === PROCESS_WATCH_KIND ? { refused: 'the rule records no hand-off' } : undefined);
+  if (received && 'refused' in received) return refuse(received.refused);
+  const byPattern = binding.kind === PATTERN_WATCH_KIND;
+  const named = binding.kind === NAMED_WATCH_KIND;
+  const key = received && binding.kind === PROCESS_WATCH_KIND ? processWatchId(received.process.name, received.process.id) : byPattern || named ? (refId(r.key) ?? '') : refId(r.key);
+  if (!byPattern && !named && !key) return refuse('the event names no key');
+  // A CONNECTOR FACT'S PERSON OR CONVERSATION, as the rule's input carried it; trusted only once the receiver's record agrees.
+  const fact = r.fact && typeof r.fact === 'object' ? r.fact as Record<string, unknown> : {};
+  const confirms = deps.confirms ?? connectorRecordConfirms;
+  const factOf = { connectorId: str(fact.connectorId, 128), eventId: str(fact.eventId, 256), classification: STATIC_CLASSIFICATION };
+  let channelArn: string;
+  let knownTags: Record<string, string | undefined> | null | undefined;
+  if (named) {
+    // AN EVENT THAT NAMES ITS CONVERSATION (DESIGN-EVENT-TARGETS 11.3): only a connector fact, only where the receiver recorded that
+    // conversation for that event, and only a conversation of the rule's type at this classification, read from its own tags.
+    if (binding.source !== CONNECTOR_FACT_SOURCE) return refuse('a named conversation is taken only from a connector fact');
+    const conversation = str(fact.conversation, 64);
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(conversation)) return refuse('the event names no conversation');
+    if (!(await confirms(factOf, { conversation }))) return refuse('the receiver did not record that conversation for the event');
+    channelArn = `${process.env.APP_INSTANCE_ARN ?? ''}/channel/${conversation}`;
+    if (!process.env.APP_INSTANCE_ARN) return refuse('this router names no app instance');
+    // ONE READ OF ITS TAGS, kept for the checks every target takes below: a conversation that is gone, or another
+    // classification's, answers nothing here and is refused once.
+    knownTags = await (deps.roomTags ?? standingRoomTags)(channelArn);
+    if (!knownTags) return refuse('the conversation the event names is gone');
+    if (knownTags[CONVERSATION_TYPE_TAG] !== binding.type) return refuse('the conversation the event names is of another type');
+  } else if (byPattern) {
+    // A PATTERN CONVERSATION (DESIGN-EVENT-TARGETS 11.2): the policy, the event's type and its age are held before anything is
+    // created, then the type's pattern is resolved from the event and the creator answers with the conversation it names.
+    if (!isPatternType(binding.type)) return refuse('the rule names a type with no conversation pattern');
+    const early = await readEventPolicy();
+    if (!early.enabled) return refuse('event triggers are switched off');
+    if (!eventTypeAllowed(early, source, detailType)) return refuse('the event type is not allowed');
+    const tooOld = eventAgeRefusal(str(r.at), early.maxEventAgeSeconds);
+    if (tooOld) return refuse(tooOld);
+    // A PERSON IN THE PATTERN is the one person the receiver admitted for this event, by its own record, never the payload alone.
+    const patternText = PATTERN_TYPES[binding.type]!.conversationPattern!;
+    let person: string | undefined;
+    let personArn: string | undefined;
+    if ((patternVariables(patternText) ?? []).includes('person')) {
+      if (binding.source !== CONNECTOR_FACT_SOURCE) return refuse('a person is taken only from a connector fact');
+      personArn = str(fact.person, 512);
+      person = personIdFromArn(personArn) ?? undefined;
+      if (!person || !(await confirms(factOf, { person }))) return refuse('the receiver did not admit that person alone for the event');
+    }
+    const resolved = resolveConversationPattern(patternText, {
+      ...(key ? { key } : {}), resource: str(r.resource).split(/[:/]/).pop() ?? '', ...(person ? { person } : {}),
+    });
+    if (!resolved) return refuse('the event does not resolve the type\'s conversation pattern');
+    if (resolved.length > MAX_PATTERN_RESOLVED) return refuse(`the event resolves the type's conversation pattern to more than ${MAX_PATTERN_RESOLVED} characters`);
+    // THE CONVERSATION'S ID IS DERIVED HERE TOO, as the creator derives it: one that stands, of this type at this classification and
+    // not archived, is run in at once. Any other is asked of the creator, which hands this event back once the conversation stands,
+    // so this router fires only asynchronous invokes. A hand-back that still finds none asks nothing more.
+    const standing = `${process.env.APP_INSTANCE_ARN ?? ''}/channel/${patternChannelId(STATIC_CLASSIFICATION, binding.type, resolved)}`;
+    const tags = await (deps.roomTags ?? standingRoomTags)(standing);
+    if (tags && tags.classification === STATIC_CLASSIFICATION && tags[CONVERSATION_TYPE_TAG] === binding.type && !isArchived(tags)) {
+      channelArn = standing;
+    } else {
+      if (Number(r.handedBack) >= 1) return refuse('the pattern conversation does not stand after the creator handed the event back');
+      // WHAT WOULD REFUSE THE RUN IS CHECKED BEFORE THE CONVERSATION IS ASKED FOR: its owning assistant and the workflow its
+      // version serves for this type, so an event that could never run opens no conversation.
+      const wouldRefuse = await (deps.patternRuns ?? patternRunRefusal)(binding, standing);
+      if (wouldRefuse) return refuse(wouldRefuse);
+      const asked = await (deps.openPattern ?? openPatternConversation)(binding.type, resolved, early.maxPatternConversationsPerDay ?? DEV_EVENT_POLICY.maxPatternConversationsPerDay!, personArn, r);
+      return refuse(asked ? 'the pattern conversation is being opened; the event is handed back once it stands' : 'the pattern conversation could not be asked for');
+    }
+  } else {
+    const watch = await (deps.watchOf ?? refWatchOf)(refWatchKey(STATIC_CLASSIFICATION, binding.kind, key!), { strict: true });
+    if (!watch || watch.classification !== STATIC_CLASSIFICATION) return refuse('no conversation watches the key');
+    channelArn = watch.room;
+    if (!(await (deps.watches ?? conversationWatchesRef)(channelArn, binding.kind, key!, binding.type, watch))) return refuse('the conversation does not watch the key');
+  }
+  const roomTags = knownTags ?? await (deps.roomTags ?? standingRoomTags)(channelArn);
+  if (!roomTags) return refuse('the conversation that watches the key is gone');
+  const closed = roomRefusal(roomTags, 'room');
   if (closed) return refuse(closed);
   // THE ASSISTANT THAT OWNS THE EVENT'S WORKFLOW (ADR-061 decision 2): its version runs, and the run speaks as it.
   const owner = await eventWorkflowOwner(channelArn, '[Router][watch-event]', { conversationType: binding.type, ...(binding.assistant !== undefined ? { attachedBy: binding.assistant } : {}) });
@@ -7247,8 +7734,14 @@ export async function handleWatchEvent(
   if (age) return refuse(age);
   const resource = str(r.resource);
   return runWorkflowFor(binding.workflow, wf, {
-    event: 'event-received', channelArn, ruleEvent: { rule, window, watch: { kind: binding.kind, key } },
-    values: { source, detailType, resource, key, label: key },
+    // An edit's replacement rule is keyed by the rule it replaced, as a team room's is, so one event during the swap runs once.
+    event: 'event-received', channelArn, ruleEvent: {
+      rule: TRIGGER_RULE_ID.test(str(r.supersedes)) ? str(r.supersedes) : rule, window,
+      // A HAND-OFF'S RUN IS KEYED BY ITS PROCESS, wherever it runs, so two processes' hand-offs in one window are two runs.
+      ...(received ? { watch: { kind: PROCESS_WATCH_KIND, key: processWatchId(received.process.name, received.process.id) } } : byPattern || named ? {} : { watch: { kind: binding.kind, key: key! } }),
+    },
+    ...(received ? { process: received.process } : {}),
+    values: { ...(received?.values ?? {}), source, detailType, resource, ...(key ? { key } : {}), label: key || (resource.split(/[:/]/).pop() ?? '') || detailType },
   }, runnerOf(owner.botArn, assistant.profile.name, served), { conversationType: binding.type });
 }
 
@@ -7422,6 +7915,8 @@ export async function handleConversationOpened(req: ConversationOpenedNaming): P
   const resource = openedBy === 'workflow' && typeof req.resource === 'string' ? req.resource.slice(0, 500) : '';
   // THE OPENING RUN'S PROCESS (P3): the run here inherits it, read only where a workflow opened the conversation.
   const inherited = openedBy === 'workflow' ? runProcessOf(req.process) : undefined;
+  // A CONVERSATION AN OPEN STEP OPENED takes the process, never the hand-off that started the opener's run (`received`).
+  if (inherited) delete inherited.received;
   // THE CUSTOMER IMPACT THE OPENING RUN'S TRIAGE RECORDED ON ITS CARD (O27): a closed set, only where a workflow opened it.
   const customerImpact = openedBy === 'workflow' && isCustomerImpact(req.customerImpact) ? req.customerImpact : '';
   // THE INCIDENT'S FACTS (O28): when it started and its Region, each kept only in its own shape, where a workflow opened it.
@@ -8889,7 +9384,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       // interception below). Inert (config is
       // null) unless ONBOARDING_INTAKE / ONBOARDING_INTAKE_PARAM is set.
       const loadedIntake = await intakeForAssistant(turnProfile.name, channelClassification);
-      // ── CHECKED BEFORE ASKED (owner rule 2026-09-03; "cheap" chosen 2026-09-14) ─────────────────
+      // ── CHECKED BEFORE ASKED, CHEAPLY ─────────────────
       //
       // Drop every field the deployment already asserts, so an intake asks only for what is genuinely
       // unknown. When nothing is left, `intakeAfterChecking` returns null and this whole branch is
@@ -9142,7 +9637,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     const { clearance: userClearance, isAdmin: isExemptAdmin } = scopedByIssuer
       ? { clearance: channelClassification, isAdmin: false } // a person of another issuer is never abuse-exempt
       : resolvedClearance;
-    // ONE CHANNEL, ONE CLASSIFICATION, AND IAM IS WHAT DECIDES IT (maintainer, 2026-08-31).
+    // ONE CHANNEL, ONE CLASSIFICATION, AND IAM IS WHAT DECIDES IT.
     //
     // This was `minRank(channelClassification, userClearance)`: a per-person cap applied in
     // application code. Two members of the SAME conversation could therefore be answered at
@@ -9479,7 +9974,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       }
 
       // COMPLETED WORK IS KEPT; WORK IN PROGRESS IS CANCELLED; THEN THEY ARE ASKED HOW TO PROCEED
-      // (ADR-033, owner 2026-09-14).
+      // (ADR-033).
       //
       // `/stop` means "stop what you are doing", and the open work is what the assistant is doing.
       // Finished work is not in this selection at all: it reads open tasks only, so nothing the person
@@ -9581,8 +10076,8 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
           senderArn: event.requestAttributes?.['CHIME.sender.arn'] || '',
           // A BOUNDED EXCERPT, never the transcript: `requestExcerpt` is what ADR-024 D5 keeps for
           // exactly this, and it does not outlive a redaction the way a copy of the message would.
-          // A PRIVATE TASK'S EXCERPT NEVER REACHES THIS PROMPT (maintainer decision, 2026-08-23: a
-          // private task is visible in that it exists, not in what it is). The evaluation's reply
+          // A PRIVATE TASK'S EXCERPT NEVER REACHES THIS PROMPT: a
+          // private task is visible in that it exists, not in what it is. The evaluation's reply
           // posts to the room, so a label carrying the excerpt would publish the one thing a
           // targeted request withheld. The requester knows what their own request was; the neutral
           // label tells them WHICH kind of cancelled thing the question is about without telling the
@@ -10357,7 +10852,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
      * this turn is targeted too, and updating it in place would bury the answer in a private message
      * only its sender can see. A duel is a comparison; its answers have to be public to be one. So the
      * targeted reply stays an acknowledgement and the worker posts the answer as a NEW, untargeted
-     * message (maintainer, 2026-08-14).
+     * message.
      */
     let resumedOwnChain = false;
     /**
@@ -10469,7 +10964,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         // conversation is mid-workflow either way.
         liveTaskInChannel = liveTaskInChannel || heldByPerson.length > 0;
         recentlyEndedTaskHere = recentlyEndedTaskHere ?? personTasks.recentlyEnded[0] ?? null;
-        // ── THE PICK IS A PROPOSAL, NOT A DECISION (maintainer, 2026-09-04; ADR-024 D7) ─────────
+        // ── THE PICK IS A PROPOSAL, NOT A DECISION (ADR-024 D7) ─────────
         //
         // This was `heldByPerson[0]` - newest-first - and holding more than one open piece of work
         // is ordinary: a long request opens a `report_generation` in `collecting_requirements` while
@@ -10548,10 +11043,23 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         // (`requesterMovableTask`), which carries the moves its step declares for the requester (WT114). It is
         // not a redirect candidate. The processor holds a redirect to the same rule from the task's own row.
         const heldForThem = (o: UserTask): boolean => o.principalId === personId || o.principalId === self || o.assigneeType === 'assistant';
-        const candidateRows = [
+        // A PUBLIC MENTION IS A PUBLIC TURN (ADR-034): a message the room saw, addressed with `@`, never answers a private
+        // item it did not name, so its reply goes to the room. A private item is answered from its card or with `.<assistant>`,
+        // each of which names it or is targeted; folding an open `@` into one made the reply private and left the room a
+        // receipt for a question everyone saw.
+        // A turn the caller established as public ('0': not targeted), in a room where someone else saw it. Absent says
+        // nobody established it, which leaves a private item answerable; a one-to-one room has nobody else to see the reply.
+        // A room whose members cannot be read, or whose read is refused, counts as shared, so it never exposes a private item;
+        // the turn itself was admitted on its own size read before this.
+        const roomCandidates = [
           ...heldByPerson,
           ...ownedHere.filter((o) => !heldByPerson.some((h) => h.taskId === o.taskId) && heldForThem(o)),
         ].filter((t) => !t.assistantId || t.assistantId === self);
+        const publicTurn = isFlowEntry(event) && event.requestAttributes?.[BYPASS_TARGETED_ATTR] === '0';
+        const openMention = publicTurn && roomCandidates.some((t) => isPrivateVisibility(t.visibility)) && channelArn
+          ? await resolveChannelSize(chimeClient, channelArn, botArn).then((s) => s.refused || s.unknown || !s.isOneToOne, () => true)
+          : false;
+        const candidateRows = roomCandidates.filter((t) => !(openMention && isPrivateVisibility(t.visibility)));
         const referents = rankReferentCandidates(
           candidateRows.map((t) => ({
             taskId: t.taskId,
@@ -10677,8 +11185,10 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         // as other work, another chain the person holds may be exactly what the message answers (another
         // assistant's troubleshooting question, say), and it is that one's answer. An item they NAMED is fixed.
         // In a conversation holding a live duel the earlier rule stands: the first candidate is the answer.
+        // The open mention's rule above holds for the waiting candidates too.
         const waitingCandidates = [mineWithThisPerson, owed, ...heldByPerson]
-          .filter((t, i, all): t is NonNullable<typeof owed> => !!t && all.findIndex((x) => x?.taskId === t.taskId) === i);
+          .filter((t, i, all): t is NonNullable<typeof owed> => !!t && all.findIndex((x) => x?.taskId === t.taskId) === i)
+          .filter((t) => !(openMention && isPrivateVisibility(t.visibility)));
         const firstCandidate = waitingCandidates[0] ?? null;
         // The first candidate the message is not other work for. In a live duel the first is never set
         // aside; the duel is read once (`duelHere` is memoized), so later candidates are the rule alone.
@@ -11322,7 +11832,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       declaredAnswerId() ? { answers: declaredAnswerId(), entry: turnEntry, ...recapKind } : { entry: turnEntry, ...recapKind },
     );
 
-    // ── THE STOP QUESTION OWNS ITS FOLLOW-UP (ADR-033, owner 2026-09-14) ─────────────────────────
+    // ── THE STOP QUESTION OWNS ITS FOLLOW-UP (ADR-033) ─────────────────────────
     //
     // A `/stop` cancelled this person's work and asked how they want to proceed. Their answer is this
     // message or a later one, in their own words, and ordinary routing cannot be trusted with it:
@@ -11511,7 +12021,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       return formatLexResponse(event, driftResponse.messages);
     }
 
-    // ONE THREAD PER PIECE OF WORK (maintainer, 2026-08-20).
+    // ONE THREAD PER PIECE OF WORK.
     //
     // Drift has already answered the question this depends on: it ran above and did not fire, so this
     // message is about the work in hand rather than a new topic. What remains is whose turn it is, and
@@ -12204,7 +12714,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     // ── AND THE AMENDMENT FOLD, WHICH IS THE OTHER RE-ENTRY ON ONE CORRELATION ────────────────────
     //
     // The paragraph above is this defect, one re-dispatch path along, and it happened again exactly
-    // as described (owner-reported, 2026-09-05).
+    // as described.
     //
     // When a reading judges that something arriving mid-turn AMENDS the work, the processor
     // re-dispatches the turn to run again with the correction folded in - deliberately on the SAME
@@ -12455,7 +12965,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
           }],
         );
       }
-      // ── THE DRAIN IS A TASK, AND THIS IS WHERE IT OPENS (ADR-033, owner 2026-09-03) ──────────
+      // ── THE DRAIN IS A TASK, AND THIS IS WHERE IT OPENS (ADR-033) ──────────
       //
       // There is a queue now, so something has to read it, and that reading is WORK. One drain per
       // QUEUE and not per pass: this path runs for every message that queues, and the claim inside

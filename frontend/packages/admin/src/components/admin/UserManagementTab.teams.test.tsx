@@ -16,7 +16,7 @@ vi.mock('../../services/sigv4Fetch', () => ({
 }));
 
 /**
- * A PERSON'S TEAMS ARE CHOSEN IN THEIR DETAILS (owner decision, 2026-10-24: "Teams should be editable").
+ * A PERSON'S TEAMS ARE CHOSEN IN THEIR DETAILS, where they are editable.
  *
  * The details offer every team the deployment has, checked for the ones the person is in, with what a team does and
  * that joining a first one gives a team member's console access. A change posts to /users/team. The row shows the

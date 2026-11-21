@@ -494,7 +494,7 @@ export interface BattleStateRow {
    */
   channelArn?: string;
   /**
-   * The person who ran /battle. A duel HAS AN OWNER (maintainer, 2026-08-13): they are who a waiting side
+   * The person who ran /battle. A duel HAS AN OWNER: they are who a waiting side
    * is waiting on, who its task is assigned to, and the only person whose reply resumes it.
    *
    * Without it the continuation matched on the mentioned BOT alone, so any member could answer a

@@ -23,6 +23,11 @@ export interface EventPolicy {
   maxWatchTriggersPerType?: number;
   /** The most incidents one team room may hold open at once: a new room opens only once one is resolved. */
   maxOpenIncidentsPerRoom: number;
+  /**
+   * The most conversations a pattern type creates in a day (DESIGN-EVENT-TARGETS 11.2), counted as they are created, so an event
+   * stream cannot open conversations without limit. Absent in a policy written before it: the default holds.
+   */
+  maxPatternConversationsPerDay?: number;
   /** How often a rule retries delivering one event, and for how long. */
   retryAttempts: number;
   maxEventAgeSeconds: number;
@@ -40,6 +45,7 @@ export const DEV_EVENT_POLICY: EventPolicy = Object.freeze({
   maxWatchTriggersPerType: 5,
   maxTriggers: 20,
   maxOpenIncidentsPerRoom: 3,
+  maxPatternConversationsPerDay: 25,
   retryAttempts: 2,
   maxEventAgeSeconds: 900,
 }) as EventPolicy;
@@ -47,6 +53,7 @@ export const DEV_EVENT_POLICY: EventPolicy = Object.freeze({
 /** What no edit may exceed: the account's 300 rules per bus, and EventBridge's own retry bounds. */
 export const EVENT_POLICY_MOST = Object.freeze({
   allowedEventTypes: 50, maxTriggersPerRoom: 100, maxWatchTriggersPerType: 100, maxTriggers: 250, maxOpenIncidentsPerRoom: 50, retryAttempts: 185, maxEventAgeSeconds: 86_400,
+  maxPatternConversationsPerDay: 1000,
 });
 
 const whole = (v: unknown, min: number, max: number): boolean => typeof v === 'number' && Number.isInteger(v) && v >= min && v <= max;
@@ -65,6 +72,7 @@ export function eventPolicyErrors(raw: unknown): string[] {
   if (raw.maxWatchTriggersPerType !== undefined && !whole(raw.maxWatchTriggersPerType, 0, c.maxWatchTriggersPerType)) errs.push(`maxWatchTriggersPerType is a whole number from 0 to ${c.maxWatchTriggersPerType}`);
   if (!whole(raw.maxTriggers, 0, c.maxTriggers)) errs.push(`maxTriggers is a whole number from 0 to ${c.maxTriggers}`);
   if (!whole(raw.maxOpenIncidentsPerRoom, 1, c.maxOpenIncidentsPerRoom)) errs.push(`maxOpenIncidentsPerRoom is a whole number from 1 to ${c.maxOpenIncidentsPerRoom}`);
+  if (raw.maxPatternConversationsPerDay !== undefined && !whole(raw.maxPatternConversationsPerDay, 1, c.maxPatternConversationsPerDay)) errs.push(`maxPatternConversationsPerDay is a whole number from 1 to ${c.maxPatternConversationsPerDay}`);
   if (!whole(raw.retryAttempts, 0, c.retryAttempts)) errs.push(`retryAttempts is a whole number from 0 to ${c.retryAttempts}`);
   if (!whole(raw.maxEventAgeSeconds, 60, c.maxEventAgeSeconds)) errs.push(`maxEventAgeSeconds is a whole number from 60 to ${c.maxEventAgeSeconds}`);
   const known = new Set(Object.keys(DEV_EVENT_POLICY));
@@ -104,7 +112,9 @@ export const EVENT_POLICY_CACHE_MS = 30_000;
  */
 export async function readEventPolicy(now = Date.now()): Promise<EventPolicy> {
   if (cached && now - cached.at < EVENT_POLICY_CACHE_MS) return cached.policy;
-  const name = process.env.EVENT_POLICY_PARAM;
+  // NAMED BY THE FUNCTION'S ENVIRONMENT, or derived from the deployment's root where the function carries only that (the router,
+  // whose environment is held under Lambda's limit).
+  const name = process.env.EVENT_POLICY_PARAM || (process.env.SSM_ROOT ? `${process.env.SSM_ROOT}/event-triggers/policy` : undefined);
   let policy: EventPolicy;
   try {
     if (!name) throw Object.assign(new Error('no policy parameter is named'), { name: 'Unconfigured' });

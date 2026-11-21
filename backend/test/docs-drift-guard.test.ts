@@ -186,7 +186,7 @@ const BANNED: Array<{ phrase: string; truth: string }> = [
     truth: "effectiveClassification is the channel's classification; the router takes it directly",
   },
 
-  // --- Class -3: "board-ready" grades the answer before anyone has seen it (maintainer, 2026-08-20). ---
+  // --- Class -3: "board-ready" grades the answer before anyone has seen it. ---
   //
   // It sat in the premium demo's SUGGESTED PROMPTS, which is the first thing a person reads and the
   // last place a claim should outrun the product. The assistant writes a structured, grounded report;
@@ -197,7 +197,7 @@ const BANNED: Array<{ phrase: string; truth: string }> = [
     truth: 'describe what is asked for ("a report on Q2 ARR performance for the leadership team"); '
       + 'the reader judges whether the output clears their bar',
   },
-  // --- Class -2: `place_item.placed` records the APPROVAL, not a host apply (maintainer, 2026-08-19). ---
+  // --- Class -2: `place_item.placed` records the APPROVAL, not a host apply. ---
   //
   // The claim lived in the machine's code comment and was copied into the spec from there, which is
   // how it survived: both readings looked mutually confirming. It describes a system this is not -
@@ -327,7 +327,7 @@ const BANNED: Array<{ phrase: string; truth: string }> = [
   // protection that is not there. That limit is carried by ADR-022 §4 and MESSAGE-FLOW §8
   // "Known limits" instead, and becomes a phrase here the first time someone writes it down wrong.
 
-  // --- Class 0c: the battle prompt adds AWARENESS ONLY (ADR-029, owner 2026-08-13). `29adb2d` deleted
+  // --- Class 0c: the battle prompt adds AWARENESS ONLY (ADR-029). `29adb2d` deleted
   //     `BATTLE_CONSTRAINTS_ROUND1` and with it FIVE prompt behaviors - one-clarifying-question
   //     permission, a ~150-word focus clause, a long-form deliverable clause, an outline-first clause,
   //     and a no-deflection guard. That deletion COMPLETED the handoff: each was a duel-only copy of
@@ -432,7 +432,7 @@ const BANNED: Array<{ phrase: string; truth: string }> = [
   //     one answer with nothing to compare it against — measurement bias, not a UX wrinkle. Four doc
   //     locations asserted the opposite (per-side charging) while the code did this, and MESSAGE-FLOW
   //     stated it inside a table column headed "what each difference costs", so the wrong value was
-  //     the one a deployer would budget from. Fidelity was traded deliberately (maintainer, 2026-08-09).
+  //     the one a deployer would budget from. Fidelity is traded deliberately.
   { phrase: 'two rate/spend charges', truth: 'the flow gates a duel once and the handler skips its gate on any battleContext, so a 2-bot duel consumes ONE charge (router-agent-handler.ts; DESIGN-BATTLE "How a duel is metered")' },
   { phrase: 'n rate-limit and spend charges', truth: 'a duel is metered once for the whole duel, not once per side (MESSAGE-FLOW §4.8; DESIGN-BATTLE §5a)' },
   { phrase: 'per-side gate charging: yes', truth: 'per-side gate charging is NO; the duel is gated once, upstream (DESIGN-BATTLE §5a decision 2)' },
@@ -451,8 +451,8 @@ const BANNED: Array<{ phrase: string; truth: string }> = [
   // words - which is the argument for banning the COUNT, not just the phrasing.
   { phrase: 'two paths still run turn logic outside the handler', truth: 'ONE path does: round 2 (battle-orchestrator.ts). `@all` and `/battle` round 1 dispatch through the handler entry, and a battle continuation arrives at it as an ordinary Lex turn (MESSAGE-FLOW §6.1)' },
 
-  // --- Class I: a task-shaped duel finishes its work with the user BEFORE the next round (ADR-026,
-  //     owner 2026-08-10). Three claims were reversed and each reads as reasonable in isolation, which
+  // --- Class I: a task-shaped duel finishes its work with the user BEFORE the next round (ADR-026).
+  //     Three claims were reversed and each reads as reasonable in isolation, which
   //     is why they need phrases rather than a review: a rebuttal still gets written either way.
   //     `WAITING_FOR_USER` is non-terminal, so it suspends round 2 with no new predicate - the
   //     `isBattleRound1Complete` separation is intact and its guard test still passes. ---
@@ -1339,7 +1339,7 @@ describe('battle, not duel, in what a person reads', () => {
 });
 
 /**
- * CONVERSATION, NOT ROOM, IN WHAT A PERSON READS (owner decision, 2026-11-14). Everything the product says to a person
+ * CONVERSATION, NOT ROOM, IN WHAT A PERSON READS. Everything the product says to a person
  * calls an AgentEchelon channel a conversation: one word for one thing, the word the chat app, the console and the docs
  * already use. Identifiers keep their names, because stored tags, keys and workflow names are read back by them: a word
  * joined to other letters (`ops-room`, `team-room`, `roomArn`), a string that is one bare identifier (the `'room'`
@@ -1711,6 +1711,64 @@ describe('private sibling projects are never named', () => {
       text.split(/\r?\n/).forEach((line, i) => {
         if (SIBLING_NAME.test(line)) hits.push(`${rel}:${i + 1}: ${line.trim().slice(0, 160)}`);
       });
+    }
+    expect(hits).toEqual([]);
+  });
+});
+
+describe('shipped code and tests state what they guarantee, never who decided it or when', () => {
+  // A COMMENT OR A TEST TITLE SAYS WHAT THE CODE GUARANTEES. An owner's or maintainer's dated attribution is history, and
+  // the decision record it points at lives in the docs, which keep theirs: the guard reads code and tests only. The word
+  // alone is domain language ("Incident owner", "the owner rule"); only the word within a short reach of a calendar date is
+  // an attribution, and a timestamp (an ISO date followed by its time) is data.
+  const DATE = String.raw`\b20\d{2}-\d{2}(?:-\d{2})?\b(?![-T\d])`;
+  const WHO = String.raw`\b(?:owner|maintainer)(?:'s|s)?\b`;
+  const ATTRIBUTION = new RegExp(String.raw`${WHO}[^\n]{0,30}?${DATE}|${DATE}[^\n]{0,14}?${WHO}`, 'i');
+  // A COMMENT THAT WRAPS is read as one line, so an attribution split across lines is still seen.
+  const unwrapped = (text: string) => text.replace(/\r?\n[ \t]*(?:\*(?!\/)|\/\/|--|#)?[ \t]*/g, ' ');
+  const CODE = /\.(?:ts|tsx|js|mjs|cjs|sql|py|sh|css)$/;
+  const files = execFileSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], {
+    cwd: REPO_ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+  })
+    .split('\0')
+    .filter(Boolean)
+    .map((rel) => rel.replace(/\\/g, '/'))
+    .filter((rel) => CODE.test(rel) && !rel.endsWith('.d.ts') && !rel.startsWith('private/') && !rel.includes('node_modules/'))
+    .filter((rel) => fs.existsSync(path.join(REPO_ROOT, rel)));
+  const DAY = '20' + '26-09-03';
+
+  it('the detector fires on each attribution shape, across a wrapped comment, and passes domain words and timestamps', () => {
+    const fires = [
+      `NEW WORK IS NOT NEXT WORK (maintainer, ${DAY}).`,
+      `IS IN THE ACCESS LOG (ADR-052, owner ${DAY}).`,
+      `describe('the draft, before and after a first activation (owner decision, ${DAY})', () => {`,
+      `a TOPIC line reached a person (owner-reported, ${DAY}).`,
+      `and that asymmetry is the owner's rule (${DAY}):`,
+      `The owner rule is from ${DAY}.`,
+      ` * Owner direction, ${DAY}: "Drift can be excluded from normal responses"`,
+      `(measured ${DAY}, owner: "analytics across the full battle")`,
+      `the alarm opens it at once (WT129; owner\n * ${DAY}): nobody is asked`,
+      `Sharing is refused instead (owner\n  // decision, ${DAY}).`,
+    ];
+    for (const s of fires) expect([s, ATTRIBUTION.test(unwrapped(s))]).toEqual([s, true]);
+    const passes = [
+      `{ label: 'Incident owner', taskId: 'evt-owner', startedAt: '${DAY}T10:00:00.000Z' }`,
+      'the owner rule holds: one drain per queue.',
+      'the incident owner resolves it from the top of the conversation.',
+      `{ ownerId: 'u-1', createdAt: '${DAY}' }`,
+      `released on ${DAY} with the meetings slice.`,
+    ];
+    for (const s of passes) expect([s, ATTRIBUTION.test(unwrapped(s))]).toEqual([s, false]);
+    expect(files.length).toBeGreaterThan(500);
+  });
+
+  it('no shipped code or test file carries an owner or maintainer attribution with a date', () => {
+    const hits: string[] = [];
+    for (const rel of files) {
+      const text = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf-8');
+      if (!/owner|maintainer/i.test(text)) continue;
+      const m = ATTRIBUTION.exec(unwrapped(text));
+      if (m) hits.push(`${rel}: ${m[0].slice(0, 120)}`);
     }
     expect(hits).toEqual([]);
   });

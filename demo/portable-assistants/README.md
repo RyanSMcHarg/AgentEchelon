@@ -55,7 +55,7 @@ npm run template -- put premium ../demo/portable-assistants/templates/advisor-in
 aws cloudwatch put-metric-alarm --alarm-name <your demo alarm name> --namespace Demo --metric-name Probe --statistic Sum --period 60 --evaluation-periods 1 --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold --treat-missing-data ignore
 ```
 
-**6. Create the outage alarm**, for an incident driven by real data: a healthy baseline for the past three hours in `AgentEchelon/Demo`, and `AgentEchelon-demo-incident` on the success rate (under 90% for 2 of 2 minutes). Attach its ARN to `incident-triage` in 3.3b.
+**6. Create the outage alarm**, for an incident driven by real data: a healthy baseline for the past three hours in `AgentEchelon/Demo`, and `Customer-API-availability` on the success rate (under 90% for 2 of 2 minutes), named for the service it watches and described by what that service does for its users. Attach its ARN to `incident-triage` in 3.3b.
 
 ```bash
 npm run demo:outage -- setup

@@ -1,5 +1,5 @@
 /**
- * A MEETING'S TRANSCRIPT, ITS ENDED CARD AND ITS ARCHIVE (SPEC-ASSISTANT-MEETINGS FR27, FR28; owner decision 2026-11-12).
+ * A MEETING'S TRANSCRIPT, ITS ENDED CARD AND ITS ARCHIVE (SPEC-ASSISTANT-MEETINGS FR27, FR28).
  *
  *  - transcription starts with the meeting where the deployment transcribes its meetings, and not otherwise;
  *  - only a host turns it on or off, and each change is recorded on the meeting's conversation;
@@ -413,20 +413,24 @@ describe('a person\'s app files only that person\'s own lines', () => {
     });
 
     it("DENY: one person's reports stop at their share of the transcript, and another person's lines are still kept", async () => {
-      mockGetContext.mockResolvedValue(transcribed);
+      // A MEETING STARTED AN HOUR AGO, whenever this runs: the share grows with the meeting's length, so a fixed start date
+      // would let the share outgrow what this test sends once enough days pass.
+      const started = Date.now() - 3_600_000;
+      const at = new Date(started).toISOString();
+      mockGetContext.mockResolvedValue({ activeMeeting: { ...RUNNING, createdAt: at }, lastMeeting: { ...transcribed.lastMeeting, createdAt: at } });
       const long = 'x'.repeat(2000);
       let refused: number | undefined;
       for (let i = 0; i < 400 && refused === undefined; i++) {
-        const res = await handler(event('/meetings/transcript', { attendeeId: 'a-1', segments: Array.from({ length: 25 }, (_v, j) => line(`f${i}-${j}`, T + 1000 * i + j, long)) }));
+        const res = await handler(event('/meetings/transcript', { attendeeId: 'a-1', segments: Array.from({ length: 25 }, (_v, j) => line(`f${i}-${j}`, started + 1000 * i + j, long)) }));
         if (res.statusCode !== 202) refused = res.statusCode;
       }
       expect(refused).toBe(429);
       const charged = mockCharge.mock.calls[0];
       // The share is the meeting's length so far at thirty characters a second, and one line more.
-      expect(charged[4]).toBeGreaterThan(30 * ((Date.now() - T) / 1000));
-      expect(charged[4]).toBeLessThan(30 * ((Date.now() - T) / 1000) + 2_000 + 30 * 20);
+      expect(charged[4]).toBeGreaterThan(30 * ((Date.now() - started) / 1000));
+      expect(charged[4]).toBeLessThan(30 * ((Date.now() - started) / 1000) + 2_000 + 30 * 20);
       mockPersonId.mockResolvedValue(GUEST);
-      const theirs = await handler(event('/meetings/transcript', { attendeeId: 'a-guest', segments: [{ ...line('g1', T + 5_000), attendeeId: 'a-guest' }] }));
+      const theirs = await handler(event('/meetings/transcript', { attendeeId: 'a-guest', segments: [{ ...line('g1', started + 5_000), attendeeId: 'a-guest' }] }));
       expect(JSON.parse(theirs.body)).toEqual({ kept: 1, skipped: 0 });
     });
 

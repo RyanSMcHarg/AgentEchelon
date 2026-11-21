@@ -1,6 +1,6 @@
 /**
- * THE PROCESS WIZARD READS ITS PHASES AND HAND-OFFS FROM THE WORKFLOWS THEMSELVES (SPEC-PROCESSES P1, P3), proven on the
- * shipped incident response: choosing what starts it reaches the incident and customer messaging by their open steps, and
+ * THE PROCESS WIZARD READS ITS PHASES AND HAND-OFFS FROM THE WORKFLOWS THEMSELVES (SPEC-PROCESSES P1, P3), proven on an
+ * incident response that triages in the team conversation first (a fixture built on the shipped one): choosing what starts it reaches the incident and customer messaging by their open steps, and
  * each hand-off says where it goes, who leads it, on what condition, whether the phase before waits, and what is told across.
  */
 import { describe, expect, it } from 'vitest';
@@ -30,10 +30,17 @@ describe('a process as a chain of workflows', () => {
     expect(h).toMatchObject({ type: 'ops', ledBy: 'on-call:ops', waits: true });
   });
 
-  it('the hand-off to the account team: on either customer-impact condition, alongside, with what is told each way', () => {
+  it('a hand-off only conditional edges reach names their conditions', () => {
+    const only = JSON.parse(JSON.stringify(wfs));
+    only['ops-room'].states['customer-impact'].onSuccess = [{ to: 'runbook-cause', when: { 'event:customerImpact': 'impacted' } }, { to: 'messaging', when: { 'task:state': 'impacted' } }];
+    only['ops-room'].states['customer-impact'].onFailure = 'runbook-cause';
+    expect(handoffBetween(only, 'ops-room', 'customer-messaging')!.when).toEqual(expect.arrayContaining([{ source: 'event:customerImpact', value: 'impacted' }, { source: 'task:state', value: 'impacted' }]));
+  });
+
+  it('the hand-off to the account team: with no condition, since naming the accounts opens it, alongside, with what is told each way', () => {
     const h = handoffBetween(wfs, 'ops-room', 'customer-messaging')!;
     expect(h).toMatchObject({ type: 'customer-messaging', ledBy: 'lead:accounts', waits: false });
-    expect(h.when).toEqual(expect.arrayContaining([{ source: 'event:customerImpact', value: 'impacted' }, { source: 'task:state', value: 'impacted' }]));
+    expect(h.when).toEqual([]);
     expect(h.toldForward).toEqual(expect.arrayContaining(['customer-messaging-mitigating', 'customer-messaging-resolved']));
     expect(h.toldBack).toEqual(['customer-notice-approved']);
   });
@@ -73,7 +80,7 @@ describe('a process with parallel work (a test fixture, not shipped)', () => {
     expect(processLayout(PARALLEL_WORKFLOWS, PARALLEL_ORDER).places.kickoff.joins).toHaveLength(1);
   });
 
-  it('the shipped incident response: customer messaging runs alongside the incident, which does not wait for it', () => {
+  it('the triage-first incident response: customer messaging runs alongside the incident, which does not wait for it', () => {
     const { steps, places } = processLayout(wfs, ['incident-triage', 'ops-room', 'customer-messaging']);
     expect(steps.map((s) => s.phases)).toEqual([['incident-triage'], ['ops-room', 'customer-messaging']]);
     expect(places['customer-messaging'].alongsideOf).toBe('ops-room');

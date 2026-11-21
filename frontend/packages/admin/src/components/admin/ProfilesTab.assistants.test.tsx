@@ -1,6 +1,5 @@
 /**
- * THE ASSISTANTS TAB: ONE LIST, CONFIGURATION IN GROUPS, OWNERSHIP INSIDE IT, DEPLOY STEPS SAID IN PLACE
- * (owner decision, 2026-10-23).
+ * THE ASSISTANTS TAB: ONE LIST, CONFIGURATION IN GROUPS, OWNERSHIP INSIDE IT, DEPLOY STEPS SAID IN PLACE.
  *
  * What it proves: an admin's tab reads the one admin listing and shows declared and console-created
  * assistants together, with no runtime section and no separate ownership section; an assistant's
@@ -147,7 +146,9 @@ describe('an admin', () => {
     await waitFor(() => expect(within(setup).getByTestId('setup-next')).not.toBeDisabled());
     fireEvent.click(within(setup).getByTestId('setup-next'));
     expect(heading()).toHaveTextContent('Step 5 of 9: Workflows');
-    expect(within(setup).getByTestId('draft-step-events')).toBeTruthy();
+    // The step opens on the list of workflows, nothing opened, with + New workflow for whoever may edit.
+    expect(within(setup).getByTestId('workflows-new')).toBeTruthy();
+    expect(within(setup).queryByTestId('draft-step-events')).toBeNull();
     expect(svc.editProfileDraft).not.toHaveBeenCalled();
     fireEvent.click(within(setup).getByTestId('setup-next'));
     expect(heading()).toHaveTextContent('Step 6 of 9: Templates');

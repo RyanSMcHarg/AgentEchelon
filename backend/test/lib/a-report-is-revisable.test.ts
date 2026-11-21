@@ -132,6 +132,8 @@ describe('completed -> revising is authorized only as a reopen', () => {
         if (def.transitions.length > 0) continue;
         if (type === 'report_generation' && state === 'completed') continue;
         if (type === 'image_generation' && state === 'done') continue;
+        // A RESOLVED INCIDENT IS REOPENED BY A PRESS OF ONE WHO DECIDES IT (`decidedBy` on its step), never by a turn.
+        if (type === 'incident_ownership' && state === 'resolved') continue;
         expect({ type, state, reopens: reopenTargetsFrom(type, state, M) }).toEqual({ type, state, reopens: [] });
       }
     }

@@ -20,6 +20,27 @@ export const TRANSIENT_ATTEMPTS = 3;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
 
+/** Attempts for a create whose id is still held by a delete in flight: the call and four more, each pause twice the last. */
+export const CONFLICT_ATTEMPTS = 5;
+
+/**
+ * RUN `call` AGAIN WHILE ITS ID IS STILL HELD (`ConflictException`), after `delayMs` and twice that each time, at most
+ * {@link CONFLICT_ATTEMPTS} times: a delete the service finishes asynchronously frees the id shortly after it answers. Any other
+ * failure, and the last conflict, throw at once.
+ */
+export async function retryWhileConflict<T>(
+  call: () => Promise<T>, delayMs: number, opts: { pause?: (ms: number) => Promise<void> } = {},
+): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await call();
+    } catch (err) {
+      if ((err as { name?: string })?.name !== 'ConflictException' || attempt >= CONFLICT_ATTEMPTS) throw err;
+      await (opts.pause ?? sleep)(delayMs * 2 ** (attempt - 1));
+    }
+  }
+}
+
 /**
  * Run `call`, and again after a pause while it fails transiently (`isTransientReadError`), at most
  * {@link TRANSIENT_ATTEMPTS} times; any other failure, and `final` ones, throw at once.

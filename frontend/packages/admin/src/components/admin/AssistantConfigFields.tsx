@@ -11,6 +11,7 @@
  */
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { ConfirmAction } from './ConfirmAction';
 import { GuideLinks, guide, guideSection, InfoTooltip, type Guide } from './AdminHelp';
 import { DOC_SECTIONS } from '../../config/docLinks';
 import { setTurnLimit } from '../../services/rosterService';
@@ -18,10 +19,11 @@ import { welcomeContextFor } from './WelcomeEditorGuide';
 import { type WelcomePromptOption } from './welcomeWorkflow';
 import { SHIPPED_EVENT_WORKFLOWS, welcomeWorkflowOf } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
 import WorkflowBuilder from './WorkflowBuilder';
+import { NEW_WORKFLOW_FOCUS } from './workflowEdits';
 import IntentWorkflowsFields from './IntentWorkflowsFields';
 import { useTaskMachineSource } from './useTaskMachineSource';
 import WelcomeModeEditor from './WelcomeModeEditor';
-import { declaredTypesFor } from './EventWorkflowEditor';
+import { declaredTypesFor, processesRenamed } from './EventWorkflowEditor';
 import { welcomeHolding, welcomeNameFor, welcomeTypeOf } from './welcomeWorkflow';
 import { parseTemplate } from '../../../../../../backend/lambda/src/lib/document-template.ts';
 import { s3PrefixUrl } from '../../services/awsConsole';
@@ -478,10 +480,9 @@ export const RetiredWelcomeNote: React.FC<{ config: ProfileDefinitionBody | null
     <div className="profiles-persona-field" role="note" data-testid="draft-retired-welcome">
       <h4>{t('admin.assistantPage.field.retiredWelcome')} <InfoTooltip label={t('admin.assistantPage.field.retiredWelcome')} content={t('admin.assistantPage.help.retiredWelcome')} /></h4>
       <p className="admin-field-hint">{t('admin.assistantPage.help.retiredWelcomeDraft')}</p>
-      <button type="button" className="btn-secondary" data-testid="draft-retired-welcome-clear"
-        onClick={() => { setRetired(false); onPatch({ welcome: null }); }}>
-        {t('admin.assistantPage.help.retiredWelcomeClear')}
-      </button>
+      <ConfirmAction testId="draft-retired-welcome-clear" className="btn-secondary" label={t('admin.assistantPage.help.retiredWelcomeClear')}
+        title={t('admin.confirm.retiredClear')} confirmLabel={t('admin.confirm.clear')} cancelLabel={t('admin.confirm.cancel')}
+        onConfirm={() => { setRetired(false); onPatch({ welcome: null }); }} />
     </div>
   );
 };
@@ -496,10 +497,9 @@ export const RetiredCopyNote: React.FC<{ config: ProfileDefinitionBody | null; o
     <div className="profiles-persona-field" role="note" data-testid="draft-retired-copy">
       <h4>{t('admin.assistantPage.field.copy')} <InfoTooltip label={t('admin.assistantPage.field.copy')} content={t('admin.assistantPage.help.copy')} /></h4>
       <p className="admin-field-hint">{t('admin.assistantPage.help.copyDraft', { keys: retiredCopy.join(', ') })}</p>
-      <button type="button" className="btn-secondary" data-testid="draft-retired-copy-clear"
-        onClick={() => { setRetiredCopy([]); onPatch({ copy: null }); }}>
-        {t('admin.assistantPage.help.copyClear')}
-      </button>
+      <ConfirmAction testId="draft-retired-copy-clear" className="btn-secondary" label={t('admin.assistantPage.help.copyClear')}
+        title={t('admin.confirm.retiredClear')} confirmLabel={t('admin.confirm.clear')} cancelLabel={t('admin.confirm.cancel')}
+        onConfirm={() => { setRetiredCopy([]); onPatch({ copy: null }); }} />
     </div>
   );
 };
@@ -524,16 +524,30 @@ export const EventWorkflowsFields: React.FC<{
   serverErrors?: readonly string[];
   /** The workflow the builder opens on. */
   focusWorkflow?: string;
+  /** Back to the Workflows list, from the create view the page opened. */
+  onLeaveWorkflow?: () => void;
+  /** The workflow the builder now shows, once one is created or renamed there, so the page's trail names it. */
+  onFocusWorkflow?: (name: string) => void;
   /** The assistant's role, for a welcome's preview. */
   role?: string;
   /** The name the assistant was provisioned with, which a welcome says when the version names none. */
   provisionedName?: string;
-}> = ({ config, catalog, onPatch, profileName, tools = [], layout: savedLayout, keptWelcome, serverErrors, focusWorkflow, role, provisionedName }) => {
+}> = ({ config, catalog, onPatch, profileName, tools = [], layout: savedLayout, keptWelcome, serverErrors, focusWorkflow, onLeaveWorkflow, onFocusWorkflow, role, provisionedName }) => {
   const { t: translate } = useTranslation();
   const t = translate as unknown as T;
   const { prompts, unreadable } = useTemplateOptions(profileName);
   const [eventWorkflows, setEventWorkflows] = useState<NonNullable<ProfileDefinitionBody['eventWorkflows']>>(() => ({ ...(config?.eventWorkflows ?? {}) }));
   const [layout, setLayout] = useState<WorkflowLayout | undefined>(savedLayout);
+  /** The version's processes as this editor last patched them, so a second rename follows the first. */
+  const [processes, setProcesses] = useState(config?.processes);
+  /** A renamed workflow stays linked from each process that linked it. */
+  const onRenamed = (from: string, to: string) => {
+    if (focusWorkflow === from) onFocusWorkflow?.(to);
+    const next = processesRenamed(processes, from, to);
+    if (!next) return;
+    setProcesses(next);
+    onPatch({ processes: next });
+  };
   /** The conversation type picked in the welcome form, or null while it shows the welcome that was opened. */
   const [welcomeType, setWelcomeType] = useState<string | null>(null);
   useEffect(() => setWelcomeType(null), [focusWorkflow]);
@@ -596,8 +610,9 @@ export const EventWorkflowsFields: React.FC<{
           </>
         ) : (
           <WorkflowBuilder workflows={shippedFocus ? { ...eventWorkflows, [focusWorkflow!]: shippedFocus } : eventWorkflows} {...options}
-            layout={layout} profileName={profileName} serverErrors={serverErrors} initialWorkflow={focusWorkflow}
-            taskMachines={taskMachines} onLayoutChange={onLayoutChange} onChange={onChange} />
+            layout={layout} profileName={profileName} serverErrors={serverErrors} initialWorkflow={focusWorkflow} startCreating={focusWorkflow === NEW_WORKFLOW_FOCUS} onCancelCreate={onLeaveWorkflow}
+            taskMachines={taskMachines} onLayoutChange={onLayoutChange} onChange={onChange} onRenamed={onRenamed}
+            onCreated={focusWorkflow ? onFocusWorkflow : undefined} />
         );
       })()}
       {/* THE WORKFLOW EACH MULTI-STEP INTENT RUNS (ADR-067 decision 1), beside the event workflows on the same builder. */}

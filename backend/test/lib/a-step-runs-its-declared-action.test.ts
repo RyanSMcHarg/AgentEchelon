@@ -156,7 +156,8 @@ describe('entering the step runs the action and takes the declared edge (FR29)',
 
     const runs = await runStepActions(ctx, env);
 
-    expect(runTool).toHaveBeenCalledWith('search_corporate_travel', { origin: 'SEA', destination: 'JFK', departDate: '2026-11-03', cabin: 'economy' });
+    // The declaring task's type rides the call, so a handler can tell a platform machine's declared step from a model's call.
+    expect(runTool).toHaveBeenCalledWith('search_corporate_travel', { origin: 'SEA', destination: 'JFK', departDate: '2026-11-03', cabin: 'economy' }, { taskType: expect.any(String) });
     expect(runs).toEqual([expect.objectContaining({ state: 'searching', tool: 'search_corporate_travel', ok: true, movedTo: 'quoting' })]);
     expect(task.taskState).toBe('quoting');
     expect((task.details?.actions as Record<string, { ok: boolean; result: unknown; key: string }>).searching)

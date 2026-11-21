@@ -9,7 +9,7 @@ import { MessagingAppInstance } from 'cdk-amazon-chime-resources';
 import { MESSAGE_RETENTION_DAYS } from '../config/conversation-types';
 import { dataRemovalPolicy } from '../config/environment';
 import { Construct } from 'constructs';
-import { SSM_ROOT, RES_PREFIX, ANALYTICS_PREFIX } from './agent-classification-common';
+import { SSM_ROOT, RES_PREFIX, ANALYTICS_PREFIX, createProcessEventBus } from './agent-classification-common';
 import { assistantProvisioner } from '../constructs/assistant-provisioner';
 
 export interface MessagingStackProps extends cdk.StackProps {
@@ -240,6 +240,11 @@ export class MessagingStack extends cdk.Stack {
     });
 
     this.assistantProvisioner = assistantProvisioner(this, { appInstanceArn: this.appInstanceArn });
+
+    // THE PROCESS EVENT BUS (DESIGN-PROCESSES section 12): held in the core every deployment stands up and the Assistants and
+    // AdminServices stacks deploy after, so its policy stands before any router may put on it or any rule is written there. Every
+    // stack names it by its fixed name (`processEventBusName`), so nothing crosses as a token.
+    createProcessEventBus(this);
 
     // Output the App Instance ARN
     new cdk.CfnOutput(this, 'AppInstanceArnOutput', {

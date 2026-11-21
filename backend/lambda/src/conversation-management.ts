@@ -48,7 +48,7 @@ import { callerReachesConversation, refusalAnswer } from './lib/conversation-acc
 import { cancelDeadlinesThroughRouter, personJoinedThroughRouter, sayThroughRouter } from './lib/say-through-router.js';
 import { defaultProfileRegistry } from '../../lib/profile-registry';
 import { primaryAssignmentOf, primaryAssistantOf } from './lib/conversation-primary.js';
-import { addContextMember, contextChannelId, createConversationForContext } from './lib/channel-creation.js';
+import { CONVERSATION_TYPE_TAG, addContextMember, contextChannelId, createConversationForContext } from './lib/channel-creation.js';
 import { conversationNameText } from './lib/conversation-name.js';
 import { resolvePerson } from './lib/person-identity.js';
 import { accountStateOfPerson, defaultDirectory } from './lib/membership-source.js';
@@ -755,13 +755,20 @@ async function addContextMemberFor(
     } catch (err) {
       if ((err as { name?: string }).name !== 'ConflictException') throw err;
       existed = true;
-      // AN EXISTING CONVERSATION IS JOINED ONLY AT THIS CLASSIFICATION.
-      const existingClassification = (await readChannelTags(messagingClient, conversationArn)).classification || '';
+      // AN EXISTING CONVERSATION IS JOINED ONLY AT THIS CLASSIFICATION, AND ONLY AS A CONTEXT CONVERSATION'S TYPE: a channel another
+      // path created at this id (a pattern conversation's is under its own namespace, so this is a second check) is never joined.
+      const existingTags = await readChannelTags(messagingClient, conversationArn);
+      const existingClassification = existingTags.classification || '';
       if (existingClassification !== CONTEXT_CLASSIFICATION) {
         console.error('[conversation-membership][SecurityEvent] refused: the existing conversation is not this classification', {
           conversationArn, existingClassification, own: CONTEXT_CLASSIFICATION,
         });
         return { ok: false, error: 'The conversation is not this deployment\'s classification' };
+      }
+      const existingType = existingTags[CONVERSATION_TYPE_TAG];
+      if (existingType && existingType !== DEFAULT_CONVERSATION_TYPE) {
+        console.error('[conversation-membership][SecurityEvent] refused: the existing conversation is another type\'s', { conversationArn, existingType });
+        return { ok: false, error: 'The conversation is not a context conversation' };
       }
       try {
         // OMISSION PRESERVES HERE TOO: our four keys win, everything else the channel carries survives.

@@ -1,7 +1,7 @@
 /**
  * CLEARANCE RESOLUTION HAS EXACTLY ONE PROVIDER-SPECIFIC STEP, AND IT IS BEHIND A SEAM.
  *
- * Owner decision 2026-09-14. `lib/user-clearance.ts` called `AdminListGroupsForUser`
+ * `lib/user-clearance.ts` called `AdminListGroupsForUser`
  * directly on the live request path for the router and the channel flow, while
  * IDENTITY-PROVIDER-GUIDE said the platform never enforces on Cognito-specific signals - and Step 7
  * of the same guide told integrators to mirror their claim into a Cognito group. The guide

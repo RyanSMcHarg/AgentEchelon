@@ -30,6 +30,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { assertNoRollback, recordDeployedCommits } from './lib/deployed-commit.mjs';
+import { ensureAdminNoticeStates } from './lib/admin-notice-states.mjs';
 import { assertImportedVpcEgress } from './check-imported-vpc.mjs';
 import { printDeclaredButRetired, orphanedConsoleAssistantsRefusal } from './lib/declared-assistants-report.mjs';
 
@@ -136,6 +137,12 @@ async function main() {
       region: REGION,
     });
     if (refusal) fail(refusal, 1);
+  }
+
+  // EACH OPERATIONAL ADMIN NOTICE'S STATE EXISTS before AdminServices reads it at deploy (DESIGN-EVENT-TARGETS section 12).
+  if (/AdminServices$/.test(stackName)) {
+    const { resolveInstanceName } = require('./lib/stack-lookup.cjs');
+    await ensureAdminNoticeStates({ region: REGION, instanceName: resolveInstanceName(process.env) });
   }
 
   // Streamed, not captured: a deploy runs for minutes. "No stacks match" cannot happen here, because

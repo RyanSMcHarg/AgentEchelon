@@ -24,13 +24,13 @@ template.
 
 | | |
 |---|---|
-| Routes | 203 |
+| Routes | 211 |
 | HTTP APIs | 2 |
-| ...authorized `AWS_IAM` by default | 152 |
-| ...authorized `CUSTOM` by default | 44 |
+| ...authorized `AWS_IAM` by default | 157 |
+| ...authorized `CUSTOM` by default | 47 |
 | ...authorized `NONE` by default | 7 |
 | ...behind the edge authorizer with no result cache | 3 |
-| Routes served in every deployment | 177 |
+| Routes served in every deployment | 185 |
 | Routes served with **no authorizer** | 7 (`GET /deployment/state`, `GET /email/preferences`, `POST /email/preferences`, `POST /guest/refresh`, `POST /guest/start`, `POST /invitations/peek`, `POST /invitations/redeem`) |
 | Payload format sent to every handler | 1.0 |
 
@@ -67,10 +67,13 @@ Declared by `AgentEchelonAdminApi`. Served in every deployment.
 | Method | Path | Authorizer | Throttle | Integration | Served in |
 |---|---|---|---|---|---|
 | `GET` | `/admin/access-log` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AccessLogReaderFunction` | every deployment |
+| `POST` | `/admin/admin-notices/{key}` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
+| `GET` | `/admin/admin-notices` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
 | `GET` | `/admin/assistants/{assistant}/conversations/{channelId}/clean` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AdminConversationFunction` | every deployment |
 | `GET` | `/admin/assistants/{assistant}/conversations/{channelId}/messages` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AdminConversationFunction` | every deployment |
 | `GET` | `/admin/assistants/{assistant}/conversations/find` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AdminConversationFunction` | every deployment |
 | `GET` | `/admin/assistants/{assistant}/conversations` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AdminConversationFunction` | every deployment |
+| `GET` | `/admin/assistants/{assistant}/event-triggers/{typeKey}/{classification}` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
 | `POST` | `/admin/assistants/{assistant}/experiments/{experimentId}/promote` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `AdminExperimentsFunction` | every deployment |
 | `POST` | `/admin/assistants/{assistant}/experiments/{experimentId}/status` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `AdminExperimentsFunction` | every deployment |
 | `DELETE` | `/admin/assistants/{assistant}/experiments/{experimentId}` | `AWS_IAM` (SigV4) | 25 req/s, burst 50 | `AdminExperimentsFunction` | every deployment |
@@ -109,8 +112,10 @@ Declared by `AgentEchelonAdminApi`. Served in every deployment.
 | `GET` | `/admin/conversations/identities` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AdminConversationFunction` | every deployment |
 | `GET` | `/admin/conversations/membership-history` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AdminConversationFunction` | every deployment |
 | `GET` | `/admin/conversations` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `AdminConversationFunction` | every deployment |
+| `GET` | `/admin/event-alarms` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
 | `GET` | `/admin/event-policy` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
 | `POST` | `/admin/event-policy` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
+| `GET` | `/admin/event-rules` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
 | `POST` | `/admin/event-triggers/{typeKey}/{classification}/{ruleId}/remove` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
 | `GET` | `/admin/event-triggers/{typeKey}/{classification}` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
 | `POST` | `/admin/event-triggers/{typeKey}/{classification}` | `AWS_IAM` (SigV4) | 10 req/s, burst 20 | `EventTriggersFn` | every deployment |
@@ -272,6 +277,9 @@ Declared by `AgentEchelonPersonApi`. Served in every deployment.
 | `POST` | `/proposals/apply` | edge authorizer (cached 300 s) | 50 req/s, burst 100 | `ProposalsFunction` | every deployment |
 | `POST` | `/share-conversation` | edge authorizer (cached 300 s) | 25 req/s, burst 50 | `ShareConversationFunction` | every deployment |
 | `POST` | `/tasks/advance` | edge authorizer (cached 300 s) | 50 req/s, burst 100 | `UserTasksApiFunction` | every deployment |
+| `POST` | `/tasks/documents/add` | edge authorizer (cached 300 s) | 50 req/s, burst 100 | `UserTasksApiFunction` | every deployment |
+| `POST` | `/tasks/documents/revise` | edge authorizer (cached 300 s) | 50 req/s, burst 100 | `UserTasksApiFunction` | every deployment |
+| `POST` | `/tasks/documents` | edge authorizer (cached 300 s) | 50 req/s, burst 100 | `UserTasksApiFunction` | every deployment |
 | `GET` | `/tasks/mine` | edge authorizer (cached 300 s) | 50 req/s, burst 100 | `UserTasksApiFunction` | every deployment |
 | `POST` | `/tasks` | edge authorizer (cached 300 s) | 50 req/s, burst 100 | `UserTasksApiFunction` | every deployment |
 | `GET` | `/turn-state` | edge authorizer (cached 300 s) | 50 req/s, burst 100 | `TurnStateApiFunction` | every deployment |

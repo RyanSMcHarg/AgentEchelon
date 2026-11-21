@@ -1,5 +1,5 @@
 /**
- * THE DRAIN IS A TASK: opening it, and ending it (ADR-033, owner 2026-09-03).
+ * THE DRAIN IS A TASK: opening it, and ending it (ADR-033).
  *
  * Working a queue is work - it has states, legal moves between them, a step that awaits a person, and
  * a point at which it is over - and it was declared in exactly that shape long before it took a task
@@ -8,7 +8,7 @@
  * empty. Split across two files, the second half is the one that gets forgotten, which is precisely
  * what happened - the record forgot the drain while the row lived on to its TTL.
  *
- * WHAT THIS DELIBERATELY DOES NOT STORE IS THE MESSAGE (maintainer, 2026-09-03). The task carries the
+ * WHAT THIS DELIBERATELY DOES NOT STORE IS THE MESSAGE. The task carries the
  * message ID and nothing of its content. Anything showing a person what a drain is about resolves
  * that id AS THE CALLER, so a targeted request stays invisible to somebody who may not read it - the
  * same rule the queue itself already follows, and the reason `queued` holds ids rather than text.

@@ -29,7 +29,7 @@
  * that names no person (a sign-in the exchange never resolved to one) carries no `actorPersonId`, so it is
  * in the day partition and the conversation index only.
  *
- * A READER THAT IS NOT A PERSON IS NAMED BY THE IAM PRINCIPAL THAT SIGNED ITS REQUEST (owner decision, 2026-11-12): an
+ * A READER THAT IS NOT A PERSON IS NAMED BY THE IAM PRINCIPAL THAT SIGNED ITS REQUEST: an
  * access granted to a signed principal no person id resolves from (an operator's own role, a service mode caller) is
  * recorded with `actorKind: 'iam'`, its `actorPrincipalArn`, and `iam#<arn>` as its `byActor` key. The ARN is the one
  * API Gateway sets on the request context from the signature (`signingPrincipalArn`), never one a header or body

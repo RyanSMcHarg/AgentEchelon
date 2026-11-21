@@ -110,7 +110,9 @@ import { noticeLine } from './assistant-notice.js';
 import { anyToolChangedState, toolOfferedToRole } from './tool-registry.js';
 import { loadCompanyContext, loadPlatformInfo, loadContextDigest, buildDigestHint } from './company-context.js';
 import { defaultProfileRegistry } from '../../../lib/profile-registry';
-import { publishDashboard, DASHBOARD_TOOL, DASHBOARD_PAGE_TOOL } from './dashboard-tool.js';
+import { publishDashboard, refreshDashboardRunbook, DASHBOARD_TOOL, DASHBOARD_PAGE_TOOL } from './dashboard-tool.js';
+import { isRunbookProgress } from './runbook-progress.js';
+import { isPlatformMachineKey } from './task-state-machines.js';
 import { readDeploymentHealth } from './deployment-health.js';
 import type { AwsCredentialIdentity } from '@aws-sdk/types';
 import {
@@ -546,7 +548,7 @@ export interface AsyncProcessorEvent {
     /** A meeting's events only: the meeting, handed back so the run's natural key is computed again. */
     meeting?: { meetingId: string };
     /** The run's process (SPEC-PROCESSES P2), handed back as it came. */
-    process?: { id: string; name: string; edition?: string; ownerTeam?: string };
+    process?: { id: string; name: string; edition?: string; ownerTeam?: string; received?: string };
     /** The run's workflow's hash (WT60), stamped on the step's message. */
     workflowHash?: string;
     /** What started the run (WT118), stamped on the step's message. */
@@ -626,7 +628,7 @@ export interface AsyncProcessorEvent {
     /** What started the run (WT118), stamped on the message the voice send posts. */
     runTrigger?: import('./task-tracking.js').RunTrigger;
     /** The run's process (SPEC-PROCESSES P8), which the message's out-of-band record carries. */
-    process?: { id: string; name: string; edition?: string; ownerTeam?: string };
+    process?: { id: string; name: string; edition?: string; ownerTeam?: string; received?: string };
   };
   /**
    * SAY THE TURN FAILED, AND NOTHING ELSE.
@@ -870,7 +872,7 @@ export interface AsyncProcessorEvent {
   broadcastMessageId?: string;
   /**
    * This turn resumed a chain an assistant was holding, so deliver it as the NORMALIZED PAIR: the
-   * answer UNTARGETED, the acknowledgement TARGETED at the person who spoke (maintainer, 2026-08-14).
+   * answer UNTARGETED, the acknowledgement TARGETED at the person who spoke.
    *
    * Set when the turn resumes a chain this assistant owns (`resumedOwnChain` in the handler). Which of
    * the two the placeholder already is depends on how the person's message arrived - Amazon Chime SDK
@@ -1333,7 +1335,7 @@ export { isPlaceholderMessage };
 const EARLY_CONVERSATION_HISTORY_LIMIT = 10;
 
 /**
- * WHERE THIS TURN'S HISTORY ENDS (owner report 2026-09-14).
+ * WHERE THIS TURN'S HISTORY ENDS.
  *
  * History is what came BEFORE the message this turn answers. The listing reads the newest messages
  * in the channel, so without a bound it also returns what arrived AFTER that message: the queued
@@ -2198,8 +2200,8 @@ const PLATFORM_INFO_TOOL_CONFIG = {
         description:
           'Retrieve documentation about the AgentEchelon platform ITSELF — what ' +
           'it is, how it works, its architecture, features, and capabilities, and ' +
-          // ORIGIN IS A PLATFORM QUESTION, and naming it here is what makes it reachable
-          // (owner-reported, 2026-09-05). "Who created it" listed none of the things this tool
+          // ORIGIN IS A PLATFORM QUESTION, and naming it here is what makes it reachable.
+          // "Who created it" listed none of the things this tool
           // said it held, so it read as a question for the company documents - which have no
           // reason to carry the provenance of the platform the company merely deploys.
           'who made it, when, under what licence, and where its source lives. Call ' +
@@ -2802,7 +2804,7 @@ export async function invokeBedrock(
   // A TOOL RUNS ONLY WHERE ITS RUNTIME PRECONDITION HOLDS ON THIS TURN: the executor answers for the tools in
   // `executableToolSpecs` and no others, whoever asks (a model's call or a declared step action).
   const executableToolNames = new Set(executableToolSpecs.map(toolSpecName));
-  const runExecutableTool = async (name: string, toolInput: Record<string, unknown>): Promise<Record<string, unknown> | undefined> => {
+  const runExecutableTool = async (name: string, toolInput: Record<string, unknown>, declared?: { taskType: string }): Promise<Record<string, unknown> | undefined> => {
     if (!executableToolNames.has(name)) return undefined;
     if (name === 'load_company_context') {
       // Honor the model's document selection (filenames) so we load only what the task needs.
@@ -2833,6 +2835,27 @@ export async function invokeBedrock(
       )) as unknown as Record<string, unknown>;
     }
     if ((name === DASHBOARD_TOOL || name === DASHBOARD_PAGE_TOOL) && dashboardOn(name) && config.conversation) {
+      // A RUN'S RUNBOOK DRAWN AGAIN (DESIGN-CONVERSATION-DASHBOARDS section 8.1): taken only from a step a platform machine
+      // declares, never from a model's call, whose input is never read. Each dashboard already published that this turn may
+      // publish is drawn again; none is published for the first time.
+      if (name === DASHBOARD_TOOL && declared && isPlatformMachineKey(declared.taskType) && (toolInput.onlyIfPublished === true || toolInput.onlyIfPublished === 'true')) {
+        let runbook: unknown;
+        try { runbook = JSON.parse(String(toolInput.runbook ?? '')); } catch { runbook = undefined; }
+        if (!isRunbookProgress(runbook)) return { error: 'the step carries no runbook' };
+        const modes = ([['snapshot', DASHBOARD_TOOL], ['page', DASHBOARD_PAGE_TOOL]] as const)
+          .filter(([, tool]) => dashboardOn(tool) && (config.tools === undefined || config.tools.includes(tool)))
+          .map(([mode]) => mode);
+        const results = await refreshDashboardRunbook({
+          credentials: actingCredentials(),
+          bucket: process.env.DASHBOARD_BUCKET || '',
+          ...config.conversation,
+          runbook, modes,
+          ...(config.watchedAlarm ? { watchedAlarm: config.watchedAlarm } : {}),
+          ...(config.copy ? { words: { copy: config.copy } } : {}),
+        }, { messaging: messagingClient });
+        const failed = results.find((r) => r.error || r.unavailable);
+        return failed ? { error: String(failed.error ?? failed.unavailable) } : { drawn: results.some((r) => r.published === true), results };
+      }
       // AS THE ASSISTANT, for this conversation only: the key comes from the turn, never from the model's input.
       return publishDashboard({
         mode: name === DASHBOARD_TOOL ? 'snapshot' : 'page',
@@ -2859,7 +2882,7 @@ export async function invokeBedrock(
   // intent's) permits, among the tools whose runtime precondition holds now. The step's own `tools` do
   // not narrow its action, which the same workflow declared.
   const actionEnv: StepActionEnv = {
-    runTool: async (name, input) => (await runExecutableTool(name, input)) ?? { error: `unknown tool: ${name}` },
+    runTool: async (name, input, declared) => (await runExecutableTool(name, input, declared)) ?? { error: `unknown tool: ${name}` },
     toolAvailable: (name) => filterToolSpecsByProfile(executableToolSpecs, config.tools).some((s) => toolSpecName(s) === name),
     // A step that produces an image is drawn by the platform, on the turn's image env (ADR-064 decision E).
     ...(config.generateImage ? { generateImage: config.generateImage } : {}),
@@ -2896,6 +2919,10 @@ export async function invokeBedrock(
         + `\nThe task is now at "${now}". Work from that step, below, not from the one described above.`
         + (taskContext.guidanceFor ? `\n\n${taskContext.guidanceFor(taskContext.task.taskType ?? '', now, taskContext.task.details)}` : '');
     }
+  }
+  // A QUIET STEP'S TURN ENDS HERE (`isQuietStep`): its declared action ran, and nothing is said, so no model is called.
+  if (taskContext?.quiet) {
+    return { response: '', inputTokens: 0, outputTokens: 0, bedrockTime: Date.now() - bedrockStart, modelMs: 0, toolMs: 0, steps: pendingActionSteps.splice(0) };
   }
   // SPEC-TASK-STATE-TRANSITIONS §3: register advance_task_state only when a machine-backed task is
   // active (one fewer distractor tool off-task). The tool result is the ONLY thing that changes
@@ -3625,7 +3652,7 @@ export async function invokeBedrock(
       });
     }
 
-    // WHAT IT SAYS DEPENDS ON WHETHER ANYTHING CHANGED, and it says what it CAN (maintainer, 2026-09-02).
+    // WHAT IT SAYS DEPENDS ON WHETHER ANYTHING CHANGED, and it says what it CAN.
     //
     // This has now been wrong in both directions. It first said "I processed your request but got an
     // unexpected response format" - a claim that something happened when nothing had. That was
@@ -4119,7 +4146,7 @@ export async function runSharedPipeline(
   //
   // DELIVERY IDENTITY IS NOT CONVERSATION IDENTITY, and sharing one string made the re-read in
   // DESIGN 2.3.3 unable to run at all. The reasoning, and why the turn's own correlationId must NOT
-  // change across passes, is on `deliveryCorrelationId` (maintainer, 2026-09-02).
+  // change across passes, is on `deliveryCorrelationId`.
   // BOTH RE-ENTRIES ON ONE CORRELATION ARE DISCRIMINATED, and the fold is the one that was missing.
   // The router scopes its duplicate-fulfillment claim to `#p{pass}#f{fold}`; this side scoped to the
   // pass alone, so an amendment fold - which re-dispatches on the same correlation id by design -
@@ -4505,7 +4532,7 @@ export async function finalizePlaceholderResponse(params: {
   /**
    * THE WORK ALREADY OPEN IN THIS CONVERSATION, for the order a triage proposal shows.
    *
-   * NEW WORK IS NOT NEXT WORK (maintainer, 2026-09-01). The proposal ranked the arrivals against each
+   * NEW WORK IS NOT NEXT WORK. The proposal ranked the arrivals against each
    * other and listed them alone, starting at 1, so a queue read after earlier work was recorded said
    * nothing about where it fell against that work - and an order ranked only against itself reads as
    * the order that goes first.
@@ -4571,7 +4598,7 @@ export async function finalizePlaceholderResponse(params: {
   /** What chose the turn's model and the work it is attributed to (ADR-064 decision 4). */
   modelChoice?: { taskType?: string; taskMachine?: string; turnStep?: string; modelKind: 'text' | 'image'; modelFrom: string; imageEgress?: { provider: string; model: string; contextSourced: boolean } };
   /**
-   * THE CLASSIFICATION ASSIGNED TO THE ASSISTANT THAT SERVED THIS TURN (owner direction, 2026-09-13).
+   * THE CLASSIFICATION ASSIGNED TO THE ASSISTANT THAT SERVED THIS TURN.
    *
    * ASSIGNED, NOT SELF-DETERMINED, and the distinction is the point. An assistant does not classify
    * itself and has no say in the matter: the deployment assigns it one classification, the CDK stack
@@ -6339,8 +6366,8 @@ export async function finalizePlaceholderResponse(params: {
       // ── THE OFFER IS THE CONVERSATION'S, SO IT IS PUT TO EVERYONE IT CONCERNS ──────────────────
       //
       // This was the principal id of whoever happened to trigger the drain, and a queue is not one
-      // person's: it holds whatever arrived while the assistant was working, from whoever sent it
-      // (maintainer, 2026-09-05). Two things were dropped by naming one of them.
+      // person's: it holds whatever arrived while the assistant was working, from whoever sent it.
+      // Two things were dropped by naming one of them.
       //
       // The offer itself, whenever that id could not be derived - `savePendingSplit` refused an
       // offer with no `offeredTo`, so every subject belonging to everybody went with it.
@@ -6397,7 +6424,7 @@ export async function finalizePlaceholderResponse(params: {
     // with nothing grouped and nothing prioritized, so presenting it in the same words as a
     // considered plan would overstate it. The confirmation matters more here, not less: this is
     // exactly the case where the assistant's expectation is most likely to be wrong.
-    // ── AND WHETHER TO PICK UP WHAT WAS ASKED EARLIER (maintainer, 2026-09-03) ─────────────────────
+    // ── AND WHETHER TO PICK UP WHAT WAS ASKED EARLIER ─────────────────────
     //
     // A clarification waits on a person, so nothing raises it again unless they think to. The queue
     // clearing is the moment the assistant has nothing more urgent, which is when it should either
@@ -6426,7 +6453,7 @@ export async function finalizePlaceholderResponse(params: {
         ? `${buildProposalMessage(proposal, lost, {
           ...(event.triage.targetedIds ? { targetedIds: event.triage.targetedIds } : {}),
           // The order shown is the WHOLE order: where these fall against what is already open here,
-          // rather than a fresh list starting at 1 (maintainer, 2026-09-01).
+          // rather than a fresh list starting at 1.
           ...(params.openWork?.length ? { openWork: params.openWork } : {}),
           ...(followUp.action !== 'stay-quiet' ? { followUp } : {}),
           ...(copy ? { copy } : {}),
@@ -6434,7 +6461,7 @@ export async function finalizePlaceholderResponse(params: {
         : buildProposalMessage(proposal, lost, {
           ...(event.triage.targetedIds ? { targetedIds: event.triage.targetedIds } : {}),
           // The order shown is the WHOLE order: where these fall against what is already open here,
-          // rather than a fresh list starting at 1 (maintainer, 2026-09-01).
+          // rather than a fresh list starting at 1.
           ...(params.openWork?.length ? { openWork: params.openWork } : {}),
           ...(followUp.action !== 'stay-quiet' ? { followUp } : {}),
           ...(copy ? { copy } : {}),
@@ -6481,7 +6508,7 @@ export async function finalizePlaceholderResponse(params: {
       messageMetadata,
     );
     }
-    // ── ONLY WAIT ON A PERSON WHEN THE NEXT STEP IS NOT CLEAR (maintainer, 2026-09-02) ────────────────
+    // ── ONLY WAIT ON A PERSON WHEN THE NEXT STEP IS NOT CLEAR ────────────────
     //
     // `clarifying` is the one stage that AWAITS A PARTY (`QUEUE_DRAIN_MACHINE`), and it was entered
     // on every drain that posted a proposal - including the ones with nothing to decide. The queue
@@ -6502,7 +6529,7 @@ export async function finalizePlaceholderResponse(params: {
     // `reviewing -> clearing` is an edge the machine already declares, so this needs no new state and
     // no new vocabulary, only the honesty about which drains actually asked something.
     //
-    // ASKED IS NOT BLOCKED (maintainer, 2026-09-03). The drain says the stage and CARRIES ON: it clears
+    // ASKED IS NOT BLOCKED. The drain says the stage and CARRIES ON: it clears
     // the queue below on its own timescale rather than on the answerer's, because a queue that lives
     // until somebody replies lives too long, and every message in it is somebody else's wait too.
     //
@@ -6518,7 +6545,7 @@ export async function finalizePlaceholderResponse(params: {
       await showStage('clarifying');
     }
 
-    // ── AND THE ONE QUESTION NOTHING WAS HOLDING (maintainer, 2026-09-03) ───────────────────────────
+    // ── AND THE ONE QUESTION NOTHING WAS HOLDING ───────────────────────────
     //
     // Of the three things above, two are already recorded somewhere durable: a split offer is written
     // to the turn record, and each queued message that became work has its own `queued_request`
@@ -6529,7 +6556,7 @@ export async function finalizePlaceholderResponse(params: {
     // That was survivable only while the drain waited at `clarifying` and was itself the holder. A
     // drain no longer waits, so without this the question is forgotten the moment the queue clears,
     // and the fate of the running work is left undecided permanently.
-    // ── AND WHERE ONE SUBJECT HOLDS TWO PEOPLE'S REQUESTS (maintainer, 2026-09-03) ─────────────────
+    // ── AND WHERE ONE SUBJECT HOLDS TWO PEOPLE'S REQUESTS ─────────────────
     //
     // The reading groups the queue by subject. A group whose messages came from DIFFERENT people is
     // the case where two requests might really be one - and merging them is not triage's call to
@@ -6661,7 +6688,7 @@ ${addressingPrivatelyLine(copy)}`,
         .then((r) => ({ noticeId: r.noticeId, drainTaskId: r.drainTaskId }))
         .catch(() => ({ noticeId: undefined, drainTaskId: undefined }));
       const noticeBeforeClear = beforeClear.noticeId;
-      // ── "CAUGHT UP" WAITS FOR THE ANSWER THE FOLLOW-UPS WENT INTO (owner report, 2026-09-14) ─────────
+      // ── "CAUGHT UP" WAITS FOR THE ANSWER THE FOLLOW-UPS WENT INTO ─────────
       //
       // When this reading handed follow-ups to an answer still being written, the queue is handled but
       // the person has not seen the result: measured live, the notice read "Caught up - I have read

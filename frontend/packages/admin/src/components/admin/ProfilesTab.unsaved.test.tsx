@@ -114,6 +114,7 @@ describe('an unsaved edit', () => {
     nav('workflows');
     fireEvent.change(await welcomeOpening(), { target: { value: 'Hello.' } });
     fireEvent.click(within(screen.getByTestId('draft-step-events')).getByTestId('draft-step-cancel'));
+    fireEvent.click(within(screen.getByTestId('draft-step-events')).getByTestId('draft-step-cancel-confirm-button'));
     expect(screen.queryByTestId('assistant-nav-workflows-unsaved')).toBeNull();
     nav('behavioral');
     expect(await persona()).toBe('You advise briefly.');
@@ -226,7 +227,7 @@ describe('a reload', () => {
     fireEvent.click(await screen.findByTestId('new-version'));
     nav('workflows');
     finish();
-    expect(await screen.findByTestId('draft-step-events')).toBeTruthy();
+    expect(await screen.findByTestId('workflows-new')).toBeTruthy();
     expect(screen.getByTestId('assistant-nav-workflows')).toHaveAttribute('aria-current', 'page');
   });
 });

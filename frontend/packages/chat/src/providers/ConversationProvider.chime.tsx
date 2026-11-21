@@ -1,6 +1,6 @@
 import { createContext, useContext, useState, useEffect, useRef, useCallback, type ReactNode, useMemo } from 'react';
 import type { Conversation, Message, UserTier, Attachment, ChannelMember, StickyMentionTarget } from '@ae/shared';
-import { fetchOpenWorkItems, type OpenWorkItem } from '../services/openWorkItemService';
+import { fetchOpenWork, type OpenWorkItem } from '../services/openWorkItemService';
 import { useAuth } from '@ae/shared';
 import { useAwsClient } from './AwsClientProvider';
 import { useMessaging } from './MessagingProvider';
@@ -109,6 +109,15 @@ interface ConversationContextType {
    *  loaded channel's messages, so the item a user is most likely to have forgotten - the one in a
    *  conversation they are not looking at - is exactly the one it cannot show. */
   openWorkItems: OpenWorkItem[];
+  /** The open items have been read at least once since sign-in, so an item missing from them is not open. */
+  openWorkLoaded: boolean;
+  /**
+   * When the items installed now were asked for (ms). A task missing from them is closed only if its card arrived before
+   * that: a card newer than the read is not in it yet, and stays answerable until a read asked after it says otherwise.
+   */
+  openWorkAskedAt?: number;
+  /** The items installed now are every open item, so one missing from them is settled; a list at its cap is not. */
+  openWorkComplete?: boolean;
   /** Re-read the queue. Called after a send, because answering is what closes an item. */
   refreshOpenWorkItems: () => void;
   /**
@@ -1223,6 +1232,9 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
   // listen for. The interval is deliberately slow - this is an ambient reminder, not a live feed - and
   // a send refreshes it immediately, because answering is what closes an item.
   const [openWorkItems, setOpenWorkItems] = useState<OpenWorkItem[]>([]);
+  const [openWorkLoaded, setOpenWorkLoaded] = useState(false);
+  const [openWorkAskedAt, setOpenWorkAskedAt] = useState(0);
+  const [openWorkComplete, setOpenWorkComplete] = useState(false);
   // ── ONLY THE NEWEST ANSWER IS INSTALLED (code review, 2026-09-09) ─────────────────────────────
   //
   // This became event-driven - the effect below re-reads on every `messages` identity change - and
@@ -1240,10 +1252,17 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
   const openWorkSeqRef = useRef(0);
   const refreshOpenWorkItems = useCallback(() => {
     const seq = ++openWorkSeqRef.current;
-    void fetchOpenWorkItems().then((items) => {
+    const askedAt = Date.now();
+    void fetchOpenWork().then((read) => {
       // SUPERSEDED. Something newer has been asked since this went out, so this answer is already
       // known to be stale - installing it would be a step backwards.
       if (seq !== openWorkSeqRef.current) return;
+      // A READ THAT FAILED SAYS NOTHING about what is open: what was read last stands, and no card is closed by it.
+      if (!read) return;
+      const { items } = read;
+      setOpenWorkLoaded(true);
+      setOpenWorkAskedAt(askedAt);
+      setOpenWorkComplete(read.complete);
       // KEEP REFERENTIAL IDENTITY when nothing changed. openWorkItems is a dependency of the
       // provider-value useMemo, so a freshly parsed (always-new) array here invalidated the context
       // value and re-rendered every useConversations consumer once a minute even when the queue was
@@ -1259,6 +1278,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!user) {
       setOpenWorkItems([]);
+      setOpenWorkLoaded(false);
       return;
     }
     refreshOpenWorkItems();
@@ -1352,6 +1372,9 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     replyToSides,
     clearReplyingToSides,
     openWorkItems,
+    openWorkLoaded,
+    openWorkAskedAt,
+    openWorkComplete,
     refreshOpenWorkItems,
     answeringTaskId,
     answerItem,
@@ -1371,6 +1394,9 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     replyToSides,
     clearReplyingToSides,
     openWorkItems,
+    openWorkLoaded,
+    openWorkAskedAt,
+    openWorkComplete,
     refreshOpenWorkItems,
     answeringTaskId,
     answerItem,

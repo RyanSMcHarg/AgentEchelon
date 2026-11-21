@@ -339,6 +339,10 @@ const SLICE_2 = (): ShippedMessageEntry[] => [
   },
   // Private requests and resumed work.
   line('answered-privately', 'Says the reply went to the person privately', 'I have replied to you privately.', 'answeredPrivately'),
+  // A REVISION ITS APPROVER ASKED FOR: what the drafting assistant is asked, with the latest version below it.
+  line('document-revise-ask', 'What the drafting assistant is asked when the approver asks for a revision of a document', 'Revise {{name}}, the document below, as its approver asks: {{instructions}} Keep its shape and everything they did not ask to change, and return the whole revised document.', undefined, { name: 'value:text', instructions: 'value:longText' }),
+  // A STEP'S OUTPUT DELIVERED AS A FILE: the line its attachment is posted with.
+  line('step-file-delivered', 'The line a workflow step posts with the file it delivered', 'Attached: {{name}}. Download it to edit, then attach your edited version here.', undefined, { name: 'value:text' }),
   line('addressing-privately', 'What the conversation sees while private requests are handled', 'Addressing private requests.', 'addressingPrivately'),
   counted('private-follow-up', 'Asks a person, privately, how to handle their private requests', { one: 'About your private request: {{labels}}. Tell me how you would like me to handle this.', other: 'About your private requests: {{labels}}. Tell me how you would like me to handle these.' }, 'privateFollowUp', { labels: 'value:longText' }),
   line('resumed-chain-answered', 'The receipt for an answer that picked up waiting work, when the turn answered', 'Thanks - picking that back up. My answer is in the conversation.', 'resumedChainAnswered'),
@@ -781,7 +785,7 @@ const MEETING_TRANSCRIPTION_NOTICES: ShippedMessageEntry[] = [
     kind: 'message',
     description: 'What the people in a meeting are told in its chat when it starts being recorded',
     fields: {},
-    sections: { chat: { text: '**This meeting is being recorded.** What is said is kept as a transcript and summarized for this conversation. The meeting\'s hosts download the transcript from its ended card; anyone else can ask a host.' } },
+    sections: { chat: { text: 'This meeting is being recorded.' } },
   },
   {
     name: 'meeting-recording-stopped',
@@ -795,7 +799,7 @@ const MEETING_TRANSCRIPTION_NOTICES: ShippedMessageEntry[] = [
     kind: 'message',
     description: 'What the people in a meeting are told in its chat when it starts being recorded where the deployment records audio and video',
     fields: {},
-    sections: { chat: { text: '**This meeting is being recorded, audio and video.** What is said and shown is kept as a recording and a transcript, and summarized for this conversation. The meeting\'s hosts download them from its ended card; anyone else can ask a host.' } },
+    sections: { chat: { text: 'This meeting is being recorded.' } },
   },
 ];
 
@@ -852,7 +856,7 @@ const INCIDENT_DECLARED: ShippedMessageEntry = {
   kind: 'message',
   description: 'What a team conversation is told when an event opens an incident from it: the incident conversation and its link, why it was opened, since when and where, and who owns it',
   fields: {
-    label: 'value:text', alarmMetric: 'value:text', alarmThreshold: 'value:text', alarmLatest: 'value:text', since: 'value:text', region: 'value:text',
+    label: 'value:text', alarmMetric: 'value:text', alarmThreshold: 'value:text', alarmLatest: 'value:text', since: 'value:text', region: 'value:text', serviceAbout: 'value:text',
     lead: 'person:displayName', conversation_link: 'value:text',
   },
   sections: {
@@ -860,6 +864,7 @@ const INCIDENT_DECLARED: ShippedMessageEntry = {
       text: '**Incident conversation opened for {label}:** [open it]({conversation_link})\n\n'
         + '[[- **Why:** {{alarmMetric}} crossed its alarm threshold of {{alarmThreshold}}]]\n'
         + '[[- **Latest value:** {{alarmLatest}}]]\n'
+        + '[[- **The service:** {{serviceAbout}}]]\n'
         + '[[- **Since:** {{since}}]]\n'
         + '[[- **AWS Region:** {{region}}]]\n'
         + '[[- **On call:** {{lead}} owns it]]\n\n'
@@ -909,6 +914,16 @@ const INCIDENT_RESOLVED: ShippedMessageEntry = {
   },
 };
 
+const INCIDENT_REOPENED: ShippedMessageEntry = {
+  name: 'incident-reopened',
+  kind: 'message',
+  description: 'Said in the incident conversation when someone who decides it reopens a resolved incident',
+  fields: { label: 'value:text' },
+  sections: {
+    chat: { text: "{label} is open again. Its post-incident review waits until it is resolved again; resolve it from the top of this conversation." },
+  },
+};
+
 const POST_INCIDENT_REVIEW: ShippedMessageEntry = {
   name: 'post-incident-review',
   kind: 'message',
@@ -954,7 +969,7 @@ const INCIDENT_RESOLVED_TEAM: ShippedMessageEntry = {
 };
 
 /**
- * ASKED PRIVATELY OF THE ON-CALL WHO PRESSED RESOLVED WHILE THE RUNBOOK STILL HAS STEPS OPEN (owner decision 2026-11-14), with
+ * ASKED PRIVATELY OF THE ON-CALL WHO PRESSED RESOLVED WHILE THE RUNBOOK STILL HAS STEPS OPEN, with
  * the card that resolves it or keeps it open: the incident, and the runbook's steps still open by their labels, a line left
  * out where none can be read.
  */
@@ -993,6 +1008,21 @@ const INCIDENT_TIMED_OUT: ShippedMessageEntry = {
   },
 };
 
+/**
+ * What a team conversation is told when an event's incident conversation could not be opened: it opens led by the on-call, so
+ * it needs exactly one person on call, and the conversation itself must be created. Nobody else is told, so the team pages the
+ * on-call directly.
+ */
+const INCIDENT_NOT_OPENED: ShippedMessageEntry = {
+  name: 'incident-not-opened',
+  kind: 'message',
+  description: 'What a team conversation is told when an event should have opened an incident conversation and it could not be opened',
+  fields: { label: 'value:text' },
+  sections: {
+    chat: { text: 'The incident conversation for {label} could not be opened: it opens led by the one person on call, so either the on-call group has no one or more than one on call, or the conversation could not be created. Page the on-call directly and work the incident here.' },
+  },
+};
+
 /** What a team conversation is told when an incident opened from it ended unresolved: cancelled, or its conversation archived. */
 const INCIDENT_ENDED_UNRESOLVED: ShippedMessageEntry = {
   name: 'incident-ended-unresolved',
@@ -1009,12 +1039,12 @@ const DASHBOARD: ShippedMessageEntry = {
   name: 'dashboard',
   kind: 'message',
   description: 'The message a conversation dashboard opens from, and the words the dashboard itself shows',
-  fields: { state: 'value:text', time: 'value:text', conversation: 'value:text' },
+  fields: { state: 'value:text', time: 'value:text', conversation: 'value:text', started: 'value:text', settled: 'value:text' },
   sections: {
     chat: { text: 'The dashboard is updated: {state} at {time} UTC.' },
     'label.title': { text: 'Dashboard: {{conversation}}' },
     'label.titleUnnamed': { text: 'Conversation dashboard' },
-    'label.about': { text: "The alarm this conversation watches and the metrics published beside it, over the last three hours, then this deployment's own assistant health. It updates whenever the alarm changes." },
+    'label.about': { text: "The alarm this conversation watches and the metrics published beside it, over the last three hours, then this deployment's own assistant health. It updates whenever the alarm changes or a runbook step moves." },
     'label.deployment': { text: "This deployment's assistants (AWS Lambda)" },
     'label.updated': { text: 'Updated {time} UTC' },
     'label.stateAlarm': { text: 'In alarm' },
@@ -1031,6 +1061,19 @@ const DASHBOARD: ShippedMessageEntry = {
     'label.unavailable': { text: 'Could not be read just now.' },
     'label.values': { text: 'Values' },
     'label.time': { text: 'Time (UTC)' },
+    'label.runbook': { text: 'Runbook' },
+    'label.runbookAbout': { text: 'Where the response stands, step by step. Each step is worked in the conversation, on its card.' },
+    'label.statusNotStarted': { text: 'Not started' },
+    'label.statusInProgress': { text: 'In progress' },
+    'label.statusWaiting': { text: 'Waiting' },
+    'label.statusDone': { text: 'Done' },
+    'label.statusSkipped': { text: 'Skipped' },
+    'label.statusTimedOut': { text: 'Timed out' },
+    'label.statusFailed': { text: 'Failed' },
+    'label.heldBy': { text: 'With' },
+    'label.stepSince': { text: 'Since {{started}} UTC' },
+    'label.stepTimes': { text: '{{started}} to {{settled}} UTC' },
+    'label.openCard': { text: 'Open its card' },
   },
 };
 
@@ -1045,7 +1088,7 @@ const INCIDENT_EVENT_REPEATED: ShippedMessageEntry = {
 };
 
 /**
- * THE INCIDENT'S TASK, told privately to its lead in the incident's room and emailed (`incident-triage`'s `hold` step,
+ * THE INCIDENT'S TASK, told privately to its lead in the incident's room and emailed (`ops-room`'s `lead-task` step,
  * `assigned`): what the incident is, the steps to take and when it is resolved. It is the lead's first word in that room, in
  * place of `ops-lead-welcome`. A team saves its own of this name to link its runbook.
  */
@@ -1063,7 +1106,7 @@ const INCIDENT_OWNER_TASK: ShippedMessageEntry = {
         + '3. Customer impact: the conversation\'s assistant lists the customers affected and their account contacts.\n'
         + '4. Account teams: bring them into the call from the card it offers you.\n'
         + '5. Mitigation: the ops assistant recommends the runbook\'s action; you decide and make the change.\n'
-        + '6. Customer notice: the conversation\'s assistant drafts it and sends it to nobody; the account teams finalize it in the call and get sign-off.\n'
+        + '6. Customer messaging: where customers are impacted, the account team\'s own conversation opens beside this one, where they draft and approve each notice. The incident never waits on it.\n'
         + '7. Recovery: the ops assistant confirms it from the metrics.\n\n'
         + 'The root-cause investigation stays open beside the work. Resolving ends the runbook; the post-incident review follows once the investigation is complete.\n'
         + 'Resolve it once the alarm is back to OK and customers have been told. The team\'s conversation is told it is resolved.',
@@ -1088,7 +1131,7 @@ const INCIDENT_OWNER_TASK_NO_CALL: ShippedMessageEntry = {
         + '1. First look: the ops assistant reads the deployment\'s health and posts what stands out.\n'
         + '2. Customer impact: the conversation\'s assistant lists the customers affected and their account contacts.\n'
         + '3. Mitigation: the ops assistant recommends the runbook\'s action; you decide and make the change.\n'
-        + '4. Customer notice: the conversation\'s assistant drafts it and sends it to nobody; the account teams finalize it and get sign-off.\n'
+        + '4. Customer messaging: where customers are impacted, the account team\'s own conversation opens beside this one, where they draft and approve each notice. The incident never waits on it.\n'
         + '5. Recovery: the ops assistant confirms it from the metrics.\n\n'
         + 'The root-cause investigation stays open beside the work. Resolving ends the runbook; the post-incident review follows once the investigation is complete.\n'
         + 'Resolve it once the alarm is back to OK and customers have been told. The team\'s conversation is told it is resolved.',
@@ -1117,7 +1160,7 @@ const CUSTOMER_IMPACT: ShippedMessageEntry = {
   description: 'What the incident\'s runbook asks of the conversation\'s primary once the call is offered: the customers affected and their account contacts',
   fields: { label: 'value:text' },
   sections: {
-    chat: { text: 'Runbook for {label}: say which customer accounts this incident reaches, from what the alarm and the first look above name, with each account\'s contact, and offer to bring their account teams into the call.' },
+    chat: { text: 'Runbook for {label}: first say in one or two plain sentences what customers experience, as the first look above reads it from the metrics and the service\'s description: which actions users cannot take or that are slow, by how much, where, since when. Then say which customer accounts this incident reaches, from what the alarm and the first look above name, with each account\'s contact, and offer to bring their account teams into the call.' },
   },
 };
 
@@ -1135,11 +1178,11 @@ const CUSTOMER_NOTICE_INITIAL: ShippedMessageEntry = {
   sections: {
     chat: {
       text: 'Draft the initial customer notice for {label}, for the affected accounts the lookup above names, from the incident\'s confirmed facts above and nothing more; a fact that is not there is left out, never guessed. Keep this shape:\n'
-        + 'What is affected: the service or feature customers may see a problem with.\n'
+        + 'What customers see: which actions fail or are slow for them (for example signing in or running a workflow), in plain words from the first look\'s customer experience, without internal metric names.\n'
         + 'Since: when it started.\n'
         + 'What we are doing: we are looking into it.\n'
         + 'Next update: when the next update comes.\n'
-        + 'Mark it a draft for the account team to adjust and approve; it is sent to nobody.',
+        + 'Begin with this line exactly, in bold, before anything else: "Proposed customer notice: needs account team approval. Not sent." Put the notice itself under it. It is sent to nobody; the account team adjusts and approves it on its card.',
     },
   },
 };
@@ -1155,7 +1198,7 @@ const CUSTOMER_NOTICE_UPDATE: ShippedMessageEntry = {
         + 'Status: where the incident stands now.\n'
         + 'What we are doing: the work in progress.\n'
         + 'Next update: when the next update comes.\n'
-        + 'Mark it a draft for the account team to adjust and approve; it is sent to nobody.',
+        + 'Begin with this line exactly, in bold, before anything else: "Proposed customer notice: needs account team approval. Not sent." Put the notice itself under it. It is sent to nobody; the account team adjusts and approves it on its card.',
     },
   },
 };
@@ -1171,7 +1214,7 @@ const CUSTOMER_NOTICE_FINAL: ShippedMessageEntry = {
         + 'Resolved: when it was resolved.\n'
         + 'What you saw: what customers experienced, and for how long.\n'
         + 'What comes next: a follow-up review, shared once it is complete.\n'
-        + 'Mark it a draft for the account team to adjust and approve; it is sent to nobody.',
+        + 'Begin with this line exactly, in bold, before anything else: "Proposed customer notice: needs account team approval. Not sent." Put the notice itself under it. It is sent to nobody; the account team adjusts and approves it on its card.',
     },
   },
 };
@@ -1183,7 +1226,7 @@ const CUSTOMER_NOTICE_APPROVAL: ShippedMessageEntry = {
   description: 'Asked privately of the account team lead with the approval card: approve the drafted customer notice once it is adjusted',
   fields: { label: 'value:text' },
   sections: {
-    chat: { text: 'Customer notice for {label}: adjust the draft above with the account\'s CSMs, then approve it here. Approving it records it as ready; your team sends it through its own tools.' },
+    chat: { text: 'The proposed customer notice for {label} needs your approval: adjust the draft above with the account\'s CSMs, then approve it here. Approving it records it as ready; your team sends it through its own tools.' },
     'email.subject': { text: 'Approve the customer notice for {{label}}' },
   },
 };
@@ -1311,10 +1354,10 @@ const CUSTOMER_MESSAGING_RESOLVED: ShippedMessageEntry = {
 const CUSTOMER_NOTICE_APPROVED: ShippedMessageEntry = {
   name: 'customer-notice-approved',
   kind: 'message',
-  description: 'What the incident conversation is told when the account team approves a customer notice',
-  fields: { label: 'value:text' },
+  description: 'What the incident conversation is told when the account team approves a customer notice, naming the version approved',
+  fields: { label: 'value:text', approvedDocument: 'value:text' },
   sections: {
-    chat: { text: 'The account team approved a customer notice for {label}.' },
+    chat: { text: 'The account team approved a customer notice for {label}.[[ Approved version: {{approvedDocument}}.]]' },
   },
 };
 
@@ -1388,8 +1431,9 @@ const OPS_FIRST_LOOK: ShippedMessageEntry = {
   sections: {
     prompt: {
       text: 'An event has just opened this ops conversation, and the conversation\'s opening is already posted above. Read the '
-        + 'deployment\'s health with the tool you have, then post a short first look for the people here: which '
-        + 'alarms are firing or recently changed state, what they point at, and the one thing worth checking first. '
+        + 'deployment\'s health with the tool you have, then post a short first look for the people here: first what a customer of the affected service sees now, read from '
+        + 'the watched alarm\'s figures and the metrics beside it, each turned into what a person notices with the figure '
+        + 'beside it; then which alarms are firing or recently changed state, what they point at, and the one thing worth checking first. '
         + 'Say plainly when the health read shows nothing wrong or could not be read. Do not guess at causes the '
         + 'data does not show, and keep it to a few short lines.',
     },
@@ -1471,7 +1515,7 @@ const INCIDENT_RECHECK_ASK: ShippedMessageEntry = {
   description: 'What the conversation\'s assistant asks the ops assistant for when the alarm the conversation watches changes state: the health read again, and what changed',
   fields: { alarm: 'value:text', alarmState: 'value:text' },
   sections: {
-    chat: { text: "The alarm this conversation is watching, {alarm}, is now {alarmState}. That state is confirmed. Your read lists only the alarms this deployment's stacks declare, so it may not list this one: do not report it as clear, and do not explain the gap any other way. Please read the deployment's health again and say what changed since the conversation last looked: what it points at now, and whether the incident looks to be recovering or spreading. Say plainly when a change is too small to mean anything, and do not guess at causes the data does not show." },
+    chat: { text: "The alarm this conversation is watching, {alarm}, is now {alarmState}. That state is confirmed. Your read lists only the alarms this deployment's stacks declare, so it may not list this one: do not report it as clear, and do not explain the gap any other way. Please read the deployment's health again and say what changed since the conversation last looked: what customers experience now, from the watched alarm's figures, what it points at now, and whether the incident looks to be recovering or spreading. Say plainly when a change is too small to mean anything, and do not guess at causes the data does not show." },
   },
 };
 
@@ -1638,7 +1682,7 @@ export function shippedMessageTemplates(): Map<string, ShippedMessageTemplate> {
   const notices = (Object.keys(DEFAULT_NOTICE_COPY) as NoticeCopyKey[]).filter((k) => !NOTICE_HOMES[k]).map(noticeEntry);
   const entries = [
     NOTIFICATION_EMAIL, EMAIL_PREFERENCES, MEMBER_WELCOME(), INVITATION, CLAIM, BRIEFING(), CONVERSATION_NAME,
-    CHILD_CONVERSATION_OPENED, MEETING_STARTED, MEETING_STARTED_FROM, MEETING_STARTED_INCIDENT, MEETING_ENDED, ...MEETING_ENDED_HOW, ...MEETING_TIMEOUTS, MEETING_SUMMARY, ...MEETING_SUMMARY_PARTS, ...MEETING_TRANSCRIPTION_NOTICES, MEETING_FILES_GUIDANCE, ...MEETING_RECORDING_STATUS, INCIDENT_DECLARED, INCIDENT_RESOLVED_TEAM, INCIDENT_TRIAGE, INCIDENT_INVESTIGATION, INCIDENT_RESOLVED, POST_INCIDENT_REVIEW, POST_INCIDENT_REVIEW_UNAVAILABLE, POST_INCIDENT_REVIEW_DRAFT, INCIDENT_RESOLVE_CONFIRM, INCIDENT_KEPT_OPEN, INCIDENT_TIMED_OUT, INCIDENT_ENDED_UNRESOLVED, WATCHED_EVENT, INCIDENT_EVENT_REPEATED, DASHBOARD, TASK_ASSIGNED, WORKFLOW_TASK_ASSIGNED, WORKFLOW_TASK_REMINDER, WORKFLOW_STEP_WITHHELD, TASK_PICKUP, JOIN_RECAP, WELCOME_GREETING, OPS_ROOM_OPENING, INCIDENT_OWNER_TASK, INCIDENT_OWNER_TASK_NO_CALL, INCIDENT_CALL_OFFER, RUNBOOK_CAUSE, CUSTOMER_IMPACT, CUSTOMER_IMPACT_CONFIRM, CUSTOMER_MESSAGING_OPENED, CUSTOMER_MESSAGING_NOT_OPENED, CUSTOMER_MESSAGING_MITIGATING, CUSTOMER_MESSAGING_OPENING, CUSTOMER_MESSAGING_ACCOUNTS, CUSTOMER_NOTICE_INITIAL, CUSTOMER_NOTICE_UPDATE, CUSTOMER_NOTICE_FINAL, CUSTOMER_NOTICE_APPROVAL, CUSTOMER_NOTICE_LATE, CUSTOMER_NOTICE_APPROVED, CUSTOMER_MESSAGING_UPDATES, CUSTOMER_MESSAGING_FINAL_READY, CUSTOMER_MESSAGING_RESOLVED, RUNBOOK_DECISION, RUNBOOK_ACT, RUNBOOK_VERIFY, OPS_LEAD_WELCOME, OPS_FIRST_LOOK, OPS_FIRST_LOOK_UNAVAILABLE, OPS_ASSISTANT_ABSENT, WORKFLOW_OPENING, WORKFLOW_SUBJECT_WELCOME,
+    CHILD_CONVERSATION_OPENED, MEETING_STARTED, MEETING_STARTED_FROM, MEETING_STARTED_INCIDENT, MEETING_ENDED, ...MEETING_ENDED_HOW, ...MEETING_TIMEOUTS, MEETING_SUMMARY, ...MEETING_SUMMARY_PARTS, ...MEETING_TRANSCRIPTION_NOTICES, MEETING_FILES_GUIDANCE, ...MEETING_RECORDING_STATUS, INCIDENT_DECLARED, INCIDENT_RESOLVED_TEAM, INCIDENT_TRIAGE, INCIDENT_INVESTIGATION, INCIDENT_RESOLVED, INCIDENT_REOPENED, POST_INCIDENT_REVIEW, POST_INCIDENT_REVIEW_UNAVAILABLE, POST_INCIDENT_REVIEW_DRAFT, INCIDENT_RESOLVE_CONFIRM, INCIDENT_KEPT_OPEN, INCIDENT_TIMED_OUT, INCIDENT_ENDED_UNRESOLVED, INCIDENT_NOT_OPENED, WATCHED_EVENT, INCIDENT_EVENT_REPEATED, DASHBOARD, TASK_ASSIGNED, WORKFLOW_TASK_ASSIGNED, WORKFLOW_TASK_REMINDER, WORKFLOW_STEP_WITHHELD, TASK_PICKUP, JOIN_RECAP, WELCOME_GREETING, OPS_ROOM_OPENING, INCIDENT_OWNER_TASK, INCIDENT_OWNER_TASK_NO_CALL, INCIDENT_CALL_OFFER, RUNBOOK_CAUSE, CUSTOMER_IMPACT, CUSTOMER_IMPACT_CONFIRM, CUSTOMER_MESSAGING_OPENED, CUSTOMER_MESSAGING_NOT_OPENED, CUSTOMER_MESSAGING_MITIGATING, CUSTOMER_MESSAGING_OPENING, CUSTOMER_MESSAGING_ACCOUNTS, CUSTOMER_NOTICE_INITIAL, CUSTOMER_NOTICE_UPDATE, CUSTOMER_NOTICE_FINAL, CUSTOMER_NOTICE_APPROVAL, CUSTOMER_NOTICE_LATE, CUSTOMER_NOTICE_APPROVED, CUSTOMER_MESSAGING_UPDATES, CUSTOMER_MESSAGING_FINAL_READY, CUSTOMER_MESSAGING_RESOLVED, RUNBOOK_DECISION, RUNBOOK_ACT, RUNBOOK_VERIFY, OPS_LEAD_WELCOME, OPS_FIRST_LOOK, OPS_FIRST_LOOK_UNAVAILABLE, OPS_ASSISTANT_ABSENT, WORKFLOW_OPENING, WORKFLOW_SUBJECT_WELCOME,
     JOIN_RECAP_UNAVAILABLE, INCIDENT_ALARM_CHANGED, INCIDENT_RECHECK_ASK, ASKED_INTENT_TURN,
     INVITATION_NUDGE_DRAFT, INVITATION_NUDGE_PROPOSAL, INVITATION_UNREDEEMED_REMINDER, OPEN_CONVERSATION_PROPOSAL, ADD_TO_MEETING_PROPOSAL, ...SLICE_2(), ...notices,
   ];

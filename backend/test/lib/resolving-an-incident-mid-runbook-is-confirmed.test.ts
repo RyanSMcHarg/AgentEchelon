@@ -1,6 +1,6 @@
 /**
  * RESOLVING AN INCIDENT WHILE ITS RUNBOOK HAS STEPS OPEN IS CONFIRMED FIRST, AND A CONFIRMED RESOLVE ENDS THE RUN
- * (owner decision 2026-11-14; SPEC-WORKFLOWS-AND-TASKS, the alongside requirement).
+ * (SPEC-WORKFLOWS-AND-TASKS, the alongside requirement).
  *
  * What it proves:
  *  - the `ops-room` step that opens the incident declares that its settlement ends the run (`endsRun`) and that a settling

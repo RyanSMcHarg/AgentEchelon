@@ -361,7 +361,7 @@ const about = {
   answering_guidance:
     'Answer from these summaries and, when deployed in Aurora mode, from the retrieved full docs. '
     + 'Point the user at the named doc path for detail. Do not fabricate; if it is not here, say so. '
-    // ── WHAT IT CAN CITE AND WHAT IT CANNOT REACH (owner-reported, 2026-09-05) ─────────────────
+    // ── WHAT IT CAN CITE AND WHAT IT CANNOT REACH ─────────────────
     //
     // Asked about the project's origin, the assistant reached for the company documents, found
     // nothing, and reported that the platform's authorship was outside the knowledge it has. The

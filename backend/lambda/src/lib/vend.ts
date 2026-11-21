@@ -336,11 +336,20 @@ export async function refuseLapsedConsoleRole(
  * GUID in the mention menu); else `cognito:username` when it is not a UUID; else the fallback. Never an
  * address.
  */
+/**
+ * THE PERSON'S REAL NAME AS THEIR IDENTITY PROVIDER GIVES IT: `name`, else the given and family names joined, as the pool
+ * directory reads a record (`cognito-pool-directory.ts`). Empty where the token names nobody.
+ */
+export function realNameOf(claims: Record<string, unknown>): string {
+  const text = (v: unknown) => (typeof v === 'string' ? v.trim() : '');
+  return text(claims.name) || [text(claims.given_name), text(claims.family_name)].filter(Boolean).join(' ');
+}
+
 export function displayNameOf(claims: Record<string, unknown>, fallback = ''): string {
   const emailLocal = typeof claims.email === 'string' && claims.email.includes('@') ? claims.email.split('@')[0] : '';
   const uname = (claims['cognito:username'] || '').toString();
   const unameUsable = uname && !/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(uname) ? uname : '';
-  return (claims.name || emailLocal || unameUsable || fallback).toString();
+  return (realNameOf(claims) || emailLocal || unameUsable || fallback).toString();
 }
 
 /**

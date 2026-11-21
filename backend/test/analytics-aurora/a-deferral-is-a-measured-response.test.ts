@@ -1,5 +1,5 @@
 /**
- * A DEFERRAL IS A RESPONSE, AND IT WAS NOT MEASURED AT ALL (maintainer, 2026-09-02).
+ * A DEFERRAL IS A RESPONSE, AND IT WAS NOT MEASURED AT ALL.
  *
  * A message that arrives while the assistant is busy is queued, and the person gets a real, visible
  * reply saying so within about 20 to 50ms. That is their first feedback. Nothing recorded it:
@@ -145,7 +145,7 @@ describe('the migration makes it queryable and does not over-claim', () => {
 });
 
 /**
- * THE READ INSTANT IS THE SETTLE, NOT THE FIRST UPDATE (maintainer, 2026-09-03).
+ * THE READ INSTANT IS THE SETTLE, NOT THE FIRST UPDATE.
  *
  * Migration 039 took `MIN(occurred_at)` over every `notice_posted` row for a notice and called it
  * `settled_at`. The notice is ONE message updated in place - posted, updated per queued send, updated

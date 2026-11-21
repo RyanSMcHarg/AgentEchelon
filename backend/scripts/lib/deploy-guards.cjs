@@ -343,7 +343,8 @@ function corsPassOrigins({ pre = {}, late = {} }) {
  *  - the origins are resolved before the first backend pass, so CORS is right in that pass;
  *  - the mode is recorded only after the first backend pass succeeds;
  *  - a configuration that drops a classification an assistant created in the console is active in is refused
- *    before the first backend pass (a classification's seed never fails its stack's delete).
+ *    before the first backend pass (a classification's seed never fails its stack's delete);
+ *  - each operational admin notice's state parameter exists before the first backend pass, since its rule reads it at deploy.
  */
 const DEPLOY_STEPS = [
   'build',
@@ -355,6 +356,7 @@ const DEPLOY_STEPS = [
   'resolveOrigins',
   'assertNoRollback',
   'assertNoOrphanedConsoleAssistants',
+  'ensureAdminNoticeStates',
   'deployBackend',
   'recordAnalyticsMode',
   'recordDeployedCommits',

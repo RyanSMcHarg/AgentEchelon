@@ -59,15 +59,14 @@ describe('the intent workflows field', () => {
   });
 
   it('Restore puts a multi-step intent\'s starting steps back, never removing its workflow', () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     const onPatch = vi.fn();
     render(<IntentWorkflowsFields config={DECLARED} catalog={catalog} onPatch={onPatch} />);
     fireEvent.click(screen.getByTestId('intent-workflow-reset-report_generation'));
+    fireEvent.click(screen.getByTestId('intent-workflow-reset-report_generation-confirm-button'));
     expect(onPatch).toHaveBeenCalledWith({ intentWorkflows: { report_generation: canonicalIntentWorkflow('report_generation') } });
   });
 
   it('a single-turn intent may be given a workflow that assigns no task, and have it removed', () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     const onPatch = vi.fn();
     render(<IntentWorkflowsFields config={DECLARED} catalog={catalog} onPatch={onPatch} />);
     fireEvent.click(screen.getByTestId('intent-workflow-add-general_question'));
@@ -75,6 +74,7 @@ describe('the intent workflows field', () => {
     expect(added).toEqual({ on: { intent: 'general_question' }, initial: 'done', states: { done: { disposition: 'success' } } });
     expect(screen.getByTestId('intent-workflow-no-task-general_question')).toBeTruthy();
     fireEvent.click(screen.getByTestId('intent-workflow-reset-general_question'));
+    fireEvent.click(screen.getByTestId('intent-workflow-reset-general_question-confirm-button'));
     expect(onPatch.mock.calls.at(-1)![0].intentWorkflows).toEqual({ report_generation: canonicalIntentWorkflow('report_generation') });
   });
 });

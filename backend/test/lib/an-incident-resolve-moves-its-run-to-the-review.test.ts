@@ -1,14 +1,15 @@
 /**
  * AN INCIDENT'S RESOLVE MOVES ITS RUN TO THE REVIEW (SPEC-WORKFLOWS-AND-TASKS WT129; SPEC-PROCESSES P11; DESIGN-PROCESSES O15, O20, O22).
  *
- * What it proves: incident response is the content of `incident-triage` and `ops-room`, built from the existing steps and one
- * field (`movesTo`): triage on the incident card opens the incident conversation; the root-cause investigation is a living task
+ * What it proves: incident response is the content of `incident-triage` and `ops-room`, built from the existing steps and the
+ * fields `movesTo` and `wait: { alongside }`: the alarm opens the incident conversation at once, asking nobody first, and
+ * triage is the incident conversation's own; the root-cause investigation is a living task
  * beside the work; resolving moves the run on rather than ending it, cancelling the runbook's open tasks and keeping the
  * investigation; the post-incident review runs in the incident conversation, drafted by the ops assistant and completed on a
  * card, and starts only once resolve is reached and the investigation is complete (`wait: { alongside }`), so a wait that
  * fails never starts it and the run ends after the review, its ending the resolve's alone, so the team hears nothing after
  * "resolved" however the investigation ended; the team conversation runs no review of its own. The ops team's
- * process links the two workflows by one id, and no step crosses to another team (O22). The runbook drafts no customer notice:
+ * process links its three workflows (`incident-triage`, `ops-room`, `customer-messaging`) by one id, and no step crosses to another team (O22). The runbook drafts no customer notice:
  * customer messaging is its own track beside the incident (O31, `customer-messaging-is-a-track-beside-the-incident.test.ts`).
  */
 import { readFileSync } from 'fs';
@@ -53,7 +54,10 @@ describe('the incident\'s shape (WT129)', () => {
   it('the alarm opens the incident conversation at once, asking nobody first', () => {
     expect(team.initial).toBe('open');
     expect(s(team).open.onSuccess).toBe('tell');
-    expect(s(team).open.onFailure).toBe('done');
+    // AN INCIDENT THAT COULD NOT OPEN tells the team why and ends failed (`an-incident-is-held-by-its-own-conversation.test.ts`).
+    expect(s(team).open.onFailure).toBe('tell-not-opened');
+    expect(s(team)['tell-not-opened'].onSuccess).toBe('failed');
+    expect(s(team).failed).toEqual({ disposition: 'failure' });
   });
 
   it('the investigation is a living task beside the work, never required before resolve', () => {
@@ -78,7 +82,7 @@ describe('the incident\'s shape (WT129)', () => {
     expect(s(room).review.onSuccess).toBe('done');
     // ONLY THE RESOLVE REACHES IT: no step before resolve leads to the wait, and the wait's failure edge leads to no review.
     expect(reachable(room, 'lead-task').has('investigation-complete')).toBe(false);
-    expect(reachable(room, 'done').has('review')).toBe(false);
+    for (const to of edgeTargets(s(room)['investigation-complete'].onFailure)) expect(reachable(room, to).has('review')).toBe(false);
     // THE TEAM CONVERSATION RUNS NO REVIEW: its run ends once the incident's has.
     expect(reachable(team, 'open').has('review')).toBe(false);
     expect(Object.keys(s(team))).not.toContain('review-draft');
@@ -214,18 +218,18 @@ describe('the incident as one process (P11, O22)', () => {
   const processes = opsIncidentProcess();
   const own = { 'incident-triage': team, 'ops-room': room, 'customer-messaging': SHIPPED_EVENT_WORKFLOWS['customer-messaging'] };
 
-  it('links both workflows by one process id, with a declared metric, and nothing else', () => {
+  it('links its three workflows by one process id, with a declared metric, and nothing else', () => {
     expect(versionProcessesErrors(processes, own)).toEqual([]);
     expect(Object.keys(processes['incident-response']).sort()).toEqual(['description', 'label', 'metrics', 'workflows']);
     expect(processes['incident-response'].workflows).toEqual(['incident-triage', 'ops-room', 'customer-messaging']);
   });
 
-  it('DENY: a process entry that declares hand-offs is refused, since no hand-off is built (O22)', () => {
-    const withHandoffs = { 'incident-response': { ...processes['incident-response'], handoffs: { 'customer-communication': { fields: { incident: { type: 'id' } } } } } };
-    expect(versionProcessesErrors(withHandoffs, own)).toEqual(['processes.incident-response: PROCESSES_SHAPE']);
+  it('DENY: a hand-off of free text is refused on the incident\'s process, as on any (O2)', () => {
+    const withHandoffs = { 'incident-response': { ...processes['incident-response'], handoffs: { 'customer-communication': { fields: { note: { type: 'text' } } } } } };
+    expect(versionProcessesErrors(withHandoffs, own)).toEqual(['processes.incident-response.handoffs.customer-communication.fields.note: HANDOFF_FIELD_TYPE']);
   });
 
-  it('no step of either workflow crosses to another team', () => {
+  it('no step of any of its three workflows crosses to another team', () => {
     for (const wf of [room, team, SHIPPED_EVENT_WORKFLOWS['customer-messaging']]) for (const d of Object.values(s(wf))) expect(Object.keys(d)).not.toContain('handoff');
     expect(Object.keys(SHIPPED_EVENT_WORKFLOWS)).not.toContain('customer-messaging-finalized');
   });

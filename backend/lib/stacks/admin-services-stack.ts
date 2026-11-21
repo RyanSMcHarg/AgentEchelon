@@ -82,11 +82,15 @@ import {
   taskServiceByNameStatements,
   EVERY_CLASSIFICATION,
   messageTemplateReadStatements,
+  eventTriggersRoleName,
+  processBusRuleArn,
+  processEventBusName,
 } from './agent-classification-common';
 import type { ArchiveStackAurora } from './archive-stack-aurora';
 import { TEAM_MEMBERS_GROUP_PRECEDENCE } from '../config/profiles';
 import { templateFamilyPrefix, templatePointerPath } from '../../lambda/src/lib/template-store';
 import { ADMIN_NOTICE_ASSISTANT, ADMIN_NOTICE_CLASSIFICATION } from '../../lambda/src/lib/admin-notice-templates';
+import { ADMIN_NOTICE_TYPES, BOUNDARY_REFUSAL_ALARM_SUFFIX, adminNoticeRuleName, adminNoticeStateParam } from '../../lambda/src/lib/admin-notice-types';
 import { ADMIN_TWIN_OWNER_TAG } from '../../lambda/src/lib/person-arn';
 import { typedCreatorName } from '../constructs/conversation-creator';
 
@@ -350,6 +354,12 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
       actions: ['chime:DescribeChannel'],
       resources: [`${props.appInstanceArn}/channel/*`],
     }));
+    // THE TAGS OF A CHANNEL ALREADY AT THE FIXED ID (`adminNoticesChannelId`), read before it is reused, on that id's family only.
+    fn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadTheFixedIdsTags',
+      actions: ['chime:ListTagsForResource'],
+      resources: [`${props.appInstanceArn}/channel/adm-notices-*`],
+    }));
     fn.addToRolePolicy(new iam.PolicyStatement({
       sid: 'ManageTheAdminChannelAsTheAdminAgent',
       actions: ['chime:DescribeChannel', 'chime:UpdateChannel', 'chime:DeleteChannel'],
@@ -531,11 +541,26 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
       resources: [`${props.appInstanceArn}/bot/*`],
       conditions: { StringEquals: { 'aws:ResourceTag/classification': profiles.adminPlaneValues() } },
     }));
-    new events.Rule(this, 'AdminAlertRule', {
-      description: 'Post every platform alert this instance raises into the admin notification channel',
-      eventPattern: { source: [ALERT_SOURCE], detail: { instance: [INSTANCE_NAME] } },
-      targets: [new targets.LambdaFunction(poster, { retryAttempts: 2 })],
-    });
+    // ONE RULE PER NOTICE TYPE (DESIGN-EVENT-TARGETS section 12), this stack's, outside the trigger service's rule prefix, so no
+    // person creates one and the service's targets stay relays. A security notice's rule is always enabled; an operational
+    // notice's state is read at deploy from a parameter no stack owns, which the trigger service writes when an administrator
+    // switches it, so the switch survives a deploy (the deploy scripts write ENABLED where it is absent).
+    for (const t of ADMIN_NOTICE_TYPES) {
+      const alarmName = t.alarms === 'boundary-refusal' ? events.Match.suffix(BOUNDARY_REFUSAL_ALARM_SUFFIX)
+        : t.alarms === 'every-other' ? events.Match.anythingButSuffix(BOUNDARY_REFUSAL_ALARM_SUFFIX) : undefined;
+      const rule = new events.Rule(this, `AdminNotice-${t.key}`, {
+        ruleName: adminNoticeRuleName(STACK_PREFIX, t.key),
+        description: `Post the ${t.messageType} notices this instance raises into the admin notifications conversation${t.security ? ' (security: always on)' : ''}`,
+        eventPattern: {
+          source: [ALERT_SOURCE], detailType: [t.messageType],
+          detail: { instance: [INSTANCE_NAME], ...(alarmName ? { notice: { extra: { alarmName } } } : {}) },
+        },
+        targets: [new targets.LambdaFunction(poster, { retryAttempts: 2 })],
+      });
+      if (!t.security) {
+        (rule.node.defaultChild as events.CfnRule).state = new cdk.CfnDynamicReference(cdk.CfnDynamicReferenceService.SSM, adminNoticeStateParam(SSM_ROOT, t.key)).toString();
+      }
+    }
   }
 
   // ── THE ADMIN CREDENTIAL EXCHANGE (L3) ──────────────────────────────────────────────────────────────
@@ -1349,24 +1374,46 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
         TYPED_CREATOR_NAME_PATTERN: typedCreatorName('{classification}'),
         EVENT_TRIGGER_RELAY_NAME_PATTERN: `${STACK_PREFIX}Assistants-{classification}-EventTriggerRelay`,
         EVENT_POLICY_PARAM: `${SSM_ROOT}/event-triggers/policy`,
+        // THE OPERATIONAL ADMIN NOTICES' STATE PARAMETERS live under it (`adminNoticeStateParam`).
+        SSM_ROOT,
         // A WATCH RULE ON A PLATFORM SOURCE MATCHES THIS INSTANCE (DESIGN-EVENT-TARGETS section 4), as its opener's rule does.
         AE_INSTANCE_NAME: INSTANCE_NAME,
+        // THE PROCESS EVENT BUS (DESIGN-PROCESSES section 12): a hand-off's rule is written there, and nowhere else.
+        PROCESS_EVENT_BUS: processEventBusName(),
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
+    // A FIXED NAME (DESIGN-PROCESSES section 12): the process event bus admits rule and target writes from this role's ARN alone,
+    // built from the name with no reference to this stack.
+    (triggersFn.role!.node.defaultChild as iam.CfnRole).roleName = eventTriggersRoleName();
     // THIS INSTANCE'S TRIGGER RULES ONLY: the separator after the prefix keeps a look-alike instance's rules outside the grant.
     // AND ITS WATCH RULES (DESIGN-EVENT-TARGETS section 4): a watched conversation's trigger, whose binding is the rule's own tags.
-    const triggerRules = [`arn:aws:events:${this.region}:${this.account}:rule/${STACK_PREFIX}-*-trigger-*`, `arn:aws:events:${this.region}:${this.account}:rule/${STACK_PREFIX}-*-watch-*`];
+    // A HAND-OFF'S RULES (DESIGN-PROCESSES section 12) are on the process event bus, under the same prefixes.
+    const triggerRules = [
+      `arn:aws:events:${this.region}:${this.account}:rule/${STACK_PREFIX}-*-trigger-*`, `arn:aws:events:${this.region}:${this.account}:rule/${STACK_PREFIX}-*-watch-*`,
+      processBusRuleArn(this, `${STACK_PREFIX}-*-trigger-*`), processBusRuleArn(this, `${STACK_PREFIX}-*-watch-*`),
+    ];
     triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'WriteOnlyTriggerRules', actions: ['events:PutRule', 'events:DeleteRule', 'events:RemoveTargets', 'events:TagResource'], resources: triggerRules }));
     triggersFn.addToRolePolicy(new iam.PolicyStatement({
       sid: 'TargetOnlyARelay', actions: ['events:PutTargets'], resources: triggerRules,
       conditions: { ArnLike: { 'events:TargetArn': `arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Assistants-*-EventTriggerRelay` } },
     }));
+    // AN OPERATIONAL NOTICE IS SWITCHED, NEVER REWRITTEN (DESIGN-EVENT-TARGETS section 12): enable and disable on those rules
+    // alone, and their state parameters. A security notice's rule is named in no grant.
+    const switchable = ADMIN_NOTICE_TYPES.filter((t) => !t.security);
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'SwitchOperationalNotices', actions: ['events:EnableRule', 'events:DisableRule'],
+      resources: switchable.map((t) => `arn:aws:events:${this.region}:${this.account}:rule/${adminNoticeRuleName(STACK_PREFIX, t.key)}`),
+    }));
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'RecordOperationalNoticeState', actions: ['ssm:GetParameter', 'ssm:PutParameter'],
+      resources: switchable.map((t) => cdk.Arn.format({ service: 'ssm', resource: 'parameter', resourceName: adminNoticeStateParam(SSM_ROOT, t.key).replace(/^\//, '') }, this)),
+    }));
     triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadARuleToCopy', actions: ['events:DescribeRule'], resources: [`arn:aws:events:${this.region}:${this.account}:rule/*`] }));
     // A WATCH RULE IS LISTED BY ITS OWN TAGS AND ITS TARGET'S KEY PATH, on this instance's watch rules only, and a team
     // room's trigger by the `assistant` tag it was attached for, on this instance's trigger rules only.
-    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadWatchRules', actions: ['events:ListTagsForResource', 'events:ListTargetsByRule'], resources: [triggerRules[1]] }));
-    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadTriggerRuleTags', actions: ['events:ListTagsForResource'], resources: [triggerRules[0]] }));
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadWatchRules', actions: ['events:ListTagsForResource', 'events:ListTargetsByRule'], resources: [triggerRules[1], triggerRules[3]] }));
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadTriggerRuleTags', actions: ['events:ListTagsForResource'], resources: [triggerRules[0], triggerRules[2]] }));
     // LIST IS EVALUATED ON THE REGISTRY'S OWN SCHEMA PATH (`schema/aws.events`, no name after it), DESCRIBE ON ONE SCHEMA's.
     triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadEventTypes', actions: ['schemas:ListSchemas', 'schemas:DescribeSchema'], resources: ['aws.events', 'discovered-schemas'].flatMap((r) => [`arn:aws:schemas:${this.region}:${this.account}:registry/${r}`, `arn:aws:schemas:${this.region}:${this.account}:schema/${r}`, `arn:aws:schemas:${this.region}:aws:schema/${r}/*`, `arn:aws:schemas:${this.region}:${this.account}:schema/${r}/*`]) }));
     triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadTeamRoomTags', actions: ['chime:ListTagsForResource'], resources: [`${props.appInstanceArn}/channel/team-*`] }));
@@ -1378,10 +1425,24 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
     // LISTING RULES TAKES NO RESOURCE: AWS evaluates `events:ListRules` on `*`, so a rule ARN never matches. It reads names only.
     triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'CountTriggerRules', actions: ['events:ListRules'], resources: ['*'] }));
     triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadAndWriteTheEventPolicy', actions: ['ssm:GetParameter', 'ssm:PutParameter'], resources: [cdk.Arn.format({ service: 'ssm', resource: 'parameter', resourceName: `${SSM_ROOT}/event-triggers/policy`.replace(/^\//, '') }, this)] }));
+    // THE ACTIVE DEFINITIONS' DECLARED HAND-OFFS (DESIGN-PROCESSES section 4.2): one read, of the definition parameters only. No
+    // path read, no history, no draft, no KMS and no body: a hand-off's declaration is inline on the definition.
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ReadActiveDefinitions', actions: ['ssm:GetParameter'], resources: [cdk.Arn.format({ service: 'ssm', resource: 'parameter', resourceName: `${SSM_ROOT}/assistant/*/definition`.replace(/^\//, '') }, this)] }));
     conversations('GET', '/admin/event-policy', triggersFn);
     conversations('POST', '/admin/event-policy', triggersFn);
     conversations('GET', '/admin/event-types', triggersFn);
+    // THE ACCOUNT'S RULES AND ALARMS for the trigger form (`manage-event-triggers`). Rules are read on the grants above. Alarms
+    // are read only, and a listing takes no alarm ARN, as `events:ListRules` takes none: `cloudwatch:DescribeAlarms` changes nothing.
+    triggersFn.addToRolePolicy(new iam.PolicyStatement({ sid: 'ListAlarmsForTheForm', actions: ['cloudwatch:DescribeAlarms'], resources: ['*'] }));
+    conversations('GET', '/admin/admin-notices', triggersFn);
+    conversations('POST', '/admin/admin-notices/{key}', triggersFn);
+    conversations('GET', '/admin/event-rules', triggersFn);
+    conversations('GET', '/admin/event-alarms', triggersFn);
     conversations('GET', '/admin/event-triggers/{typeKey}/{classification}', triggersFn);
+    // A TEAM'S OWN TRIGGERS (`view-event-triggers`): its console session names its assistants on this route, and the handler
+    // re-reads the caller's teams and the assistant's owner before it lists the rules attached for that assistant.
+    conversations('GET', '/admin/assistants/{assistant}/event-triggers/{typeKey}/{classification}', triggersFn);
+    grantAssistantScopeCheck(triggersFn, props.appInstanceArn, props.selfPoolId, { tableName: props.identitiesTable.tableName, tableArn: props.identitiesTable.tableArn });
     conversations('POST', '/admin/event-triggers/{typeKey}/{classification}', triggersFn);
     conversations('POST', '/admin/event-triggers/{typeKey}/{classification}/{ruleId}/remove', triggersFn);
 

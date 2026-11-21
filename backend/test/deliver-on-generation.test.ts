@@ -1,5 +1,5 @@
 /**
- * THE DELIVERY CONTRACT IS DECLARED, NOT INFERRED (maintainer decision 2026-08-18).
+ * THE DELIVERY CONTRACT IS DECLARED, NOT INFERRED.
  *
  * This file used to pin the opposite: `advanceDeliveredTaskToCompletion` walked a task to its
  * terminal state whenever the OUTPUT looked deliverable-shaped, and `completeOnDelivery` keyed
@@ -177,7 +177,7 @@ describe('every task-state writer is a DECLARATION (the exclusivity test §8 nev
     // structure or from what the output looked like. Add it here with that argument stated, or the
     // commit that adds it fails this test - which is the point.
     //
-    //   assistant-async-processor.ts x1   the delivered-step close (maintainer, 2026-08-20)
+    //   assistant-async-processor.ts x1   the delivered-step close
     //
     // AND IT DOES NOT MEET THE RULE ABOVE, which is stated plainly rather than argued around. It is an
     // inference from structure: the machine declares the state `delivers`, a document was uploaded, so
@@ -203,7 +203,7 @@ describe('every task-state writer is a DECLARATION (the exclusivity test §8 nev
     // If that gating is ever loosened, this entry should be removed rather than widened: the value of
     // this test is that a third writer had to argue for itself in writing, and a fourth must too.
     //
-    //   lib/queue-drain-task.ts x4        the drain's stage, and its close (maintainer, 2026-09-03)
+    //   lib/queue-drain-task.ts x4        the drain's stage, and its close
     //
     // FOUR CALLS, TWO DECISIONS. One mirrors the stage. The other three are the close: it asks for
     // `settled`, and when the machine refuses - a drain that asked something sits in `clarifying` -
@@ -216,8 +216,8 @@ describe('every task-state writer is a DECLARATION (the exclusivity test §8 nev
     // removed walker read what the output looked like and closed steps nobody had answered.
     //
     // A drain cannot have that failure mode, and the reason is a property of the machine rather than
-    // a promise about the code: `queue_drain` declares no `awaits` at any step (maintainer, 2026-09-03 -
-    // a drain that waits is a queue that lives until somebody answers). There is no party whose
+    // a promise about the code: `queue_drain` declares no `awaits` at any step (a
+    // drain that waits is a queue that lives until somebody answers). There is no party whose
     // answer could be annexed, because no step of a drain is ever waiting for one. That is asserted
     // directly, in `a-step-declares-who-it-awaits.test.ts`, which names this machine as the single
     // shipped exception to every-machine-has-a-wait.
@@ -233,7 +233,7 @@ describe('every task-state writer is a DECLARATION (the exclusivity test §8 nev
     // If a drain ever gains a waiting step, this entry must be removed rather than kept: the whole
     // argument above rests on there being none.
     //
-    //   lib/async-processor-core.ts x1   the merge that a combination answered (maintainer, 2026-09-03)
+    //   lib/async-processor-core.ts x1   the merge that a combination answered
     //
     // THE ARGUMENT. `queued_combination` asks two people whether their requests are one thing and who
     // would own the result. The model declares `merging` on a state that AWAITS a person, having read

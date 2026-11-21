@@ -35,7 +35,10 @@ export function idTokenDisplayClaims(idToken: string | null | undefined): IdToke
   if (!payload) return null;
   return {
     email: text(payload['email']),
-    name: text(payload['name']),
+    // THE NAME AS THE DIRECTORY READS IT (`cognito-pool-directory.ts`): `name`, else the given and family names, so a person
+    // whose identity provider sends only those is shown by name rather than by email.
+    name: text(payload['name'])
+      || text([text(payload['given_name']), text(payload['family_name'])].filter(Boolean).join(' ').trim()),
     tier: text(payload['custom:tier']),
   };
 }

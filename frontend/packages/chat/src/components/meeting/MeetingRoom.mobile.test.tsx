@@ -147,10 +147,10 @@ describe('at a phone width', () => {
     expect(screen.queryByTestId('meeting-pane-unread')).toBeNull();
   });
 
-  it('closing the chat from its own header returns to the video, which takes the window', () => {
+  it('the Video tab returns from the chat to the video, which takes the window', () => {
     render(<Window />);
     fireEvent.click(tab(en.meeting.panes.chat));
-    fireEvent.click(screen.getByRole('button', { name: en.meeting.chat.hide }));
+    fireEvent.click(tab(en.meeting.panes.video));
     expect(shown()).toEqual(['ae-meeting-pane-video']);
     expect(screen.getByTestId('meeting-side').hidden).toBe(true);
   });
@@ -173,7 +173,8 @@ describe('at a wider width', () => {
   it('shows every column at once, with the splitter and no tab bar, and a swipe changes nothing', () => {
     render(<Window />);
     expect(screen.queryByRole('tablist')).toBeNull();
-    expect(screen.getByRole('separator')).toBeInTheDocument();
+    expect(screen.getByTestId('meeting-side-splitter')).toBeInTheDocument();
+    expect(screen.getByTestId('meeting-roster-chat-splitter')).toBeInTheDocument();
     expect(shown()).toEqual(['ae-meeting-pane-video', 'ae-meeting-pane-people', 'ae-meeting-chat-panel']);
     expect(video()).not.toHaveAttribute('role');
     swipe(document.querySelector('.ae-meeting-body') as HTMLElement, -200);

@@ -1,6 +1,5 @@
 /**
- * A QUEUE BEHIND A TURN IS NOT ITS HISTORY, AND A READING CHECKS THE WORK IT AMENDS IS STILL RUNNING
- * (owner report 2026-09-14).
+ * A QUEUE BEHIND A TURN IS NOT ITS HISTORY, AND A READING CHECKS THE WORK IT AMENDS IS STILL RUNNING.
  *
  * Four messages sent back to back. The turn answering the first loaded the other three from channel
  * history and answered them; the reading then proposed them anyway, recorded two as amendments against

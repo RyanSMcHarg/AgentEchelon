@@ -439,7 +439,7 @@ describe('creation through the shared creator', () => {
 });
 
 /**
- * Adding a member must not wipe the conversation's grounding (maintainer, 2026-08-10).
+ * Adding a member must not wipe the conversation's grounding.
  *
  * Add-member create-or-GETS an EXISTING conversation and adds one person - the host is saying "this member
  * joins", not "and here is the complete grounding again".

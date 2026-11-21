@@ -17,6 +17,7 @@ import { render, screen, fireEvent, within, waitFor } from '@testing-library/rea
 import { SHIPPED_EVENT_WORKFLOWS, type EventWorkflow } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
 import type { WorkflowLayout } from '../../../../../../backend/lambda/src/lib/workflow-layout.ts';
 import WorkflowBuilder from './WorkflowBuilder';
+import { shippedMessageTemplates } from '../../../../../../backend/lambda/src/lib/shipped-message-templates.ts';
 import * as svc from '../../services/profileService';
 import type { ToolDescriptor } from '../../services/profileService';
 
@@ -279,5 +280,87 @@ describe('a step no edge reaches', () => {
     fireEvent.click(screen.getByTestId('wfb-node-stray'));
     expect(screen.getByTestId('wfb-step-unreached')).toHaveTextContent('stray never runs. Connect a step to it, or make it the start.');
     expect(screen.getByTestId('wfb-status')).toHaveTextContent("Meets the server's rules");
+  });
+});
+
+describe('a hand-off step is drawn as a hand-off, never as the run\'s end', () => {
+  const HANDOFF: EventWorkflow = {
+    on: 'person-joined', initial: 'pass',
+    states: { pass: { handoff: { process: 'customer-request', name: 'security-review', fields: {} }, onSuccess: 'done', onFailure: 'done' }, done: { disposition: 'success' } },
+  } as unknown as EventWorkflow;
+
+  it('names the hand-off on its node, draws it in its own kind, and offers Preview run', () => {
+    renderBuilder({ handoff: HANDOFF });
+    const node = screen.getByTestId('wfb-node-pass');
+    expect(node.className).toContain('admin-wfb-kind-handoff');
+    expect(node.className).not.toContain('admin-wfb-kind-end');
+    expect(node.getAttribute('aria-label')).toContain('Hands off security-review of the customer-request process to another team');
+    expect(screen.getByTestId('wfb-preview')).toBeTruthy();
+  });
+
+  it('an assistant step with no fallback renders, and is not previewed until it has one', () => {
+    const noFallback = clone(HANDOFF) as unknown as { states: Record<string, unknown> };
+    noFallback.states.pass = { agent: { prompt: 'ops-first-look', tools: [], to: 'room', deadlineMs: 20_000 }, onSuccess: 'done', onFailure: 'done' };
+    renderBuilder({ nofallback: noFallback as unknown as EventWorkflow });
+    expect(screen.getByTestId('wfb-node-pass')).toBeTruthy();
+    expect(screen.queryByTestId('wfb-preview')).toBeNull();
+  });
+});
+
+describe('Preview run says what it does, and shows the walk as a numbered list', () => {
+  it('says beside the button what it does before it is pressed', () => {
+    renderBuilder();
+    expect(screen.getByTestId('wfb-preview-what')).toHaveTextContent("follows each step's success unless you pick another ending, and sends and saves nothing");
+    expect(screen.getByTestId('wfb-preview')).not.toBeDisabled();
+  });
+
+  it('is disabled with its reason beside it where there is no draft', () => {
+    render(<WorkflowBuilder workflows={{ ops: OPS }} templates={TEMPLATES} tools={TOOLS} onChange={vi.fn()} onLayoutChange={vi.fn()} />);
+    expect(screen.getByTestId('wfb-preview')).toBeDisabled();
+    expect(screen.getByTestId('wfb-preview-what')).toHaveTextContent("Preview run needs the assistant's draft.");
+  });
+
+  it('lists each step reached in order, what it would do and the text it would post, and runs again with another ending', async () => {
+    const shipped = shippedMessageTemplates();
+    const withSource = TEMPLATES.map((x) => (x.name === 'workflow-opening' ? { ...x, source: shipped.get('workflow-opening')!.source } : x));
+    preview.mockResolvedValue({
+      steps: [{ step: 'opening', outcome: 'posted' }, { step: 'first-look', outcome: 'dispatched' }],
+      acts: [{ step: 'opening', act: 'send', template: 'workflow-opening', to: 'room', values: {} }, { step: 'first-look', act: 'agent', template: 'ops-first-look' }],
+      ended: 'success',
+    });
+    render(<WorkflowBuilder workflows={{ ops: OPS }} templates={withSource} tools={TOOLS} profileName="ops-premium" onChange={vi.fn()} onLayoutChange={vi.fn()} />);
+    fireEvent.click(screen.getByTestId('wfb-preview'));
+    const result = await screen.findByTestId('wfb-preview-result');
+    expect(result.tagName).toBe('OL');
+    expect(within(result).getByTestId('wfb-preview-step-0')).toHaveTextContent('says workflow-opening to the conversation');
+    expect(within(result).getByTestId('wfb-preview-text-0-0').textContent!.length).toBeGreaterThan(0);
+    // The step that waits on someone carries its ending on its own row, and Run again walks it with the new one.
+    fireEvent.change(within(within(result).getByTestId('wfb-preview-step-1')).getByTestId('wfb-ending-first-look'), { target: { value: 'failure' } });
+    fireEvent.click(screen.getByTestId('wfb-preview-again'));
+    await waitFor(() => expect(preview).toHaveBeenCalledTimes(2));
+    expect(preview.mock.calls[1][3]).toEqual({ values: {}, outcomes: { 'first-look': 'failure' } });
+  });
+});
+
+describe('Preview run shows only once there is enough to preview', () => {
+  it('shows nothing for preview on a workflow with no step besides its end', () => {
+    renderBuilder({ bare: { on: 'person-joined', initial: 'done', states: { done: { disposition: 'success' } } } as EventWorkflow });
+    expect(screen.queryByTestId('wfb-preview')).toBeNull();
+    expect(screen.queryByTestId('wfb-preview-what')).toBeNull();
+    expect(screen.queryByTestId('wfb-preview-panel')).toBeNull();
+  });
+
+  it('shows nothing for preview while a send has no template', () => {
+    const blank = clone(OPS);
+    blank.states.opening = { ...blank.states.opening, send: { ...blank.states.opening.send!, template: '' } };
+    renderBuilder({ ops: blank });
+    expect(screen.queryByTestId('wfb-preview')).toBeNull();
+    expect(screen.queryByTestId('wfb-preview-what')).toBeNull();
+  });
+
+  it('shows Preview run and what it does on a workflow with a trigger, a step and nothing missing', () => {
+    renderBuilder();
+    expect(screen.getByTestId('wfb-preview')).not.toBeDisabled();
+    expect(screen.getByTestId('wfb-preview-what')).toBeTruthy();
   });
 });

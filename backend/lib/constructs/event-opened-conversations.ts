@@ -31,7 +31,7 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as destinations from 'aws-cdk-lib/aws-lambda-destinations';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import { Construct } from 'constructs';
-import { CONVERSATION_TYPES } from '../config/conversation-types';
+import { CONVERSATION_TYPES, conversationPatternErrors } from '../config/conversation-types';
 import { eventOpenersAt, resolveEventOpeners, type ResolvedOpener } from '../config/event-openers';
 import { INSTANCE_NAME, RES_PREFIX, STACK_PREFIX, sayThroughRouterWiring } from '../stacks/agent-classification-common';
 
@@ -101,6 +101,9 @@ export function wireEventOpenedConversations(scope: Construct, props: EventOpene
 } {
   // EVERY DECLARATION IS CHECKED, not only this classification's, so an invalid one fails every synth.
   resolveEventOpeners(CONVERSATION_TYPES);
+  // A TYPE'S CONVERSATION PATTERN IS CHECKED HERE TOO, so a deployment with a malformed one never synthesizes.
+  const patternErrors = conversationPatternErrors(CONVERSATION_TYPES);
+  if (patternErrors.length) throw new Error(`conversation patterns: ${patternErrors.join('; ')}`);
 
   // The welcomes: this classification's router, by name. The creator already knows the room's primary.
   const notices = sayThroughRouterWiring(scope, [props.classification], { resolvesPrimary: false });

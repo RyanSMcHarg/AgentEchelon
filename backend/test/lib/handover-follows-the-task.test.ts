@@ -1,5 +1,5 @@
 /**
- * ROUTING FOLLOWS THE TASK, NEVER THE TARGET (maintainer, 2026-08-14).
+ * ROUTING FOLLOWS THE TASK, NEVER THE TARGET.
  *
  * Whether a person addressed nobody or addressed the wrong assistant is the SAME case. Targeting is a
  * delivery concern the client settled at send - it says who can see a message, not what the message is

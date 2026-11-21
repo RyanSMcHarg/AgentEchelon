@@ -42,6 +42,19 @@ let mockElsewhere = false;
 vi.mock('../../services/meetingPresence', () => ({
   watchMeetingPresenceAs: (_ids: readonly string[], on: (here: boolean) => void) => { if (mockElsewhere) on(true); return () => undefined; },
 }));
+// THE DEVICE CHECK: jsdom has no camera or microphone, so its one permission request would settle at once. A test that
+// sets `mockAccess` holds the check where it says (`pending` until the browser answers), and the rest see the real hook.
+let mockAccess: 'pending' | 'granted' | 'denied' | undefined;
+vi.mock('../../hooks/useMeetingDevices', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../hooks/useMeetingDevices')>();
+  return {
+    ...real,
+    useMeetingDevices: (opts?: Parameters<typeof real.useMeetingDevices>[0]) => {
+      const devices = real.useMeetingDevices(opts);
+      return mockAccess && opts?.preview ? { ...devices, access: mockAccess } : devices;
+    },
+  };
+});
 const runningHere = (over: Record<string, unknown> = {}) => ({ running: true, joinedHere: false, mayEnd: false, isHost: false, mayStart: false, ended: false, known: true, ...over });
 const notRunningHere = (over: Record<string, unknown> = {}) => ({ running: false, joinedHere: false, mayEnd: false, isHost: false, mayStart: true, ended: false, known: true, ...over });
 
@@ -179,7 +192,7 @@ describe('the controls exist only while connected', () => {
     render(<MeetingRoom channelArn={CHANNEL} />);
     expect(screen.getByRole('button', { name: en.meeting.join })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: en.meeting.start })).not.toBeInTheDocument();
-    // Only its host and the moderators may end it.
+    // The pre-join screen offers End for everyone to nobody, a host included.
     expect(screen.queryByRole('button', { name: en.meeting.end })).not.toBeInTheDocument();
   });
 
@@ -203,8 +216,7 @@ describe('the controls exist only while connected', () => {
     expect(screen.queryByRole('button', { name: en.meeting.start })).not.toBeInTheDocument();
   });
 
-  it('never offers End for everyone before joining, even to its host: a host ends it from inside', () => {
-    mockMeeting.mockReturnValue(meetingState({ end: vi.fn(), join: vi.fn() }));
+  it('never offers End for everyone before joining, even to its host: a host ends it from the Leave dialog or the conversation banner', () => {
     mockHere.mockReturnValue(runningHere({ mayEnd: true, isHost: true }));
     render(<MeetingRoom channelArn={CHANNEL} />);
     expect(screen.getByText(en.meeting.host)).toBeInTheDocument();
@@ -273,32 +285,40 @@ describe('the controls exist only while connected', () => {
   it('joins a meeting this window started once the device check has settled, with no second press', () => {
     const start = vi.fn();
     mockMeeting.mockReturnValue(meetingState({ startedHere: true, start }));
-    render(<MeetingRoom channelArn={CHANNEL} />);
-    expect(screen.getByTestId('meeting-started-here')).toHaveTextContent(en.meeting.startedJoining);
-    expect(start).toHaveBeenCalledWith(CHANNEL);
-    // No Start again: the meeting runs and this window is joining it.
-    expect(screen.queryByRole('button', { name: en.meeting.start })).not.toBeInTheDocument();
+    mockAccess = 'pending';
+    try {
+      const { rerender } = render(<MeetingRoom channelArn={CHANNEL} />);
+      expect(screen.getByTestId('meeting-started-here')).toHaveTextContent(en.meeting.startedJoining);
+      // The browser has not answered the permission request yet: nothing joins.
+      expect(start).not.toHaveBeenCalled();
+      mockAccess = 'granted';
+      rerender(<MeetingRoom channelArn={CHANNEL} />);
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(start).toHaveBeenCalledWith(CHANNEL);
+      // No Start again: the meeting runs and this window is joining it.
+      expect(screen.queryByRole('button', { name: en.meeting.start })).not.toBeInTheDocument();
+    } finally { mockAccess = undefined; }
   });
 
-  it('while a start waits on the device check, keeps Join within reach, and offers no End for everyone', async () => {
+  it('while a start waits on the device check, keeps Join within reach, and offers no End for everyone', () => {
     const start = vi.fn();
     const end = vi.fn(async () => true);
     mockMeeting.mockReturnValue(meetingState({ startedHere: true, mayEnd: true, start, end }));
     mockHere.mockReturnValue(runningHere());
-    render(<MeetingRoom channelArn={CHANNEL} onLeave={vi.fn()} />);
-    // Closing without joining stays possible beside them.
-    expect(screen.getByRole('button', { name: en.meeting.close })).toBeInTheDocument();
-    start.mockClear();
-    screen.getByRole('button', { name: en.meeting.join }).click();
-    expect(start).toHaveBeenCalledWith(CHANNEL);
-    expect(screen.queryByRole('button', { name: en.meeting.end })).not.toBeInTheDocument();
-    expect(end).not.toHaveBeenCalled();
-  });
-
-  it('offers no End for everyone on a kept start to someone who may not end it', () => {
-    mockMeeting.mockReturnValue(meetingState({ startedHere: true, mayEnd: false }));
-    render(<MeetingRoom channelArn={CHANNEL} />);
-    expect(screen.queryByRole('button', { name: en.meeting.end })).not.toBeInTheDocument();
+    mockAccess = 'pending';
+    try {
+      render(<MeetingRoom channelArn={CHANNEL} onLeave={vi.fn()} />);
+      // The check is still pending, so the start has not joined on its own.
+      expect(start).not.toHaveBeenCalled();
+      // Closing without joining stays possible beside Join, which a press takes at once.
+      expect(screen.getByRole('button', { name: en.meeting.close })).toBeInTheDocument();
+      const join = screen.getByRole('button', { name: en.meeting.join });
+      expect(join).toBeEnabled();
+      join.click();
+      expect(start).toHaveBeenCalledWith(CHANNEL);
+      expect(screen.queryByRole('button', { name: en.meeting.end })).not.toBeInTheDocument();
+      expect(end).not.toHaveBeenCalled();
+    } finally { mockAccess = undefined; }
   });
 
   it('says a kept start has ended once the service says its meeting no longer runs, and lets the start go', () => {

@@ -104,7 +104,7 @@ test.describe('platform self-knowledge', () => {
   });
 
   /**
-   * WHO MADE IT (owner-reported, 2026-09-05).
+   * WHO MADE IT.
    *
    * Asked this on a live premium conversation, the assistant answered that the retrieved context
    * does not name a creator or founding team, and reached for the deploying company's documents to

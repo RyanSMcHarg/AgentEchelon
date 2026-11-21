@@ -1,5 +1,5 @@
 /**
- * TWO PEOPLE ASKED FOR WHAT LOOKS LIKE ONE THING (maintainer, 2026-09-03).
+ * TWO PEOPLE ASKED FOR WHAT LOOKS LIKE ONE THING.
  *
  * A queue is not one person's. When the reading groups messages from DIFFERENT senders under one
  * subject, that is the moment two requests might really be one - and merging them is not triage's

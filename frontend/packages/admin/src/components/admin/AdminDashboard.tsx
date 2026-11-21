@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import AdminNoticesPanel from './AdminNoticesPanel';
+import EventPolicyPanel from './EventPolicyPanel';
 import { useTranslation } from 'react-i18next';
 import { queryAnalytics, writeAnalytics } from '../../services/analyticsService';
 import OverviewTab from './OverviewTab';
@@ -969,6 +971,10 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             isLoading={isLoading}
           />
         )}
+        {/* WHAT THE PLATFORM POSTS TO ADMIN NOTIFICATIONS (DESIGN-EVENT-TARGETS section 12): deployment-wide, beside the alerts. */}
+        {shownTab === 'alerts' && can('manage-event-triggers') && <AdminNoticesPanel />}
+        {/* WHAT AN AWS EVENT MAY DO IN THIS DEPLOYMENT (WT122): one policy for every workflow's triggers, beside the notices. */}
+        {shownTab === 'alerts' && can('manage-event-policy') && <EventPolicyPanel />}
         {shownTab === 'alerts' && (
           <AlertsTab
             intentEffectiveness={results.intent_effectiveness ?? null}

@@ -1,5 +1,5 @@
 /**
- * A MEETING'S AUDIO AND VIDEO RECORDING (SPEC-ASSISTANT-MEETINGS FR70, owner decision 2026-11-12): its keys, its settings,
+ * A MEETING'S AUDIO AND VIDEO RECORDING (SPEC-ASSISTANT-MEETINGS FR70): its keys, its settings,
  * its record on the meeting's conversation and the ended card's recording items. Pure: no client.
  *
  * ONE SWITCH. Recording mode (`recording`, `meeting-transcription.ts`) keeps the transcript and the

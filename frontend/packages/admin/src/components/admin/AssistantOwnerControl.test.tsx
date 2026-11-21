@@ -1,5 +1,5 @@
 /**
- * THE OWNING TEAM IS PART OF AN ASSISTANT'S CONFIGURATION (owner decision, 2026-10-23).
+ * THE OWNING TEAM IS PART OF AN ASSISTANT'S CONFIGURATION.
  *
  * What it proves: an admin chooses any team or none and saves on the admin route; a team member with one
  * team sees their team and is offered nothing to move it to; a team member with several teams is offered

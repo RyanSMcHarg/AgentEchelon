@@ -1,6 +1,6 @@
 /**
  * AN ANSWER THAT IS READY WAITS FOR THE READING BESIDE IT, AND FOLLOW-UPS ARE KEPT ACROSS PASSES
- * (ADR-033, owner 2026-09-14).
+ * (ADR-033).
  *
  * Measured live: the reading's first pass finished at 20:45:42.5 and was discarded because more
  * messages had arrived; the answer was ready at 48.3 with nothing recorded to fold; the second pass

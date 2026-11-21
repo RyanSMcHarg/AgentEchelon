@@ -280,7 +280,7 @@
     },
     {
       "title": "DESIGN: Multi-Agent Orchestration",
-      "summary": "**Status:** Design (alignment doc), not scheduled - the backend swarm is not being built yet (owner, 2026-09-19). This proposes a structure and a set of explicit decisions to confirm. Every \"Recommendation\" below is a starting position, not a committed design, and Decision 2 (sub-agent identity) is an OPEN question rather than a recommendation - the identity mechanism this doc originally leaned on",
+      "summary": "**Status:** Design (alignment doc), not scheduled - the backend swarm is not being built yet. This proposes a structure and a set of explicit decisions to confirm. Every \"Recommendation\" below is a starting position, not a committed design, and Decision 2 (sub-agent identity) is an OPEN question rather than a recommendation - the identity mechanism this doc originally leaned on",
       "path": "docs/specs/interaction/assistants/DESIGN-MULTI-AGENT-ORCHESTRATION.md"
     },
     {

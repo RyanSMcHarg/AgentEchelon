@@ -93,6 +93,8 @@ describe('the assistant publishes as itself, and only where its version declares
     let stored: string | undefined;
     const s3 = { send: jest.fn(async (cmd: { constructor: { name: string }; input: { Key: string; Metadata?: Record<string, string> } }) => {
       if (cmd.constructor.name === 'HeadObjectCommand') { if (!stored) throw Object.assign(new Error('nf'), { name: 'NotFound' }); return { Metadata: { 'message-id': stored } }; }
+      // NO RUNBOOK IS STORED for this conversation (section 8): the read finds none, and the dashboard is drawn without it.
+      if (cmd.constructor.name === 'GetObjectCommand') throw Object.assign(new Error('nk'), { name: 'NoSuchKey' });
       puts.push(cmd.input); if (cmd.input.Metadata?.['message-id']) stored = cmd.input.Metadata['message-id']; return {};
     }) };
     const sent: string[] = [];

@@ -96,7 +96,7 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
     return respond(event, 503, { error: 'No task service is wired for this deployment' });
   }
 
-  // WHAT IS BEING ASKED ABOUT TRAVELS IN THE PATH, NOT THE QUERY STRING (maintainer, 2026-08-31).
+  // WHAT IS BEING ASKED ABOUT TRAVELS IN THE PATH, NOT THE QUERY STRING.
   //
   // An API Gateway resource ARN is api/stage/METHOD/path, and a query string is no part of it - so
   // while the channel arrived as `?channelArn=`, `execute-api:Invoke` could not be conditioned on

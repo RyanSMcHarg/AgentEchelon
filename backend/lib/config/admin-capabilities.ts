@@ -117,12 +117,32 @@ export const ADMIN_CAPABILITIES: Record<string, AdminCapability> = {
     roles: ADMINS,
     wired: true,
   },
+  // SEEING WHICH EVENTS START A WORKFLOW is apart from attaching them: a team reads the triggers attached for its own assistant,
+  // on its team route, and only an admin attaches or removes one (`manage-event-triggers`).
+  'view-event-triggers': {
+    key: 'view-event-triggers',
+    enforcement: 'signOnRole',
+    resources: [
+      { api: 'admin-conversations', method: 'GET', path: 'admin/event-triggers/{typeKey}/{classification}' },
+    ],
+    roles: BOTH,
+    teamScope: 'assistant',
+    // The handler lists only the rules tagged for the route's assistant, after re-checking that the caller's team owns it.
+    teamResources: [{ api: 'admin-conversations', method: 'GET', path: 'admin/assistants/{assistant}/event-triggers/{typeKey}/{classification}' }],
+    teamScoped: true,
+    wired: true,
+  },
   'manage-event-triggers': {
     key: 'manage-event-triggers',
     enforcement: 'signOnRole',
     resources: [
       { api: 'admin-conversations', method: 'GET', path: 'admin/event-types' },
-      { api: 'admin-conversations', method: 'GET', path: 'admin/event-triggers/{typeKey}/{classification}' },
+      // What the trigger form chooses from: the account's rules and alarms, listed to an admin only.
+      { api: 'admin-conversations', method: 'GET', path: 'admin/event-rules' },
+      { api: 'admin-conversations', method: 'GET', path: 'admin/event-alarms' },
+      // The admin notices: listed, and an operational one switched (DESIGN-EVENT-TARGETS section 12).
+      { api: 'admin-conversations', method: 'GET', path: 'admin/admin-notices' },
+      { api: 'admin-conversations', method: 'POST', path: 'admin/admin-notices/{key}' },
       { api: 'admin-conversations', method: 'POST', path: 'admin/event-triggers/{typeKey}/{classification}' },
       { api: 'admin-conversations', method: 'POST', path: 'admin/event-triggers/{typeKey}/{classification}/{ruleId}/remove' },
     ],
@@ -672,7 +692,7 @@ export const ADMIN_CAPABILITIES: Record<string, AdminCapability> = {
   },
   'manage-users': {
     key: 'manage-users',
-    // Clearance, membership groups and console teams (`team`, owner decision 2026-10-24: a team is a `team-<name>`
+    // Clearance, membership groups and console teams (`team`: a team is a `team-<name>`
     // group, and joining one keeps the `team-members` role in step). `admins` is assigned in the identity provider.
     enforcement: 'signOnRole',
     // `readmit` lets an offboarded subject sign in again, which is a decision about the account, like approval;

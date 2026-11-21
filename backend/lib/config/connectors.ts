@@ -145,7 +145,23 @@ export interface VendorDefinition {
 }
 
 /** The vendors that are built: an adapter exists for each in `lambda/src/lib/connectors/`. */
-export const VENDORS: Readonly<Record<'pagerduty' | 'salesforce', VendorDefinition>> = {
+export const VENDORS: Readonly<Record<'pagerduty' | 'salesforce' | 'app', VendorDefinition>> = {
+  // THE DEPLOYMENT'S OWN APPLICATION (WT84): a connector over a bus of its own, whose resource policy admits `PutEvents` from
+  // the app's declared principal and declared source only (`appPrincipal`, `connectors-stack.ts`). An event names its people by
+  // the app's own immutable user id and may name the conversation it concerns, which only this vendor's facts carry.
+  app: {
+    vendor: 'app',
+    summary: "The deployment's own application, over its own event bus: an event names its people by the app's user id, and may name its conversation",
+    capabilities: ['resolveParticipant', 'ingest'],
+    eventSource: {
+      prefix: 'ae.app.',
+      pattern: /^ae\.app\.[a-z0-9][a-z0-9-]{0,39}$/,
+      shape: 'ae.app.<name>',
+      typeAt: 'detail-type',
+    },
+    events: { pattern: /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, shape: 'an event name of letters, digits, ".", "_" and "-"' },
+    subject: "the app's own immutable user id for each person it names",
+  },
   pagerduty: {
     vendor: 'pagerduty',
     summary: 'On-call and incidents: an incident event names its assignees, each resolved through Identities',
@@ -243,12 +259,17 @@ export interface ConnectorConfig {
   grants?: { redirectUris: string[]; scopes?: string[] };
   /** Salesforce: the org's login URL (`https://<my-domain>.my.salesforce.com`). Default `https://login.salesforce.com`. */
   loginUrl?: string;
+  /**
+   * The app connector only, and required where it subscribes (WT84): the IAM principal ARN of the deployment's own application,
+   * the one principal its bus admits `PutEvents` from. Every other principal in the account is denied by the bus's own policy.
+   */
+  appPrincipal?: string;
 }
 
 /** What a Lambda needs of one entry, written to `CONNECTORS` at synth. */
 export interface RuntimeConnector {
   id: string;
-  vendor: 'pagerduty' | 'salesforce';
+  vendor: 'pagerduty' | 'salesforce' | 'app';
   capabilities: ConnectorCapability[];
   subscribes: string[];
   /** The partner event source its events arrive from; the receiver refuses an event from any other. */
@@ -412,12 +433,21 @@ function entryErrors(raw: unknown, index: number, ctx: ConnectorContext, seen: S
     errors.push(`${at}: actForPerson needs grants, the redirect URIs a person completes the vendor's authorization on`);
   }
 
+  // THE APP'S PRINCIPAL, the one its bus admits: an IAM role or user of this account's partition, never a wildcard.
+  if (vendor === 'app' && e.subscribes !== undefined) {
+    if (typeof e.appPrincipal !== 'string' || !/^arn:aws[a-z-]*:iam::\d{12}:(role|user)\/[A-Za-z0-9+=,.@_/-]{1,512}$/.test(e.appPrincipal)) {
+      errors.push(`${at}: an app connector that subscribes names appPrincipal, the IAM role or user ARN of the application that puts its events`);
+    }
+  } else if (e.appPrincipal !== undefined) {
+    errors.push(`${at}: appPrincipal is read only for an app connector that subscribes to events`);
+  }
+
   if (e.loginUrl !== undefined) {
     if (vendor !== 'salesforce') errors.push(`${at}: loginUrl is read only for a salesforce connector`);
     else if (typeof e.loginUrl !== 'string' || !/^https:\/\/[a-z0-9.-]+$/i.test(e.loginUrl)) errors.push(`${at}: loginUrl is an https origin with no path`);
   }
 
-  const known = new Set(['id', 'vendor', 'capabilities', 'subscribes', 'eventSource', 'classification', 'personIssuer', 'grants', 'loginUrl']);
+  const known = new Set(['id', 'vendor', 'capabilities', 'subscribes', 'eventSource', 'classification', 'personIssuer', 'grants', 'loginUrl', 'appPrincipal']);
   for (const k of Object.keys(e)) if (!known.has(k)) errors.push(`${at}: "${k}" is not a connector field`);
   return errors;
 }

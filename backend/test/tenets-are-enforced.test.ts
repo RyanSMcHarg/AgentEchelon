@@ -46,7 +46,7 @@ describe('tenet D6 - event-driven, not polling', () => {
     // The subscription remains the mechanism, not a fallback to it.
     expect(hook).toContain('changeSignal');
 
-    // ── WHY `setTimeout` IS NO LONGER BANNED OUTRIGHT (owner direction, 2026-09-12) ──────────────
+    // ── WHY `setTimeout` IS NO LONGER BANNED OUTRIGHT ──────────────
     //
     // A queue that cannot be READ says so and tries again, and that retry needs a timer. The rule
     // matches the behavior rather than the word, so it admits that bounded retry and still catches a

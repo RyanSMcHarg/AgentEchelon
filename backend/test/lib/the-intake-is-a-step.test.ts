@@ -64,7 +64,7 @@ describe('where an intake may be offered', () => {
   it('is a step of its own kind, and never the opening of an arrival', () => {
     const both = withIntake('person-joined', 'joined');
     (both.states.intake as Record<string, unknown>).send = { to: 'room', template: 'x' };
-    expect(eventWorkflowErrors('b', both).join()).toMatch(/exactly one of a send, an agent step, an action, an opening, a prompt, a task, a wait, an open, or a terminal disposition/);
+    expect(eventWorkflowErrors('b', both).join()).toMatch(/exactly one of a send, an agent step, an action, an opening, a prompt, a task, a wait, an open, a hand-off, or a terminal disposition/);
     expect(eventWorkflowErrors('f', withIntake('person-joined', 'joined', 'intake')).join()).toMatch(/initial must be a send/);
   });
 });

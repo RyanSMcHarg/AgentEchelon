@@ -67,6 +67,12 @@ export interface ClassificationCatalog {
    */
   storedPack?: StoredIntentPack;
   /**
+   * THE MACHINES THIS DEPLOYMENT RUNS, whole, as the runtime resolves them for the classification (its pack's over the
+   * platform's). The console starts a machine edit from these, never from the machines bundled into its own build, which
+   * are only as current as the console's last deploy.
+   */
+  machines?: Record<string, TaskStateMachine>;
+  /**
    * THE PLATFORM INTENTS EVERY ASSISTANT ANSWERS (the universal intents and `platform_question`), each with whether it
    * answers through the `general` route when a version gives it no route of its own (`ANSWERS_THROUGH_GENERAL`, ADR-064
    * decision A). Served from the resolver's own list, so the console's Platform intents group cannot drift from it.
@@ -346,6 +352,7 @@ export async function classificationCatalog(
     ...(pack ? { packIntents: pack.intents.map((i) => i.key), packSource: packValue ? 'classification' as const : 'platform' as const } : {}),
     ...(intents ? { intents } : {}),
     ...(storedPack ? { storedPack } : {}),
+    machines,
     ...(topology ? { topology } : {}),
     retrievalReach,
     ...(process.env.CONTEXT_BUCKET ? { contextBucket: process.env.CONTEXT_BUCKET } : {}),

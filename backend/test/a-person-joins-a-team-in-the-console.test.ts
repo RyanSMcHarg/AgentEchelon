@@ -1,7 +1,7 @@
 import { edgeContext } from './helpers/edge-context';
 /**
- * AN ADMINISTRATOR PUTS A PERSON IN A CONSOLE TEAM, OR TAKES THEM OUT (owner decision, 2026-10-24: "Teams should
- * be editable").
+ * AN ADMINISTRATOR PUTS A PERSON IN A CONSOLE TEAM, OR TAKES THEM OUT: a person's teams are
+ * editable.
  *
  * A team is a `team-<name>` group, and the console admits a team member only on the `team-members` role group, so
  * POST /users/team keeps the two in step: joining a first team adds the role, leaving the last one removes it, and

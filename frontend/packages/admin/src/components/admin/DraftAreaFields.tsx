@@ -68,6 +68,10 @@ export interface AreaProps {
   validationErrors?: readonly string[];
   /** The workflow the builder opens on: the one the page's Edit in a draft chose. */
   focusWorkflow?: string;
+  /** Back to the Workflows list from the create view the page opened. */
+  onLeaveWorkflow?: () => void;
+  /** The workflow the builder now shows, once one is created or renamed there, so the page's trail names it. */
+  onFocusWorkflow?: (name: string) => void;
   /** Opens the version's Workflows section, where the process wizard sends a person to create a workflow. */
   onOpenWorkflows?: () => void;
   /** The configId of the draft shown, which a process import adds to (SPEC-PROCESSES P13). */
@@ -293,7 +297,7 @@ export const AreaFields: React.FC<AreaProps & { area: InlineArea }> = ({ area, .
     case 'settings': return <GuardrailAndSources only="guardrail" config={props.draft} catalog={props.catalog} onPatch={props.onPatch} role={props.role} />;
     case 'routing': return <RoutingFields {...props} />;
     case 'messages': return <MessagesFields {...props} />;
-    case 'events': return <EventWorkflowsFields config={props.draft} catalog={props.catalog} onPatch={props.onPatch} profileName={props.profileName} tools={props.tools} layout={props.layout} keptWelcome={props.keptWelcome} serverErrors={props.validationErrors} focusWorkflow={props.focusWorkflow} role={props.role} provisionedName={props.provisionedName} />;
+    case 'events': return <EventWorkflowsFields config={props.draft} catalog={props.catalog} onPatch={props.onPatch} profileName={props.profileName} tools={props.tools} layout={props.layout} keptWelcome={props.keptWelcome} serverErrors={props.validationErrors} focusWorkflow={props.focusWorkflow} onLeaveWorkflow={props.onLeaveWorkflow} onFocusWorkflow={props.onFocusWorkflow} role={props.role} provisionedName={props.provisionedName} />;
     case 'processes': return <ProcessesFields draft={props.draft} onPatch={props.onPatch} canEdit={props.canEdit} profileName={props.draft.displayName || props.provisionedName || props.profileName} validationErrors={props.validationErrors} onOpenWorkflows={props.onOpenWorkflows}
       assistant={props.profileName} draftConfigId={props.draftConfigId} onProcessImported={props.onProcessImported} />;
     case 'variables': return <VariablesFields {...props} />;

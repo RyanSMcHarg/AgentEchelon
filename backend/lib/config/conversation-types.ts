@@ -192,7 +192,7 @@ export interface Capabilities {
  *
  * A TYPE THAT DECLARES NO SOURCE IS MANUAL: the opener is a member, everybody else is added by a person,
  * and nothing reconciles it. On a type that DOES declare one, sharing is refused, because an invited
- * person would be silently removed by the next reconcile (owner decision, 2026-10-05).
+ * person would be silently removed by the next reconcile.
  */
 export interface MembershipSource {
   /** An identity-provider group whose members are the conversation's people. */
@@ -370,6 +370,15 @@ export interface ConversationTypeConfig {
    * event to carry. See {@link EventOpener} (`lib/config/event-openers.ts`).
    */
   openedBy?: EventOpener[];
+  /**
+   * THE PATTERN THAT NAMES THIS TYPE'S STANDING CONVERSATIONS (DESIGN-EVENT-TARGETS 11.2): an event a trigger attaches for this
+   * type runs in the conversation the pattern names for it, which is created on its first event. Literal parts and
+   * `{key}` (the key the trigger reads from the event) or `{resource}` (the last segment of the event's first resource), for
+   * example `ticket:{key}` for one conversation per ticket. The conversation's id is derived from the pattern under its own
+   * namespace (`patternChannelId`), never chosen by it. Only a type the platform opens (`initiation: 'system'`) declares one,
+   * and such a type has no single team room. See {@link conversationPatternErrors}.
+   */
+  conversationPattern?: string;
   /**
    * THE NAME A CONVERSATION OF THIS TYPE IS CREATED WITH, as a template in the `{{field}}` form over what opened it
    * ({@link CONVERSATION_NAME_FIELDS}): `{{label}}`, `{{summary}}`, `{{alarm}}`, `{{service}}` and `{{date}}`. It is the
@@ -813,7 +822,102 @@ export function meetingSettingsOf(typeKey: string | undefined): MeetingSettings 
  */
 export function isTeamRoomType(typeKey: string | undefined): boolean {
   const config = typeKey ? CONVERSATION_TYPES[typeKey] : undefined;
-  return !!config && config.initiation === 'system' && !config.meeting;
+  return !!config && config.initiation === 'system' && !config.meeting && config.conversationPattern === undefined;
+}
+
+/** A type whose standing conversations a pattern names (`conversationPattern`), one per value the pattern resolves to. */
+export function isPatternType(typeKey: string | undefined): boolean {
+  const config = typeKey ? CONVERSATION_TYPES[typeKey] : undefined;
+  return !!config && config.initiation === 'system' && !config.meeting && typeof config.conversationPattern === 'string';
+}
+
+/** The tag a pattern conversation carries, naming its type (`pattern-room`); IAM bounds it to the declared pattern types. */
+export const PATTERN_ROOM_TAG_KEY = 'pattern-room';
+
+/** The watch kind a pattern trigger's rule is tagged with: its target is a pattern conversation, not a watched key's. */
+export const PATTERN_WATCH_KIND = 'pattern';
+
+/**
+ * The variables a conversation pattern may name. `{person}` is the one person a connector fact admitted, accepted only where the
+ * connector receiver's own record says it admitted that person (DESIGN-EVENT-TARGETS 11.2), so its trigger's source is the
+ * receiver's (`ae.connector`).
+ */
+export const CONVERSATION_PATTERN_VARIABLES = ['key', 'resource', 'person'] as const;
+/** The source whose facts carry a person or a conversation a consumer can verify: the connector receiver's. */
+export const CONNECTOR_FACT_SOURCE = 'ae.connector';
+/** The watch kind of a trigger whose event names its conversation (DESIGN-EVENT-TARGETS 11.3), from a connector fact only. */
+export const NAMED_WATCH_KIND = 'named';
+/**
+ * The watch kind of a process (DESIGN-PROCESSES sections 3 and 12): recorded by the runner of a conversation a process opened,
+ * keyed `<process>.<process id>`, and attached only as a hand-off's target, so a hand-off answered back reaches it. No opener records it.
+ */
+export const PROCESS_WATCH_KIND = 'process';
+/** The pattern a type declares to hold one conversation per process (DESIGN-PROCESSES section 12), keyed by the process id. */
+export const PROCESS_CONVERSATION_PATTERN = 'process:{key}';
+export type ConversationPatternVariable = (typeof CONVERSATION_PATTERN_VARIABLES)[number];
+/** A pattern's literal characters, and the longest pattern. */
+const PATTERN_LITERAL = /^[A-Za-z0-9:._-]*$/;
+const MAX_PATTERN = 64;
+/** A value a variable resolves to: the id alphabet, bounded. */
+const MAX_PATTERN_VALUE = 128;
+const PATTERN_VALUE = /^[A-Za-z0-9:._-]{1,128}$/;
+/** The longest value a pattern may resolve to, which the creator's id check holds too. */
+export const MAX_PATTERN_RESOLVED = 200;
+
+/** The longest value a pattern can resolve to: its literal characters, and each variable at its longest. */
+export function patternResolvedMax(pattern: string): number | undefined {
+  const vars = patternVariables(pattern);
+  if (!vars) return undefined;
+  return pattern.replace(/\{[a-z]+\}/g, '').length + vars.length * MAX_PATTERN_VALUE;
+}
+
+/** The variables a pattern names, in order, or null where it names something else or is malformed. */
+export function patternVariables(pattern: string): ConversationPatternVariable[] | null {
+  const out: ConversationPatternVariable[] = [];
+  const literal = pattern.replace(/\{([a-z]+)\}/g, (_m, name: string) => {
+    if (!(CONVERSATION_PATTERN_VARIABLES as readonly string[]).includes(name)) out.push('__unknown__' as ConversationPatternVariable);
+    else out.push(name as ConversationPatternVariable);
+    return '';
+  });
+  if (out.includes('__unknown__' as ConversationPatternVariable) || !PATTERN_LITERAL.test(literal)) return null;
+  return out;
+}
+
+/**
+ * WHAT A CONVERSATION PATTERN IS REFUSED FOR, checked at synth: a pattern on a type the platform does not open, one that names a
+ * variable other than the declared ones, a literal outside the id alphabet, or more than its bound. Each error names the type.
+ */
+export function conversationPatternErrors(types: Readonly<Record<string, Pick<ConversationTypeConfig, 'conversationPattern' | 'initiation' | 'meeting'> & { openedBy?: ReadonlyArray<{ watches?: { kind: string } }> }>>): string[] {
+  const errs: string[] = [];
+  for (const [key, type] of Object.entries(types)) {
+    // THE KIND A PATTERN TRIGGER IS MARKED WITH is reserved: no opener records a key of that kind.
+    if ((type.openedBy ?? []).some((o) => o.watches?.kind === PATTERN_WATCH_KIND || o.watches?.kind === NAMED_WATCH_KIND || o.watches?.kind === PROCESS_WATCH_KIND)) errs.push(`${key}.openedBy records a "${PATTERN_WATCH_KIND}", "${NAMED_WATCH_KIND}" or "${PROCESS_WATCH_KIND}" key, kinds reserved for pattern, named and process triggers`);
+    const p = type.conversationPattern;
+    if (p === undefined) continue;
+    if (typeof p !== 'string' || !p || p.length > MAX_PATTERN) { errs.push(`${key}.conversationPattern is 1 to ${MAX_PATTERN} characters`); continue; }
+    if (type.initiation !== 'system' || type.meeting) errs.push(`${key}.conversationPattern is on a type the platform opens (initiation: 'system'), never a meeting's`);
+    // ONE ANSWER TO WHICH CONVERSATION HOLDS A KEY: a type whose pattern names its conversations records no watch.
+    if ((type.openedBy ?? []).some((o) => !!o.watches)) errs.push(`${key} declares both conversationPattern and an opener that watches a key; a pattern names its conversations, so it records no watch`);
+    if (!patternVariables(p)) errs.push(`${key}.conversationPattern names only {${CONVERSATION_PATTERN_VARIABLES.join('}, {')}} and literal letters, digits, ':', '.', '_' and '-'`);
+    // EVERY VALUE IT CAN RESOLVE TO FITS THE CONVERSATION'S ID, so an event is never refused for its length after it is attached.
+    else if ((patternResolvedMax(p) ?? 0) > MAX_PATTERN_RESOLVED) errs.push(`${key}.conversationPattern can resolve to more than ${MAX_PATTERN_RESOLVED} characters, each variable being up to ${MAX_PATTERN_VALUE}`);
+  }
+  return errs;
+}
+
+/**
+ * THE VALUE A PATTERN RESOLVES TO FOR ONE EVENT: each variable from the event's values, each in the id alphabet. Undefined where
+ * a variable is missing or outside the alphabet, so nothing is created for an event the pattern cannot name.
+ */
+export function resolveConversationPattern(pattern: string, values: Readonly<Partial<Record<ConversationPatternVariable, string>>>): string | undefined {
+  if (!patternVariables(pattern)) return undefined;
+  let missing = false;
+  const out = pattern.replace(/\{([a-z]+)\}/g, (_m, name: string) => {
+    const v = values[name as ConversationPatternVariable];
+    if (typeof v !== 'string' || !PATTERN_VALUE.test(v)) { missing = true; return ''; }
+    return v;
+  });
+  return missing ? undefined : out;
 }
 
 /** Why no AWS event reaches a conversation of a type: undeclared, a meeting's conversation, or a type no key is watched in. */
@@ -829,7 +933,7 @@ export function eventUnreachableReason(typeKey: string | undefined): EventUnreac
   const config = typeKey ? CONVERSATION_TYPES[typeKey] : undefined;
   if (!config) return 'undeclared';
   if (config.meeting) return 'meeting';
-  if (isTeamRoomType(typeKey)) return undefined;
+  if (isTeamRoomType(typeKey) || isPatternType(typeKey)) return undefined;
   return (config.openedBy ?? []).some((o) => !!o.watches) ? undefined : 'noWatchedKey';
 }
 

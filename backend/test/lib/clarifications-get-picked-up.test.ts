@@ -1,5 +1,5 @@
 /**
- * THE ASSISTANT PICKS UP WHAT IT ASKED ABOUT, WHEN IT HAS NOTHING BETTER TO DO (maintainer, 2026-09-03).
+ * THE ASSISTANT PICKS UP WHAT IT ASKED ABOUT, WHEN IT HAS NOTHING BETTER TO DO.
  *
  * A clarification waits on a person. Left alone it waits forever: it sits in their list and nothing
  * raises it again unless they think to. The owner's rule closes that in two halves -
@@ -124,7 +124,7 @@ describe('what the person reads', () => {
 });
 
 /**
- * AND ANSWERING ONE HAS TO MOVE IT FORWARD (maintainer, 2026-09-03).
+ * AND ANSWERING ONE HAS TO MOVE IT FORWARD.
  *
  * A clarification stores the message's ID and none of its words, which is what keeps a targeted
  * request out of a row the room can read. Kept only that far the rule is half a rule: the row is safe

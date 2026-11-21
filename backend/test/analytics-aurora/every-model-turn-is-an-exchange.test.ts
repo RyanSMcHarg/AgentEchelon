@@ -111,8 +111,13 @@ describe('the flow times a platform turn from its own exchange, where no ledger 
 
 describe('the judge always reads a platform turn', () => {
   it('a platform exchange is drawn every time and recorded as the always stratum, never as a sample', () => {
-    const unscored = judge.slice(judge.indexOf('async function getUnscoredExchanges('), judge.indexOf('\n}\n', judge.indexOf('async function getUnscoredExchanges(')));
+    const unscored = fn(judge, 'async function getUnscoredExchanges(', '\n}\n');
     expect(unscored).toContain("CASE WHEN e.intent_confidence = 'low' OR hf.message_id IS NOT NULL OR e.paired_by = 'platform' OR");
-    expect(code(unscored)).toMatch(/OR hf\.message_id IS NOT NULL\s+OR e\.paired_by = 'platform'\s+OR \$\{HAS_SAFETY_FINDING_SQL\}/);
+    // THE WHERE CLAUSE ADMITS IT TOO, not only the stratum: the draw's own `AND (` block, read up to the hash sample it closes on.
+    const where = code(unscored).slice(code(unscored).indexOf("AND (\n          e.intent_confidence = 'low'"));
+    const draw = where.slice(0, where.indexOf('% 100 < $2'));
+    expect(draw.length).toBeGreaterThan(0);
+    expect(draw).toMatch(/OR hf\.message_id IS NOT NULL\s+OR e\.paired_by = 'platform'\s+OR \$\{HAS_SAFETY_FINDING_SQL\}/);
+    expect(draw).not.toContain('CASE WHEN');
   });
 });

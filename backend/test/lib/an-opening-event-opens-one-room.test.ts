@@ -34,7 +34,7 @@ describe('one room per opening event', () => {
     const at = (t: string) => creator.indexOf(t);
     expect(at('const opening = openingKey(event);')).toBeGreaterThan(at("throw new Error('detail.watchesAlarm is not an alarm name')"));
     expect(at('const opening = openingKey(event);')).toBeGreaterThan(at('if (!allowed.admitted.has(forUserArn))'));
-    expect(at('const claim = await claimOpening(opening);')).toBeLessThan(at('const created = await createConversationFromEvent({'));
+    expect(at('const claim = await claimOpening(opening);')).toBeLessThan(at('const created = await (recreating'));
     expect(creator).toMatch(/return \{ ok: true, reused: true, channelArn: claim\.existing,/);
     expect(at('if (opening) await settleOpening(opening, created.channelArn);')).toBeLessThan(at("nameEventThroughRouter(DEPLOYED_CLASSIFICATION, {"));
   });

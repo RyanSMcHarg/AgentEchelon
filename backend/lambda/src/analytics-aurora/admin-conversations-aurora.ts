@@ -166,13 +166,19 @@ export async function adminListConversations(
        -- archived state is mirrored into channel Metadata by conversation-management
        -- (the tag is authoritative but tags are not streamed to Kinesis; the
        -- UpdateChannel metadata mirror IS), captured onto the row's metadata column.
-       -- There is no un-archive path, so presence is authoritative. Deleted wins.
-       SELECT channel_arn,
-              bool_or(event_type = 'DELETE_CHANNEL') AS is_deleted,
-              bool_or(metadata->>'archived' = 'true') AS is_archived
-         FROM messages
-        WHERE event_type IN ('CREATE_CHANNEL','UPDATE_CHANNEL','DELETE_CHANNEL')
-        GROUP BY channel_arn
+       -- There is no un-archive path. A pattern conversation that was archived is deleted and created again at the same id
+       -- (DESIGN-EVENT-TARGETS 11.2), so only its latest generation counts: the events since its last CREATE_CHANNEL.
+       SELECT l.channel_arn,
+              bool_or(l.event_type = 'DELETE_CHANNEL') AS is_deleted,
+              bool_or(l.metadata->>'archived' = 'true') AS is_archived
+         FROM messages l
+         LEFT JOIN (
+           SELECT channel_arn, MAX(created_at) AS born
+             FROM messages WHERE event_type = 'CREATE_CHANNEL' GROUP BY channel_arn
+         ) g ON g.channel_arn = l.channel_arn
+        WHERE l.event_type IN ('CREATE_CHANNEL','UPDATE_CHANNEL','DELETE_CHANNEL')
+          AND (g.born IS NULL OR l.created_at >= g.born)
+        GROUP BY l.channel_arn
      ),
      members AS (
        -- Current member count from the archived membership events (humans + bots):

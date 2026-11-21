@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { ConfirmAction } from './ConfirmAction';
 import WorkflowBuilder, { type TaskMachineSource } from './WorkflowBuilder';
 import { useTaskMachineSource } from './useTaskMachineSource';
 import { InfoTooltip } from './AdminHelp';
@@ -123,13 +124,15 @@ export const IntentWorkflowsFields: React.FC<{
             {declared[intent] ? (
               <>
                 <button type="button" className="btn-link" data-testid={`intent-workflow-edit-${intent}`} onClick={() => setOpen(intent)}>{t('admin.intentWorkflows.edit')}</button>{' '}
-                <button type="button" className="btn-link" data-testid={`intent-workflow-reset-${intent}`} onClick={() => {
-                  if (!window.confirm(t('admin.intentWorkflows.resetConfirm', { intent }))) return;
-                  // A multi-step intent always has its workflow, so a reset restores its starting steps; a single-turn
-                  // intent's is removed, and it is answered in one turn.
-                  if (intents.includes(intent)) save({ ...declared, [intent]: startingWorkflow(intent) });
-                  else { const { [intent]: _gone, ...rest } = declared; save(rest); if (open === intent) setOpen(undefined); }
-                }}>{intents.includes(intent) ? t('admin.intentWorkflows.reset') : t('admin.intentWorkflows.remove')}</button>
+                <ConfirmAction testId={`intent-workflow-reset-${intent}`} className="btn-link"
+                  label={intents.includes(intent) ? t('admin.intentWorkflows.reset') : t('admin.intentWorkflows.remove')}
+                  title={t('admin.intentWorkflows.resetConfirm', { intent })} confirmLabel={t('admin.confirm.reset')} cancelLabel={t('admin.confirm.cancel')}
+                  onConfirm={() => {
+                    // A multi-step intent always has its workflow, so a reset restores its starting steps; a single-turn
+                    // intent's is removed, and it is answered in one turn.
+                    if (intents.includes(intent)) save({ ...declared, [intent]: startingWorkflow(intent) });
+                    else { const { [intent]: _gone, ...rest } = declared; save(rest); if (open === intent) setOpen(undefined); }
+                  }} />
                 {/* THE TASKS IT ASSIGNS, EACH WITH ITS STATES. */}
                 <ul className="admin-plain-list" data-testid={`intent-workflow-tasks-${intent}`}>
                   {assignedTasksOf(declared[intent], machines).map((task) => (

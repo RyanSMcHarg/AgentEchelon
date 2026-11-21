@@ -75,6 +75,7 @@ import {
   type TaskCreateOptions,
   ACTIVE_TASK_STATUSES,
   attachRequestRun,
+  takeReopenedTask,
   openTasksOpenedFrom as storeOpenTasksOpenedFrom,
   openWorkflowTasksIn,
   releaseAskedBy,
@@ -93,6 +94,8 @@ import { putRunEndedFact, putTaskSettledFact, type RunEndedFact, type TaskSettle
 import { PROCESS_ID } from './lib/event-workflow.js';
 import { formAnswersOf, pressTarget } from './lib/task-step.js';
 import { alongsideEndWaitId } from './lib/held-run.js';
+import { APPROVED_DOCUMENT_VALUE, MAX_REVISION_INSTRUCTIONS, MAX_TASK_DOCUMENTS, documentsOf, draftingOf, isAssistantDocumentKey, isOwnMarkdownUpload, latestDocument, revisionPending, type TaskDocument, type TaskRevisionRequest } from './lib/task-documents.js';
+import { appendTaskDocument, clearTaskRevision, setTaskRevision, setTaskRunValue } from './lib/task-tracking.js';
 import { PLATFORM_TASK_MACHINE_KEYS, isPlatformMachineKey, requesterMovesOf, validateTaskStateMachine, type TaskStateMachine } from './lib/task-state-machines.js';
 import { personIdFromArn } from './lib/person-arn.js';
 import { versionDeclaredMachines } from './lib/version-machines.js';
@@ -244,6 +247,16 @@ export type TaskServiceOp =
   | 'openWorkflowTask'
   /** A person takes a choice on their task's card (ADR-063 decision 2). See `advanceAsAssignee`. */
   | 'advanceAsAssignee'
+  /** The versions of the document a task approves. See `taskDocuments`. */
+  | 'taskDocuments'
+  /** Its approver attaches an edited version. See `addTaskDocument`. */
+  | 'addTaskDocument'
+  /** Its approver asks the drafting assistant to revise it. See `requestRevision`. */
+  | 'requestRevision'
+  /** The drafting assistant's revision lands as the task's next version (stage 2). See `addRevisedDocument`. */
+  | 'addRevisedDocument'
+  /** A revision that will not land is cleared, so another may be asked. See `abandonRevision`. */
+  | 'abandonRevision'
   /** A task step's deadline ends its task (ADR-063 decision 4). See `cancelForDeadline`. */
   | 'cancelForDeadline'
   /** Archiving a conversation settles its open workflow tasks (ADR-017). See `settleArchivedTasks`. */
@@ -261,6 +274,8 @@ export type TaskServiceOp =
   | 'requesterMovableTask'
   /** A request whose task no router turn opened takes its intent's run (WT115, WT106). See `attachRequestRunOp`. */
   | 'attachRequestRun'
+  /** A reopen run's step takes the reopened task (`takes: 'reopened'`). See `takeReopenedTaskOp`. */
+  | 'takeReopenedTask'
   | 'readRunWait'
   /** An assistant's ready work in one conversation, in the order it takes it up (ADR-063 decision 5). See `readyTasks`. */
   | 'readyTasks'
@@ -372,7 +387,7 @@ async function refusesChannel(channelArn: string, leg: AdmissionLeg = 'here'): P
   }
   const found = await classificationOf(channelArn);
 
-  // WHAT THIS CHECK IS, STATED WITHOUT OVERCLAIMING (maintainer, 2026-08-31).
+  // WHAT THIS CHECK IS, STATED WITHOUT OVERCLAIMING.
   //
   // Access to CHANNELS is IAM: `classificationChannelScopedAllow` is applied to the
   // per-classification Cognito user roles AND the assistant roles, tag-gated and fail-closed. The
@@ -608,8 +623,12 @@ export async function advanceTask(input: {
   conditionValues?: Parameters<typeof advanceTaskStateTo>[0]['conditionValues'];
   /** The caller goes on with the run itself, in the turn it is in, so nothing else may. */
   continuedByCaller?: boolean;
+  /** A reopen pressed by a decider, whom `advanceAsAssignee` checked. */
+  reopenByDecider?: boolean;
+  /** A quiet step's move (`isQuietStep`): no turn's message carries it, so its settlement is closed and recorded here. */
+  quiet?: true;
 }): Promise<AdvanceResult> {
-  const { taskId, channelArn, continuedByCaller, ...rest } = input;
+  const { taskId, channelArn, continuedByCaller, quiet, ...rest } = input;
   if (!taskId || !channelArn) return { ok: false, error: 'no_active_task' };
   if (await refusesChannel(channelArn)) return { ok: false, error: 'no_active_task' };
 
@@ -617,6 +636,14 @@ export async function advanceTask(input: {
   if (!task) return { ok: false, error: 'no_active_task' };
   const result = await advanceTaskStateTo({ task, ...rest });
   if (result.ok) {
+    // A QUIET STEP'S SETTLEMENT (section 8.1 of DESIGN-CONVERSATION-DASHBOARDS): no turn closes the task or archives the move,
+    // so this does, before the settlement is named. The fact carries the action the step ran and how it went.
+    if (quiet && result.terminal) {
+      await updateTaskStatus(task.taskId, channelArn, result.terminal === 'success' ? 'completed' : 'failed').catch(() => undefined);
+      await putTaskSettledFact(settledFact(task, 'platform-step', {
+        fromState: result.from, toState: result.to, terminal: result.terminal, ...(rest.action ? { action: rest.action } : {}),
+      }));
+    }
     if (!continuedByCaller) await nameWhatChanged(task.taskId, channelArn, rest.machines);
     // A FINISHED TASK TAKEN BACK (WT104): from an ending into a state with a way on, which is a reopen, named once per move.
     const machine = machinesOfTask(task, { ...packTaskStateMachines(), ...(rest.machines ?? {}) })[task.taskType ?? ''];
@@ -676,6 +703,19 @@ async function isOwnAssistant(id: string): Promise<boolean> {
   return live.some((a) => principalIdFromArn(a.botArn) === id);
 }
 
+/** The largest opening details a task may carry, as JSON. */
+export const MAX_OPENING_DETAILS_CHARS = 24_000;
+
+/** Opening details as written: undefined where none were given, null where they are not top-level text within the bound. */
+export function openingDetails(given: unknown): Record<string, string> | undefined | null {
+  if (given === undefined) return undefined;
+  if (!given || typeof given !== 'object' || Array.isArray(given)) return null;
+  const entries = Object.entries(given as Record<string, unknown>);
+  if (!entries.every(([k, v]) => /^[A-Za-z][A-Za-z0-9_]{0,47}$/.test(k) && typeof v === 'string')) return null;
+  const out = Object.fromEntries(entries) as Record<string, string>;
+  return JSON.stringify(out).length <= MAX_OPENING_DETAILS_CHARS ? out : null;
+}
+
 /**
  * OPEN A WORKFLOW STEP'S TASK (ADR-063 decision 1). The router resolved the references; this service decides whether the
  * write may happen and makes it. Refused, and nothing written, when the conversation is not this classification's, when
@@ -706,6 +746,11 @@ export async function openWorkflowTask(input: {
   requestExcerpt?: string;
   /** The conversation whose workflow opened this task's conversation (`Task.openedFrom`), as the router read it from its row. */
   openedFrom?: string;
+  /**
+   * What the task starts out recording, read by its steps' bindings (`detail:<key>`): a run's runbook drawn on its
+   * dashboards carries the progress here. Top-level text values only, at most `MAX_OPENING_DETAILS_CHARS` as JSON.
+   */
+  details?: Record<string, string>;
 }): Promise<Task | null> {
   const { channelArn, taskId, machine } = input ?? ({} as typeof input);
   if (!channelArn || !taskId || !machine || !input.workflowRun?.runKey || await refusesChannel(channelArn)) return null;
@@ -715,6 +760,11 @@ export async function openWorkflowTask(input: {
   }
   const machines = { ...packTaskStateMachines(), ...(input.machineDef ? { [machine]: input.machineDef } : {}) };
   if (!machines[machine]) return null;
+  const details = openingDetails(input.details);
+  if (details === null) {
+    console.warn('[task-service][workflow-task] the opening details of a task are not top-level text within their bound; refusing', { machine });
+    return null;
+  }
   // ONLY THIS CLASSIFICATION'S ASSISTANTS DO OR OWN ITS WORK. The router chose them from its own live list; this is the
   // second layer, against the same assignment records, before anything is written.
   for (const id of new Set([input.assistantId, ...(input.worker?.type === 'assistant' ? [input.worker.id] : [])])) {
@@ -759,6 +809,7 @@ export async function openWorkflowTask(input: {
       ...(input.askedBy?.runKey ? { askedBy: input.askedBy } : {}),
       ...(opener ? { openedFrom: opener } : {}),
       requestExcerpt: typeof input.requestExcerpt === 'string' ? input.requestExcerpt : '',
+      ...(details ? { details } : {}),
       throwOnWriteFailure: true,
     },
   ).catch((err) => {
@@ -784,6 +835,15 @@ export async function advanceAsAssignee(input: {
   messageId?: string;
   /** The router goes on with the run in the turn that relayed this, so the settlement is not named a second time. */
   continuedByCaller?: boolean;
+  /** The version the card showed as the one approved, by its key. */
+  document?: string;
+  /**
+   * The participant roles the caller holds in this conversation, read by the user-tasks function from the conversation's own
+   * record (never from the request): a holder of a role the step names as deciding it may press as its assignee may.
+   */
+  callerRoles?: string[];
+  /** The person confirmed the choice where they pressed it, so a choice that ends the run mid-way is not asked again. */
+  confirmed?: boolean;
 }): Promise<{ ok: true; to: string } | { ok: false; error: AssigneeAdvanceRefusal | 'REFUSED' }> {
   if (!input?.taskId || !input?.channelArn || await refusesChannel(input.channelArn)) return { ok: false, error: 'NOT_FOUND' };
   const task = await getTask(input.taskId, input.channelArn).catch(() => null);
@@ -791,20 +851,43 @@ export async function advanceAsAssignee(input: {
   const machines = machinesOfTask(task, packTaskStateMachines());
   const refusal = assigneeAdvanceRefusal(task, machines, input);
   if (refusal || !task) return { ok: false, error: refusal ?? 'NOT_FOUND' };
+  // A REOPEN (a decider's press on a finished task, into a state its ending declares): through the one advance, recorded as a
+  // reopen, and named to the router, which runs what the version declares on `task-reopened`.
+  const ending = task.taskType ? machines[task.taskType]?.states[task.taskState ?? ''] : undefined;
+  if (ending && !ending.transitions.length) {
+    const reopened = await advanceTask({
+      taskId: task.taskId, channelArn: task.channelArn, toState: input.choice, by: 'system', reason: 'reopened by a holder of a role that decides it', machines,
+      reopenByDecider: true, ...(task.assistantId ? { assistantId: task.assistantId } : {}),
+    });
+    if (!reopened.ok) return { ok: false, error: reopened.error === 'state_changed' ? 'STATE_MOVED' : 'REFUSED' };
+    await putTaskSettledFact(settledFact(task, 'card', { fromState: input.state, toState: reopened.to, personId: input.callerPersonId }));
+    return { ok: true, to: reopened.to };
+  }
+  // AN APPROVAL OF A DOCUMENT APPROVES THE VERSION THE CARD SHOWED, and only while it is the latest: a version
+  // attached since is refused, so nobody approves a file they did not see. The approved version's name rides the run on.
+  const latest = latestDocument(task as Task & { documents?: unknown });
+  if (latest && input.choice === 'approved') {
+    // A PRESS THAT NAMES NO VERSION came from a card that could not read them: it is asked to read them, not told one moved.
+    if (!input.document) return { ok: false, error: 'DOCUMENT_REQUIRED' };
+    if (input.document !== latest.fileKey) return { ok: false, error: 'DOCUMENT_MOVED' };
+    await setTaskRunValue(task.taskId, task.channelArn, APPROVED_DOCUMENT_VALUE, latest.name);
+  }
   // A FORM'S ANSWERS (WT50) are held to its fields before anything moves, and kept on the task as the person wrote them.
   const fields = task.workflowRun?.fields;
   const answers = fields?.length && input.choice === 'answered' ? formAnswersOf(fields, input.answers) : undefined;
   if (fields?.length && input.choice === 'answered' && !answers) return { ok: false, error: 'REFUSED' };
-  // A PRESS THAT WOULD END A RUN MID-WAY IS CONFIRMED FIRST (owner decision 2026-11-14): where the task's settlement ends its
+  // A PRESS THAT WOULD END A RUN MID-WAY IS CONFIRMED FIRST: where the task's settlement ends its
   // run (`confirmEnd`) and the run has not reached its end, the press moves the task to the state that asks, an edge the
   // machine declares, and the person's confirmation there settles it.
   const machine = task.taskType ? machines[task.taskType] : undefined;
-  const confirmable = !!task.workflowRun?.confirmEnd && pressTarget(machine, task.taskState ?? '', input.choice, task.workflowRun, false) !== input.choice;
+  // CONFIRMED WHERE IT WAS PRESSED (the pinned band asks before it sends), so the person is not asked twice.
+  const confirmable = !input.confirmed && !!task.workflowRun?.confirmEnd && pressTarget(machine, task.taskState ?? '', input.choice, task.workflowRun, false) !== input.choice;
   const toState = confirmable ? pressTarget(machine, task.taskState ?? '', input.choice, task.workflowRun, await runReachedItsEnd(task)) : input.choice;
   // THE PERSON'S CHOICE, RELAYED THROUGH THE ONE ADVANCE (`advanceTask`): the state it leaves awaits that person, and the
   // edge is one the state declares as a choice, so the move is theirs and the runtime decides nothing.
   const result = await advanceTask({
-    taskId: task.taskId, channelArn: task.channelArn, toState, by: 'system', reason: toState === input.choice ? 'chosen by its assignee on the task card' : 'its assignee asked to settle it while its run has steps open', machines,
+    taskId: task.taskId, channelArn: task.channelArn, toState, by: 'system', reason: toState !== input.choice ? 'its assignee asked to settle it while its run has steps open'
+      : task.assigneeId === input.callerPersonId ? 'chosen by its assignee on the task card' : 'chosen by a holder of a role that decides it', machines,
     ...(task.assistantId ? { assistantId: task.assistantId } : {}),
     ...(answers ? { details: { form: answers } } : {}),
     ...(typeof input.messageId === 'string' && input.messageId ? { messageId: input.messageId.slice(0, 128) } : {}),
@@ -816,6 +899,85 @@ export async function advanceAsAssignee(input: {
   // THE PRESS IS A FACT NO TURN RECORDS (WT61): one archive record of the move it made, ids and states only.
   await putTaskSettledFact(settledFact(task, 'card', { fromState: input.state, toState: result.to, ...(result.terminal ? { terminal: result.terminal } : {}), personId: input.callerPersonId }));
   return { ok: true, to: result.to };
+}
+
+/** The task's assignee, a person, or nothing: the one who may read and attach its versions. */
+async function assignedTo(input: { taskId?: unknown; channelArn?: unknown; callerPersonId?: unknown }): Promise<Task | null> {
+  if (typeof input?.taskId !== 'string' || typeof input?.channelArn !== 'string' || typeof input?.callerPersonId !== 'string') return null;
+  if (await refusesChannel(input.channelArn)) return null;
+  const task = await getTask(input.taskId, input.channelArn).catch(() => null);
+  return task && task.assigneeType === 'user' && task.assigneeId === input.callerPersonId ? task : null;
+}
+
+/** THE VERSIONS OF THE DOCUMENT A TASK APPROVES, oldest first, for its assignee. */
+async function taskDocuments(input: { taskId: string; channelArn: string; callerPersonId: string }): Promise<{ ok: true; documents: TaskDocument[] } | { ok: false; error: 'NOT_FOUND' }> {
+  const task = await assignedTo(input);
+  return task ? { ok: true, documents: documentsOf(task as Task & { documents?: unknown }) } : { ok: false, error: 'NOT_FOUND' };
+}
+
+/**
+ * ITS APPROVER ATTACHES AN EDITED VERSION: the task's assignee, while it is open, a Markdown file they uploaded
+ * to this conversation themselves (`isOwnMarkdownUpload`), recorded as the task's newest version.
+ */
+async function addTaskDocument(input: { taskId: string; channelArn: string; callerPersonId: string; fileKey: string; name: string }): Promise<{ ok: true; documents: TaskDocument[] } | { ok: false; error: 'NOT_FOUND' | 'SETTLED' | 'NOT_YOURS' | 'FULL' }> {
+  const task = await assignedTo(input);
+  if (!task || !task.workflowRun) return { ok: false, error: 'NOT_FOUND' };
+  if (settlementOutcome(task, machinesOfTask(task, packTaskStateMachines()))) return { ok: false, error: 'SETTLED' };
+  const conversationId = task.channelArn.split('/').pop() ?? '';
+  if (!isOwnMarkdownUpload(input.fileKey, conversationId, input.callerPersonId)) return { ok: false, error: 'NOT_YOURS' };
+  const doc: TaskDocument = { fileKey: input.fileKey, name: String(input.name || input.fileKey.split('/').pop()).slice(0, 120), by: input.callerPersonId, at: new Date().toISOString() };
+  if (!(await appendTaskDocument(task.taskId, task.channelArn, doc, MAX_TASK_DOCUMENTS))) return { ok: false, error: 'FULL' };
+  const now = await getTask(task.taskId, task.channelArn).catch(() => null);
+  return { ok: true, documents: documentsOf((now ?? task) as Task & { documents?: unknown }) };
+}
+
+/**
+ * ITS APPROVER ASKS THE DRAFTING ASSISTANT TO REVISE IT: the task's assignee, while it is open and its
+ * versions start from an assistant's draft, with their instructions. The request is recorded on the task, then named to the
+ * router, which asks the same assistant for the same intent; its revised file lands as this task's next version
+ * (`addRevisedDocument`). One revision at a time: one that failed is cleared where its failure is seen (`abandonRevision`), and one
+ * past `REVISION_PENDING_MS` holds nothing back, so a revision whose turn ended unseen never blocks the next.
+ */
+async function requestRevision(input: { taskId: string; channelArn: string; callerPersonId: string; instructions: string }): Promise<{ ok: true } | { ok: false; error: 'NOT_FOUND' | 'SETTLED' | 'NO_DRAFT' | 'PENDING' | 'REFUSED' }> {
+  const task = await assignedTo(input) as (Task & { documents?: unknown; revision?: TaskRevisionRequest }) | null;
+  if (!task || !task.workflowRun) return { ok: false, error: 'NOT_FOUND' };
+  if (settlementOutcome(task, machinesOfTask(task, packTaskStateMachines()))) return { ok: false, error: 'SETTLED' };
+  if (!draftingOf(task)) return { ok: false, error: 'NO_DRAFT' };
+  if (revisionPending(task.revision)) return { ok: false, error: 'PENDING' };
+  const instructions = String(input.instructions ?? '').trim().slice(0, MAX_REVISION_INSTRUCTIONS);
+  if (!instructions) return { ok: false, error: 'REFUSED' };
+  const n = documentsOf(task).length + 1;
+  if (!(await setTaskRevision(task.taskId, task.channelArn, { instructions, by: input.callerPersonId, at: new Date().toISOString(), n }))) return { ok: false, error: 'REFUSED' };
+  if (!(await nameTaskThroughRouter(SERVICE_CLASSIFICATION, { kind: 'revise', channelArn: task.channelArn, taskId: task.taskId }))) {
+    await setTaskRevision(task.taskId, task.channelArn, null);
+    return { ok: false, error: 'REFUSED' };
+  }
+  return { ok: true };
+}
+
+/**
+ * A REVISION THAT WILL NOT LAND IS CLEARED (`clearTaskRevision`): named by the router where no assistant holds the drafting role or
+ * the turn could not be dispatched, and by the drafting turn where it ended without a file. Only that revision, by its number.
+ */
+async function abandonRevision(input: { taskId: string; channelArn: string; n: number }): Promise<{ cleared: boolean }> {
+  if (typeof input?.taskId !== 'string' || typeof input?.channelArn !== 'string' || !Number.isInteger(input?.n) || await refusesChannel(input.channelArn)) return { cleared: false };
+  return { cleared: await clearTaskRevision(input.taskId, input.channelArn, input.n) };
+}
+
+/**
+ * THE DRAFTING ASSISTANT'S REVISION LANDS AS THE TASK'S NEXT VERSION (stage 2): only while a revision is asked for and the task
+ * is open, and only a file an assistant delivered in this conversation. The request is cleared, so another may be asked.
+ */
+async function addRevisedDocument(input: { taskId: string; channelArn: string; fileKey: string; name: string; by: string }): Promise<{ ok: boolean; error?: string }> {
+  if (typeof input?.taskId !== 'string' || typeof input?.channelArn !== 'string' || await refusesChannel(input.channelArn)) return { ok: false, error: 'NOT_FOUND' };
+  const task = await getTask(input.taskId, input.channelArn).catch(() => null) as (Task & { revision?: TaskRevisionRequest }) | null;
+  if (!task?.revision) return { ok: false, error: 'NOT_ASKED' };
+  if (settlementOutcome(task, machinesOfTask(task, packTaskStateMachines()))) return { ok: false, error: 'SETTLED' };
+  if (!isAssistantDocumentKey(input.fileKey, task.channelArn.split('/').pop() ?? '') || typeof input.by !== 'string' || !input.by.startsWith('assistant:')) return { ok: false, error: 'NOT_YOURS' };
+  const doc: TaskDocument = { fileKey: input.fileKey, name: String(input.name || '').slice(0, 120) || input.fileKey.split('/').pop()!, by: input.by.slice(0, 60), at: new Date().toISOString() };
+  const added = await appendTaskDocument(task.taskId, task.channelArn, doc, MAX_TASK_DOCUMENTS);
+  await setTaskRevision(task.taskId, task.channelArn, null);
+  return added ? { ok: true } : { ok: false, error: 'FULL' };
 }
 
 /**
@@ -853,7 +1015,7 @@ function processFieldsOf(input: Pick<RunEndedFact, 'processId' | 'process' | 'pr
 }
 
 /** The archive record of a settlement no turn records (WT61): the task's references, never its content. */
-function settledFact(task: Task, cause: TaskSettledFact['cause'], move: Pick<TaskSettledFact, 'fromState' | 'toState' | 'terminal' | 'personId'>): TaskSettledFact {
+function settledFact(task: Task, cause: TaskSettledFact['cause'], move: Pick<TaskSettledFact, 'fromState' | 'toState' | 'terminal' | 'personId' | 'action'>): TaskSettledFact {
   const at = new Date().toISOString();
   return {
     // Fixed when the fact is made, so a stream redelivery of the record lands on the row it already wrote; a task that
@@ -913,14 +1075,14 @@ export async function settleArchivedTasks(input: { channelArn: string }): Promis
 }
 
 /**
- * A RUN THAT ENDED MID-WAY CANCELS ITS OPEN WORK (`endsRun`, owner decision 2026-11-14): the router ended the run because the
+ * A RUN THAT ENDED MID-WAY CANCELS ITS OPEN WORK (`endsRun`): the router ended the run because the
  * task it went on alongside settled, and asks here. Each open task the run's steps opened, and each request it made of
  * another assistant, is cancelled with the run's end recorded as its reason, and its settlement named, so nothing is left
  * pending. The run's end is already claimed, so no settlement named here continues it. The task that ended the run is
  * settled and is not touched. Only in a conversation of this service's classification; a read that fails cancels nothing
  * and says so.
  */
-export async function endRunTasks(input: { channelArn: string; runKey: string; keepAlongside?: boolean }): Promise<{ cancelled: string[] } | { failed: true }> {
+export async function endRunTasks(input: { channelArn: string; runKey: string; keepAlongside?: boolean; keepTaskId?: string }): Promise<{ cancelled: string[] } | { failed: true }> {
   if (!input?.channelArn || !input?.runKey || await refusesChannel(input.channelArn)) return { failed: true };
   const open = await openWorkflowTasksIn(input.channelArn);
   if (!open) return { failed: true };
@@ -929,6 +1091,8 @@ export async function endRunTasks(input: { channelArn: string; runKey: string; k
     if (task.workflowRun?.runKey !== input.runKey && task.askedBy?.runKey !== input.runKey) continue;
     // A RUN MOVED ON (O15) KEEPS WHAT IT WENT ON ALONGSIDE: an investigation outlives the resolve.
     if (input.keepAlongside && task.workflowRun?.holdsEnd) continue;
+    // A REOPEN KEEPS THE TASK IT REOPENED, which the reopen's own run takes next.
+    if (input.keepTaskId && task.taskId === input.keepTaskId) continue;
     if (settlementOutcome(task, machinesOfTask(task, packTaskStateMachines()))) continue;
     await updateTaskStatus(task.taskId, task.channelArn, 'cancelled', undefined, TASK_RUN_ENDED_ENDING);
     await putTaskSettledFact(settledFact(task, 'run-ended', { ...(task.taskState ? { fromState: task.taskState } : {}), terminal: TASK_RUN_ENDED_ENDING }));
@@ -1438,6 +1602,21 @@ async function recordTaskDeliveryOp(input: {
  * and its own task step takes this task. Refused where the conversation is not this classification's, and where the task
  * is not a request awaiting its run (`requestAwaitingRun`).
  */
+/**
+ * A REOPEN RUN TAKES THE REOPENED TASK (`takes: 'reopened'`): refused where the conversation is not this classification's, where
+ * the task is not open again (a reopen leaves it in a state with a way on), and where it no longer names the run it was reopened
+ * from.
+ */
+export async function takeReopenedTaskOp(input: { taskId: string; channelArn: string; fromRunKey: string; workflowRun: WorkflowRunRef; ttlSeconds?: number }): Promise<Task | null> {
+  if (!input?.taskId || !input?.channelArn || !input?.fromRunKey || !input?.workflowRun?.runKey || await refusesChannel(input.channelArn)) return null;
+  const task = await getTask(input.taskId, input.channelArn).catch(() => null);
+  if (!task?.workflowRun || task.workflowRun.runKey !== input.fromRunKey) return null;
+  const machine = machinesOfTask(task, packTaskStateMachines())[task.taskType ?? ''];
+  if (!machine?.states[task.taskState ?? '']?.transitions.length) return null;
+  return takeReopenedTask(input.taskId, input.channelArn, input.fromRunKey, input.workflowRun,
+    typeof input.ttlSeconds === 'number' && Number.isFinite(input.ttlSeconds) ? { ttlSeconds: input.ttlSeconds } : {});
+}
+
 export async function attachRequestRunOp(input: { taskId: string; channelArn: string; workflowRun: WorkflowRunRef; dueBy?: string; ttlSeconds?: number }): Promise<Task | null> {
   if (!input?.taskId || !input?.channelArn || !input?.workflowRun?.runKey || await refusesChannel(input.channelArn)) return null;
   const task = await getTask(input.taskId, input.channelArn).catch(() => null);
@@ -1576,6 +1755,16 @@ export const handler = async (event: TaskServiceRequest): Promise<unknown> => {
       return openWorkflowTask(input as never);
     case 'advanceAsAssignee':
       return advanceAsAssignee(input as never);
+    case 'taskDocuments':
+      return taskDocuments(input as never);
+    case 'addTaskDocument':
+      return addTaskDocument(input as never);
+    case 'requestRevision':
+      return requestRevision(input as never);
+    case 'addRevisedDocument':
+      return addRevisedDocument(input as never);
+    case 'abandonRevision':
+      return abandonRevision(input as never);
     case 'cancelForDeadline':
       return cancelForDeadline(input as never);
     case 'settleArchivedTasks':
@@ -1592,6 +1781,8 @@ export const handler = async (event: TaskServiceRequest): Promise<unknown> => {
       return adminCancelRun(input as never);
     case 'attachRequestRun':
       return attachRequestRunOp(input as never) as never;
+    case 'takeReopenedTask':
+      return takeReopenedTaskOp(input as never) as never;
     case 'requesterMovableTask':
       return requesterMovableTask(input as never) as never;
     case 'holdRunWait':

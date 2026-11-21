@@ -116,7 +116,7 @@ describe('GET /tasks/mine', () => {
     mockGetActiveTasksForUser.mockResolvedValue([]);
     const res = await handler(event({}, 'me'));
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ items: [], count: 0 });
+    expect(JSON.parse(res.body)).toEqual({ items: [], count: 0, complete: true });
   });
 });
 

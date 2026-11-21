@@ -124,6 +124,8 @@ export interface ClassificationCatalog {
   intents?: CatalogIntent[];
   /** The classification's pack as stored, when it sets one: what a version copies as its own when it first edits a machine. */
   storedPack?: { intents: unknown[]; machines?: Record<string, TaskStateMachine>; extends?: 'default' };
+  /** The machines this deployment runs for the classification, whole: what a machine edit starts from. */
+  machines?: Record<string, TaskStateMachine>;
   /** The platform intents every assistant answers, each with whether it answers through the `general` route unrouted. */
   platformIntents?: Array<{ key: string; answersThroughGeneral: boolean }>;
   topology?: { processorTimeout: number; memorySize: number; reservedConcurrency?: number; maxTokens?: number };
@@ -506,13 +508,14 @@ export type ProfileDraftPatch = { [K in keyof ProfileDefinitionBody]?: ProfileDe
 /**
  * Edit the draft this console is showing, named by its configId. The server merges the patch only while that is still
  * the stored draft: a draft saved since is refused `409 DRAFT_CHANGED`, and an edit naming none while one exists is
- * `409 CONFIG_ID_REQUIRED`. With no draft and no configId, the edit starts one from the active version.
+ * `409 CONFIG_ID_REQUIRED`. With no draft and no configId, the edit starts one from the active version, held to the active
+ * version this console was showing (`basedOnVersion`): one activated since is refused `409 VERSION_CHANGED`.
  */
-export async function editProfileDraft(profileName: string, patch: ProfileDraftPatch, configId: string | null | undefined): Promise<{ profileName: string; draftConfigId: string }> {
+export async function editProfileDraft(profileName: string, patch: ProfileDraftPatch, configId: string | null | undefined, basedOnVersion?: number | null): Promise<{ profileName: string; draftConfigId: string }> {
   return post({
     admin: () => adminUrl('assistant-admin', '/admin/profiles/draft'),
     team: (a) => adminUrl('assistant-admin', `/admin/assistants/${a}/profiles/draft`),
-  }, { profileName, patch, ...(configId ? { configId } : {}) });
+  }, { profileName, patch, ...(configId ? { configId } : typeof basedOnVersion === 'number' ? { basedOnVersion } : {}) });
 }
 
 /**

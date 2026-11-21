@@ -1,19 +1,22 @@
 import { useEffect, useRef } from 'react';
-import { requestMessageFocus } from '../utils/focusMessage';
+import { requestMessageFocus, TASK_FOCUS_PREFIX } from '../utils/focusMessage';
 
 type Select = (conversationId: string) => Promise<void>;
 
 /**
- * The conversation and message a link names: `?conversation=<id>` with an optional `#message=<id>`. A message id that
- * does not decode names no message, and the conversation still opens.
+ * The conversation and message a link names: `?conversation=<id>` with an optional `#message=<id>`, or `#task=<id>`, which
+ * names that task's newest card. An id that does not decode names nothing, and the conversation still opens.
  */
-function linkTarget(search: string, hash: string): { conversationId: string; messageId: string } | null {
+export function linkTarget(search: string, hash: string): { conversationId: string; messageId: string } | null {
   const conversationId = new URLSearchParams(search).get('conversation');
   if (!conversationId) return null;
-  const rawMessageId = (hash.match(/message=([^&]+)/) || [])[1] || '';
-  let messageId = '';
-  try { messageId = decodeURIComponent(rawMessageId); } catch { /* no message to focus */ }
-  return { conversationId, messageId };
+  const decoded = (key: string) => {
+    const raw = (hash.match(new RegExp(`(?:^#|&)${key}=([^&]+)`)) || [])[1] || '';
+    try { return decodeURIComponent(raw); } catch { return ''; }
+  };
+  const messageId = decoded('message');
+  const taskId = messageId ? '' : decoded('task');
+  return { conversationId, messageId: messageId || (taskId ? `${TASK_FOCUS_PREFIX}${taskId}` : '') };
 }
 
 /**

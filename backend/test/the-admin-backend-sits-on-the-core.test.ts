@@ -9,6 +9,7 @@
  *  - The admin credential exchange's token route is the admin backend's own, so the core's exchange
  *    carries no admin route.
  */
+import { ADMIN_NOTICE_TYPES } from '../lambda/src/lib/admin-notice-types';
 import * as path from 'path';
 import { synthesizeApp, SYNTH_CAPABILITIES, type SynthesizedApp } from '../lib/docs/api-contract';
 import { componentRuleViolations, ssmEdgeViolations, assistantParameterViolations, type Synthesized } from './deploy-matrix/matrix';
@@ -75,11 +76,11 @@ describe('every built capability (athena)', () => {
     expect(routes(app.templates.Experiments)).toEqual([]);
   });
 
-  it('has the ae.alert rule in AdminServices and nowhere else', () => {
+  it('has the ae.alert rules, one per catalogued notice type, in AdminServices and nowhere else', () => {
     const rules = Object.entries(app.templates).flatMap(([stack, t]) => Object.values(t.Resources ?? {})
       .filter((r) => r.Type === 'AWS::Events::Rule' && JSON.stringify(r.Properties?.EventPattern?.source ?? []).includes('ae.alert'))
       .map(() => stack));
-    expect(rules).toEqual(['AdminServices']);
+    expect(rules).toEqual(ADMIN_NOTICE_TYPES.map(() => 'AdminServices'));
   });
 
   it('reads no admin-channel ARN, agent or parameter in any core stack', () => {

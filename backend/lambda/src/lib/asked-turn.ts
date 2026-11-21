@@ -24,6 +24,13 @@ export interface AskedTurn {
   for?: string;
   /** This assistant's own run for the intent, which the turn's message and its measures carry. */
   run: { runKey: string; origin?: RunOrigin; trigger: RunTrigger };
+  /** The asking step delivers the answer as a file (`deliver: 'file'`), whatever the intent declares. */
+  deliver?: 'file';
+  /**
+   * A REVISION OF A TASK'S DOCUMENT: the approval task and the version revised. Its file lands as that
+   * task's next version, and it hands no run on (the run waits on the approval).
+   */
+  revisionOf?: { taskId: string; fileKey: string; name: string };
 }
 
 /** The prompt template an asked turn takes, which the owning team may reword. */

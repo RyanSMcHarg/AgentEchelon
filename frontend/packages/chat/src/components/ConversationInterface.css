@@ -561,6 +561,11 @@
   border-left: 3px solid var(--surface-300, var(--surface-200));
   color: var(--text-secondary, var(--text-muted));
 }
+/* AN ASSISTANT'S REPLY IS ALREADY SET APART BY ITS BOX: a quote inside it reads as the reply's own text, with no second rule. */
+.assistant-message .message-markdown blockquote {
+  border-left: none;
+  padding-left: 0;
+}
 .message-markdown table {
   border-collapse: collapse;
   margin: 0 0 var(--space-3);
@@ -627,11 +632,7 @@
   outline: none;
 }
 
-/* Subtle left border on agent messages */
-.assistant-message .message-text {
-  padding-left: var(--space-4);
-  border-left: 2px solid var(--accent-200);
-}
+/* AN ASSISTANT'S MESSAGE IS SET APART BY ITS BOX ALONE: no second rule down its text. */
 
 .message-feedback-row {
   display: flex;
@@ -1158,6 +1159,9 @@
   background: color-mix(in srgb, var(--accent-500) 7%, var(--surface-0));
   box-shadow: var(--shadow-md);
 }
+
+/* A CARD INSIDE A CARD DRAWS NO SECOND BOX: a task or proposal card on a message that is itself a card (a meeting's) is its body. */
+.meeting-card-message .proposal-card { border: none; box-shadow: none; background: transparent; padding: 0; }
 
 /* THE CONFIRMATION CARD of a proposal addressed to this person (ADR-061 decision 8). */
 .proposal-card {

@@ -534,7 +534,7 @@ suite('Analytics numbers mean what the spec says they mean', () => {
   });
 
   /**
-   * THE SHADOW DIFF ANSWERS, OVER LIVE TRAFFIC (latency record, owner 2026-09-15).
+   * THE SHADOW DIFF ANSWERS, OVER LIVE TRAFFIC (latency record).
    *
    * The Latency tab reads from the ledger because the derived path and the ledger are watched agreeing
    * on the same turns. This is that watch: it reads the comparison through the signed path and logs

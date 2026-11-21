@@ -50,6 +50,7 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNodeJs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import { connectorEventPattern, connectorSecretNames } from '../config/connectors';
 import { dataRemovalPolicy } from '../config/environment';
@@ -59,7 +60,7 @@ import { grantAccountStateRead, grantDirectoryRead } from '../constructs/directo
 import { grantIssuerRegistry, issuersOf } from '../constructs/trusted-issuers';
 import { isProvisionedOnly } from '../config/issuers';
 import type { RouteSource, RouteSpec } from '../constructs/http-api';
-import { INSTANCE_NAME, RES_PREFIX, alertEmitterWiring } from './agent-classification-common';
+import { INSTANCE_NAME, RES_PREFIX, SSM_ROOT, alertEmitterWiring } from './agent-classification-common';
 
 /** The source the receiver publishes vendor events under. Mirrors `CONNECTOR_SOURCE` in the handler. */
 export const CONNECTOR_EVENT_SOURCE = 'ae.connector';
@@ -219,10 +220,21 @@ export class ConnectorsStack extends cdk.Stack implements RouteSource {
       }
       this.ingestFunction = ingest;
 
+      // THE RECEIVER'S RECORD, named where the router reads it (DESIGN-EVENT-TARGETS 11.2, 11.3): a person or a conversation in a
+      // connector fact is trusted only where this record, which no other principal writes, says the same.
+      new ssm.StringParameter(this, 'ConnectorReplayTableNameParam', {
+        parameterName: CONNECTOR_REPLAY_TABLE_PARAM,
+        stringValue: replayTable.tableName,
+        description: 'The connector receiver\'s replay table, whose published records a consumer of connector facts verifies against',
+      });
+
       // ONE RULE PER SUBSCRIBING CONNECTOR, on its vendor's partner event bus, pinned to its declared source.
       // `targets.LambdaFunction` adds the receiver's resource policy for this rule's ARN alone.
       for (const c of subscribing) {
-        const bus = events.EventBus.fromEventBusName(this, `PartnerBus-${c.id}`, c.eventSource as string);
+        // THE APP'S OWN BUS (WT84): created here, and its policy is the trust boundary, so only the app's principal puts on it.
+        const bus = c.vendor === 'app'
+          ? appEventBus(this, c.id, c.eventSource as string, c.appPrincipal as string)
+          : events.EventBus.fromEventBusName(this, `PartnerBus-${c.id}`, c.eventSource as string);
         const pattern = connectorEventPattern(c);
         const rule = new events.Rule(this, `ConnectorEvents-${c.id}`, {
           description: `The ${c.vendor} events connector ${c.id} subscribes to, from its partner event source`,
@@ -380,4 +392,30 @@ export class ConnectorsStack extends cdk.Stack implements RouteSource {
 
     cdk.Tags.of(this).add('Component', 'Connectors');
   }
+}
+
+/** The SSM parameter naming the connector receiver's replay table, which the router reads a connector fact's record from. */
+export const CONNECTOR_REPLAY_TABLE_PARAM = `${SSM_ROOT}/connectors/replay-table-name`;
+
+/**
+ * THE DEPLOYMENT'S OWN APP'S BUS (WT84): its resource policy allows `events:PutEvents` from the app's principal for its declared
+ * source, and denies every other principal and every other source. The denies are what make it a trust boundary: a principal in
+ * this account whose own IAM allows `events:PutEvents` on `*` is still refused here, so an event on this bus is the app's.
+ */
+export function appEventBus(scope: Construct, connectorId: string, source: string, appPrincipal: string): events.EventBus {
+  const bus = new events.EventBus(scope, `AppBus-${connectorId}`, { eventBusName: `${cdk.Stack.of(scope).stackName}-app-${connectorId}` });
+  bus.addToResourcePolicy(new iam.PolicyStatement({
+    sid: 'TheAppPutsItsOwnSource', effect: iam.Effect.ALLOW, principals: [new iam.ArnPrincipal(appPrincipal)],
+    actions: ['events:PutEvents'], resources: [bus.eventBusArn], conditions: { StringEquals: { 'events:source': [source] } },
+  }));
+  bus.addToResourcePolicy(new iam.PolicyStatement({
+    sid: 'NoOtherPrincipalPuts', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()],
+    actions: ['events:PutEvents'], resources: [bus.eventBusArn], conditions: { ArnNotEquals: { 'aws:PrincipalArn': appPrincipal } },
+  }));
+  bus.addToResourcePolicy(new iam.PolicyStatement({
+    sid: 'NoOtherSource', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()],
+    actions: ['events:PutEvents'], resources: [bus.eventBusArn], conditions: { StringNotEquals: { 'events:source': [source] } },
+  }));
+  new cdk.CfnOutput(scope, `AppBusName-${connectorId}`, { value: bus.eventBusName, description: `The bus the application of connector ${connectorId} puts its events on` });
+  return bus;
 }

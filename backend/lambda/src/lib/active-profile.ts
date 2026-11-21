@@ -501,7 +501,7 @@ export interface AssistantCopy {
    */
   queuedPrivateCount?: string;
   /**
-   * How this assistant heads the queued messages it could not make out (maintainer, 2026-09-03).
+   * How this assistant heads the queued messages it could not make out.
    *
    * A queue reading may hold a message and still be unable to tell what it asks for. Saying so is
    * better than guessing a request, because a guess becomes a work item the person has to notice and

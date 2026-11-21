@@ -11,6 +11,7 @@ import { pressCard } from './workflow-task';
 import { signedCall, type VendedCredentials, exchange } from './admin-api';
 import { adminUrl } from './api-urls';
 import { shippedMessageTemplate } from '../../../backend/lambda/src/lib/shipped-message-templates';
+import { untilRoomChanges } from './watchdog/wire-wait';
 
 /** An SSM parameter's value, or '' where it is not set or cannot be read. */
 export const ssmValue = (name: string): string => {
@@ -19,11 +20,33 @@ export const ssmValue = (name: string): string => {
 
 const visible = (content: string) => content.replace(/<!--[\s\S]*?-->/g, '').trim();
 
-/** What an assistant posted in a conversation, as one person sees it, oldest first. */
+/** A message's Metadata, parsed, or an empty object where it carries none or none that parses. */
+const metaOf = (raw: string): Record<string, any> => {
+  try { const v = JSON.parse(raw || '{}'); return v && typeof v === 'object' ? v : {}; } catch { return {}; }
+};
+
+/**
+ * What an assistant posted in a conversation, as one person sees it, oldest first, each with its parsed Metadata (`meta`),
+ * where an event workflow records the step that posted it (`meta.eventStep.workflow`, the workflow or the asked intent).
+ */
 export const posts = (room: string, asArn: string) => messageRowsVisibleTo(room, asArn)
   .filter((m) => m.senderArn.includes('/bot/'))
-  .map((m) => ({ ...m, text: visible(m.content) }))
+  .map((m) => ({ ...m, text: visible(m.content), meta: metaOf(m.metadata) }))
   .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+
+/** One post as `posts` reads it. */
+export type Post = ReturnType<typeof posts>[number];
+
+/** The workflow, or the asked intent, whose step posted a message, or '' for one no run posted. */
+export const postedBy = (m: Post): string => String(m.meta?.eventStep?.workflow || '');
+
+/**
+ * WHAT AN ASSISTANT POSTED, ONCE `done` ACCEPTS IT: read now, then again on each of the room's message events
+ * (`untilRoomChanges`), so a wait on a room's messages follows its events rather than a timer. Returns the last read when
+ * `timeoutMs` passes, so an assertion on it reports what was seen.
+ */
+export const postsUntil = (room: string, asArn: string, done: (p: Post[]) => boolean, opts: { timeoutMs?: number } = {}): Promise<Post[]> =>
+  untilRoomChanges(room, asArn, () => posts(room, asArn), done, opts);
 
 /**
  * WHETHER A POST READS AS ONE SHIPPED TEMPLATE'S CHAT TEXT, its values filled: the template's own words, read from the

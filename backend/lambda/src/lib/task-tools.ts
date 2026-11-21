@@ -139,6 +139,12 @@ export interface TaskLoopContext {
    */
   runtimeMoves?: number;
   /**
+   * A QUIET STEP'S TURN (`isQuietStep`): the platform runs the step's declared action and the turn ends there, with no
+   * model call and no message. Its moves are marked quiet, so the task service closes a settled task and records the
+   * settlement in the archive, which no turn's message carries.
+   */
+  quiet?: true;
+  /**
    * WHAT THE TURN'S RESOLVER HOLDS (ADR-060, slice 1d): the classification's sources, the values this turn read by
    * source, and what its call site settled. A step's `when` and `edgeWhen` decide on these (`turnConditionValues`), and
    * an action argument bound to a variable source is inserted from them (`bindActionArgs`). Absent, no condition

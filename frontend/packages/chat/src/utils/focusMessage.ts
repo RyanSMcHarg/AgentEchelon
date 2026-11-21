@@ -38,6 +38,12 @@ const FOCUS_TTL_MS = 30_000;
 let pending: PendingFocus | null = null;
 
 /**
+ * A TASK'S CARD AS A FOCUS TARGET (`#task=<id>`, a dashboard runbook's link): held as this prefix and the task id, and
+ * resolved when the history renders to the newest card for that task, as answering from the task list resolves it.
+ */
+export const TASK_FOCUS_PREFIX = 'task:';
+
+/**
  * Reduce either spelling of a conversation to the channel id both share.
  *
  * A backend-composed deep link addresses the conversation by its full channel ARN

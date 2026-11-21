@@ -98,9 +98,11 @@ import {
   deploymentPackRaw,
   audit,
   DraftConflictError,
+  activationBasisError,
   assertDraftReplaceable,
   requestConfigId,
   withDeclaredWorkflows,
+  declaredConnectors,
   type FirstDraftResult,
 } from './lib/profile-lifecycle.js';
 import { goldenGateOutcome, pastGateDecision, effectiveMinimum, type GoldenGateRead } from './lib/golden-gate.js';
@@ -1433,7 +1435,7 @@ const handleProfiles = async (event: APIGatewayProxyEvent, context?: { invokedFu
         const target = await processTargetOf(ssm, SSM_ROOT, owner, landed, requires);
         if ('error' in target) return respond(503, { error: target.error, code: 'PROCESS_TARGET_UNREADABLE' });
         const refusals = processRequirementErrors(requires, target);
-        const errors = refusals.some((r) => r.code === 'PROCESS_REQ_WORKFLOW') ? [] : versionProcessesErrors(landed.processes, landed.eventWorkflows, landed.intentWorkflows);
+        const errors = refusals.some((r) => r.code === 'PROCESS_REQ_WORKFLOW') ? [] : versionProcessesErrors(landed.processes, landed.eventWorkflows, landed.intentWorkflows, { connectors: declaredConnectors() });
         if (refusals.length || errors.length) {
           return respond(422, { error: 'This deployment does not have what the process needs', code: 'PROCESS_REQUIREMENTS_UNMET', refusals, errors });
         }
@@ -1479,7 +1481,8 @@ const handleProfiles = async (event: APIGatewayProxyEvent, context?: { invokedFu
         }
         // Held to the draft the editor was showing: a draft saved since is refused, never merged over.
         // A guardrail key is stored as the id it names, read against the catalog import reads (`guardrailCatalogFor`).
-        const draft = await editDraft(ssm, SSM_ROOT, profileName, patch, sub, { configId: requestConfigId(body.configId) }, guardrailCatalogFor);
+        const activeVersion = typeof body.basedOnVersion === 'number' && Number.isInteger(body.basedOnVersion) ? body.basedOnVersion : undefined;
+        const draft = await editDraft(ssm, SSM_ROOT, profileName, patch, sub, { configId: requestConfigId(body.configId), ...(activeVersion !== undefined ? { activeVersion } : {}) }, guardrailCatalogFor);
         return respond(200, { profileName, draftConfigId: draft.configId });
       }
       if (path.endsWith('/validate')) {
@@ -1613,6 +1616,9 @@ const handleProfiles = async (event: APIGatewayProxyEvent, context?: { invokedFu
             configId: pendingDraft.configId,
           });
         }
+        // A NEWER VERSION ACTIVATED SINCE THE DRAFT WAS STARTED IS NEVER REPLACED BY IT.
+        const stale = await activationBasisError(ssm, SSM_ROOT, profileName, pendingDraft);
+        if (stale) return respond(409, { error: stale.message, code: stale.code, configId: stale.configId });
         // CHECKED AGAIN AT ACTIVATION: another assistant may have taken the name since the draft was edited,
         // and an import lands a name without passing the edit.
         const pending = pendingDraft.displayName;

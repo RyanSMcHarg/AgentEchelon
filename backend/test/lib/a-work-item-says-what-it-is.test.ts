@@ -1,5 +1,5 @@
 /**
- * A WORK ITEM SAYS WHAT IT IS, AND WHAT FINISHING IT NEEDS (maintainer, 2026-09-03).
+ * A WORK ITEM SAYS WHAT IT IS, AND WHAT FINISHING IT NEEDS.
  *
  * The open-work panel lists what a person still owes. Every row read the name of its TYPE:
  * "Queued request", "Report generation", repeated. Measured on the deployment: 72 rows of one type

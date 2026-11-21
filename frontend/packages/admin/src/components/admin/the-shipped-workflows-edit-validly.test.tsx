@@ -85,7 +85,7 @@ describe('an edit on a shipped workflow keeps it valid', () => {
   it('a wait on the opened conversation goes with the step that opens it, removed or changed to another kind', () => {
     // A TEAM'S OWN SHAPE, with a step in front of the open step (the shipped incident opens first).
     const removed = removeStep(clone(TRIAGE_FIRST_WORKFLOWS['incident-triage']), 'open');
-    expect(Object.keys(removed.states)).toEqual(['triage', 'tell', 'report-timed-out', 'report-ended', 'done']);
+    expect(Object.keys(removed.states)).toEqual(['triage', 'tell', 'report-timed-out', 'report-ended', 'tell-not-opened', 'done', 'failed']);
     expect(removed.states.tell).not.toHaveProperty('onSuccess');
     expect(removed.states.triage).not.toHaveProperty('onSuccess');
     expect(errorsOf('incident-triage', removed)).toEqual([]);

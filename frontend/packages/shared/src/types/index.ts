@@ -105,7 +105,7 @@ export interface Message {
    * A TASK A WORKFLOW ASSIGNED THIS PERSON (ADR-063 decision 2): the task's handle, the state the card was drawn in and the
    * choices it offers, carried on the targeted message's Metadata and drawn as a task card.
    */
-  taskCard?: { id: string; state: string; choices: string[]; expiresAt?: number };
+  taskCard?: { id: string; state: string; choices: string[]; expiresAt?: number; documents?: boolean; pinned?: boolean };
   /**
    * A CONVERSATION'S MEETING CARD (the `meetings` capability): the platform's message that its meeting started or ended,
    * which tells a person already looking at the conversation without a read of their own. `conversationId` is the
@@ -117,7 +117,16 @@ export interface Message {
    * A CONVERSATION'S DASHBOARD (DESIGN-CONVERSATION-DASHBOARDS): which kind, which conversation, when it was updated and
    * the alarm's state. References only; the figures are read with the member's own credentials when it is opened.
    */
-  dashboard?: { kind: 'snapshot' | 'page'; conversationId: string; updatedAt: string; state?: 'ALARM' | 'OK' | 'INSUFFICIENT_DATA' };
+  dashboard?: {
+    kind: 'snapshot' | 'page'; conversationId: string; updatedAt: string; state?: 'ALARM' | 'OK' | 'INSUFFICIENT_DATA';
+    /** The step the conversation's run is on now, and who holds its roles: what the conversation pins at its top. */
+    now?: { label: string; status: string; holder?: string };
+    people?: Array<{ role: string; name: string }>;
+    /** Where the conversation stands, from its pinned step. */
+    standing?: 'open' | 'resolved' | 'ended';
+    /** Who may decide the pinned step (person ids) and its choices now; `reopen` where it ended and may be reopened. */
+    decide?: { taskId: string; state: string; choices: string[]; by: string[]; reopen?: boolean };
+  };
   // True when the SendChannelMessage Target included the current user's ARN —
   // i.e., the message was targeted to us (and is invisible to other channel
   // members). Used to drive the sticky-mention follow-up behavior.

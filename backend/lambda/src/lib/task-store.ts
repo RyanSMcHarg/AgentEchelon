@@ -368,6 +368,11 @@ export async function cancelForDeadline(input: { taskId: string; channelArn: str
   return hasTaskService() ? service.cancelForDeadline(input) : { cancelled: false };
 }
 /** A request whose task no router turn opened takes its intent's run (WT115, WT106). Null without the service: only the service writes it. */
+/** A reopen run's step takes the reopened task (`takes: 'reopened'`). */
+export async function takeReopenedTask(input: { taskId: string; channelArn: string; fromRunKey: string; workflowRun: Record<string, unknown> }): Promise<Task | null | undefined> {
+  return hasTaskService() ? service.takeReopenedTask(input) : null;
+}
+
 export async function attachRequestRun(input: { taskId: string; channelArn: string; workflowRun: Record<string, unknown>; dueBy?: string; ttlSeconds?: number }): Promise<Task | null | undefined> {
   return hasTaskService() ? service.attachRequestRun(input) : null;
 }
@@ -406,18 +411,30 @@ export async function settleArchivedTasks(channelArn: string): Promise<string[] 
   return hasTaskService() ? service.settleArchivedTasks({ channelArn }) : null;
 }
 /** A run a settlement ended mid-way cancels its open work (`endsRun`): the ids cancelled, or null. Through the service only. */
-export async function endRunTasks(channelArn: string, runKey: string, opts: { keepAlongside?: boolean } = {}): Promise<string[] | null> {
-  return hasTaskService() ? service.endRunTasks({ channelArn, runKey, ...(opts.keepAlongside ? { keepAlongside: true } : {}) }) : null;
+export async function endRunTasks(channelArn: string, runKey: string, opts: { keepAlongside?: boolean; keepTaskId?: string } = {}): Promise<string[] | null> {
+  return hasTaskService() ? service.endRunTasks({ channelArn, runKey, ...(opts.keepAlongside ? { keepAlongside: true } : {}), ...(opts.keepTaskId ? { keepTaskId: opts.keepTaskId } : {}) }) : null;
 }
 /** Which of a run's step claims are held, with their outcomes, or null when they cannot be read. Through the service only. */
 export async function readEventSteps(input: { runKey: string; channelArn: string; steps: string[] }): Promise<Record<string, string> | null> {
   return hasTaskService() ? service.readEventSteps(input) : null;
 }
 
-export async function workflowTaskIds(channelArn: string): Promise<string[]> {
-  return hasTaskService() ? service.workflowTaskIds({ channelArn }) : [];
+export async function workflowTaskIds(channelArn: string, opts: { skipMachines?: readonly string[] } = {}): Promise<string[]> {
+  return hasTaskService() ? service.workflowTaskIds({ channelArn, ...(opts.skipMachines?.length ? { skipMachines: opts.skipMachines } : {}) }) : [];
 }
 /** The open item an id names, when its sender may answer it (ADR-035). Null without the service: only the service answers it. */
 export async function answerableTaskById(input: { channelArn: string; taskId: string; senderSub: string }): Promise<{ taskId: string; assistantId?: string; private?: true } | null> {
   return hasTaskService() ? service.answerableTaskById(input) : null;
+}
+
+/** A revision that will not land is cleared, through the task service. */
+export async function abandonRevision(input: Parameters<typeof service.abandonRevision>[0]): Promise<{ cleared: boolean }> {
+  if (!hasTaskService()) return { cleared: false };
+  return service.abandonRevision(input);
+}
+
+/** The drafting assistant's revision lands as the task's next version, through the task service. */
+export async function addRevisedDocument(input: Parameters<typeof service.addRevisedDocument>[0]): Promise<{ ok: boolean; error?: string }> {
+  if (!hasTaskService()) return { ok: false, error: 'NO_TASK_SERVICE' };
+  return service.addRevisedDocument(input);
 }

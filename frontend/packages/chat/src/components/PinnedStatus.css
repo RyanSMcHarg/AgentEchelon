@@ -1,0 +1,32 @@
+/* THE PINNED STATUS (PinnedStatus.tsx): one band above the messages, the dashboard's card at its right, wrapping under it on a
+   narrow screen; a pinned task card, for whoever holds it, below. Every color is a design-system token with its light value as
+   the fallback. */
+.pinned-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2, 8px) var(--space-4, 16px);
+  align-items: center;
+  padding: var(--space-3, 12px) var(--space-4, 16px);
+  border-bottom: 1px solid var(--surface-200, #E4E4E7);
+  background: var(--surface-0, #FFFFFF);
+  flex: none;
+  font-size: var(--text-md, 15px);
+}
+.pinned-status-lines { flex: 1 1 280px; min-width: 0; }
+.pinned-status-lines p { margin: 0 0 var(--space-1, 4px); }
+.pinned-status-now, .pinned-status-standing { font-size: var(--text-md, 15px); }
+.pinned-status-people { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 2px var(--space-4, 16px); font-size: var(--text-base, 14px); color: var(--text-secondary, #52525B); }
+.pinned-status-key { font-weight: 600; color: var(--text-primary, #09090B); }
+.pinned-status-standing--open span:last-child { color: var(--status-critical, #B91C1C); font-weight: 600; }
+.pinned-status-standing--resolved span:last-child { color: var(--status-good, #15803D); font-weight: 600; }
+.pinned-status-alarm--ALARM span:nth-child(2) { color: var(--status-critical, #B91C1C); font-weight: 600; }
+.pinned-status-alarm--OK span:nth-child(2) { color: var(--status-good, #15803D); font-weight: 600; }
+.pinned-status-hint { color: var(--text-secondary, #52525B); }
+/* THE COMPACT DASHBOARD CARD: its state, when it was updated and its button on one short row. */
+.pinned-status .dashboard-card { margin: 0; flex: 0 1 auto; }
+.dashboard-card--compact { flex-direction: row !important; align-items: center; gap: 12px !important; padding: 8px 12px !important; }
+.dashboard-card--compact .proposal-card-actions { margin: 0; }
+/* THE PINNED STEP'S CHOICES, and the question that confirms one. */
+.pinned-status-decide { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2, 8px); flex: 0 1 auto; }
+.pinned-status-confirm { font-weight: 600; color: var(--text-primary, #09090B); }
+.pinned-status-error { color: var(--status-critical, #B91C1C); font-size: var(--text-base, 14px); }

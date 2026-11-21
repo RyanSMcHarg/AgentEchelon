@@ -77,7 +77,7 @@ export function fromPlatform(key: string, overrides: Partial<IntentDef> = {}): I
   }
   return { ...platform, ...overrides };
 }
-// PLATFORM QUESTIONS, AT TWO DEPTHS (owner, 2026-10-14). Every classification answers what AgentEchelon is.
+// PLATFORM QUESTIONS, AT TWO DEPTHS. Every classification answers what AgentEchelon is.
 // Basic, which serves external conversations, explains and stops: no recommendation, no configuration
 // steps, no code and no architecture advice. The internal classifications answer how to build with it,
 // with the specifics that takes.
@@ -237,7 +237,7 @@ export const STRATUM_INLINE_INTENTS: Record<'basic' | 'standard' | 'premium', In
         + 'estimating, and point the person at the premium assistant for that material.',
     }),
     fromPlatform('image_generation'),
-    // A short piece of code, answered in the message (owner, 2026-10-08). Taken whole from the platform,
+    // A short piece of code, answered in the message. Taken whole from the platform,
     // so its instructions and answer guidance (one fenced block, low temperature) come with it.
     fromPlatform('code_generation'),
     PLATFORM_QUESTION_INTERNAL,
@@ -461,6 +461,19 @@ export const OPS_INLINE_INTENTS: InlineIntent[] = [
       "Another assistant's workflow asks for this conversation's dashboard to be refreshed after an alarm changed state. A person "
       + 'asking to see or share the dashboard is incident_dashboard.',
     keywords: ['refresh the dashboard'],
+    delivery: 'TASK_MULTI_STEP',
+    tools: ['publish_dashboard'],
+  },
+  // A RUN'S RUNBOOK DRAWN ON THIS CONVERSATION'S DASHBOARD (DESIGN-CONVERSATION-DASHBOARDS section 8.1): advertising it is Ops's
+  // consent to be given the platform's quiet `dashboard_runbook` task when a labeled step of a run here moves. Its one step
+  // draws each dashboard already published again, with no model call and no message.
+  {
+    key: 'dashboard_runbook',
+    summary: "I keep the runbook section of this conversation's dashboard current as the incident's steps move",
+    description:
+      "The platform asks for this conversation's dashboard to show where a run's runbook stands after one of its steps moved. A "
+      + 'person asking to see or share the dashboard is incident_dashboard.',
+    keywords: [],
     delivery: 'TASK_MULTI_STEP',
     tools: ['publish_dashboard'],
   },

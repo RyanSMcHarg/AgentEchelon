@@ -41,6 +41,7 @@ import { ADAPTERS, UnreadableEvent, type PartnerEvent, type VendorEvent } from '
 import { publishConnectorEvent, type ConnectorEventDetail } from './lib/connectors/events.js';
 import { resolveParticipants, type ParticipantDeps } from './lib/connector-participants.js';
 import { defaultDirectory } from './lib/membership-source.js';
+import { personIdFromArn } from './lib/person-arn.js';
 // The deployment's set, read at runtime from the rows its stacks publish, before the handler runs.
 import { withProfileRegistry } from '../../lib/profile-registry';
 
@@ -142,6 +143,28 @@ async function release(deps: IngestDeps, connectorId: string, eventId: string, c
   }
 }
 
+/**
+ * TAKE BACK A RECORD WHOSE FACT WAS NEVER PUBLISHED: this claim's own record goes back to claimed, with nothing recorded as
+ * published, then the claim is released, so a retry claims the event afresh and publishes it; a release that fails lapses with
+ * its lease, as any claim's does. A record that cannot be taken back is logged, since its retry reads it as published.
+ */
+async function unrecord(deps: IngestDeps, connectorId: string, eventId: string, claimedAt: number): Promise<void> {
+  try {
+    await deps.doc.send(new UpdateCommand({
+      TableName: deps.replayTable,
+      Key: { pk: replayKey(connectorId, eventId) },
+      UpdateExpression: 'SET #s = :claimed REMOVE publishedAt, admittedPeople, factClassification, namedConversation',
+      ConditionExpression: '#s = :published AND claimedAt = :mine',
+      ExpressionAttributeNames: { '#s': 'state' },
+      ExpressionAttributeValues: { ':claimed': 'claimed', ':published': 'published', ':mine': claimedAt },
+    }));
+  } catch (err) {
+    log('error', connectorId, 'unrecord-failed', { eventId, err: (err as Error)?.name });
+    return;
+  }
+  await release(deps, connectorId, eventId, claimedAt);
+}
+
 export async function handleEvent(event: PartnerEvent, deps: IngestDeps): Promise<IngestResult> {
   // 1. THE SOURCE: the rule matched it, and the receiver checks it again.
   const connector = connectorOf(event, deps.connectors);
@@ -184,11 +207,41 @@ export async function handleEvent(event: PartnerEvent, deps: IngestDeps): Promis
     return done('duplicate');
   }
 
-  // 4 and 5. THE PEOPLE, AND THE FACT. A failure releases the claim and throws, so the retry is processed.
+  // 4. THE PEOPLE. A failure releases the claim and throws, so the retry is processed.
   let outcomes: Awaited<ReturnType<typeof resolveParticipants>>;
   const classification = connector.classification || '';
   try {
     outcomes = classification ? await resolveParticipants(connector, parsed.people, classification, deps.participants) : [];
+  } catch (err) {
+    await release(deps, connector.id, parsed.eventId, claimedAt);
+    log('error', connector.id, 'retry', { eventId: parsed.eventId, reason: 'participants', err: (err as Error)?.name });
+    throw new IngestRetry('the event\'s people could not be resolved', err);
+  }
+
+  // 5. THE RECORD, THEN THE FACT. What this receiver publishes is recorded before it is published, where no other principal
+  // writes: the people it admitted and, for the app's own event, the conversation it named. A consumer trusts a person or a
+  // conversation in a fact only where this record says the same (DESIGN-EVENT-TARGETS 11.2 and 11.3), since another principal
+  // can put a look-alike fact on the default bus, so a fact is never on the bus without its record. A record that cannot be
+  // written releases the claim and throws, so the event is retried.
+  try {
+    await deps.doc.send(new UpdateCommand({
+      TableName: deps.replayTable,
+      Key: { pk: replayKey(connector.id, parsed.eventId) },
+      UpdateExpression: 'SET #s = :published, publishedAt = :at, admittedPeople = :people, factClassification = :cls' + (parsed.conversation ? ', namedConversation = :conv' : ''),
+      ConditionExpression: '#s = :claimed AND claimedAt = :mine',
+      ExpressionAttributeNames: { '#s': 'state' },
+      ExpressionAttributeValues: {
+        ':published': 'published', ':claimed': 'claimed', ':mine': claimedAt, ':at': Math.floor(deps.now() / 1000), ':cls': classification ?? '',
+        ':people': outcomes.flatMap((o) => (o.state === 'admitted' ? [personIdFromArn(o.personArn) ?? ''] : [])).filter(Boolean),
+        ...(parsed.conversation ? { ':conv': parsed.conversation } : {}),
+      },
+    }));
+  } catch (err) {
+    await release(deps, connector.id, parsed.eventId, claimedAt);
+    log('error', connector.id, 'retry', { eventId: parsed.eventId, reason: 'record', err: (err as Error)?.name });
+    throw new IngestRetry('the event\'s record could not be written', err);
+  }
+  try {
     const count = (s: string) => outcomes.filter((o) => o.state === s).length;
     await deps.publish({
       instance: deps.instance,
@@ -201,25 +254,13 @@ export async function handleEvent(event: PartnerEvent, deps: IngestDeps): Promis
       ref: { connectorId: connector.id, system: connector.vendor, ...parsed.ref },
       admitted: outcomes.flatMap((o) => (o.state === 'admitted' ? [{ role: o.role, personArn: o.personArn }] : [])),
       notAdmitted: { refused: count('refused'), undetermined: count('undetermined'), unresolved: count('unresolved'), pending: count('pending') },
+      ...(parsed.conversation ? { conversation: parsed.conversation } : {}),
     });
   } catch (err) {
-    await release(deps, connector.id, parsed.eventId, claimedAt);
+    // NOTHING WAS PUBLISHED, so the record is taken back and the event retried: a retry that found it would read as a duplicate.
+    await unrecord(deps, connector.id, parsed.eventId, claimedAt);
     log('error', connector.id, 'retry', { eventId: parsed.eventId, reason: 'publish', err: (err as Error)?.name });
     throw new IngestRetry('the event could not be published', err);
-  }
-
-  try {
-    await deps.doc.send(new UpdateCommand({
-      TableName: deps.replayTable,
-      Key: { pk: replayKey(connector.id, parsed.eventId) },
-      UpdateExpression: 'SET #s = :published, publishedAt = :at',
-      ExpressionAttributeNames: { '#s': 'state' },
-      ExpressionAttributeValues: { ':published': 'published', ':at': Math.floor(deps.now() / 1000) },
-    }));
-  } catch (err) {
-    // The fact is on the bus, so the event is not retried. The claim lapses after the lease, and a vendor
-    // resend after that would be published again: recorded, so a second fact for one event id is explained.
-    log('error', connector.id, 'mark-failed', { eventId: parsed.eventId, err: (err as Error)?.name });
   }
   const count = (s: string) => outcomes.filter((o) => o.state === s).length;
   log('log', connector.id, 'accepted', {

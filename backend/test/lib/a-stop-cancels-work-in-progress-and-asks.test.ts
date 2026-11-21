@@ -1,6 +1,6 @@
 /**
  * COMPLETED WORK IS KEPT, WORK IN PROGRESS IS CANCELLED, THEN THE PERSON IS ASKED HOW TO PROCEED
- * (ADR-033, owner 2026-09-14).
+ * (ADR-033).
  *
  * `/stop` means "stop what you are doing". The work still running is what the assistant is doing, so
  * it is cancelled at the stop; the work already finished is not in the selection at all. What the
@@ -99,7 +99,7 @@ describe('what the assistant is asked to work out', () => {
 });
 
 /**
- * A PRIVATE TASK IS VISIBLE IN THAT IT EXISTS, NOT IN WHAT IT IS (maintainer decision, 2026-08-23).
+ * A PRIVATE TASK IS VISIBLE IN THAT IT EXISTS, NOT IN WHAT IT IS.
  *
  * The evaluation's reply posts to the room. A cancelled private task must reach its prompt as a
  * neutral label - existence, never the excerpt - or the stop of a targeted request publishes the one

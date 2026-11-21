@@ -1,6 +1,6 @@
 # DESIGN: Multi-Agent Orchestration
 
-**Status:** Design (alignment doc), not scheduled - the backend swarm is not being built yet (owner, 2026-09-19). This proposes a structure and a set of explicit decisions to confirm. Every "Recommendation" below is a starting position, not a committed design, and Decision 2 (sub-agent identity) is an OPEN question rather than a recommendation - the identity mechanism this doc originally leaned on no longer exists in the form it assumed. Nothing here should be read as ready to build.
+**Status:** Design (alignment doc), not scheduled - the backend swarm is not being built yet. This proposes a structure and a set of explicit decisions to confirm. Every "Recommendation" below is a starting position, not a committed design, and Decision 2 (sub-agent identity) is an OPEN question rather than a recommendation - the identity mechanism this doc originally leaned on no longer exists in the form it assumed. Nothing here should be read as ready to build.
 
 **Coverage:** none - an alignment document proposing a structure; no code implements it yet.
 

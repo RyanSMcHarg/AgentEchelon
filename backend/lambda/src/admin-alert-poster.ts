@@ -1,7 +1,9 @@
 /**
  * THE ONE PLACE AN `ae.alert` BECOMES A MESSAGE: the `AdminServices` stack's rule on the default bus
  * delivers each platform alert here, and it is posted into the admin notification channel as the admin
- * assistant (`lib/admin-channel-post.ts`). The channel flow's `notify` directive then emails the admin roster.
+ * assistant (`lib/admin-channel-post.ts`), carrying a `notify` directive in its Metadata. The notification bridge reads the
+ * message from the Kinesis message stream and emails the admin roster (`notification-bridge.ts`), so email is never on the
+ * path the post takes: one message, said in the conversation and reaching email from it.
  *
  * The rule matches this instance's alerts only (`detail.instance`), so the check here is the second
  * layer: an event from another instance, or one that is not a notice, is dropped and logged.

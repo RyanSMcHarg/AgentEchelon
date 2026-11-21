@@ -376,13 +376,16 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
   async function saveDraft(name: string, patch: ProfileDraftPatch): Promise<boolean> {
     let saved = false;
     let refused = false;
+    let refusedCode: string | null = null;
     await run('edit-draft', async () => {
       try {
-        const r = await editProfileDraft(name, patch, draftLoadedId);
+        // A FIRST EDIT NAMES THE ACTIVE VERSION THIS PAGE SHOWS, so one activated elsewhere since is never written over.
+        const r = draftLoadedId ? await editProfileDraft(name, patch, draftLoadedId) : await editProfileDraft(name, patch, draftLoadedId, selected?.activeVersion ?? null);
         if (r?.draftConfigId) setAwaitingDraft(r.draftConfigId);
       } catch (e) {
         if (draftConflictOf(e)) {
           refused = true;
+          refusedCode = draftConflictOf(e);
           if (draftConfig) conflictBase.current = { before: draftConfig, fromId: draftLoadedId };
           return;
         }
@@ -392,7 +395,7 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
       setValidation(null);
     });
     // Said once the reload has finished, so the reload does not clear it.
-    if (refused) setError(translate('admin.draftCards.conflict.edit'));
+    if (refused) setError(translate(refusedCode === 'VERSION_CHANGED' ? 'admin.draftCards.conflict.editVersion' : 'admin.draftCards.conflict.edit'));
     return saved;
   }
 
@@ -431,7 +434,8 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenLink, ini
         const conflict = draftConflictOf(e);
         if (conflict) {
           // The reload that follows shows the newer draft, so the reason is said outside it (below), where it outlives it.
-          conflicted = translate(conflict === 'NO_DRAFT' ? 'admin.draftCards.conflict.activateGone' : 'admin.draftCards.conflict.activate');
+          conflicted = translate(conflict === 'NO_DRAFT' ? 'admin.draftCards.conflict.activateGone'
+            : conflict === 'VERSION_CHANGED' ? 'admin.draftCards.conflict.activateVersion' : 'admin.draftCards.conflict.activate');
           setValidation(null);
           return;
         }

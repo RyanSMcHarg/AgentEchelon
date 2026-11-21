@@ -10,8 +10,7 @@
  * triggers nothing on its own.
  *
  * CLOSING THE TASK IS SEPARATE, and it took three tries to land on the right shape. Completion was the
- * model's alone (owner 2026-08-18 - "do not reintroduce a walker that completes a task the model did not
- * complete"), which was a rule about a walker gated on OUTPUT SHAPE that closed a task while its reply
+ * model's alone (no walker completes a task the model did not complete), which was a rule about a walker gated on OUTPUT SHAPE that closed a task while its reply
  * was still asking for approval. Then the owner stated what completion MEANS: "if the report is
  * delivered it is complete, unless the user objects with additional changes required."
  *

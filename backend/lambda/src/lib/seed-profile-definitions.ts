@@ -12,7 +12,7 @@
  * which is read-only on this namespace (§7). Kept in its own module so the read-only runtime resolver
  * (`active-profile.ts`) never imports a write command.
  */
-import { SSMClient, PutParameterCommand } from '@aws-sdk/client-ssm';
+import { SSMClient, PutParameterCommand, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { labelJustWrittenVersion } from './label-active.js';
 import { ssmJsonValue } from './ssm-json-value.js';
 import type { EventWorkflow } from './event-workflow.js';
@@ -33,6 +33,8 @@ export interface SeedResult {
   profileName: string;
   version: number;
   labeled: boolean;
+  /** The active version is not the seed's own (a team or an import advanced it), so the seed wrote nothing. */
+  left?: boolean;
 }
 
 /**
@@ -47,6 +49,22 @@ export interface SeedResult {
  * only exists under `-c assistantIntentPack`, so on a deployment that passes neither there is no update
  * path for the taxonomy at all. Seeding it onto version 1 gives it one.
  */
+const ACTIVE_LABEL = 'active';
+/** The label the seed puts on each version it writes, so a later seed can tell its own active version from a team's. */
+export const SEEDED_LABEL = 'seeded';
+
+/** The version a label is on, or undefined where the parameter or the label does not exist. Any other failure throws. */
+async function labeledVersion(ssm: Pick<SSMClient, 'send'>, name: string, label: string): Promise<number | undefined> {
+  try {
+    const r = await ssm.send(new GetParameterCommand({ Name: `${name}:${label}` }));
+    return r.Parameter?.Version;
+  } catch (err) {
+    const code = String((err as { name?: string })?.name);
+    if (code === 'ParameterNotFound' || code === 'ParameterVersionNotFound' || code === 'ParameterVersionLabelNotFound') return undefined;
+    throw err;
+  }
+}
+
 export async function seedActiveProfileDefinition(
   ssm: SSMClient,
   ssmRoot: string,
@@ -61,6 +79,11 @@ export async function seedActiveProfileDefinition(
   const seeded = serializeSeedDefinition(profileName, persona, intentPack, onboarding, boundary, welcomeWorkflows);
   if (seeded === null) return null;
   const name = definitionParamName(ssmRoot, profileName);
+  // AN ACTIVE VERSION THE SEED DID NOT WRITE IS LEFT AS IT IS: a team's activation or an import moved `active` off the version
+  // labeled `seeded`, and a rerun of the seed never regresses it. Only an assistant with no active version, or whose active
+  // version is still the seed's own, is written.
+  const active = await labeledVersion(ssm, name, ACTIVE_LABEL);
+  if (active !== undefined && active !== (await labeledVersion(ssm, name, SEEDED_LABEL))) return { profileName, version: active, labeled: false, left: true };
   // Offload before measuring: with a body store configured the persona AND the intent pack live in S3
   // and the parameter holds pointers, so what has to fit is everything except those two. Without a body
   // store this is a no-op and the check below behaves exactly as it always has.
@@ -96,7 +119,8 @@ export async function seedActiveProfileDefinition(
   );
   const version = put.Version ?? 1;
   // Move the `active` label onto the just-written version (LabelParameterVersion moves an existing label).
-  await labelJustWrittenVersion(ssm, name, version, 'active');
+  await labelJustWrittenVersion(ssm, name, version, SEEDED_LABEL);
+  await labelJustWrittenVersion(ssm, name, version, ACTIVE_LABEL);
   // A LABEL MOVE IS AN ACTIVATION, so the advertisement is republished here exactly as the console's
   // activation does (`profile-lifecycle.ts` republishAdvertisement), from the same stored pack. Without
   // it every seed left roommates routing on the previous version's advertisement: a seed

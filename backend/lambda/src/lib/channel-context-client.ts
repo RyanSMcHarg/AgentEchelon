@@ -176,8 +176,8 @@ export interface ChannelContext {
    * `list`, or `group:<name>+list`. Absent is manual.
    *
    * READ BY THE PATHS THAT CANNOT IMPORT THE TYPE REGISTRY - the share Lambda refuses an invite on a
-   * conversation that carries it, because the next reconcile would silently remove the person invited
-   * (owner decision, 2026-10-05). Stamped rather than re-resolved for the same reason the type key is:
+   * conversation that carries it, because the next reconcile would silently remove the person invited.
+   * Stamped rather than re-resolved for the same reason the type key is:
    * a change to a type reaches new conversations only (ADR-053), so the stamp states what this
    * conversation was created to be.
    */
@@ -319,6 +319,12 @@ export interface ChannelContext {
    */
   watchedRefs?: string[];
   /**
+   * WHICH GENERATION OF ITS ID A PATTERN CONVERSATION IS (DESIGN-EVENT-TARGETS 11.2), written by the creator with the row. A
+   * recreation at the same id resets the row only while it still names the archived generation (`resetPatternRoomContext`),
+   * so a later generation's row is never wiped. Absent on a first generation written before it was recorded.
+   */
+  generation?: number;
+  /**
    * THE `thread` CHILDREN THIS CONVERSATION OPENED (DESIGN-WORKFLOWS-AND-TASKS section 6), oldest first, written by the
    * creator as each opens (`recordChildConversation`). Server-only, never channel Metadata, which members can write. A
    * child that ended stays listed; whether a turn may read it is decided when it is read.
@@ -439,6 +445,8 @@ const OWNED_FIELDS: Array<keyof ChannelContextPatch> = [
   'watchedAlarm',
   // The keys a watch trigger follows here (DESIGN-EVENT-TARGETS), which decide where its `event-received` runs.
   'watchedRefs',
+  // A pattern conversation's generation of its id, which a recreation's reset is conditioned on.
+  'generation',
 ];
 
 /**
@@ -448,6 +456,57 @@ const OWNED_FIELDS: Array<keyof ChannelContextPatch> = [
 const WRITE_ONCE_FIELDS: ReadonlySet<keyof ChannelContextPatch> = new Set(['createdAt', 'enrollment']);
 
 let _ddb: Pick<DynamoDBDocumentClient, 'send'> | null = null;
+/**
+ * CLAIM ONE OF A PATTERN TYPE'S CREATIONS FOR TODAY (DESIGN-EVENT-TARGETS 11.2): a conditional count per classification, type
+ * and day, so the cap holds however many creators run at once. False where the day is at its cap; a write that fails throws, so
+ * nothing is created on a count that could not be taken.
+ */
+export async function claimPatternCreation(classification: string, typeKey: string, cap: number, now = Date.now()): Promise<boolean> {
+  const table = tableName();
+  if (!table) throw new Error('CHANNEL_CONTEXT_TABLE is not configured');
+  const day = new Date(now).toISOString().slice(0, 10);
+  try {
+    await ddb().send(new UpdateCommand({
+      TableName: table,
+      Key: { channelArn: `pattern-created#${classification}#${typeKey}#${day}` },
+      UpdateExpression: 'ADD #n :one SET #ttl = :ttl',
+      ConditionExpression: 'attribute_not_exists(#n) OR #n < :cap',
+      ExpressionAttributeNames: { '#n': 'created', '#ttl': 'ttl' },
+      ExpressionAttributeValues: { ':one': 1, ':cap': cap, ':ttl': Math.floor(now / 1000) + 2 * 86_400 },
+    }));
+    return true;
+  } catch (err) {
+    if ((err as { name?: string })?.name === 'ConditionalCheckFailedException') return false;
+    throw err;
+  }
+}
+
+/**
+ * RESET AN ARCHIVED PATTERN CONVERSATION'S ROW BEFORE ITS ID IS CREATED AGAIN (DESIGN-EVENT-TARGETS 11.2): every field but
+ * its key is removed, so the next generation inherits nothing the previous one held (its participant roles, member
+ * identities, summary, watched keys, children) and starts from what its own creation writes. The archive keeps the previous
+ * generation's history. Conditioned on the row still naming the archived generation (or none, for a row written before its
+ * generation was recorded), so a later generation's row is never wiped. A row that is absent is nothing to reset; a write that
+ * fails, or a row that names another generation, throws, and nothing is created.
+ */
+export async function resetPatternRoomContext(channelArn: string, archivedGeneration: number): Promise<void> {
+  const table = tableName();
+  if (!table) throw new Error('CHANNEL_CONTEXT_TABLE is not configured');
+  const read = await ddb().send(new GetCommand({ TableName: table, Key: { channelArn }, ConsistentRead: true }));
+  const fields = Object.keys(read.Item ?? {}).filter((k) => k !== 'channelArn');
+  if (!read.Item || !fields.length) return;
+  const names: Record<string, string> = { '#generation': 'generation' };
+  fields.forEach((f, i) => { names[`#f${i}`] = f; });
+  await ddb().send(new UpdateCommand({
+    TableName: table,
+    Key: { channelArn },
+    UpdateExpression: `REMOVE ${fields.map((_, i) => `#f${i}`).join(', ')}`,
+    ConditionExpression: 'attribute_not_exists(#generation) OR #generation = :g',
+    ExpressionAttributeNames: names,
+    ExpressionAttributeValues: { ':g': archivedGeneration },
+  }));
+}
+
 function ddb(): Pick<DynamoDBDocumentClient, 'send'> {
   if (!_ddb) _ddb = sessionDocumentClient({ requestHandler: BOUNDED_REQUEST_HANDLER });
   return _ddb;

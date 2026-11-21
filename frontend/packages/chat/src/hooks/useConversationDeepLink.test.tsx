@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, fireEvent, cleanup } from '@testing-library/react';
-import { useConversationDeepLink, openConversationLinkInPlace } from './useConversationDeepLink';
+import { useConversationDeepLink, openConversationLinkInPlace, linkTarget } from './useConversationDeepLink';
 import { CollapsibleText } from '../components/CollapsibleText';
 import * as focus from '../utils/focusMessage';
 
@@ -60,5 +60,15 @@ describe('a conversation link in a message opens in place', () => {
     const { unmount } = render(<Opener ready select={select} />);
     unmount();
     expect(openConversationLinkInPlace('?conversation=conv-ops-1')).toBe(false);
+  });
+});
+
+// A DASHBOARD RUNBOOK STEP'S LINK (DESIGN-CONVERSATION-DASHBOARDS section 8) names the task, not a message: the conversation opens
+// and the view scrolls to that task's newest card once its history renders.
+describe("a link to a task's card", () => {
+  it('names the task as a card to focus, and a message link still names its message', () => {
+    expect(linkTarget('?conversation=conv-ops-1', '#task=evt-abc123')).toEqual({ conversationId: 'conv-ops-1', messageId: `${focus.TASK_FOCUS_PREFIX}evt-abc123` });
+    expect(linkTarget('?conversation=conv-ops-1', '#message=m-1')).toEqual({ conversationId: 'conv-ops-1', messageId: 'm-1' });
+    expect(linkTarget('?conversation=conv-ops-1', '#task=%E0%A4%A')).toEqual({ conversationId: 'conv-ops-1', messageId: '' });
   });
 });

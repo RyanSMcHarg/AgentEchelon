@@ -148,7 +148,7 @@ export interface TriageTurnContext {
  * An unbounded loop on a path a person is waiting on is a latency defect wearing an intelligence
  * costume. ONE bound, and it counts passes.
  *
- * THERE WAS A WALL CLOCK HERE AND IT IS GONE (maintainer, 2026-08-30). Six seconds, started when the
+ * THERE WAS A WALL CLOCK HERE AND IT IS GONE. Six seconds, started when the
  * first pass was dispatched, and its own comment called it deliberate that it "binds first". It did
  * bind first - it bound ALWAYS. Every check of it happens after a model call has answered, and a
  * model call is longer than six seconds, so the option was granted before the turn ran and refused
@@ -314,7 +314,7 @@ export type QueuedIntent =
   /** It asks for something new, which becomes its own task. */
   | 'new'
   /**
-   * IT IS HERE AND THE READING CANNOT SAY WHAT THE WORK IS (maintainer, 2026-09-03).
+   * IT IS HERE AND THE READING CANNOT SAY WHAT THE WORK IS.
    *
    * The vocabulary was `amends` or `new`, so every message was forced to be one of them - and `new`
    * opens a `queued_request` in `proposed`, which is a row saying "here is the work I propose to
@@ -326,7 +326,7 @@ export type QueuedIntent =
    * do. Saying "I have it, I cannot tell what it needs" is both truer and more useful, and it is what
    * a placeholder MEANS - the message is safe, the work is not yet defined, and one answer defines it.
    *
-   * IT COVERS AN UNSUPPLIED REFERENT, not only an unintelligible message (maintainer, 2026-09-04). A
+   * IT COVERS AN UNSUPPLIED REFERENT, not only an unintelligible message. A
    * reading that works out the SUBJECT and still cannot name the request is unclear: "the usual",
    * "the other one", "like we did last time" all leave a specific that only the person has.
    * Measured on the deployment - the model classified "Same as the other one, but do it the way we
@@ -522,7 +522,7 @@ export function triageContractDirective(
   /**
    * WHETHER THIS CONVERSATION ALREADY HAS OPEN WORK to rank the arrivals against.
    *
-   * NEW WORK IS NOT NEXT WORK (maintainer, 2026-09-01). Priority was assigned against the batch alone, so
+   * NEW WORK IS NOT NEXT WORK. Priority was assigned against the batch alone, so
    * a queue read after earlier work was already recorded produced a fresh ordering blind to it - and
    * a list ranked only against itself is, in effect, the list that goes first.
    *
@@ -595,7 +595,7 @@ export function triageContractDirective(
     ] : []),
   ];
   // THE TEXT FORM IS ASKED FOR ON THE TEXT CHANNEL ONLY, and leaving it ungated put a runtime marker
-  // in front of a person (owner-reported, 2026-09-05): `TOPIC: Status / what's happening next |
+  // in front of a person: `TOPIC: Status / what's happening next |
   // IN_FLIGHT, 60c1373a...` opened a reply on the TOOL channel.
   //
   // The `TRIAGE:` form beside it was already gated and this was not, which is the whole of the
@@ -689,7 +689,7 @@ export function triageContractDirective(
     'and then say to the person, in your own voice and in the language of the conversation, what',
     'you understood and what you propose to do. That part is yours. The lines above are not.',
   ]));
-  // ── SPEAK ABOUT THE MESSAGES YOU WERE GIVEN, AND NOTHING ELSE (owner-reported, 2026-09-05) ─────
+  // ── SPEAK ABOUT THE MESSAGES YOU WERE GIVEN, AND NOTHING ELSE ─────
   //
   // The open work above is POSITIONS, NOT SUBJECTS - `openWork` carries a type, a priority and
   // whether it is private, and deliberately no label, so that a private task can hold its place in
@@ -1227,8 +1227,8 @@ export function deriveTriageProposal(
     .filter((m) => m.messageId)
     .map((m) => ({
       messageId: m.messageId,
-      // UNCLEAR, AND NEVER `new` OR `amends` (maintainer, 2026-09-03: "if a whole reading is unclear the
-      // assistant should just state so").
+      // UNCLEAR, AND NEVER `new` OR `amends`: a whole reading that is unclear
+      // says so.
       //
       // This floor runs when the judged reading was UNUSABLE - nothing was understood about any of
       // these messages. It marked them `new` anyway, which opens a `queued_request` in `proposed`:
@@ -1344,7 +1344,7 @@ export function buildProposalMessage(
   const amends = kept.filter((i) => i.intent === 'amends');
   const fresh = kept.filter((i) => i.intent === 'new');
 
-  // ── WHEN NOTHING WAS UNDERSTOOD, SAY THAT AND NOTHING ELSE (maintainer, 2026-09-03) ────────────────
+  // ── WHEN NOTHING WAS UNDERSTOOD, SAY THAT AND NOTHING ELSE ────────────────
   //
   // "Here is what I understood" is a false sentence in front of a list of things it did not
   // understand, and it is the most damaging place to say it: the person reads the opening, trusts the
@@ -1391,15 +1391,15 @@ export function buildProposalMessage(
     // a list with no order is not a plan anyone can correct.
     const rank: Record<TaskPriority, number> = { high: 0, normal: 1, low: 2 };
 
-    // ── NEW WORK IS NOT NEXT WORK (maintainer, 2026-09-01) ────────────────────────────────────────────
+    // ── NEW WORK IS NOT NEXT WORK ────────────────────────────────────────────
     //
     // This ranked the arriving messages against each other and showed them alone, so a queue read
     // after earlier work was already recorded produced a fresh numbered list starting at 1. Nothing
     // said where those items fell against the tasks already open, and a list ranked only against
     // itself reads as the list that goes first - which is the opposite of what triage is for.
     //
-    // A PRIVATE ROW TAKES ITS PLACE AND SAYS SO (maintainer, 2026-09-01, extending the 2026-08-23 rule
-    // that existence is conversation-visible). Its position is occupancy, not content, so it is
+    // A PRIVATE ROW TAKES ITS PLACE AND SAYS SO, as a private task's existence is
+    // conversation-visible. Its position is occupancy, not content, so it is
     // listed as private rather than omitted - omitting it would move everything below it up a place
     // and misstate the order for everyone.
     const open = (opts.openWork ?? []).map((t) => ({
@@ -1434,7 +1434,7 @@ export function buildProposalMessage(
   // Counted, never described.
   if (targetedCount) lines.push('', publicProposalCount(targetedCount, opts.copy));
 
-  // ── AND WHAT IS STILL OUTSTANDING FROM BEFORE (maintainer, 2026-09-03) ─────────────────────────────
+  // ── AND WHAT IS STILL OUTSTANDING FROM BEFORE ─────────────────────────────
   //
   // A clarification waits on a person, so left alone it waits forever - it sits in their list and
   // nothing raises it again unless they think to. The queue clearing is the moment the assistant has
@@ -1654,8 +1654,8 @@ export function spokenFromReply(raw: string): string {
 
   // EVERY MACHINE LINE, NOT JUST THE ONE THAT LEAKED FIRST.
   //
-  // `PROPOSAL:` alone was stripped, and a `TOPIC:` line reached a person anyway (owner-reported,
-  // 2026-09-05). The prompt no longer asks for that line on this channel, which removes the cause;
+  // `PROPOSAL:` alone was stripped, and a `TOPIC:` line could otherwise reach a person.
+  // The prompt no longer asks for that line on this channel, which removes the cause;
   // this removes the CLASS, because the next marker added to the text contract would otherwise
   // arrive here by the same route, and the pairing of a prompt that no longer asks with a stripper
   // that refuses is the shape this repo already uses for rules it cannot afford to restate.
@@ -1730,8 +1730,8 @@ function isMarkerOnlyLine(line: string): boolean {
 
 /**
  * THE SELECTION THAT DRIVES THE PROCESS IS A CHOICE FROM A SET, NOT A LINE OF PROSE
- * (maintainer, 2026-09-03: "the model is making calls on clarify meaning etc ... but the selection to
- * drive process downstream should have deterministic outcomes").
+ * The model makes the calls on meaning, and the selection that drives the process downstream has deterministic
+ * outcomes.
  *
  * The JUDGEMENT stays the model's, and has to: whether a message amends the work in flight, whether
  * it can be understood at all, how it ranks, which subject it belongs to. None of that is mechanical.

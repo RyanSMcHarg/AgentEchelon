@@ -388,6 +388,11 @@ export interface AgentStep {
    * them as a confirmation card. Nothing happens until that person applies it.
    */
   propose?: string[];
+  /**
+   * WHAT THE STEP'S OUTPUT IS DELIVERED AS: `file` attaches it as a Markdown file, with one line saying so,
+   * so a long draft (a review, a notice) is a document people download, edit and attach again. Absent, it is a message.
+   */
+  deliver?: 'file';
   /** For `open_conversation`: the conversation type the proposal opens, a declared type. */
   opens?: string;
   /**
@@ -713,6 +718,8 @@ export interface EventStepDef {
   action?: IntakeAction | MeetingAction;
   /** A CHILD CONVERSATION THE STEP OPENS (WT120): the run waits for it, and goes on knowing the child's link (`OpenStep`). */
   open?: OpenStep;
+  /** A HAND-OFF TO ANOTHER TEAM (SPEC-PROCESSES P4): one typed event on this classification's own process source (`HandoffStep`). */
+  handoff?: HandoffStep;
   /**
    * A TASK THE STEP ASSIGNS (ADR-063 decision 1): one task of a declared machine, for a person and worked by a person, a
    * participant role's one holder or an assistant. The run waits on it and continues when it settles: `onSuccess` for a
@@ -755,6 +762,11 @@ export interface EventWorkflow {
    * router brings it forward to before the timed thing's own expiry (`deadlineAt`).
    */
   deadline?: { afterMinutes: number };
+  /**
+   * On `task-reopened` only: the machine whose tasks it takes back. A reopen runs the workflow naming its task's machine, else
+   * the one that names none, so each kind of task a version reopens has its own steps.
+   */
+  reopens?: string;
 }
 
 /** The longest an `agent` step may wait on its model before its fallback is posted. */
@@ -780,6 +792,34 @@ export const SHIPPED_EVENT_WORKFLOWS: Readonly<Record<string, EventWorkflow>> = 
       done: { disposition: 'success' },
     },
   },
+  // A REOPENED INCIDENT (`reopens` on its owner's machine): the room is told, the owner's task is this run's again, and its next
+  // resolve tells the room and runs the post-incident review again. Its earlier run ended at the reopen.
+  'incident-reopened': {
+    on: 'task-reopened',
+    types: ['ops'],
+    reopens: 'incident_ownership',
+    initial: 'tell-reopened',
+    states: {
+      'tell-reopened': { label: 'Reopened', description: 'The incident is open again; its conversation is told.', send: { to: 'room', template: 'incident-reopened' }, onSuccess: 'owner', onFailure: 'owner' },
+      owner: {
+        label: 'Incident owner', description: 'The on-call owns the reopened incident until they resolve it.',
+        task: { machine: 'incident_ownership', by: { participantRole: 'on-call:ops' }, takes: 'reopened', pinned: true, decidedBy: ['on-call:ops', 'secondary:ops', 'lead'], deadline: { afterMinutes: 43_200 } },
+        onSuccess: 'resolved', onFailure: 'done',
+      },
+      resolved: { label: 'Resolve', description: 'The incident is resolved again; its conversation is told.', send: { to: 'room', template: 'incident-resolved' }, onSuccess: 'review-draft', onFailure: 'review-draft' },
+      'review-draft': {
+        label: 'Post-incident review draft', description: "The ops assistant drafts the review from the incident's timeline and findings.",
+        agent: { prompt: 'post-incident-review-draft', reads: 'messages', to: 'room', deadlineMs: 60_000, deliver: 'file', fallback: { send: { to: 'room', template: 'post-incident-review-unavailable' } } },
+        onSuccess: 'review', onFailure: 'review',
+      },
+      review: {
+        label: 'Post-incident review', description: 'The on-call completes and signs off the review.',
+        task: { machine: 'acknowledgement', by: { participantRole: 'on-call:ops' }, assigned: { template: 'post-incident-review' }, deadline: { afterMinutes: 10_080 } },
+        onSuccess: 'done', onFailure: 'done',
+      },
+      done: { disposition: 'success' },
+    },
+  },
   'ops-room': {
     on: 'conversation-opened',
     types: ['ops'],
@@ -802,9 +842,13 @@ export const SHIPPED_EVENT_WORKFLOWS: Readonly<Record<string, EventWorkflow>> = 
         task: {
           machine: 'incident_ownership', by: { participantRole: 'on-call:ops' }, continue: 'alongside',
           assigned: { template: 'incident-owner-task', withoutMeetings: 'incident-owner-task-no-call' }, deadline: { afterMinutes: 43_200 },
-          // RESOLVING IT ENDS THE RUN (owner decision 2026-11-14): settled while the runbook has steps open, the on-call is asked
-          // first, and once confirmed the run ends now as resolved, its open runbook tasks cancelled, and the team is told.
+          // RESOLVING IT IS CONFIRMED WHILE THE RUNBOOK HAS STEPS OPEN: the on-call is asked first, and once confirmed the
+          // resolve moves the run on (`movesTo`, below). A settlement that is not a resolve ends the run.
           endsRun: true, confirmEnd: 'confirming_resolve',
+          // RESOLVED FROM THE TOP: the card is kept in the pinned band with where the incident stands.
+          pinned: true,
+          // RESOLVED OR REOPENED BY WHOEVER HOLDS THESE ROLES, by a press in the band, confirmed there; no assistant's turn moves it.
+          decidedBy: ['on-call:ops', 'secondary:ops', 'lead'],
           // RESOLVING MOVES THE RUN ON (WT129, DESIGN-PROCESSES O15): the runbook's open tasks are cancelled, the investigation stays
           // open, and the run goes on to tell the room, then the post-incident review follows once the investigation is complete.
           movesTo: 'resolved',
@@ -867,16 +911,11 @@ export const SHIPPED_EVENT_WORKFLOWS: Readonly<Record<string, EventWorkflow>> = 
       'customer-impact': {
         label: 'Customer impact', description: 'The accounts this incident reaches, with their account contacts.',
         task: { machine: 'impacted_accounts', for: { participantRole: 'lead' }, by: { assistantRole: 'primary' }, ask: { template: 'customer-impact' } },
-        onSuccess: [{ to: 'runbook-cause', when: { 'event:customerImpact': 'impacted' } }, { to: 'impact-confirm' }],
-        onFailure: [{ to: 'runbook-cause', when: { 'event:customerImpact': 'impacted' } }, { to: 'impact-confirm' }],
-      },
-      // CUSTOMERS IMPACTED? ASKED OF THE LEAD where triage did not already say yes (O27), once the lookup has named the accounts.
-      // A yes opens customer messaging beside the incident; a no, or no answer in ten minutes, and the runbook goes on.
-      'impact-confirm': {
-        label: 'Customers impacted?', description: 'The lead confirms whether customers are impacted, which starts customer messaging.',
-        task: { machine: 'customer_impact', by: { participantRole: 'lead' }, assigned: { template: 'customer-impact-confirm' }, deadline: { afterMinutes: 10 } },
-        onSuccess: [{ to: 'messaging', when: { 'task:state': 'impacted' } }, { to: 'runbook-cause' }],
-        onFailure: 'runbook-cause',
+        // CUSTOMER MESSAGING STARTS AS SOON AS THE ACCOUNTS ARE NAMED, asking nobody: an incident opened by a customer-facing
+        // service's alarm reaches its customers, so the account teams start at once. Where triage already said so, messaging
+        // opened beside the investigation and is not opened again.
+        onSuccess: [{ to: 'runbook-cause', when: { 'event:customerImpact': 'impacted' } }, { to: 'messaging' }],
+        onFailure: [{ to: 'runbook-cause', when: { 'event:customerImpact': 'impacted' } }, { to: 'messaging' }],
       },
       messaging: {
         open: { type: 'customer-messaging', for: { typeRole: 'lead:accounts' } },
@@ -931,7 +970,7 @@ export const SHIPPED_EVENT_WORKFLOWS: Readonly<Record<string, EventWorkflow>> = 
       // it on its card; the run ends once it is done.
       'review-draft': {
         label: 'Post-incident review draft', description: "The ops assistant drafts the review from the incident's timeline and findings.",
-        agent: { prompt: 'post-incident-review-draft', reads: 'messages', to: 'room', deadlineMs: 60_000, fallback: { send: { to: 'room', template: 'post-incident-review-unavailable' } } },
+        agent: { prompt: 'post-incident-review-draft', reads: 'messages', to: 'room', deadlineMs: 60_000, deliver: 'file', fallback: { send: { to: 'room', template: 'post-incident-review-unavailable' } } },
         onSuccess: 'review', onFailure: 'review',
       },
       review: {
@@ -1014,15 +1053,15 @@ export const SHIPPED_EVENT_WORKFLOWS: Readonly<Record<string, EventWorkflow>> = 
   },
   // AN EVENT OPENS AN INCIDENT FROM THE TEAM'S CONVERSATION (WT120, WT121): nobody is asked. An `ops` conversation opens, led by the
   // on-call, and the team's conversation is told where it is. The incident is the `ops` conversation's own: its
-  // `conversation-opened` workflow (`ops-room`) gives the on-call its task, takes the first look and runs the runbook there.
+  // `conversation-opened` workflow (`ops-room`) gives the on-call its task, takes the first look and runs the runbook there,
+  // triage and customer impact included. The severity is the incident tool's (O11).
   'incident-triage': {
     on: 'event-received',
     types: ['ops-team'],
     initial: 'open',
     states: {
-      // THE INCIDENT CONVERSATION OPENS AT ONCE (WT120), led by the on-call: nobody is asked first. Triage, and
-      // with it customer impact, is the incident conversation's own (`ops-room`). The severity is the incident tool's (O11).
-      open: { open: { type: 'ops', for: { typeRole: 'on-call:ops' } }, onSuccess: 'tell', onFailure: 'done' },
+      // AN INCIDENT THAT COULD NOT OPEN IS NEVER SILENT: the team is told it did not open and why, and the run ends failed.
+      open: { open: { type: 'ops', for: { typeRole: 'on-call:ops' } }, onSuccess: 'tell', onFailure: 'tell-not-opened' },
       // THE WHOLE TEAM IS TOLD WHY THE INCIDENT CONVERSATION WAS OPENED, with the on-call mentioned and a link to it.
       tell: { send: { template: 'incident-declared', to: 'room', mention: { lead: 'participantRole:on-call:ops' } }, onSuccess: 'hold', onFailure: 'hold' },
       hold: {
@@ -1032,7 +1071,9 @@ export const SHIPPED_EVENT_WORKFLOWS: Readonly<Record<string, EventWorkflow>> = 
       // A THREAD'S END THAT WAS NOT A RESOLVE IS REPORTED TO ITS PARENT (DESIGN-WORKFLOWS-AND-TASKS section 6, rule 3), as it ended.
       'report-timed-out': { send: { template: 'incident-timed-out', to: 'room' }, onSuccess: 'done', onFailure: 'done' },
       'report-ended': { send: { template: 'incident-ended-unresolved', to: 'room' }, onSuccess: 'done', onFailure: 'done' },
+      'tell-not-opened': { send: { template: 'incident-not-opened', to: 'room' }, onSuccess: 'failed', onFailure: 'failed' },
       done: { disposition: 'success' },
+      failed: { disposition: 'failure' },
     },
   },
   // AN INCIDENT'S CUSTOMER MESSAGING (DESIGN-PROCESSES O26 to O33): the run of the account team's conversation an incident opens
@@ -1055,7 +1096,7 @@ export const SHIPPED_EVENT_WORKFLOWS: Readonly<Record<string, EventWorkflow>> = 
       },
       'initial-draft': {
         label: 'Initial notice', description: "Advisor drafts the first customer notice from the incident's confirmed facts.",
-        task: { machine: 'customer_notice_draft', by: { assistantRole: 'primary' }, ask: { template: 'customer-notice-initial' } },
+        task: { machine: 'customer_notice_draft', by: { assistantRole: 'primary' }, ask: { template: 'customer-notice-initial' }, deliver: 'file' },
         onSuccess: 'initial-approval', onFailure: 'initial-approval',
       },
       // THE TIME TO FIRST NOTICE (O29): fifteen minutes from impact confirmed by default, declared here and tightened by editing it.
@@ -1066,42 +1107,44 @@ export const SHIPPED_EVENT_WORKFLOWS: Readonly<Record<string, EventWorkflow>> = 
         onDeadline: 'initial-late',
         onFailure: 'updates',
       },
-      // A MISSED DEADLINE TELLS THE LEAD PRIVATELY, AND THE CARD IS OFFERED AGAIN.
+      // A MISSED DEADLINE TELLS THE LEAD PRIVATELY, AND THE CARD IS OFFERED AGAIN. Past the time to first notice, and for every
+      // later approval and the account team's standing cards, the card carries no answer-by time: its holder is reminded instead
+      // (every 15 minutes for an approval, hourly for the update and final-notice cards), and nothing ends the work early.
       'initial-late': { send: { to: { participantRole: 'lead:accounts' }, template: 'customer-notice-late' }, onSuccess: 'initial-revise', onFailure: 'initial-revise' },
       'initial-revise': {
-        task: { machine: 'approval', by: { participantRole: 'lead:accounts' }, assigned: { template: 'customer-notice-approval' }, deadline: { afterMinutes: 43_200 } },
+        task: { machine: 'approval', by: { participantRole: 'lead:accounts' }, assigned: { template: 'customer-notice-approval' }, deadline: { kind: 'remind', afterMinutes: 15, times: 4 } },
         onSuccess: [{ to: 'tell-initial', when: { 'task:state': 'approved' } }, { to: 'updates' }],
         onFailure: 'updates',
       },
       'tell-initial': { send: { to: 'room', in: 'opener', template: 'customer-notice-approved' }, onSuccess: 'updates', onFailure: 'updates' },
       updates: {
         label: 'Updates', description: 'The account team asks for an update while the incident is open, or for the final notice.',
-        task: { machine: 'customer_updates', by: { participantRole: 'lead:accounts' }, assigned: { template: 'customer-messaging-updates' }, deadline: { afterMinutes: 43_200 } },
+        task: { machine: 'customer_updates', by: { participantRole: 'lead:accounts' }, assigned: { template: 'customer-messaging-updates' }, deadline: { kind: 'remind', afterMinutes: 60, times: 5 } },
         onSuccess: [{ to: 'update-draft', when: { 'task:state': 'draft_update' } }, { to: 'final-draft' }],
         onFailure: 'done',
       },
       'update-draft': {
-        task: { machine: 'customer_notice_draft', by: { assistantRole: 'primary' }, ask: { template: 'customer-notice-update' } },
+        task: { machine: 'customer_notice_draft', by: { assistantRole: 'primary' }, ask: { template: 'customer-notice-update' }, deliver: 'file' },
         onSuccess: 'update-approval', onFailure: 'update-approval',
       },
       'update-approval': {
-        task: { machine: 'approval', by: { participantRole: 'lead:accounts' }, assigned: { template: 'customer-notice-approval' }, deadline: { afterMinutes: 43_200 } },
+        task: { machine: 'approval', by: { participantRole: 'lead:accounts' }, assigned: { template: 'customer-notice-approval' }, deadline: { kind: 'remind', afterMinutes: 15, times: 4 } },
         onSuccess: [{ to: 'tell-update', when: { 'task:state': 'approved' } }, { to: 'final-ready' }],
         onFailure: 'final-ready',
       },
       'tell-update': { send: { to: 'room', in: 'opener', template: 'customer-notice-approved' }, onSuccess: 'final-ready', onFailure: 'final-ready' },
       'final-ready': {
-        task: { machine: 'final_notice', by: { participantRole: 'lead:accounts' }, assigned: { template: 'customer-messaging-final-ready' }, deadline: { afterMinutes: 43_200 } },
+        task: { machine: 'final_notice', by: { participantRole: 'lead:accounts' }, assigned: { template: 'customer-messaging-final-ready' }, deadline: { kind: 'remind', afterMinutes: 60, times: 2 } },
         onSuccess: 'final-draft', onFailure: 'done',
       },
       'final-draft': {
         label: 'Final notice', description: 'Advisor drafts the final notice once the incident is resolved.',
-        task: { machine: 'customer_notice_draft', by: { assistantRole: 'primary' }, ask: { template: 'customer-notice-final' } },
+        task: { machine: 'customer_notice_draft', by: { assistantRole: 'primary' }, ask: { template: 'customer-notice-final' }, deliver: 'file' },
         onSuccess: 'final-approval', onFailure: 'final-approval',
       },
       'final-approval': {
         label: 'Final notice approval', description: 'The account team lead approves the final notice.',
-        task: { machine: 'approval', by: { participantRole: 'lead:accounts' }, assigned: { template: 'customer-notice-approval' }, deadline: { afterMinutes: 43_200 } },
+        task: { machine: 'approval', by: { participantRole: 'lead:accounts' }, assigned: { template: 'customer-notice-approval' }, deadline: { kind: 'remind', afterMinutes: 15, times: 4 } },
         onSuccess: [{ to: 'tell-final', when: { 'task:state': 'approved' } }, { to: 'done' }],
         onFailure: 'done',
       },
@@ -1340,6 +1383,8 @@ function agentErrors(agent: unknown, at: string, event: WorkflowEvent, opts: Wor
   if (isInvitationEvent(event) && isObject(agent.to) && agent.to.people === 'event:person') {
     errs.push(`${at}.to names the invitee, who reads nothing in the conversation until they redeem the invitation; address the inviter, and propose send_nudge to reach the invitee`);
   }
+  if (agent.deliver !== undefined && agent.deliver !== 'file') errs.push(`${at}.deliver is file, or left out for a message`);
+  if (agent.deliver === 'file' && Array.isArray(agent.propose) && agent.propose.length) errs.push(`${at}.deliver is a file, and a step that proposes is a card`);
   if (typeof agent.deadlineMs !== 'number' || !Number.isInteger(agent.deadlineMs) || agent.deadlineMs <= 0 || agent.deadlineMs > MAX_AGENT_DEADLINE_MS) {
     errs.push(`${at}.deadlineMs is a whole number of milliseconds, at most ${MAX_AGENT_DEADLINE_MS}`);
   }
@@ -1573,10 +1618,12 @@ export function rolesOfTypes(lookup: SourceLookup, types: readonly string[] | un
 
 /**
  * THE NAMES OF RUNS THE PLATFORM MAKES ITSELF, with no workflow behind them: a meeting's summary (`MEETING_SUMMARY_RUN`),
- * whose action items' settlements continue no run. A task's run is read by its workflow's name, so no version's workflow
- * takes one of these names, and every run of a version's workflow goes on when its task settles.
+ * whose action items' settlements continue no run, and a run's runbook drawn on its dashboards (`DASHBOARD_RUNBOOK_RUN`).
+ * A task's run is read by its workflow's name, so no version's workflow takes one of these names, a task under one of them
+ * continues no run when it settles, and every run of a version's workflow goes on when its task settles.
  */
-export const PLATFORM_RUN_NAMES: readonly string[] = Object.freeze(['meeting-summary']);
+export const DASHBOARD_RUNBOOK_RUN = 'dashboard-runbook';
+export const PLATFORM_RUN_NAMES: readonly string[] = Object.freeze(['meeting-summary', DASHBOARD_RUNBOOK_RUN]);
 
 /**
  * WHY A WORKFLOW IS REFUSED, or nothing. Every rule here is one ADR-061 states for what is built; a rule a later
@@ -1626,6 +1673,14 @@ export function eventWorkflowErrors(name: string, wf: unknown, opts: WorkflowVal
   } else if (wf.deadline !== undefined) {
     errs.push(`${at}.deadline is declared only on a deadline event (${DEADLINE_EVENTS.join(', ')})`);
   }
+  if (wf.reopens !== undefined && (event !== TASK_REOPENED || typeof wf.reopens !== 'string' || !wf.reopens.trim())) {
+    errs.push(`${at}.reopens names a machine, on a workflow that runs on ${TASK_REOPENED}`);
+  }
+  // A STEP TAKES A REOPENED TASK only on a reopen.
+  for (const [k, st] of Object.entries(isObject(wf.states) ? wf.states as Record<string, unknown> : {})) {
+    const task = isObject(st) && isObject((st as { task?: unknown }).task) ? (st as { task: { takes?: unknown } }).task : undefined;
+    if (task?.takes !== undefined && event !== TASK_REOPENED) errs.push(`${at}.states.${k}.task.takes is on a workflow that runs on ${TASK_REOPENED}`);
+  }
   const declaredTypes = Array.isArray(types) && types.every((t) => typeof t === 'string' && CONVERSATION_TYPES[t]) && types.length ? types as string[] : undefined;
   // A CONDITION ON A PARTICIPANT ROLE IS CHECKED AGAINST THE TYPES THE WORKFLOW RUNS IN (ADR-060, participant:role).
   opts = { ...opts, lookup: rolesOfTypes(opts.lookup ?? defaultLookup(), declaredTypes) };
@@ -1644,8 +1699,9 @@ export function eventWorkflowErrors(name: string, wf: unknown, opts: WorkflowVal
   for (const [key, raw] of Object.entries(states)) {
     const sat = `${at}.states.${key}`;
     if (!isObject(raw)) { errs.push(`${sat} must be a step`); continue; }
-    const kinds = ['send', 'agent', 'action', 'opening', 'prompt', 'task', 'wait', 'open', 'disposition'].filter((k) => raw[k] !== undefined);
-    if (kinds.length !== 1) { errs.push(`${sat} is exactly one of a send, an agent step, an action, an opening, a prompt, a task, a wait, an open, or a terminal disposition`); continue; }
+    const kinds = ['send', 'agent', 'action', 'opening', 'prompt', 'task', 'wait', 'open', 'handoff', 'disposition'].filter((k) => raw[k] !== undefined);
+    if (kinds.length !== 1) { errs.push(`${sat} is exactly one of a send, an agent step, an action, an opening, a prompt, a task, a wait, an open, a hand-off, or a terminal disposition`); continue; }
+    if (raw.handoff !== undefined) errs.push(...handoffStepErrors(raw.handoff, `${sat}.handoff`));
     // A RESOLVE THAT MOVES THE RUN ON (O15) names a step of this workflow.
     const movesTo = isObject(raw.task) ? raw.task.movesTo : undefined;
     if (typeof movesTo === 'string' && !Object.prototype.hasOwnProperty.call(states, movesTo)) errs.push(`${sat}.task.movesTo names a step of this workflow`);
@@ -2118,7 +2174,7 @@ export interface EventTransition { step: string; outcome: string }
 
 /** `gated`: the step's own `when` did not hold, so it posted nothing and the run took its `onSuccess`. */
 /** `withheld`: a private request's step that would have reached someone other than the person who asked (decision 8). */
-export type StepOutcome = 'posted' | 'skipped' | 'gated' | 'failed' | 'dispatched' | 'not-dispatched' | 'no-role-assistant' | 'already-claimed' | 'opened' | 'no-worker' | 'withheld' | 'waiting' | 'refused';
+export type StepOutcome = 'posted' | 'skipped' | 'gated' | 'failed' | 'dispatched' | 'not-dispatched' | 'no-role-assistant' | 'already-claimed' | 'opened' | 'no-worker' | 'withheld' | 'waiting' | 'refused' | HandoffOutcome;
 
 export interface EventRunDeps {
   /** The run's exactly-once claim. False when this run already started. */
@@ -2164,6 +2220,11 @@ export interface EventRunDeps {
    * WT90), and the run goes on at once, carrying its link.
    */
   openChild?: (step: string, def: OpenStep, transitions: EventTransition[]) => Promise<'requested' | 'no-person' | 'nested' | 'failed' | { opened: string }>;
+  /**
+   * Put the step's hand-off on this classification's own process source (SPEC-PROCESSES P4): `sent` once it is on the bus,
+   * `refused` where a value is outside its declared type or the put was refused. Absent, a hand-off step takes its failure edge.
+   */
+  handoff?: (step: string, def: HandoffStep) => Promise<HandoffOutcome>;
   /** Post the welcome's opening to the room (`opening`), composed as `WelcomeIntent` composes it. True when it posted. */
   opening?: (step: string, def: WelcomeOpeningStep, transitions: EventTransition[]) => Promise<boolean>;
   /** Dispatch the welcome's prompt turn (`prompt`). True when it was handed to the processor. */
@@ -2679,6 +2740,20 @@ export async function runEventWorkflow(
           record(at, out === 'started' ? 'posted' : out);
           ok = out !== 'failed';
         }
+      } else if (def.handoff) {
+        // ONE HAND-OFF PER RUN'S STEP (SPEC-PROCESSES P4): claimed before it is put, so a redelivered event puts nothing twice. Its
+        // outcome, `sent` or `refused`, is recorded on the run, and the run goes on by its edge.
+        if (!deps.handoff) {
+          record(at, 'not-dispatched');
+          ok = false;
+        } else if (!(await deps.claimStep(at, HANDOFF_SENT).catch(() => false))) {
+          record(at, 'already-claimed');
+          ok = true;
+        } else {
+          const out = await deps.handoff(at, def.handoff).catch((): HandoffOutcome => HANDOFF_REFUSED);
+          record(at, out);
+          ok = out === HANDOFF_SENT;
+        }
       } else if (def.open) {
         // ONE CHILD PER RUN'S STEP: claimed before it is asked for, so a redelivered event opens nothing twice and, finding the
         // step claimed, waits as the first run does. The creator hands the run back when the child stands or could not.
@@ -3082,53 +3157,71 @@ export function versionEventWorkflowsErrors(raw: unknown, opts: WorkflowValidati
 
 // ── PROCESSES (SPEC-PROCESSES, DESIGN-PROCESSES sections 2 and 3) ────────────────────────────────────────────────────
 //
-// A process is a definition on the owner team's version: the workflows it links by id, and optional metrics. Everything else
-// is an ordinary workflow run, which carries the process it belongs to.
+// A process is a definition on the owner team's version: the workflows it links by id, the typed hand-offs it sends to
+// another team, and optional metrics. Everything else is an ordinary workflow run, which carries the process it belongs to.
 
+/** The types a hand-off field may take (O2): no free text exists, so no declaration can carry one. */
+export const HANDOFF_FIELD_TYPES = ['enum', 'number', 'boolean', 'time', 'id', 'ref'] as const;
+export type HandoffFieldType = typeof HANDOFF_FIELD_TYPES[number];
+export interface HandoffField { type: HandoffFieldType; values?: string[]; store?: string }
+export interface ProcessHandoff { fields: Record<string, HandoffField> }
 export interface ProcessMetric { id: string; label: string; workflow: string; step?: string; outcome?: string; within?: string; target?: number }
 export interface VersionProcess {
   label: string;
   /** What the process is for and who owns it end to end, in the owner team's words, shown above its stages. */
   description?: string;
   workflows: string[];
+  /** The hand-offs its workflows send to another team (DESIGN-PROCESSES section 2), each a set of typed fields. */
+  handoffs?: Record<string, ProcessHandoff>;
   metrics?: ProcessMetric[];
 }
 
-/** What a run carries of its process: the id across its runs, the edition its first run started on, and its run's team. */
-export interface RunProcess { id: string; name: string; edition?: string; ownerTeam?: string }
+/**
+ * What a run carries of its process: the id across its runs, the edition its first run started on (absent on a run a
+ * received hand-off started, whose edition the query reads from the run that started the process), its run's team, and
+ * for a run a hand-off started, the hand-off (`<process>.<handoff>`), which its run-end record names as its trigger.
+ */
+export interface RunProcess { id: string; name: string; edition?: string; ownerTeam?: string; received?: string }
 
 /** A process id and an edition: twelve hex characters, as `contentHash12` writes them. */
 export const PROCESS_ID = /^[a-f0-9]{12}$/;
+export const HANDOFF_FIELD_NAME = /^[A-Za-z][A-Za-z0-9]{0,31}$/;
 export const MAX_VERSION_PROCESSES = 4;
+export const MAX_HANDOFF_FIELDS = 16;
+const MAX_ENUM_VALUES = 32;
 const MAX_PROCESS_METRICS = 8;
-const PROCESS_KEYS = ['label', 'description', 'workflows', 'metrics'];
+const PROCESS_KEYS = ['label', 'description', 'workflows', 'handoffs', 'metrics'];
 const ISO_DURATION = /^P(?=\d|T\d)(?:\d{1,4}D)?(?:T(?=\d)(?:\d{1,4}H)?(?:\d{1,5}M)?)?$/;
 
 /** Each refusal a `processes` entry is given, as a code the console says from its locale bundle (D11). */
 export const PROCESS_REFUSALS = [
   'PROCESSES_SHAPE', 'PROCESSES_TOO_MANY', 'PROCESS_NAME', 'PROCESS_LABEL', 'PROCESS_DESCRIPTION', 'PROCESS_NO_WORKFLOWS', 'PROCESS_WORKFLOW_UNDECLARED',
-  'PROCESS_WORKFLOW_LINKED_TWICE', 'METRIC_SHAPE', 'METRIC_WORKFLOW', 'METRIC_STEP',
+  'PROCESS_WORKFLOW_LINKED_TWICE', 'HANDOFF_NAME', 'HANDOFF_FIELDS', 'HANDOFF_FIELD_TYPE', 'HANDOFF_ENUM_EMPTY', 'HANDOFF_REF_STORE',
+  'HANDOFF_UNDECLARED', 'METRIC_SHAPE', 'METRIC_WORKFLOW', 'METRIC_STEP',
 ] as const;
 export type ProcessRefusal = typeof PROCESS_REFUSALS[number];
 const refusal = (at: string, code: ProcessRefusal): string => `${at}: ${code}`;
 
 /**
  * WHY A VERSION'S `processes` IS REFUSED AS WRITTEN, or nothing (DESIGN-PROCESSES section 2): an entry with a key other than its
- * label, its workflows and its metrics, a linked workflow the version does not declare, a workflow two processes link, and a
+ * label, its description, its workflows, its hand-offs and its metrics, a linked workflow the version does not declare, a
+ * workflow two processes link, a hand-off field type outside the closed set, an enum with no values, a `ref` naming a store the
+ * deployment does not declare as a connector, a `handoff` step naming a hand-off its workflow's process does not declare, and a
  * metric naming a workflow or step the process does not link. A process links the version's event workflows and its
- * request-started workflows (`intentWorkflows`, keyed by the intent) alike (`linkableWorkflows`).
+ * request-started workflows (`intentWorkflows`, keyed by the intent) alike (`linkableWorkflows`). `connectors` absent, a `ref`
+ * names a store by shape only.
  */
-export function versionProcessesErrors(raw: unknown, eventWorkflows: unknown, intentWorkflows?: unknown): string[] {
-  if (raw === undefined || raw === null) return [];
-  if (!isObject(raw)) return [refusal('processes', 'PROCESSES_SHAPE')];
+export function versionProcessesErrors(raw: unknown, eventWorkflows: unknown, intentWorkflows?: unknown, opts: { connectors?: readonly string[] } = {}): string[] {
+  if (raw !== undefined && raw !== null && !isObject(raw)) return [refusal('processes', 'PROCESSES_SHAPE')];
+  const declared: Record<string, unknown> = isObject(raw) ? raw : {};
   const own = linkableWorkflows(eventWorkflows, intentWorkflows);
   const errs: string[] = [];
-  const names = Object.keys(raw);
+  const names = Object.keys(declared);
   if (names.length > MAX_VERSION_PROCESSES) errs.push(refusal('processes', 'PROCESSES_TOO_MANY'));
   const linkedBy = new Map<string, string>();
   for (const name of names) {
     const at = `processes.${name}`;
-    const p = raw[name];
+    const p = declared[name];
     if (!NAME.test(name)) { errs.push(refusal(at, 'PROCESS_NAME')); continue; }
     if (!isObject(p) || Object.keys(p).some((k) => !PROCESS_KEYS.includes(k))) { errs.push(refusal(at, 'PROCESSES_SHAPE')); continue; }
     if (typeof p.label !== 'string' || !p.label.trim() || p.label.length > MAX_STEP_LABEL) errs.push(refusal(`${at}.label`, 'PROCESS_LABEL'));
@@ -3141,10 +3234,47 @@ export function versionProcessesErrors(raw: unknown, eventWorkflows: unknown, in
       if (other && other !== name) errs.push(refusal(`${at}.workflows.${wf}`, 'PROCESS_WORKFLOW_LINKED_TWICE'));
       else linkedBy.set(wf, name);
     }
+    if (p.handoffs !== undefined) {
+      if (!isObject(p.handoffs)) errs.push(refusal(`${at}.handoffs`, 'PROCESSES_SHAPE'));
+      else for (const [h, decl] of Object.entries(p.handoffs)) errs.push(...handoffErrors(`${at}.handoffs.${h}`, h, decl, opts.connectors));
+    }
     if (p.metrics !== undefined) {
       if (!Array.isArray(p.metrics) || p.metrics.length > MAX_PROCESS_METRICS) errs.push(refusal(`${at}.metrics`, 'METRIC_SHAPE'));
       else p.metrics.forEach((m, i) => errs.push(...metricErrors(`${at}.metrics.${i}`, m, workflows, own)));
     }
+  }
+  // A `handoff` STEP NAMES A HAND-OFF ITS WORKFLOW'S PROCESS DECLARES, and reads exactly the declared fields (P4, P5). A version
+  // that declares no process declares no hand-off, so every such step is refused.
+  for (const [wfName, wf] of Object.entries(own)) {
+    for (const [step, def] of Object.entries(isObject(wf) && isObject(wf.states) ? wf.states : {})) {
+      const h = isObject(def) && isObject(def.handoff) ? def.handoff : undefined;
+      if (!h) continue;
+      const proc = linkedBy.get(wfName);
+      const handoffs = proc && h.process === proc && isObject(declared[proc]) ? (declared[proc] as { handoffs?: unknown }).handoffs : undefined;
+      const decl = isObject(handoffs) && typeof h.name === 'string' && isObject(handoffs[h.name]) ? (handoffs[h.name] as { fields?: unknown }).fields : undefined;
+      const read = isObject(h.fields) ? Object.keys(h.fields).sort().join(',') : '';
+      if (!isObject(decl) || Object.keys(decl).sort().join(',') !== read) errs.push(refusal(`${isObject(eventWorkflows) && Object.prototype.hasOwnProperty.call(eventWorkflows, wfName) ? 'eventWorkflows' : 'intentWorkflows'}.${wfName}.states.${step}.handoff`, 'HANDOFF_UNDECLARED'));
+    }
+  }
+  return errs;
+}
+
+/** Why one declared hand-off is refused: its name, at least one field and at most the bound, each of a closed type. */
+function handoffErrors(at: string, name: string, decl: unknown, connectors: readonly string[] | undefined): string[] {
+  if (!NAME.test(name)) return [refusal(at, 'HANDOFF_NAME')];
+  const fields = isObject(decl) && Object.keys(decl).every((k) => k === 'fields') && isObject(decl.fields) ? decl.fields : undefined;
+  if (!fields || !Object.keys(fields).length || Object.keys(fields).length > MAX_HANDOFF_FIELDS) return [refusal(`${at}.fields`, 'HANDOFF_FIELDS')];
+  const errs: string[] = [];
+  for (const [f, spec] of Object.entries(fields)) {
+    const fat = `${at}.fields.${f}`;
+    if (!HANDOFF_FIELD_NAME.test(f)) { errs.push(refusal(fat, 'HANDOFF_FIELDS')); continue; }
+    const type = isObject(spec) ? spec.type : undefined;
+    if (!(HANDOFF_FIELD_TYPES as readonly unknown[]).includes(type)) { errs.push(refusal(fat, 'HANDOFF_FIELD_TYPE')); continue; }
+    const s = spec as Record<string, unknown>;
+    if (type === 'enum' && !(Array.isArray(s.values) && s.values.length && s.values.length <= MAX_ENUM_VALUES && s.values.every((v) => typeof v === 'string' && NAME.test(v)))) {
+      errs.push(refusal(fat, 'HANDOFF_ENUM_EMPTY'));
+    }
+    if (type === 'ref' && !(typeof s.store === 'string' && NAME.test(s.store) && (!connectors || connectors.includes(s.store)))) errs.push(refusal(fat, 'HANDOFF_REF_STORE'));
   }
   return errs;
 }
@@ -3168,6 +3298,116 @@ export function linkableWorkflows(eventWorkflows: unknown, intentWorkflows?: unk
   return { ...(isObject(intentWorkflows) ? intentWorkflows : {}), ...(isObject(eventWorkflows) ? eventWorkflows : {}) };
 }
 
+// ── THE HAND-OFF (SPEC-PROCESSES P4 to P7, DESIGN-PROCESSES sections 4 and 12) ─────────────────────────────────────────
+
+/**
+ * A HAND-OFF STEP (SPEC-PROCESSES P4): the process and the hand-off it declares, and where each declared field's value is
+ * read from the run's own values: `event:<value>`, a value a task of the run recorded (`task:value:<need>`), or one the step
+ * names (`value:<enum value>`).
+ */
+export interface HandoffStep { process: string; name: string; fields: Record<string, string> }
+export const HANDOFF_SENT = 'sent' as const;
+export const HANDOFF_REFUSED = 'refused' as const;
+export type HandoffOutcome = typeof HANDOFF_SENT | typeof HANDOFF_REFUSED;
+const HANDOFF_VALUE_SOURCE = /^(?:event:[A-Za-z0-9_-]{1,64}|task:value:[A-Za-z0-9_-]{1,64}|value:[a-z0-9][a-z0-9-]{0,62})$/;
+/** Every process source starts so: an event on one is a hand-off, attached and received only as one. */
+export const PROCESS_SOURCE_PREFIX = 'ae.process.';
+/** The source a process hand-off is put on: the sending classification's own, which the default bus admits from its router's role alone. */
+export const processSource = (classification: string): string => `${PROCESS_SOURCE_PREFIX}${classification}`;
+/** The `detail-type` of a hand-off: the process and the hand-off, which the receiving rule matches exactly. */
+export const handoffDetailType = (process: string, name: string): string => `${process}.${name}`;
+
+function handoffStepErrors(raw: unknown, at: string): string[] {
+  if (!isObject(raw) || typeof raw.process !== 'string' || !NAME.test(raw.process) || typeof raw.name !== 'string' || !NAME.test(raw.name) || !isObject(raw.fields)
+    || Object.keys(raw).some((k) => !['process', 'name', 'fields'].includes(k))) {
+    return [`${at} is { process, name, fields }: the process and the hand-off it declares, and where each field's value is read`];
+  }
+  return Object.entries(raw.fields).filter(([f, src]) => !HANDOFF_FIELD_NAME.test(f) || typeof src !== 'string' || !HANDOFF_VALUE_SOURCE.test(src))
+    .map(([f]) => `${at}.fields.${f} reads a value of the run (event:<value> or task:value:<need>) or names one (value:<enum value>)`);
+}
+
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/;
+const HANDOFF_ID = /^[A-Za-z0-9._:/-]{1,256}$/;
+export type HandoffValue = string | number | boolean | { store: string; id: string };
+
+/** One value as its declared type, or undefined where it is outside it (DESIGN-PROCESSES section 4.1). */
+export function typedHandoffValue(raw: unknown, field: HandoffField): HandoffValue | undefined {
+  switch (field.type) {
+    case 'enum': return typeof raw === 'string' && (field.values ?? []).includes(raw) ? raw : undefined;
+    case 'number': { const n = typeof raw === 'number' ? raw : typeof raw === 'string' && raw.trim() ? Number(raw) : NaN; return Number.isFinite(n) ? n : undefined; }
+    case 'boolean': return raw === true || raw === 'true' ? true : raw === false || raw === 'false' ? false : undefined;
+    case 'time': return typeof raw === 'string' && ISO_TIME.test(raw) && Number.isFinite(Date.parse(raw)) ? raw : undefined;
+    case 'id': return typeof raw === 'string' && HANDOFF_ID.test(raw) ? raw : undefined;
+    case 'ref': {
+      const id = isObject(raw) ? raw.id : raw;
+      const store = isObject(raw) ? raw.store : field.store;
+      return typeof id === 'string' && HANDOFF_ID.test(id) && store === field.store && typeof store === 'string' ? { store, id } : undefined;
+    }
+    default: return undefined;
+  }
+}
+
+/**
+ * THE HAND-OFF'S DETAIL, OR WHY IT IS REFUSED BEFORE THE PUT (SPEC-PROCESSES P4, P5): the run's process is the one the step
+ * names, the step reads exactly the declared fields, and every value is of its declared type. Fixed shape: these five keys,
+ * and `fields` holding exactly the declared names. Refusals name the field only, never its value.
+ */
+export function handoffDetail(args: {
+  step: HandoffStep; declared: ProcessHandoff | undefined; values: Readonly<Record<string, string>> | undefined; process: RunProcess | undefined; instance: string;
+}): { detail: { instance: string; processId: string; process: string; handoff: string; fields: Record<string, HandoffValue> } } | { refused: string } {
+  const { step, declared, process } = args;
+  if (!process || process.name !== step.process) return { refused: 'the run is not of the process the step names' };
+  if (!declared) return { refused: 'the version declares no such hand-off' };
+  if (!args.instance) return { refused: 'this deployment names no instance' };
+  const names = Object.keys(declared.fields);
+  if (names.length !== Object.keys(step.fields).length || names.some((n) => !Object.prototype.hasOwnProperty.call(step.fields, n))) return { refused: 'the step does not read exactly the declared fields' };
+  const values = args.values ?? {};
+  const fields: Record<string, HandoffValue> = {};
+  for (const n of names) {
+    const src = step.fields[n];
+    // A NAMED VALUE (`value:<enum value>`) is the step's own, chosen by the edge that reached it; every other is the run's.
+    const raw = src.startsWith('value:') ? src.slice('value:'.length) : values[src.startsWith('event:') ? src.slice('event:'.length) : src];
+    const v = typedHandoffValue(raw, declared.fields[n]);
+    if (v === undefined) return { refused: `the field ${n} is outside its declared type` };
+    fields[n] = v;
+  }
+  return { detail: { instance: args.instance, processId: process.id, process: step.process, handoff: step.name, fields } };
+}
+
+/**
+ * THE `process` WATCH'S KEY: the process and its id, so a hand-off of another process finds no conversation (the watched
+ * target's process check). The kind (`PROCESS_WATCH_KIND`) is the platform's own, recorded by the runner, never by an opener.
+ */
+export const processWatchId = (process: string, processId: string): string => `${process}.${processId}`;
+
+/** What the receiving rule recorded at attach: the exact source and `detail-type`, and the declared fields as they stood. */
+export interface AttachedHandoff { source: string; detailType: string; fields: Record<string, HandoffField> }
+
+/**
+ * WHY A RECEIVED HAND-OFF STARTS NO RUN, or undefined (DESIGN-PROCESSES section 4.3), before any run: the source and
+ * `detail-type` are the ones attached, the `detail-type` agrees with the detail's process and hand-off, the process id is a
+ * `contentHash12` value, and the fields carry exactly the recorded names, each of its recorded type. A declaration changed
+ * since attach is refused here until the receiving team attaches again.
+ */
+export function receivedHandoffRefusal(attached: AttachedHandoff, event: { source: unknown; detailType: unknown; processId: unknown; process: unknown; handoff: unknown; fields: unknown }): string | undefined {
+  if (event.source !== attached.source || event.detailType !== attached.detailType) return 'the event is not the attached hand-off';
+  if (typeof event.process !== 'string' || typeof event.handoff !== 'string' || handoffDetailType(event.process, event.handoff) !== attached.detailType) return 'the detail-type disagrees with the detail';
+  if (typeof event.processId !== 'string' || !PROCESS_ID.test(event.processId)) return 'the process id is not a process id';
+  if (!isObject(event.fields)) return 'the fields are not the attached declaration';
+  const names = Object.keys(attached.fields);
+  if (Object.keys(event.fields).length !== names.length || names.some((n) => !Object.prototype.hasOwnProperty.call(event.fields, n))) return 'the fields are not the attached declaration';
+  for (const n of names) if (typedHandoffValue((event.fields as Record<string, unknown>)[n], attached.fields[n]) === undefined) return 'a field is not of its attached type';
+  return undefined;
+}
+
+/** A received hand-off's fields as the run's values (read as `event:<field>`): a reference by its id, every value a string. */
+export function receivedHandoffValues(fields: Record<string, unknown>, attached: AttachedHandoff): Record<string, string> {
+  return Object.fromEntries(Object.keys(attached.fields).map((n) => {
+    const v = typedHandoffValue(fields[n], attached.fields[n]);
+    return [n, typeof v === 'object' ? v.id : String(v)];
+  }));
+}
+
 /** The process a version links a workflow into, by the workflow's name, or undefined. One process links a workflow at most. */
 export function processOfWorkflow(processes: Readonly<Record<string, VersionProcess>> | undefined, workflow: string): { name: string; process: VersionProcess } | undefined {
   for (const [name, process] of Object.entries(processes ?? {})) if (Array.isArray(process?.workflows) && process.workflows.includes(workflow)) return { name, process };
@@ -3181,8 +3421,11 @@ export function runProcessOf(raw: unknown): RunProcess | undefined {
   return {
     id: raw.id, name: raw.name, ...(typeof raw.edition === 'string' ? { edition: raw.edition } : {}),
     ...(typeof raw.ownerTeam === 'string' && TEAM_NAME.test(raw.ownerTeam) ? { ownerTeam: raw.ownerTeam } : {}),
+    ...(typeof raw.received === 'string' && RECEIVED.test(raw.received) ? { received: raw.received } : {}),
   };
 }
+/** A received hand-off as a run names it: `<process>.<handoff>`. */
+const RECEIVED = /^[a-z0-9][a-z0-9-]{0,62}\.[a-z0-9][a-z0-9-]{0,62}$/;
 const TEAM_NAME = /^[a-z0-9][a-z0-9-]{0,47}$/;
 
 /**
@@ -3241,9 +3484,14 @@ export function verifiedJoiners(named: readonly string[], roster: ReadonlyArray<
 export function declaredWorkflowOn(
   own: Record<string, EventWorkflow> | null | undefined,
   event: WorkflowEvent,
+  /** `task-reopened` only: the reopened task's machine, which a workflow naming it (`reopens`) is chosen for. */
+  machine?: string,
 ): { name: string; workflow: EventWorkflow } | undefined {
   if (!EVENTS_SELECTING_THEIR_WORKFLOW.includes(event)) return undefined;
-  const found = Object.entries(own ?? {}).find(([, wf]) => wf?.on === event);
+  const on = Object.entries(own ?? {}).filter(([, wf]) => wf?.on === event);
+  const found = event === TASK_REOPENED
+    ? on.find(([, wf]) => !!machine && wf.reopens === machine) ?? on.find(([, wf]) => wf.reopens === undefined)
+    : on[0];
   return found ? { name: found[0], workflow: found[1] } : undefined;
 }
 

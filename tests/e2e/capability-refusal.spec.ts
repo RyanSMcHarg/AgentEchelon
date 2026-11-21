@@ -143,7 +143,7 @@ test.describe.serial('a request for something the assistant does not offer is re
     expect(roomSees.some((m) => m.content.includes(REFUSED_IMAGE)), 'a targeted request was refused publicly (FR16)').toBe(false);
   });
 
-  // SUMMARIZING THE CONVERSATION IS THE PLATFORM'S, NOT A REPORT (FR19, owner 2026-10-05). The word
+  // SUMMARIZING THE CONVERSATION IS THE PLATFORM'S, NOT A REPORT (FR19). The word
   // "summary" sits in report_generation's description, so before conversation_summary was a universal
   // intent this request could be refused on basic as a report.
   test('a request to summarize the conversation is answered on basic, not refused as a report', async ({ page }) => {

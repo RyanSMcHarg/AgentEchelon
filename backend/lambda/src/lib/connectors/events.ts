@@ -39,6 +39,8 @@ export interface ConnectorEventDetail {
   admitted: Array<{ role: string; personArn: string }>;
   /** How many were named and not admitted, by why. */
   notAdmitted: { refused: number; undetermined: number; unresolved: number; pending: number };
+  /** The app connector only (WT84): the conversation the event names, by its channel id, as the receiver recorded it. */
+  conversation?: string;
 }
 
 let defaultClient: Sender | null = null;

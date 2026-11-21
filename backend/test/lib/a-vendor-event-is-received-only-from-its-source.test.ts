@@ -76,8 +76,13 @@ function replayStore() {
       case 'GetCommand':
         return { Item: items.get(input.Key.pk) };
       case 'UpdateCommand': {
+        // THE STATE THE UPDATE SETS, under the state and claim its condition names.
         const old = items.get(input.Key.pk);
-        if (old) items.set(input.Key.pk, { ...old, state: input.ExpressionAttributeValues[':published'], publishedAt: input.ExpressionAttributeValues[':at'] });
+        const values = input.ExpressionAttributeValues;
+        const from = /#s = (:\w+) AND claimedAt = :mine/.exec(input.ConditionExpression ?? '');
+        if (from && (!old || old.state !== values[from[1]] || old.claimedAt !== values[':mine'])) throw ccf();
+        const to = /SET #s = (:\w+)/.exec(input.UpdateExpression)![1];
+        if (old) items.set(input.Key.pk, { ...old, state: values[to], ...(values[':at'] !== undefined ? { publishedAt: values[':at'] } : {}) });
         return {};
       }
       case 'DeleteCommand': {
@@ -245,5 +250,36 @@ describe('the fact', () => {
     await handleEvent(sfEvent(), sf.deps);
     expect(sf.published[0].admitted).toEqual([]);
     expect(sf.published[0].notAdmitted).toEqual({ refused: 0, undetermined: 0, unresolved: 1, pending: 0 });
+  });
+});
+
+describe('a fact is never on the bus without its record', () => {
+  it('records what it publishes before it publishes, so a consumer can confirm the fact the moment it arrives', async () => {
+    const { deps, store } = world();
+    const order: string[] = [];
+    const send = store.send.getMockImplementation()!;
+    store.send.mockImplementation(async (cmd: any) => { order.push(cmd.constructor.name); return send(cmd); });
+    const publish = deps.publish;
+    deps.publish = async (d) => { order.push('publish'); return publish(d); };
+    expect((await handleEvent(pdEvent(), deps)).outcome).toBe('accepted');
+    expect(order.indexOf('UpdateCommand')).toBeGreaterThan(-1);
+    expect(order.indexOf('UpdateCommand')).toBeLessThan(order.indexOf('publish'));
+  });
+
+  it('DENY: a record that cannot be written publishes nothing, releases the claim, and the retry publishes', async () => {
+    const { deps, store, published } = world();
+    const send = store.send.getMockImplementation()!;
+    let down = true;
+    store.send.mockImplementation(async (cmd: any) => {
+      if (down && cmd.constructor.name === 'UpdateCommand') throw Object.assign(new Error('x'), { name: 'InternalServerError' });
+      return send(cmd);
+    });
+    await expect(handleEvent(pdEvent(), deps)).rejects.toBeInstanceOf(IngestRetry);
+    expect(published).toEqual([]);
+    expect(store.items.size).toBe(0);
+    down = false;
+    expect((await handleEvent(pdEvent(), deps)).outcome).toBe('accepted');
+    expect(published).toHaveLength(1);
+    expect(store.items.get('pagerduty#msg-1')!.state).toBe('published');
   });
 });

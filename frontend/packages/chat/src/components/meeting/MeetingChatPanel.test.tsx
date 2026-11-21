@@ -197,19 +197,53 @@ describe('the in-meeting chat panel', () => {
 describe('the right column: the roster above, the chat in a panel of its own, resized from its edge', () => {
   beforeEach(() => { try { localStorage.removeItem('ae.meeting.sideWidth'); } catch { /* none kept */ } });
 
-  it('keeps the roster when the chat is closed, and the chat header is the chat panel\'s, not the roster\'s', () => {
-    render(
-      <MeetingChatProvider>
-        <MeetingChatPanel roster={<div data-testid="roster">People</div>}><p>chat</p></MeetingChatPanel>
-      </MeetingChatProvider>,
-    );
-    const side = screen.getByTestId('meeting-side');
-    // The chat panel holds its own header; the roster sits before it, outside it.
+  const withRoster = () => render(
+    <MeetingChatProvider>
+      <MeetingChatPanel roster={<div data-testid="roster">People</div>}><p>chat</p></MeetingChatPanel>
+    </MeetingChatProvider>,
+  );
+
+  it('shows the roster, the chat or both from the toggles at its top, and one always stays on', () => {
+    withRoster();
+    const people = screen.getByTestId('meeting-side-view-people');
+    const chat = screen.getByTestId('meeting-side-view-chat');
+    // Both at first, the roster outside the chat panel, and the chat panel has no header of its own.
+    expect(people).toHaveAttribute('aria-pressed', 'true');
+    expect(chat).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByTestId('meeting-chat-panel').contains(screen.getByTestId('roster'))).toBe(false);
-    fireEvent.click(screen.getByRole('button', { name: /Hide chat/ }));
+    expect(screen.queryByRole('heading')).toBeNull();
+    expect(screen.queryByRole('button', { name: /Hide chat/ })).toBeNull();
+    // The chat alone: the roster hides, and the chat's toggle is the one left on, so it cannot be turned off.
+    fireEvent.click(people);
+    expect(screen.getByTestId('roster').parentElement!.hidden).toBe(true);
+    expect(screen.getByTestId('meeting-chat-panel').hidden).toBe(false);
+    expect(chat).toBeDisabled();
+    // The roster alone.
+    fireEvent.click(people);
+    fireEvent.click(chat);
     expect(screen.getByTestId('meeting-chat-panel').hidden).toBe(true);
-    expect(side.hidden).toBe(false);
-    expect(screen.getByTestId('roster')).toBeTruthy();
+    expect(screen.getByTestId('roster').parentElement!.hidden).toBe(false);
+    expect(screen.getByTestId('meeting-side').hidden).toBe(false);
+    expect(people).toBeDisabled();
+  });
+
+  it('gives the roster or the chat more room from the line between them, and remembers the split', () => {
+    try { localStorage.removeItem('ae.meeting.rosterShare'); } catch { /* none kept */ }
+    withRoster();
+    const line = screen.getByTestId('meeting-roster-chat-splitter');
+    expect(line).toHaveAttribute('aria-orientation', 'horizontal');
+    expect(line).toHaveAttribute('aria-valuenow', '40');
+    fireEvent.keyDown(line, { key: 'ArrowDown' });
+    expect(line).toHaveAttribute('aria-valuenow', '45');
+    expect(localStorage.getItem('ae.meeting.rosterShare')).toBe('0.45');
+    expect(screen.getByTestId('roster').parentElement!.style.flex).toBe('0 0 45%');
+    fireEvent.keyDown(line, { key: 'End' });
+    expect(line).toHaveAttribute('aria-valuenow', '85');
+    fireEvent.keyDown(line, { key: 'Home' });
+    expect(line).toHaveAttribute('aria-valuenow', '15');
+    // Only while both show.
+    fireEvent.click(screen.getByTestId('meeting-side-view-chat'));
+    expect(screen.queryByTestId('meeting-roster-chat-splitter')).toBeNull();
   });
 
   it('resizes from the keyboard within its bounds, and remembers the width', () => {

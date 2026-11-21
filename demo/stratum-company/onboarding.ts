@@ -88,7 +88,7 @@ export const STANDARD_ONBOARDING: IntakeConfig = {
  */
 export const PREMIUM_ONBOARDING: IntakeConfig = {
   greeting: 'Welcome.',
-  // A REPLY PREFERENCE, NOT A FACT (owner, 2026-10-14). Answer style shapes every reply in every
+  // A REPLY PREFERENCE, NOT A FACT. Answer style shapes every reply in every
   // conversation (lib/config/reply-preferences.ts), so asking once is worth it; a reporting default
   // stored as a fact shaped nothing after the conversation it was asked in. The offer never blocks: a
   // message that is not itself one of these answers goes to the assistant and the offer stays open, and

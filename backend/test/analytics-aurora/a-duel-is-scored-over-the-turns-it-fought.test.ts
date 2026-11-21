@@ -1,7 +1,7 @@
 /**
  * A DUEL IS SCORED OVER THE TURNS IT ACTUALLY FOUGHT.
  *
- * ── WHAT WAS WRONG (measured 2026-09-23, owner: "Don't we want analytics across the full battle") ─
+ * ── A DUEL IS MEASURED ACROSS THE FULL BATTLE ─
  *
  * The pairing key was (turn, sender). That is right for a normal duel - two sides answering one
  * message, two exchanges - and it caps a MULTI-ROUND duel at two: a side's round-2 rebuttal answers

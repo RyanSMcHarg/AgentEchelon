@@ -1,5 +1,5 @@
 /**
- * A PLAIN REPLY GOES TO THE WORK IT IS ABOUT, NOT THE NEWEST (maintainer, 2026-09-04; ADR-024 D7).
+ * A PLAIN REPLY GOES TO THE WORK IT IS ABOUT, NOT THE NEWEST (ADR-024 D7).
  *
  * The router resumed `getAssigneeChannelTasks(...).live[0]`, which is newest-first. Holding more than one
  * open piece of work is ordinary rather than exotic - a long request opens a `report_generation` in
@@ -319,7 +319,7 @@ describe('a candidate says where it can go', () => {
 });
 
 /**
- * ── THE LIST HAS SOMETHING TO RANK (maintainer, 2026-09-04) ───────────────────────────────────────────
+ * ── THE LIST HAS SOMETHING TO RANK ───────────────────────────────────────────
  *
  * The ranking rule above is only worth anything if the list it sorts can contain both kinds of work.
  * The first build fed it `heldByPerson` alone - and a task is owned by the person ONLY when its state
@@ -408,7 +408,8 @@ describe('the writable candidate set', () => {
   );
 
   it('excludes chains belonging to another assistant, rather than only ranking them lower', () => {
-    expect(router).toContain('.filter((t) => !t.assistantId || t.assistantId === self);');
+    // Another assistant's chain is excluded from the room's candidates before anything else holds one back.
+    expect(router).toContain('].filter((t) => !t.assistantId || t.assistantId === self);');
   });
 
   it('keeps a row that predates `assistantId`, so the set is not narrower than what it replaced', () => {

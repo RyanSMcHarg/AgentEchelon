@@ -69,15 +69,23 @@ export function isOpenWorkItemsConfigured(): boolean {
  * the thing most likely forgotten, and answering in the order asked is what stops a queue becoming a
  * pile. Sorting here rather than in the UI keeps one definition of "next".
  *
- * Returns [] on any failure. A queue is an ambient affordance, not a primary flow: a failed poll must
- * not raise anything at the user, and the next poll fixes it.
+ * Returns null on any failure, which says nothing about what is open: a queue is an ambient affordance, so a failed poll
+ * raises nothing at the user, and the caller keeps what it had until the next poll answers. An empty list is an answer.
  */
-export async function fetchOpenWorkItems(): Promise<OpenWorkItem[]> {
-  if (!personApiServes('core')) return [];
+export async function fetchOpenWorkItems(): Promise<OpenWorkItem[] | null> {
+  return (await fetchOpenWork())?.items ?? null;
+}
+
+/**
+ * The open items with whether they are all of them (`complete`): a list at the service's cap may leave some out, so an item
+ * missing from an incomplete list is not known to be settled. Null where the read failed.
+ */
+export async function fetchOpenWork(): Promise<{ items: OpenWorkItem[]; complete: boolean } | null> {
+  if (!personApiServes('core')) return { items: [], complete: true };
   const url = personUrl('/tasks/mine');
 
   const idToken = localStorage.getItem('idToken');
-  if (!idToken) return [];
+  if (!idToken) return null;
 
   try {
     const response = await fetch(url, {
@@ -88,15 +96,16 @@ export async function fetchOpenWorkItems(): Promise<OpenWorkItem[]> {
     });
     if (!response.ok) {
       console.warn('[openWorkItems] fetch failed:', response.status);
-      return [];
+      return null;
     }
-    const body = (await response.json()) as { items?: OpenWorkItem[] };
+    const body = (await response.json()) as { items?: OpenWorkItem[]; complete?: boolean };
     const items = Array.isArray(body.items) ? body.items : [];
-    return [...items].sort((a, b) =>
-      String(a.updatedAt ?? '').localeCompare(String(b.updatedAt ?? '')),
-    );
+    return {
+      items: [...items].sort((a, b) => String(a.updatedAt ?? '').localeCompare(String(b.updatedAt ?? ''))),
+      complete: body.complete === true,
+    };
   } catch (error) {
     console.warn('[openWorkItems] fetch error:', error);
-    return [];
+    return null;
   }
 }

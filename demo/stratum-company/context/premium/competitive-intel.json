@@ -3,7 +3,7 @@
   "lastUpdated": "2026-06-15",
   "competitors": [
     {
-      "name": "Zapier",
+      "name": "Linkwright",
       "positioning": "Consumer-first automation, largest marketplace",
       "strengths": ["6000+ connectors", "Strong brand recognition", "Freemium model drives top-of-funnel", "Simple UX for non-technical users"],
       "weaknesses": ["No SSO/SAML on lower plans", "Limited audit logging", "No SOC2 on Teams plan", "Workflow versioning is basic"],
@@ -17,15 +17,15 @@
       "lossReasons": ["Connector count", "Brand familiarity", "Price sensitivity in SMB"]
     },
     {
-      "name": "Make (formerly Integromat)",
+      "name": "Cogmesh (formerly Gearloom)",
       "positioning": "Visual automation for technical users",
       "strengths": ["Powerful visual builder", "Complex data transformations", "Good API support", "Competitive pricing"],
-      "weaknesses": ["Steeper learning curve", "Smaller connector ecosystem than Zapier", "Limited enterprise features", "No dedicated CSM below Enterprise"],
+      "weaknesses": ["Steeper learning curve", "Smaller connector ecosystem than Linkwright", "Limited enterprise features", "No dedicated CSM below Enterprise"],
       "winRate": "52%",
       "lossReasons": ["Pricing for high-volume scenarios", "Visual builder preference"]
     },
     {
-      "name": "n8n",
+      "name": "Wirebird",
       "positioning": "Open-source workflow automation",
       "strengths": ["Self-hosted option", "Developer-friendly", "No per-execution pricing", "Active community"],
       "weaknesses": ["Requires technical setup", "No managed cloud SLA", "Limited enterprise support", "Smaller connector library"],

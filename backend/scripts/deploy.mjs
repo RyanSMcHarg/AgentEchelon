@@ -63,6 +63,7 @@ const {
   recordAnalyticsModeText,
 } = require('./lib/deploy-guards.cjs');
 import { assertNoRollback, recordDeployedCommits } from './lib/deployed-commit.mjs';
+import { ensureAdminNoticeStates } from './lib/admin-notice-states.mjs';
 import { assertImportedVpcEgress } from './check-imported-vpc.mjs';
 import { printDeclaredButRetired, orphanedConsoleAssistantsRefusal } from './lib/declared-assistants-report.mjs';
 // deploy-context is COMPILED OUTPUT, and `backend/.gitignore` starts with `*.js`, so it does not
@@ -542,7 +543,14 @@ const STEPS = {
     });
   },
 
-  // A CLASSIFICATION IS NOT REMOVED WHILE THE CONSOLE'S ASSISTANTS ARE ACTIVE IN IT (ADR-048, amended 2026-10-24).
+  // EACH OPERATIONAL ADMIN NOTICE'S STATE EXISTS before AdminServices reads it at deploy (DESIGN-EVENT-TARGETS section 12).
+  ensureAdminNoticeStates: async () => {
+    const { resolveInstanceName } = require('./lib/stack-lookup.cjs');
+    const written = await ensureAdminNoticeStates({ region: REGION, instanceName: resolveInstanceName(process.env) });
+    if (written.length) console.log(`  admin notices switched on by default: ${written.join(', ')}`);
+  },
+
+  // A CLASSIFICATION IS NOT REMOVED WHILE THE CONSOLE'S ASSISTANTS ARE ACTIVE IN IT (ADR-048).
   // Its seed never fails its stack's delete, so the refusal is here, before anything deploys.
   assertNoOrphanedConsoleAssistants: async () => {
     const { resolveDeploymentProfiles } = await import('../lib/config/profiles.js');

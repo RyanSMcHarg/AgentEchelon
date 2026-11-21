@@ -1,5 +1,5 @@
 /**
- * ONE LIST OF ASSISTANTS, HOWEVER EACH WAS CREATED (owner decision, 2026-10-23).
+ * ONE LIST OF ASSISTANTS, HOWEVER EACH WAS CREATED.
  *
  * What it proves: a declared assistant and one created in the console are rows of the same table, with
  * how each was created as a detail under its name and no separate "runtime" section; every build state is
@@ -228,7 +228,7 @@ describe('the event workflows column', () => {
     const welcome = cell.querySelector('[data-event="assistant-joined"]') as HTMLElement;
     expect(welcome).toHaveTextContent('Welcome welcomewelcome-ops');
     expect(within(welcome).getByText('welcome-ops')).toHaveAttribute('title', 'In ops conversations');
-    expect(cell.querySelector('[data-event="conversation-opened"]')).toHaveTextContent('Conversation opened ops-room');
+    expect(cell.querySelector('[data-event="conversation-opened"]')).toHaveTextContent('Conversation created ops-room');
   });
 
   it('says how an assistant with none welcomes people, and leaves an unread one unclaimed', () => {

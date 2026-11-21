@@ -16,11 +16,14 @@ import {
 import { TASK_STEP_ALONGSIDE, type TaskPerson } from '../../../../../../backend/lambda/src/lib/task-step.ts';
 import { isAudienceRole, participantRoleOf, participantRolesOf } from '../../../../../../backend/lib/config/participant-roles.ts';
 
-export type Kind = 'send' | 'agent' | 'intake' | 'task' | 'wait' | 'meeting' | 'opening' | 'prompt' | 'open' | 'end';
+export type Kind = 'send' | 'agent' | 'intake' | 'task' | 'wait' | 'meeting' | 'opening' | 'prompt' | 'open' | 'handoff' | 'end';
 export type EdgeName = 'onSuccess' | 'onFailure' | 'onDeadline';
 
 /** A step or workflow name the server accepts. */
 export const STEP_NAME = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+/** The page's request to open the builder on creating a workflow: never a name STEP_NAME accepts, so never a workflow's. */
+export const NEW_WORKFLOW_FOCUS = '+new';
 
 /**
  * THE ONE PERSON A TASK STEP AT THIS EVENT IS FOR AND WORKED BY, as a new task step names them: the subject at
@@ -50,7 +53,7 @@ export const kindsFor = (on: EventWorkflow['on'] | undefined, types?: readonly s
   return all.filter((k) => (k !== 'intake' || (!!on && INTAKE_EVENTS.includes(on))) && (k !== 'task' || !!taskPersonAt(on, types)));
 };
 
-export const kindOf = (def: EventStepDef): Kind => (def.send ? 'send' : def.agent ? 'agent' : def.action ? (isMeetingAction(def.action) ? 'meeting' : 'intake') : def.task ? 'task' : def.wait ? 'wait' : def.opening ? 'opening' : def.prompt ? 'prompt' : def.open ? 'open' : 'end');
+export const kindOf = (def: EventStepDef): Kind => (def.send ? 'send' : def.agent ? 'agent' : def.action ? (isMeetingAction(def.action) ? 'meeting' : 'intake') : def.task ? 'task' : def.wait ? 'wait' : def.opening ? 'opening' : def.prompt ? 'prompt' : def.open ? 'open' : def.handoff ? 'handoff' : 'end');
 
 /** The one person an intake is offered to at an event: the subject, the person who joined, or the person the opening named. */
 const intakeTo = (on: EventWorkflow['on'] | undefined): IntakeAction['to'] => (on === 'assistant-joined' ? 'subject' : on === 'person-joined' ? 'joined' : { people: 'event:person' });

@@ -1,7 +1,7 @@
 /**
  * Keep every live conversation of a group-sourced type equal to its group (DESIGN-CONVERSATION-TYPES §6).
  *
- * ONE PER CLASSIFICATION (owner decision, 2026-10-05). Membership writes authorize against the user
+ * ONE PER CLASSIFICATION. Membership writes authorize against the user
  * resource, which carries no classification tag, so they cannot be tag-conditioned in IAM. Running one
  * reconcile per classification, acting as that classification's own assistant - which moderates only
  * the conversations created at its classification, and Amazon Chime SDK refuses a membership change to

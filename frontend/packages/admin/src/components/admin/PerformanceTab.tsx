@@ -299,6 +299,23 @@ const PerformanceTab: React.FC<PerformanceTabProps> = ({
   };
   const outcomeLabel = (o: string) => t(`admin.performance.outcome.${o}`);
 
+  // AN INTENT WITH NO TURNS IN THE PERIOD, or one the data does not name at all (a link to an intent the platform raises, which
+  // no classified turn ever carries), says so, with the way back to the overview, never an empty page.
+  if (scopedIntent !== null && scopedIntent !== OTHER && !flowRows.length && !effRows.length) {
+    return (
+      <div className="admin-tab">
+        <div className="admin-tab-header"><h2>{t('admin.performance.title')}</h2></div>
+        <div className="admin-tab-empty" role="status" data-testid="perf-intent-empty">
+          <p>{t('admin.performance.intentEmpty', { intent: scopedIntent })}</p>
+          <button type="button" className="btn-secondary" data-testid="perf-intent-empty-back" onClick={() => onViewChange({ view: 'overview' })}>
+            {t('admin.performance.backToOverview')}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+
   return (
     <div className="admin-tab">
       <div className="admin-tab-header">

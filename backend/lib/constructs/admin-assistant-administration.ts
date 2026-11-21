@@ -30,6 +30,7 @@ import {
 } from '../stacks/agent-classification-common';
 import { invokeTheProvisioner, claimWriteFor } from './assistant-provisioner';
 import { defaultProfileRegistry } from '../profile-registry';
+import { connectorsOf } from './connectors';
 import { goldenRunInvoke, CLASSIFIER_REPLAY_PARAM_ROOT } from './classification-archive-functions';
 import type { ProfileDirectCaller } from '../../lambda/src/lib/profile-direct-callers';
 import { TeamWriterRole, TEAM_ASSISTANT, TEAM_ALT, WHEN_TAGGED_WITH_AN_ALT } from './team-writer-role';
@@ -196,6 +197,8 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
         ...adminAuthEnv(this),
         ADMIN_IAM_ENFORCEMENT: 'true',
         SSM_ROOT,
+        // THE CONNECTORS A PROCESS HAND-OFF'S `ref` MAY NAME (SPEC-PROCESSES P5): ids only, as the registry declares them.
+        DECLARED_CONNECTORS: connectorsOf(this).entries.map((c) => c.id).join(','),
         AWS_ACCOUNT_ID: account,
         ALLOWED_ORIGIN: adminAppUrl,
         // Without this the lifecycle keeps personas INLINE and silently re-imposes the 4096-character

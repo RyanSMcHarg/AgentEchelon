@@ -47,7 +47,7 @@ describe('what the shipped incident response requires, computed from its workflo
   });
 
   it('the machines its steps open themselves, and none it asks of another assistant', () => {
-    expect(requires.machines).toEqual(['acknowledgement', 'approval', 'customer_impact', 'customer_updates', 'final_notice', 'incident_ownership', 'meeting_offer']);
+    expect(requires.machines).toEqual(['acknowledgement', 'approval', 'customer_updates', 'final_notice', 'incident_ownership', 'meeting_offer']);
     const asked = requires.assistantRoles.flatMap((r) => r.intents);
     for (const m of requires.machines) expect(asked).not.toContain(m);
   });

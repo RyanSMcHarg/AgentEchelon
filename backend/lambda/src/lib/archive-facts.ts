@@ -20,8 +20,8 @@ import { KinesisClient, PutRecordCommand } from '@aws-sdk/client-kinesis';
 export const PLATFORM_FACT_EVENT_TYPES = ['AE_TASK_SETTLED', 'AE_RUN_ENDED'] as const;
 export type PlatformFactEventType = typeof PLATFORM_FACT_EVENT_TYPES[number];
 
-/** Why a task settled with no turn of its own. */
-export type SettlementCause = 'card' | 'deadline' | 'archive' | 'run-ended';
+/** Why a task settled with no message of its own: a card, a deadline, an archive, a run's end, or a quiet step the platform ran. */
+export type SettlementCause = 'card' | 'deadline' | 'archive' | 'run-ended' | 'platform-step';
 
 export interface TaskSettledFact {
   /** Fixed when the fact is made, so a redelivered record lands on the row it already wrote: `<taskId>#<cause>#<toState or ending>#<at>`. */
@@ -33,6 +33,8 @@ export interface TaskSettledFact {
   toState?: string;
   /** The terminal kind the task ended in, where it ended. */
   terminal?: string;
+  /** The declared action a quiet step ran, and how it went (`platform-step`). */
+  action?: { tool: string; outcome: 'success' | 'failure' };
   cause: SettlementCause;
   /** Whoever pressed the card, as an AppInstanceUser id. Absent for a deadline. */
   personId?: string;

@@ -1,5 +1,5 @@
 /**
- * HOW A TASK'S VISIBILITY IS READ: THE ONE RULE EVERY READER USES (ADR-033, owner 2026-09-15).
+ * HOW A TASK'S VISIBILITY IS READ: THE ONE RULE EVERY READER USES (ADR-033).
  *
  * `conversation` is ADR-024 D4: the task is visible to the conversation's current members whatever
  * the owner. `private` is the existence rule: the room may learn THAT the task

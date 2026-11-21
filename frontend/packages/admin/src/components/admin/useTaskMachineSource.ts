@@ -30,7 +30,10 @@ export function useTaskMachineSource(
   return useMemo<TaskMachineSource>(() => ({
     of: (key) => {
       if (isPlatformMachineKey(key)) return undefined;
-      return own[key] ?? catalog?.storedPack?.machines?.[key] ?? (DEFAULT_TASK_STATE_MACHINES as Record<string, TaskStateMachine>)[key];
+      // THE DEPLOYED MACHINE FIRST, as the server resolves it, so an edit never starts from a copy older than what runs; the
+      // bundled default only where the catalog has not been read.
+      return own[key] ?? catalog?.storedPack?.machines?.[key] ?? catalog?.machines?.[key]
+        ?? (DEFAULT_TASK_STATE_MACHINES as Record<string, TaskStateMachine>)[key];
     },
     onChange: (key, next) => {
       if (isPlatformMachineKey(key)) return;

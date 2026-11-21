@@ -197,3 +197,19 @@ describe('a person opens a work item', () => {
     expect(res.statusCode).toBe(200);
   });
 });
+
+describe('the open items list never reads an outage or a cap as nothing open', () => {
+  const src = (f: string) => require('fs').readFileSync(require('path').join(__dirname, '..', 'lambda', 'src', f), 'utf8') as string;
+  it('a read that fails, or a table that is not configured, is an error to /tasks/mine, never an empty list', () => {
+    const api = src('user-tasks-api.ts');
+    expect(api).toContain('const rows = await getActiveTasksForUser(personId, { limit: MAX_ITEMS, admit, strict: true });');
+    const tracking = src('lib/task-tracking.ts');
+    const fn = tracking.slice(tracking.indexOf('export async function getActiveTasksForUser('), tracking.indexOf('export async function getActiveTasksForUser(') + 3000);
+    expect(fn).toMatch(/if \(!USER_TASKS_TABLE\) \{\s+if \(opts\.strict\) throw new Error/);
+    expect(fn).toMatch(/console\.error\('Error getting cross-channel tasks for user:', error\);\s+if \(opts\.strict\) throw error;/);
+  });
+
+  it('the answer says whether it lists every open item, so a reader never takes one missing from a capped list as settled', () => {
+    expect(src('user-tasks-api.ts')).toContain('return respond(200, { items, count: items.length, complete: rows.length < MAX_ITEMS }, origin);');
+  });
+});

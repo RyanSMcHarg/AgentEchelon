@@ -764,7 +764,7 @@ const handleExperiments = async (
     // ── BATTLE ON/OFF, PER CLASSIFICATION (ADR-049) ──────────────────────────────────────────────
     //
     // Battle eligibility is a classification-level setting, not a property of an assistant, and it is
-    // OFF until an operator turns it on ("typically only used for internal users", owner 2026-09-21).
+    // OFF until an operator turns it on ("typically only used for internal users").
     // It lives here because this is the surface an operator already uses to arm the experiment a duel
     // runs on, so turning battle on and arming the comparison are one visit rather than two.
     //

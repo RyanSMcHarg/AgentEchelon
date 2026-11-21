@@ -403,7 +403,7 @@ async function getUnscoredExchanges(limit: number): Promise<UnscoredExchange[]> 
         AND (
           e.intent_confidence = 'low'
           OR hf.message_id IS NOT NULL
-          -- A TURN THE PLATFORM STARTED IS ALWAYS JUDGED (FR43, owner 2026-11-17): a workflow step runs the same way every
+          -- A TURN THE PLATFORM STARTED IS ALWAYS JUDGED (FR43): a workflow step runs the same way every
           -- time, so one unsampled step is a step whose quality is never read at all.
           OR e.paired_by = 'platform'
           OR ${HAS_SAFETY_FINDING_SQL}

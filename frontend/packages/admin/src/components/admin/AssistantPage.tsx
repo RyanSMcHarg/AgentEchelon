@@ -58,14 +58,21 @@ import {
 } from '../../services/profileService';
 import { bedrockGuardrailUrl, bedrockGuardrailsUrl, bedrockModelsUrl, cloudwatchLogsUrl, lambdaFunctionUrl, lambdaFunctionsUrl } from '../../services/awsConsole';
 import { EVENT_WORKFLOW_EVENTS, SHIPPED_EVENT_WORKFLOWS, type EventWorkflow } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
-import { DEFAULT_TASK_STATE_MACHINES, isPlatformMachineKey, type TaskStateMachine } from '../../../../../../backend/lambda/src/lib/task-state-machines.ts';
+import { DEFAULT_TASK_STATE_MACHINES, isPlatformMachineKey, isPlatformRaisedMachine, type TaskStateMachine } from '../../../../../../backend/lambda/src/lib/task-state-machines.ts';
 import { TaskMachineBuilder } from './WorkflowBuilder';
+import { NEW_WORKFLOW_FOCUS } from './workflowEdits';
+import { ConfirmAction, ConfirmPanel } from './ConfirmAction';
 import { declaredParticipantRoles } from './useTaskMachineSource';
 import { assignedTasksOf } from './IntentWorkflowsFields';
 import { canonicalIntentWorkflow, type IntentWorkflow } from '../../../../../../backend/lambda/src/lib/intent-workflow.ts';
 import { packWithMachine } from './machineEdits';
 import { machineLayoutKey, type StepPosition } from '../../../../../../backend/lambda/src/lib/workflow-layout.ts';
 import { useUrlView, viewParam } from './consoleViewUrl';
+
+/** Whether the platform raises an intent's tasks itself (`isPlatformRaisedMachine`), so it has no classified turns to measure. */
+export function platformRaised(card: Pick<IntentCard, 'key' | 'machine'>): boolean {
+  return isPlatformRaisedMachine(card.machine) || isPlatformRaisedMachine(card.key);
+}
 
 /** Whether a value names one of the page's sections. */
 const isSection = (v: string | null): v is Section => !!v && (SECTIONS as readonly string[]).includes(v);
@@ -224,6 +231,8 @@ const AssistantPage: React.FC<AssistantPageProps> = (props) => {
   const assistant = selected.profileName;
 
   const go = (s: Section) => { setSection(s); setMachine(null); };
+  /** A request to leave an open workflow that holds unsaved edits, waiting on the inline confirm. */
+  const [leaving, setLeaving] = useState(false);
   /** The intent whose Workflows entry a card's link opened, shown marked and scrolled to (ADR-067 decision 4, WT97). */
   const [focusIntent, setFocusIntent] = useState<string | null>(null);
   const showInWorkflows = (key: string) => { go('workflows'); setFocusIntent(key); };
@@ -301,6 +310,17 @@ const AssistantPage: React.FC<AssistantPageProps> = (props) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.linkedWorkflow, config, draft, catalog]);
 
+  /**
+   * BACK TO THE WORKFLOWS LIST, NOTHING OPEN: from the side nav, the breadcrumb or the editor's own back link, every time. An
+   * open workflow holding unsaved edits asks first, and leaving drops them.
+   */
+  const toWorkflowList = () => {
+    if (focusWorkflow && unsavedAreas(unsaved, ['events']).length) { setLeaving(true); return; }
+    setFocusWorkflow(null);
+    setFocusEvent(null);
+    go('workflows');
+  };
+  const leaveWorkflow = () => { onUnsavedDrop(['events']); setLeaving(false); setFocusWorkflow(null); setFocusEvent(null); go('workflows'); };
   const areaNames = (areas: readonly DraftArea[]) => areas.map((a) => t(`admin.draftCards.area.${a}`)).join(', ');
   const pending = unsavedAreas(unsaved);
 
@@ -318,10 +338,11 @@ const AssistantPage: React.FC<AssistantPageProps> = (props) => {
   /** One draft area, inline in its section, saved alone. The builder opens on the workflow Edit in a draft chose. */
   const inline = (area: InlineArea) => draft && (
     <DraftStep key={`${area}:${draftKey}:${reset}`} area={area} draft={draft} autoFocus={false}
-      ctx={area === 'events' && focusWorkflow ? { ...ctx, focusWorkflow } : area === 'processes' ? { ...ctx, onOpenWorkflows: () => go('workflows') } : ctx}
+      ctx={area === 'events' && focusWorkflow ? { ...ctx, focusWorkflow, onLeaveWorkflow: () => setFocusWorkflow(null), onFocusWorkflow: setFocusWorkflow } : area === 'processes' ? { ...ctx, onOpenWorkflows: () => go('workflows') } : ctx}
       unsaved={unsaved[area]} onUnsavedPatch={(p) => onUnsavedPatch(area, p)} actions={(edited) => (
         <>
-          <button type="button" className="btn-ghost" disabled={busy || !edited} data-testid="draft-step-cancel" onClick={() => resetArea(area)}>{t('admin.assistantPage.reset')}</button>
+          <ConfirmAction testId="draft-step-cancel" className="btn-ghost" disabled={busy || !edited} label={t('admin.assistantPage.reset')}
+            title={t('admin.confirm.areaReset')} confirmLabel={t('admin.confirm.discard')} cancelLabel={t('admin.confirm.cancel')} onConfirm={() => resetArea(area)} />
           <button type="button" className="btn-primary" disabled={busy || !edited || !canEdit} data-testid="draft-step-save" onClick={() => { void saveAreas([area]); }}>
             {t('admin.draftCards.save')}
           </button>
@@ -458,7 +479,7 @@ const AssistantPage: React.FC<AssistantPageProps> = (props) => {
           return (
             <li key={s}>
               <button type="button" className={cx('admin-assistant-menu-btn', on && 'active')} aria-current={on ? 'page' : undefined}
-                data-testid={`assistant-nav-${s}`} onClick={() => go(s)}>
+                data-testid={`assistant-nav-${s}`} onClick={() => (s === 'workflows' ? toWorkflowList() : go(s))}>
                 <span>{t(`admin.assistantPage.sections.${s}.title`)}</span>
                 {editing && changed.has(s) && (
                   <span className="admin-changed-dot" role="img" aria-label={t('admin.assistantPage.changedInDraft')} data-testid={`assistant-nav-${s}-changed`} />
@@ -617,11 +638,19 @@ const AssistantPage: React.FC<AssistantPageProps> = (props) => {
   const workflowFocused = editing && !!focusWorkflow;
   const workflows = () => sectionCard('workflows', !body ? (editing ? draftLoading : notRead) : workflowFocused ? (
     <>
-      <button type="button" className="btn-link" data-testid="welcome-focus-back" onClick={() => setFocusWorkflow(null)}>{t('admin.workflowsList.backToAll')}</button>
+      <button type="button" className="btn-link" data-testid="welcome-focus-back" onClick={toWorkflowList}>{t('admin.workflowsList.backToAll')}</button>
       {inline('events')}
     </>
   ) : (
     <>
+      {/* THE PAGE OPENS ON THE LIST, NOTHING OPENED: a workflow opens from its row, and a new one from here, for whoever may edit. */}
+      {canEdit && (
+        <div className="admin-workflow-item-actions">
+          <button type="button" className="btn-primary" disabled={busy} data-testid="workflows-new" onClick={() => editInDraft(NEW_WORKFLOW_FOCUS)}>
+            {t('admin.workflowEditor.newWorkflow')}
+          </button>
+        </div>
+      )}
       {/* ONE WORKFLOWS LIST, GROUPED BY WHAT STARTS EACH (ADR-067 stage 1): the welcome first, then each event, then the
           requests a person makes, then the platform's own, which no team edits. */}
       <h3 data-testid="workflows-heading-events">{t('admin.assistantPage.eventWorkflowsHeading')}</h3>
@@ -665,7 +694,6 @@ const AssistantPage: React.FC<AssistantPageProps> = (props) => {
       </div>
       {/* THE SAME WORKFLOWS, BY THE ROOM THEY RUN IN: what runs in the ops team room, an ops room, a meeting's conversation. */}
       {!editing && <RoomTypeWorkflows name={name} workflows={body?.eventWorkflows} classification={selected.classification} />}
-      {editing && inline('events')}
 
       {/* WHEN SOMEONE ASKS: every multi-step intent, drawn as the default workflow the router runs for it (one task of its
           machine). Only a task's steps differ by version; in stage 1 they are read here, and the steps around the task are
@@ -969,7 +997,8 @@ const AssistantPage: React.FC<AssistantPageProps> = (props) => {
   // ---- One task machine ----
   const machineView = () => {
     const m = catalog?.workflows?.find((w) => w.key === machine!.key);
-    const answers = intentsRunning(body, catalog, machine!.key);
+    // AN INTENT THE PLATFORM RAISES HAS NO CLASSIFIED TURNS, so no performance link is offered for it.
+    const answers = isPlatformRaisedMachine(machine!.key) ? [] : intentsRunning(body, catalog, machine!.key);
     const key = machine!.key;
     // WHICH TASK STEPS A TEAM EDITS (ADR-067 stages 1 and 2): an intent's own machine, and a machine a workflow step opens
     // (the incident first look), on the version. The platform's machines are fixed for every assistant.
@@ -1035,9 +1064,9 @@ const AssistantPage: React.FC<AssistantPageProps> = (props) => {
                 </>
               ) : undefined} />
             <div className="admin-config-actions">
-              <button type="button" className="btn-ghost" disabled={busy || (!machineEdit && !machinePoints)} data-testid="assistant-machine-reset" onClick={() => { setMachineEdit(null); setMachinePoints(null); }}>
-                {t('admin.assistantPage.reset')}
-              </button>
+              <ConfirmAction testId="assistant-machine-reset" className="btn-ghost" disabled={busy || (!machineEdit && !machinePoints)} label={t('admin.assistantPage.reset')}
+                title={t('admin.confirm.machineReset')} confirmLabel={t('admin.confirm.discard')} cancelLabel={t('admin.confirm.cancel')}
+                onConfirm={() => { setMachineEdit(null); setMachinePoints(null); }} />
               <button type="button" className="btn-primary" disabled={busy || !machineChanged} data-testid="assistant-machine-save" onClick={() => saveMachine(machineEdit ?? shown)}>
                 {t('admin.draftCards.save')}
               </button>
@@ -1095,7 +1124,26 @@ const AssistantPage: React.FC<AssistantPageProps> = (props) => {
         <button className="btn-link" onClick={onBack}>← {t('admin.config.back')}</button>
         <span> / </span>
         <span>{name}</span>
+        {/* THE WORKFLOWS LEVEL: a link back to the list while a workflow or the create view is open, the trail's end on the list. */}
+        {section === 'workflows' && !machine && (
+          <>
+            <span> / </span>
+            {editing && focusWorkflow
+              ? <button type="button" className="btn-link" data-testid="breadcrumb-workflows" onClick={toWorkflowList}>{t('admin.assistantPage.sections.workflows.title')}</button>
+              : <span data-testid="breadcrumb-workflows" aria-current="page">{t('admin.assistantPage.sections.workflows.title')}</span>}
+            {editing && focusWorkflow && (
+              <>
+                <span> / </span>
+                <span data-testid="breadcrumb-workflow" aria-current="page">{focusWorkflow === NEW_WORKFLOW_FOCUS ? t('admin.workflowEditor.newWorkflowCrumb') : focusWorkflow}</span>
+              </>
+            )}
+          </>
+        )}
       </nav>
+      {leaving && (
+        <ConfirmPanel testId="workflow-leave" title={t('admin.confirm.leaveWorkflow')} body={t('admin.confirm.leaveWorkflowBody')}
+          confirmLabel={t('admin.confirm.leave')} cancelLabel={t('admin.confirm.cancel')} onConfirm={leaveWorkflow} onCancel={() => setLeaving(false)} />
+      )}
     </div>
   );
 
@@ -1132,7 +1180,8 @@ const AssistantPage: React.FC<AssistantPageProps> = (props) => {
   }
 
   return (
-    <div className={cx('admin-tab', 'admin-assistant-page')}>
+    // THE WORKFLOWS SECTION CARRIES A FLOW, ITS TRIGGERS AND A STEP INSPECTOR SIDE BY SIDE, so it takes the console's widest column.
+    <div className={cx('admin-tab', 'admin-assistant-page', section === 'workflows' && 'admin-assistant-page-wide')}>
       {breadcrumb}
       {header}
       {notices}
@@ -1230,10 +1279,13 @@ const IntentHead: React.FC<{
             {t('admin.assistantPage.inWorkflows')}
           </button>
         )}
-        <ConsoleLink link={{ tab: 'effectiveness', assistant, intent: card.key }} onOpen={onOpenLink} testId={`intent-performance-${card.key}`}
-          title={t('admin.assistantPage.intentPerformanceTitle', { name, intent: card.key })}>
-          {t('admin.assistantPage.performanceLink')}
-        </ConsoleLink>
+        {/* AN INTENT THE PLATFORM RAISES (a quiet runbook refresh, a required dashboard refresh) has no classified turns, so no link. */}
+        {!platformRaised(card) && (
+          <ConsoleLink link={{ tab: 'effectiveness', assistant, intent: card.key }} onOpen={onOpenLink} testId={`intent-performance-${card.key}`}
+            title={t('admin.assistantPage.intentPerformanceTitle', { name, intent: card.key })}>
+            {t('admin.assistantPage.performanceLink')}
+          </ConsoleLink>
+        )}
       </div>
       {/* WHAT THE INTENT IS: the description the classifier chooses by, or the platform's words for an intent the platform declares. */}
       <p className="admin-intent-purpose" data-testid={`intent-purpose-${card.key}`}>
@@ -1372,10 +1424,12 @@ const IntentModels: React.FC<{
                   <div className="admin-workflow-item-head">
                     <code>{s.key}</code>
                     <span className="admin-chip" data-testid={`intent-step-${card.key}-${s.key}-produces`}>{t(`admin.assistantPage.intentModels.produces.${s.produces ?? 'text'}`)}</span>
-                    <ConsoleLink link={{ tab: 'effectiveness', assistant, intent: card.key, step: s.key }} onOpen={onOpenLink} testId={`intent-step-performance-${card.key}-${s.key}`}
-                      title={t('admin.assistantPage.intentModels.stepPerformanceTitle', { state: s.key, intent: card.key, name })}>
-                      {t('admin.assistantPage.intentModels.stepPerformance')}
-                    </ConsoleLink>
+                    {!platformRaised(card) && (
+                      <ConsoleLink link={{ tab: 'effectiveness', assistant, intent: card.key, step: s.key }} onOpen={onOpenLink} testId={`intent-step-performance-${card.key}-${s.key}`}
+                        title={t('admin.assistantPage.intentModels.stepPerformanceTitle', { state: s.key, intent: card.key, name })}>
+                        {t('admin.assistantPage.intentModels.stepPerformance')}
+                      </ConsoleLink>
+                    )}
                   </div>
                   <StepModelControl body={body} catalog={catalog} intent={card.key} step={s} onRoute={editing ? (next) => set(next ?? {}) : undefined} />
                   {s.requiresTool?.length ? (

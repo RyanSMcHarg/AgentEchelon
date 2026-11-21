@@ -38,7 +38,7 @@ import { withWorkflowFor } from './helpers/version-under-test';
 import { replacingDraft, draftIdOf } from './helpers/profile-draft';
 import { pressCard } from './helpers/workflow-task';
 import { joinMembershipGroup } from './helpers/team-group';
-import { acknowledge, press, forgetChild, isLive, liveTaskAt, opsRoomsOf as opsRoomsFor, posts, removeTasksHeldBy, runTasksIn, saysTemplate, ssmValue } from './helpers/ops-incident';
+import { acknowledge, press, forgetChild, isLive, liveTaskAt, opsRoomsOf as opsRoomsFor, posts, postsUntil, removeTasksHeldBy, runTasksIn, saysTemplate, ssmValue } from './helpers/ops-incident';
 
 const RUN = process.env.INCIDENT_TRIAGE_E2E === '1';
 const haveCreds = () => Boolean(process.env.AWS_PROFILE || process.env.AWS_ACCESS_KEY_ID || process.env.AWS_SESSION_TOKEN);
@@ -72,7 +72,8 @@ test.describe.serial('an AWS event opens an incident from the team\'s room (inci
   let leaveTeamGroup: () => void = () => undefined;
   const cognito = (args: string[]) => awsv(['cognito-idp', ...args, '--user-pool-id', userPool]);
   /** What the team's room is told about one child, and how it reads each ending. */
-  const teamToldOf = (room: string) => posts(teamRoom, leadArn).filter((m) => m.text.includes(room.split('/').pop()!));
+  const aboutRoom = (room: string) => (m: { text: string }) => m.text.includes(room.split('/').pop()!);
+  const teamToldOf = (room: string) => posts(teamRoom, leadArn).filter(aboutRoom(room));
   const resolved = saysTemplate('incident-resolved-team');
   const otherEndings = [saysTemplate('incident-timed-out'), saysTemplate('incident-ended-unresolved')];
 
@@ -214,7 +215,7 @@ test.describe.serial('an AWS event opens an incident from the team\'s room (inci
     child = rooms[0];
     expect(rooms, 'one event, one child').toHaveLength(1);
 
-    const childPosts = await pollFor(() => Promise.resolve(posts(child, leadArn)), (p) => p.some((m) => m.content.includes('incident_first_look') && m.text && !looksLikeTaskPlaceholder(m.text)), { timeoutMs: 240_000, intervalMs: 10_000 });
+    const childPosts = await postsUntil(child, leadArn, (p) => p.some((m) => m.content.includes('incident_first_look') && m.text && !looksLikeTaskPlaceholder(m.text)), { timeoutMs: 240_000 });
     const parentPosts = posts(teamRoom, leadArn).filter((m) => m.text.includes(child.split('/').pop()!));
     console.log(`[what the room reads] the team's room:\n${parentPosts.map((m) => m.text).join('\n')}`);
     console.log(`[what the room reads] the child:\n${childPosts.map((m) => `--- ${m.text}`).join('\n')}`);
@@ -253,7 +254,7 @@ test.describe.serial('an AWS event opens an incident from the team\'s room (inci
         awsv(['cloudwatch', 'set-alarm-state', '--alarm-name', ALARM, '--state-value', 'OK', '--state-reason', 'AgentEchelon e2e']);
         await sleep(5_000);
         awsv(['cloudwatch', 'set-alarm-state', '--alarm-name', ALARM, '--state-value', 'ALARM', '--state-reason', 'AgentEchelon e2e']);
-        told = await pollFor(() => Promise.resolve(posts(child, leadArn).filter((m) => /happened again/.test(m.text))), (p) => p.length > 0, { timeoutMs: 40_000, intervalMs: 8_000 });
+        told = (await postsUntil(child, leadArn, (p) => p.some((m) => /happened again/.test(m.text)), { timeoutMs: 40_000 })).filter((m) => /happened again/.test(m.text));
       }
       expect(told.length, 'the incident\'s room is told its event happened again').toBeGreaterThan(0);
       expect(opsRoomsOf(leadArn), 'an open incident takes a repeat from another rule, and opens no second room').toHaveLength(1);
@@ -287,7 +288,8 @@ test.describe.serial('an AWS event opens an incident from the team\'s room (inci
     expect([200, 201], JSON.stringify(started.body).slice(0, 300)).toContain(started.status);
     try {
       noteProgress('harness', 'waiting for the incident call card');
-      const card = await pollFor(() => Promise.resolve(posts(child, leadArn).filter((m) => m.text.includes('Incident call in progress'))), (p) => p.length > 0, { timeoutMs: 90_000, intervalMs: 5_000 });
+      const callCard = (m: { text: string }) => m.text.includes('Incident call in progress');
+      const card = (await postsUntil(child, leadArn, (p) => p.some(callCard), { timeoutMs: 90_000 })).filter(callCard);
       console.log(`[what the room reads] the call card:\n--- ${card[0]?.text}`);
       expect(card, 'the room is told the call started, once').toHaveLength(1);
       expect(card[0].text).toContain(ALARM);
@@ -301,7 +303,7 @@ test.describe.serial('an AWS event opens an incident from the team\'s room (inci
   // this a room fills to its policy's cap of open incidents one e2e run at a time. Only this run's incident is resolved,
   // the one held by the child it opened: an earlier run's child is deleted with its tasks (`removeTasksHeldBy`), so none of
   // its tasks is left for this run to press, and no real incident in the room is touched.
-  // RESOLVING WHILE THE RUNBOOK HAS STEPS OPEN IS CONFIRMED FIRST (WT128, owner decision 2026-11-14): the press moves the task
+  // RESOLVING WHILE THE RUNBOOK HAS STEPS OPEN IS CONFIRMED FIRST (WT128): the press moves the task
   // to the confirmation, the on-call alone is asked, naming the steps still open, and their confirmation resolves it, moves the
   // run on (WT129) and cancels its open runbook tasks with the run's end as their reason, keeping the investigation open.
   test('the on-call resolves the incident on its card, confirms it, and the room holds it open no longer', async () => {
@@ -332,7 +334,7 @@ test.describe.serial('an AWS event opens an incident from the team\'s room (inci
     const confirming = saysTemplate('incident-resolve-confirm');
     const labels = Object.values(SHIPPED_EVENT_WORKFLOWS['ops-room'].states).map((st) => st.label).filter((l): l is string => !!l);
     noteProgress('harness', 'waiting for the confirmation');
-    const asked = await pollFor(() => Promise.resolve(posts(child, leadArn).filter((m) => confirming(m.text))), (p) => p.length > 0, { timeoutMs: 60_000, intervalMs: 4_000 });
+    const asked = (await postsUntil(child, leadArn, (p) => p.some((m) => confirming(m.text)), { timeoutMs: 60_000 })).filter((m) => confirming(m.text));
     console.log(`[what the on-call reads] the confirmation:\n--- ${asked[0]?.text}`);
     expect(asked, 'the on-call is asked once').toHaveLength(1);
     expect(labels.some((l) => asked[0].text.includes(l)), 'it names at least one open runbook step by its label').toBe(true);
@@ -359,7 +361,7 @@ test.describe.serial('an AWS event opens an incident from the team\'s room (inci
     // THE TEAM'S ROOM IS TOLD IT RESOLVED, once, by the incident conversation's run at the resolve (DESIGN-PROCESSES O24), the
     // path this spec drives, and neither of the other endings.
     expect(SHIPPED_EVENT_WORKFLOWS['ops-room'].states['tell-team']?.send).toMatchObject({ template: 'incident-resolved-team', in: 'opener' });
-    const told = await pollFor(() => Promise.resolve(teamToldOf(child)), (p) => p.some((m) => resolved(m.text)), { timeoutMs: 90_000, intervalMs: 5_000 });
+    const told = (await postsUntil(teamRoom, leadArn, (p) => p.some((m) => aboutRoom(child)(m) && resolved(m.text)), { timeoutMs: 90_000 })).filter(aboutRoom(child));
     console.log(`[what the room reads] the team's room, after the resolve:\n${told.map((m) => m.text).join('\n')}`);
     expect(told.filter((m) => resolved(m.text)), "the team's room is told the incident is resolved, once").toHaveLength(1);
     expect(told.filter((m) => otherEndings.some((says) => says(m.text))), 'and is told of no other ending').toEqual([]);

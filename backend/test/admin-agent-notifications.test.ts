@@ -44,10 +44,14 @@ jest.mock('@aws-sdk/client-cognito-identity-provider', () => ({
   ListUsersInGroupCommand: class { __t = 'ListUsersInGroup'; constructor(public input: any) {} },
 }));
 
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { adminNoticesChannelId } = require('../lambda/src/lib/channel-creation') as typeof import('../lambda/src/lib/channel-creation');
 const APP = 'arn:aws:chime:us-east-1:1:app-instance/i';
 const SERVICE_ADMIN = `${APP}/user/agent-echelon-admin`;
 const AGENT_BOT = `${APP}/bot/admin-agent`;
-const CHANNEL = `${APP}/channel/c1`;
+// THE CHANNEL AT ITS FIXED ID (`adminNoticesChannelId`), which an update keeps; one at any other id moves there.
+const CHANNEL = `${APP}/channel/${adminNoticesChannelId(APP)}`;
+const OLD_CHANNEL = `${APP}/channel/c1`;
 const ADMIN_A = '11111111-0000-4000-8000-00000000aaaa';
 const ADMIN_B = '22222222-0000-4000-8000-00000000bbbb';
 
@@ -173,17 +177,8 @@ describe('provisioning the admin notification channel', () => {
 });
 
 describe('migrating a deployment whose channel the agent does not own', () => {
-  // ── WHY THE CHANNEL IS ADOPTED AND NOT REPLACED ─────────────────────────────────────────────
-  //
-  // A channel provisioned by the previous version was created by the service app-instance-admin, so
-  // the agent can neither post into it nor update it. Making a new one the agent owns is the
-  // obvious fix and CANNOT WORK: the channel ARN is a cross-stack export consumed by the analytics
-  // stack and every classification stack. Both routes were tried against CloudFormation and both
-  // were refused - renaming the construct gives "Cannot delete export ... as it is in use", and
-  // returning a different ARN gives "Cannot update export ... as it is in use".
-  //
-  // So the authority moves instead of the channel, and these pin that end state: the agent may
-  // speak in the channel, the service admin is not a member of it, and the ARN never changes.
+  // A CHANNEL AT THE FIXED ID THE AGENT DOES NOT OWN is adopted: the authority moves instead of the channel, and these pin that
+  // end state: the agent may speak in the channel, the service admin is not a member of it, and the ARN stays.
 
   const describeAs = (creator: string) => {
     mockChimeSend.mockImplementation(async (cmd: any) => {
@@ -193,7 +188,16 @@ describe('migrating a deployment whose channel the agent does not own', () => {
     });
   };
 
-  it('keeps the channel ARN, because other stacks import it', async () => {
+  it('moves a recorded channel at any other id to the fixed id, and leaves the old one for CloudFormation to delete', async () => {
+    mockChimeSend.mockImplementation(async (cmd: any) => (cmd.__t === 'CreateChannel' ? { ChannelArn: CHANNEL } : {}));
+    const out: any = await handler({ RequestType: 'Update', PhysicalResourceId: OLD_CHANNEL } as never);
+    expect(out.PhysicalResourceId).toBe(CHANNEL);
+    expect(callsOf('CreateChannel')[0].input.ChannelId).toBe(adminNoticesChannelId(APP));
+    // The update deletes nothing: a changed physical id is what makes CloudFormation send the old one's Delete.
+    expect(callsOf('DeleteChannel')).toHaveLength(0);
+  });
+
+  it('keeps the channel ARN at the fixed id', async () => {
     describeAs(SERVICE_ADMIN);
 
     const out: any = await handler({ RequestType: 'Update', PhysicalResourceId: CHANNEL } as never);
@@ -284,9 +288,11 @@ describe('an alert is an event, and only the admin backend posts it', () => {
     expect(common).not.toContain('export function adminErrorAlertWiring(');
   });
 
-  it('posts from one rule, in AdminServices, into its own channel as its own agent', () => {
+  it('posts from one rule per notice type, in AdminServices, into its own channel as its own agent', () => {
     const stack = read('lib/stacks/admin-services-stack.ts');
-    expect(stack).toContain('eventPattern: { source: [ALERT_SOURCE], detail: { instance: [INSTANCE_NAME] } }');
+    expect(stack).toContain('for (const t of ADMIN_NOTICE_TYPES) {');
+    expect(stack).toContain('source: [ALERT_SOURCE], detailType: [t.messageType],');
+    expect(stack).toContain('detail: { instance: [INSTANCE_NAME],');
     expect(stack).toContain('resources: [notification.channelArn],');
     expect(stack).toContain("conditions: { StringEquals: { 'aws:ResourceTag/classification': profiles.adminPlaneValues() } },");
   });

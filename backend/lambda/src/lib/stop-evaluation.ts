@@ -133,7 +133,7 @@ export function buildStopEvaluationPrompt(args: {
     // BELT TO THE LABEL'S BRACES. The dispatcher already withholds a private task's excerpt from the
     // list above, so the model cannot quote what it was never given - this line covers what it may
     // KNOW from its own turn context. Other members may see that private work exists, never what it
-    // is (ADR-033, maintainer decision 2026-08-23).
+    // is (ADR-033).
     'If any cancelled item is described as a private request, do not name or guess at its contents:',
     'this reply is visible to the conversation, and what that request says is not.',
   ].filter(Boolean).join('\n');

@@ -280,6 +280,7 @@ if (senderEmail === PLACEHOLDER_SENDER) {
 const messagingStack = new MessagingStack(app, stackId('Messaging'), {
   env,
   appInstanceName: APP_INSTANCE_NAME,
+  // Each classification's process source is admitted on the process event bus from its router's role alone (DESIGN-PROCESSES section 12).
   description: 'The Amazon Chime SDK app instance, its service admin and retention, and the message stream',
 });
 

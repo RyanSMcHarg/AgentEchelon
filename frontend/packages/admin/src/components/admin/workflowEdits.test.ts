@@ -93,6 +93,14 @@ describe('a new workflow never conflicts with the version\'s own', () => {
   });
 });
 
+describe('a hand-off step', () => {
+  it('is read as its own kind, and a workflow holding one does something', () => {
+    const def = { handoff: { process: 'customer-request', name: 'security-review', fields: {} }, onSuccess: 'done' } as unknown as Parameters<typeof kindOf>[0];
+    expect(kindOf(def)).toBe('handoff');
+    expect(kindOf({ disposition: 'success' } as Parameters<typeof kindOf>[0])).toBe('end');
+  });
+});
+
 describe('a wait step (ADR-067 WT20)', () => {
   it('is offered on every event, added as an hour, and read as its own kind', async () => {
     const { kindsFor, stepOf, kindOf } = await import('./workflowEdits');

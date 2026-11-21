@@ -37,7 +37,7 @@ import { ADMIN_CHANNEL_TAG_KEY, ADMIN_CHANNEL_TAG_VALUE } from './lib/admin-chan
 import { personIdFromArn } from './lib/person-arn.js';
 import { defaultDirectory, type Directory } from './lib/membership-source.js';
 import { chimeMessagingClient } from './lib/chime/clients.js';
-import { createAdminNotificationChannel } from './lib/channel-creation.js';
+import { adminNoticesChannelId, createAdminNotificationChannel } from './lib/channel-creation.js';
 import { audienceTagFor } from './lib/channel-classification.js';
 import { primaryTagFor } from './lib/conversation-primary.js';
 import { conversationNameFor } from './lib/conversation-name.js';
@@ -311,6 +311,16 @@ export const handler = async (event: CloudFormationCustomResourceEvent) => {
 
   // Update reuses the existing channel (its ARN is the PhysicalResourceId); Create makes a new one.
   let channelArn = event.RequestType === 'Update' ? event.PhysicalResourceId : '';
+
+  // THE CONVERSATION LIVES AT ITS FIXED ID (DESIGN-EVENT-TARGETS section 12). A recorded channel at any other id is replaced by
+  // one created there: the new ARN is returned, so CloudFormation deletes the old channel through this handler's Delete, and
+  // the poster and the parameter take the new ARN in the same deploy, since nothing outside this stack reads it. Its history
+  // stays in the conversation archive.
+  const fixedArn = `${APP_INSTANCE_ARN}/channel/${adminNoticesChannelId(APP_INSTANCE_ARN)}`;
+  if (channelArn && channelArn.includes('/channel/') && channelArn !== fixedArn) {
+    console.log('[AdminNotifChannel] moving to the fixed id; the recorded channel is deleted once this update succeeds', { from: channelArn, to: fixedArn });
+    channelArn = '';
+  }
 
   // ── AN EXISTING CHANNEL IS ADOPTED, NOT REPLACED (2026-09-09) ───────────────────────────────
   //

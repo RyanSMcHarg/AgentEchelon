@@ -42,6 +42,8 @@ export interface VendorEvent {
   occurredAt: string;
   ref: Omit<ExternalRef, 'connectorId' | 'system'>;
   people: VendorPerson[];
+  /** The app connector only (WT84): the conversation the event concerns, by its channel id. */
+  conversation?: string;
 }
 
 /** An event the adapter cannot read: the receiver records nothing and drops it (a retry reads it no better). */
@@ -128,4 +130,34 @@ const salesforce: VendorAdapter = {
   },
 };
 
-export const ADAPTERS: Readonly<Record<'pagerduty' | 'salesforce', VendorAdapter>> = { pagerduty, salesforce };
+/**
+ * THE DEPLOYMENT'S OWN APP (WT84), over its own bus: `detail-type` is the event's name, and the detail is the declared schema
+ * `{ eventId, occurredAt, ref: { recordId, url? }, people: [{ role, subject }], conversation? }`. A person is named by the app's
+ * immutable user id; `conversation` is a channel id, read as one and nothing else.
+ */
+const APP_SUBJECT = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/;
+const APP_ROLE = /^[a-z][a-z0-9-]{0,31}$/;
+const CHANNEL_ID = /^[A-Za-z0-9_-]{1,64}$/;
+const app: VendorAdapter = {
+  read(event) {
+    const detail = obj(event.detail);
+    const type = str(event['detail-type']);
+    const eventId = str(detail.eventId) ?? str(event.id);
+    const occurredAt = isoOf(detail.occurredAt) ?? isoOf(event.time);
+    const ref = obj(detail.ref);
+    const recordId = str(ref.recordId);
+    if (!eventId || !type || !occurredAt || !recordId || recordId.length > 256) throw new UnreadableEvent('the event names no id, type, time or record');
+    const people: VendorPerson[] = [];
+    for (const p of Array.isArray(detail.people) ? detail.people.slice(0, 20) : []) {
+      const role = str(obj(p).role);
+      const subject = str(obj(p).subject);
+      if (role && subject && APP_ROLE.test(role) && APP_SUBJECT.test(subject)) people.push({ role, subject });
+    }
+    const conversation = str(detail.conversation);
+    if (conversation !== null && !CHANNEL_ID.test(conversation)) throw new UnreadableEvent('the event names a conversation that is not a channel id');
+    const url = str(ref.url);
+    return { eventId, type, occurredAt, ref: { recordId, ...(url && /^https:\/\//.test(url) ? { url } : {}) }, people, ...(conversation ? { conversation } : {}) };
+  },
+};
+
+export const ADAPTERS: Readonly<Record<'pagerduty' | 'salesforce' | 'app', VendorAdapter>> = { pagerduty, salesforce, app };

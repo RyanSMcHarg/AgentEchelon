@@ -103,6 +103,13 @@ describe('the ops assistant manifest', () => {
     expect(ad.intents.find((i) => i.key === 'deployment_health')?.multiStep).toBeUndefined();
   });
 
+  it('advertises dashboard_runbook, so a fresh deployment draws its runs\' runbooks on the dashboard', () => {
+    const ad = projectAdvertisement({ assistant: OPS_ASSISTANT, pack: opsIntentPack() as never });
+    expect(ad.intents.find((i) => i.key === 'dashboard_runbook')).toMatchObject({ multiStep: true });
+    const own = (opsIntentPack().intents as Array<{ key: string; tools?: string[] }>).find((i) => i.key === 'dashboard_runbook');
+    expect(own?.tools).toEqual(['publish_dashboard']);
+  });
+
   it('imports as a draft, activates, and exports saying exactly what the manifest says', async () => {
     const { client } = fakeSsmStore();
     const draft = await importManifest(client, ROOT, manifest, {

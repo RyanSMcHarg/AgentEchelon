@@ -1,5 +1,5 @@
 /**
- * AN ANSWER WAITS FOR THE READING, AND THE READING IS WHAT RESUMES IT (ADR-033, owner 2026-09-14).
+ * AN ANSWER WAITS FOR THE READING, AND THE READING IS WHAT RESUMES IT (ADR-033).
  *
  * The queue's promise is that follow-ups sent while the assistant is working are rolled into the answer
  * before it is sent. The reading decides which queued messages are follow-ups, and it runs BESIDE the

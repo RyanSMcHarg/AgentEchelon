@@ -1,5 +1,5 @@
 /**
- * A RECORDED MEETING IS SUMMARIZED, AND ITS ACTION ITEMS ARE TASKS (SPEC-ASSISTANT-MEETINGS FR66, FR67; owner, 2026-11-12).
+ * A RECORDED MEETING IS SUMMARIZED, AND ITS ACTION ITEMS ARE TASKS (SPEC-ASSISTANT-MEETINGS FR66, FR67).
  *
  *  - the summary's sections and rules, asked for as one
  *    JSON object, from the stored transcript's segments, with every speaker a reference the platform gave;
@@ -12,12 +12,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import {
-  MEETING_ACTION_ITEM_MACHINE, MEETING_SUMMARY_DEADLINE_MS, MEETING_SUMMARY_HAND_BACK_RESERVE_MS, MEETING_SUMMARY_INSTRUCTIONS, MEETING_SUMMARY_MAX_TOKENS,
+  MEETING_ACTION_ITEM_MACHINE, MEETING_SUMMARY_RUN, MEETING_SUMMARY_DEADLINE_MS, MEETING_SUMMARY_HAND_BACK_RESERVE_MS, MEETING_SUMMARY_INSTRUCTIONS, MEETING_SUMMARY_MAX_TOKENS,
   actionItemHolder, fitSummaryCard, meetingSummaryDeadlineMs, meetingSummaryPrompt, participantLegend,
   planActionItems, readMeetingSegments, readMeetingSummaryReply, readMeetingSummaryWritten, runMeetingSummaryTurn, topicsOf,
   type MeetingSummaryDeps, type MeetingSummaryTurnRequest,
 } from '../../lambda/src/lib/meeting-summary-turn';
 import { DEFAULT_TASK_STATE_MACHINES, PLATFORM_MACHINE_KEYS } from '../../lambda/src/lib/task-state-machines';
+import { PLATFORM_RUN_NAMES } from '../../lambda/src/lib/event-workflow';
 import { ANSWERS_NO_MESSAGE_KINDS, INTERACTION_KINDS } from '../../lambda/src/lib/interaction-kinds';
 import { TURN_KINDS } from '../../lambda/src/lib/turn-declaration';
 import type { TranscriptSegment } from '../../lambda/src/lib/meeting-transcript';
@@ -313,7 +314,9 @@ describe('the router', () => {
   });
 
   it('continues no run when an action item settles', () => {
-    expect(fnOf('handleTaskNaming')).toContain('task.workflowRun?.workflow === MEETING_SUMMARY_RUN ? undefined : task.workflowRun');
+    // A meeting summary is one of the platform's own runs, none of whose task settlements continues a run.
+    expect(fnOf('handleTaskNaming')).toContain("PLATFORM_RUN_NAMES.includes(task.workflowRun?.workflow ?? '') ? undefined : task.workflowRun");
+    expect(PLATFORM_RUN_NAMES).toContain(MEETING_SUMMARY_RUN);
   });
 
   it("never words a card's length from the moment it is rewritten: the card's own, the figures', or the recorded end", () => {

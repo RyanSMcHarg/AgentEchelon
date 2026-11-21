@@ -1470,7 +1470,7 @@ describe('CDK Synthesis', () => {
       expect(policies).toContain('dynamodb:PutItem');
     });
 
-    // INVERTED (maintainer, 2026-08-30). This asserted that the budget and the circuit were OPT-IN, and
+    // INVERTED. This asserted that the budget and the circuit were OPT-IN, and
     // opt-in is what left every deployment with no limit on model spend: the flags that turned them
     // on were read through a wrapper the config-drift guard could not see, so they were undocumented,
     // and undocumented meant unset, and unset meant off. The default is now ON, and the circuit

@@ -17,7 +17,7 @@
  * `getModelEffectiveness` put 151 of 797 exchanges - 18.9 percent - into one model 'unknown' /
  * intent 'unknown' bucket. Those rows are greetings, drift notices and split confirmations.
  *
- * THE FIRST ATTEMPT AT THIS EXCLUDED THEM, AND THAT WAS WRONG (owner correction, 2026-09-14). It
+ * THE FIRST ATTEMPT AT THIS EXCLUDED THEM, AND THAT WAS WRONG. It
  * rested on two claims that do not hold:
  *
  *   "No model ran."  The notice TEXT is a constant, but drift detection runs an embedding call to

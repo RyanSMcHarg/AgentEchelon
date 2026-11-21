@@ -66,6 +66,7 @@ sequenceDiagram
 |---|---|---|---|---|---|
 | Salesforce (Event Relay) | `aws.partner/salesforce.com/<organization id>/<event relay id>` | the relayed event's API name | the `detail-type` | `detail.id`, the event's UUID | Change Data Capture: `payload.ChangeEventHeader.recordIds[0]` and `payload.OwnerId`. Platform Event: the org's `RecordId__c` and `OwnerId__c` fields. The owner is `<organization id from the source>:<OwnerId>` |
 | PagerDuty (EventBridge integration) | `aws.partner/pagerduty.com/<subdomain>-<event source name>` | `PagerDuty Webhook` | `detail.event` | `detail.id`, the message id | `detail.incident.id`, and each `incident.assignments[].assignee.id` |
+| The deployment's own app (ADR-068, WT84) | its own bus, `<stack>-app-<connector id>`, source `ae.app.<name>`; its policy allows `PutEvents` from `appPrincipal` alone, for that source alone | the event's name | the `detail-type` | `detail.eventId` | `detail.ref.recordId`, each `detail.people[].subject` (the app's own user id), and `detail.conversation`, a channel id the receiver records |
 
 **The replay record** is one item per vendor event id, `<connector>#<event id>`, kept for seven days, and an event older than that, or dated more than five minutes in the future, is refused. It is claimed with a conditional write before any work and marked `published` once the fact is on the bus. Only a `published` record makes a delivery a replay. A failure the retry can cure (the replay store, `Identities` or the bus not answering) releases the claim and throws, so Lambda retries the invocation (twice) and the retry is processed rather than dropped as a replay; an event every retry fails lands in the dead-letter queue (`ConnectorEventsDlq`, fourteen days), and the `connector-events-undelivered` alarm fires. A claim another invocation still holds is retried, not dropped; one older than its lease (60 seconds, four times the receiver's timeout) belongs to an invocation that died, and is taken over. A refusal a retry cannot cure (a foreign source, an unreadable or out-of-window event) is not retried.
 
@@ -222,7 +223,7 @@ The statuses are `(unit, behavior)`, `(unit, source text)`, `(synth)` and `none`
 | Field | Meaning |
 |---|---|
 | `id` | The registry id: the rule's name, the secret's name and the `Identities` namespace. Never an issuer's id |
-| `vendor` | `pagerduty` or `salesforce` |
+| `vendor` | `pagerduty`, `salesforce` or `app` (the deployment's own application, with `appPrincipal`, the IAM role or user ARN its bus admits) |
 | `capabilities` | A subset of what the vendor implements (`resolveParticipant`, `ingest`, `actForPerson`); default all of them |
 | `subscribes` | The vendor event types received: PagerDuty `incident.trigger`, `incident.acknowledge`, `incident.unacknowledge`, `incident.resolve`, `incident.assign`, `incident.escalate`, `incident.delegate`, `incident.annotate`; Salesforce the API names of the relayed Platform Events (`<Name>__e`) and Change Data Capture events (`<Object>ChangeEvent`) |
 | `eventSource` | Required with `subscribes`: the full name of the vendor's partner event source (`aws.partner/salesforce.com/<org id>/<relay id>`, `aws.partner/pagerduty.com/<subdomain>-<name>`), one per connector |

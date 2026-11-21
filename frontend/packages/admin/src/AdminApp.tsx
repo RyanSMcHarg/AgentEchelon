@@ -4,6 +4,7 @@ import { AuthProvider, useAuth, LoginScreen, ForgotPasswordScreen, ErrorBoundary
 import AdminDashboard from './components/admin/AdminDashboard';
 import { detectAnalyticsMode } from './services/analyticsService';
 import { CapabilityProvider, useConsoleAccess } from './capabilities';
+import { clearReasons } from './services/adminReason';
 import '@ae/shared/styles/App.css';
 
 type AdminAuthView = 'login' | 'forgot';
@@ -32,6 +33,10 @@ function AdminAppContent() {
   // THE DEPLOYMENT'S CLASSIFICATIONS, loaded once signed in (`GET /classifications` on the person API). The console
   // renders nothing before sign-in, so its build carries no fallback.
   const classificationsReady = useDeploymentClassificationsReady(isAuthenticated ? idToken : null);
+  // A STATED REASON IS THE PERSON'S WHO GAVE IT: the reasons remembered for this page are forgotten whenever the person signed in
+  // changes, sign-out included, so the next person is asked for their own and their reads are never recorded under another's.
+  const signedInAs = isAuthenticated ? (user?.email ?? user?.name ?? '') : '';
+  useEffect(() => { clearReasons(); }, [signedInAs]);
   const [authView, setAuthView] = useState<AdminAuthView>('login');
   // Which analytics backend this deployment runs (env-first, then a backend
   // probe). Drives the dashboard's mode-specific banners + tab set.

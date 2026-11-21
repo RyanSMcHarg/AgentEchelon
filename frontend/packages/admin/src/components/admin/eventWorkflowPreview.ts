@@ -59,7 +59,7 @@ export function workflowSteps(wf: EventWorkflow): StepSummary[] {
 
 function summarizeStep(key: string, def: EventStepDef): StepSummary {
   const kind = kindOf(def);
-  const names = def.send?.template ?? def.agent?.prompt ?? def.prompt?.template ?? def.task?.machine;
+  const names = def.send?.template ?? def.agent?.prompt ?? def.prompt?.template ?? def.task?.machine ?? def.handoff?.name;
   return {
     key,
     kind,

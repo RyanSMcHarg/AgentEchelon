@@ -3,7 +3,9 @@
  *
  * What it proves:
  *  - the team conversation's `incident-triage` run opens the incident's conversation, tells the team where it is, and waits
- *    for that conversation's own run to end, holding no task of it; then it reports the incident resolved;
+ *    for that conversation's own run to end, holding no task of it; a resolve ends it saying nothing more, because the
+ *    incident's conversation tells the team at the resolve itself, and an end that was not a resolve is reported to the team;
+ *  - an incident conversation that could not be opened is told to the team, with why, and the team's run ends failed;
  *  - the incident's conversation's `ops-room` run gives the on-call the incident's task itself, in its own conversation,
  *    and goes on alongside it with the first look, the call offer and the runbook; its end waits on that task, so the run ends
  *    when the on-call resolves it, and not before;
@@ -83,6 +85,33 @@ describe('the team conversation opens the incident and waits for its conversatio
     expect(Object.entries(wf.states).filter(([, s]) => s.task).map(([k]) => k)).toEqual([]);
   });
 
+  it('tells the team when the incident conversation could not be opened, and why, and ends the run failed', async () => {
+    expect(wf.states.open.onFailure).toBe('tell-not-opened');
+    expect(wf.states['tell-not-opened']).toEqual({ send: { template: 'incident-not-opened', to: 'room' }, onSuccess: 'failed', onFailure: 'failed' });
+    expect(wf.states.failed).toEqual({ disposition: 'failure' });
+    const ctx = { event: 'event-received' as const, channelArn: TEAM, values: { label: 'X' } };
+    for (const refused of ['no-person', 'nested', 'failed'] as const) {
+      const run = recordingDeps({ openChild: async () => refused });
+      const sentTemplates: string[] = [];
+      run.deps.send = async ({ template }) => { sentTemplates.push(template); return true; };
+      const out = await runEventWorkflow('incident-triage', wf, ctx, run.deps);
+      expect({ refused, steps: out.steps.map((s) => s.step), ended: out.ended }).toEqual({ refused, steps: ['open', 'tell-not-opened'], ended: 'failure' });
+      expect(sentTemplates).toEqual(['incident-not-opened']);
+      expect(run.ended).toEqual(['failure']);
+    }
+    // A CREATOR THAT HANDS THE RUN BACK UNOPENED takes the same edge.
+    const back = recordingDeps();
+    const sentBack: string[] = [];
+    back.deps.send = async ({ template }) => { sentBack.push(template); return true; };
+    await continueAfter('incident-triage', wf, ctx, { step: 'open', outcome: 'failed' }, back.deps);
+    expect(sentBack).toEqual(['incident-not-opened']);
+    expect(back.ended).toEqual(['failure']);
+    // THE WORDS SAY WHY AND WHAT TO DO, naming the incident and no person.
+    const r = renderMessageTemplate(shippedMessageTemplate('incident-not-opened')!, { label: 'X' }, { sections: ['chat'] });
+    expect(r.ok && r.sections.chat).toMatch(/could not be opened: it opens led by the one person on call/);
+    expect(r.ok && r.sections.chat).toMatch(/Page the on-call directly/);
+  });
+
   it('goes on at once where the opened conversation\'s run ended first, and waits where it has not', async () => {
     const ctx = { event: 'event-received' as const, channelArn: TEAM, values: { label: 'X', conversation_link: '?conversation=conv-ops-1' } };
     const came = recordingDeps({ wait: async () => 'came' });
@@ -157,7 +186,7 @@ describe('the incident\'s conversation holds its lead\'s task and runs the runbo
     expect(room.states['lead-task'].task).toEqual({
       machine: 'incident_ownership', by: { participantRole: 'on-call:ops' }, continue: 'alongside',
       assigned: { template: 'incident-owner-task', withoutMeetings: 'incident-owner-task-no-call' }, deadline: { afterMinutes: 43_200 },
-      endsRun: true, confirmEnd: 'confirming_resolve', movesTo: 'resolved',
+      endsRun: true, confirmEnd: 'confirming_resolve', movesTo: 'resolved', pinned: true, decidedBy: ['on-call:ops', 'secondary:ops', 'lead'],
     });
     expect(room.states['lead-task'].onSuccess).toBe('investigation');
     expect(room.states['greet-lead'].onSuccess).toBe('first-look');

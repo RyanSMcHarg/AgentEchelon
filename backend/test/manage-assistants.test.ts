@@ -222,7 +222,7 @@ describe('create refuses what it must', () => {
     expect(await refused({ ...good, role: 'sales' })).toMatch(/not a role/);
   });
 
-  it('takes a role the registry row deploys, with no record to say so (ADR-048, amended 2026-10-23)', async () => {
+  it('takes a role the registry row deploys, with no record to say so (ADR-048)', async () => {
     // A role is enabled when its classification's stack deploys it, read from the registry row; no assignment
     // record is consulted, so a role whose declared assistant was retired still takes a console-created one.
     const res = await handler(evt({ body: { ...good, role: 'ops', displayName: 'Ops Two' } })) as any;

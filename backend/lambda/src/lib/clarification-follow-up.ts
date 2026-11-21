@@ -1,5 +1,5 @@
 /**
- * WORKING THROUGH CLARIFICATIONS IS SOMETHING THE ASSISTANT OFFERS TO DO (maintainer, 2026-09-03).
+ * WORKING THROUGH CLARIFICATIONS IS SOMETHING THE ASSISTANT OFFERS TO DO.
  *
  * A clarification is a question the assistant asked and cannot answer itself, so it waits on a
  * person. Left there it waits forever: it sits in their list, and nothing brings it up again unless
@@ -75,7 +75,7 @@ export function decideClarificationFollowUp(
   // THE CLARIFICATIONS OUTRANK WHAT IS OPEN, so taking them up is not an interruption.
   if (theirs < others) return { action: 'work-through', count };
 
-  // EQUAL, WHICH IS "NOT CLEAR" RATHER THAN "TIED" (maintainer, 2026-09-03). Priority is recorded rather
+  // EQUAL, WHICH IS "NOT CLEAR" RATHER THAN "TIED". Priority is recorded rather
   // than inferred, and most work carries the default - so equal ranks mean nothing established an
   // order between them, not that somebody weighed them and found them balanced. Choosing either way
   // would be inventing a decision, so it is put to the person instead.

@@ -16,6 +16,7 @@ import { dashboardPrefix, DASHBOARDS_FAMILY } from '../../lambda/src/lib/dashboa
 import { transcriptPrefix } from '../../lambda/src/lib/meeting-transcript';
 import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as events from 'aws-cdk-lib/aws-events';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
@@ -31,6 +32,7 @@ import { AUDIENCE_TAG } from '../../lambda/src/lib/channel-classification';
 import { classificationPackPrefix } from '../../lambda/src/lib/profile-bodies';
 import { templatePrefix, templatePointerPath } from '../../lambda/src/lib/template-store';
 import { toolOfferedToRole, toolRolesOf } from '../../lambda/src/lib/tool-registry';
+import { processSource } from '../../lambda/src/lib/event-workflow';
 
 // RE-EXPORTED, NOT RESTATED. This was a second literal copy of the union, which is two places to edit
 // and one of them to forget: a classification declared in the registry and in `model-strategy` but not
@@ -464,8 +466,8 @@ export function conversationalClassifications(): string[] {
 }
 
 /**
- * A MEMBERSHIP CHANGE BEARING AN ASSISTANT, CONDITIONED ON THE CONVERSATION'S CLASSIFICATION
- *. The same two legs as `classificationChannelScopedAllow`, for a service
+ * A MEMBERSHIP CHANGE BEARING AN ASSISTANT, CONDITIONED ON THE CONVERSATION'S CLASSIFICATION.
+ * The same two legs as `classificationChannelScopedAllow`, for a service
  * that serves a set of classifications rather than one.
  *
  * WHAT IAM CAN AND CANNOT SEE HERE (ACCESS-CONTROL-BY-EXAMPLE, ADR-042). The MEMBER cannot be
@@ -526,8 +528,8 @@ export const CREATOR_MEMBERSHIP_ACTIONS = [
 ];
 
 /**
- * A MEMBERSHIP CHANGE BEARING THE SERVICE ADMIN, CONDITIONED ON THE CONVERSATION'S CLASSIFICATION
- *. The creators (the router's drift split, the conversation split, the
+ * A MEMBERSHIP CHANGE BEARING THE SERVICE ADMIN, CONDITIONED ON THE CONVERSATION'S CLASSIFICATION.
+ * The creators (the router's drift split, the conversation split, the
  * typed-conversation creator and the conversation creation function) create as the service admin, an
  * AppInstanceUser, so the bot leg of `membershipAsAssistantStatements` cannot match them. The same two
  * legs, with the bearer named:
@@ -1559,7 +1561,7 @@ export const INSTANCE_SSM = {
  * is present (which it always is here) - it fixes the duplicate-fulfillment task clobber and is
  * always safe.
  *
- * THE SPEND LIMIT IS ON BY DEFAULT (maintainer, 2026-08-30), and it used to be opt-in. Opt-in was the
+ * THE SPEND LIMIT IS ON BY DEFAULT, and it used to be opt-in. Opt-in was the
  * wrong default for the same reason an unset flag is never a safe one: the limits defaulted to 0,
  * the runtime reads 0 as "not configured" and allows everything, and the two flags that would have
  * turned them on were not even discoverable - they are read through the `ctxNum` wrapper below, so
@@ -1713,6 +1715,110 @@ export function alertEmitterWiring(scope: Construct): { env: Record<string, stri
     }));
   };
   return { env, grant };
+}
+
+// ── THE PROCESS EVENT BUS (DESIGN-PROCESSES section 12) ───────────────────────────────────────────────────────────────
+//
+// Every name below is fixed and known at synthesis, so the bus's policy names each principal it admits, and each stack names
+// the bus, with no cross-stack token and no export.
+
+/** The deployment's process event bus: the one bus hand-offs are put on and hand-off rules match on. */
+export function processEventBusName(): string {
+  return `${STACK_PREFIX}-process`;
+}
+
+/** The process event bus's ARN in a stack's account and Region. */
+export function processEventBusArn(scope: Construct): string {
+  const stack = cdk.Stack.of(scope);
+  return `arn:aws:events:${stack.region}:${stack.account}:event-bus/${processEventBusName()}`;
+}
+
+/** A rule on the process event bus, as IAM names it: `rule/<bus>/<name>`. */
+export function processBusRuleArn(scope: Construct, ruleName: string): string {
+  const stack = cdk.Stack.of(scope);
+  return `arn:aws:events:${stack.region}:${stack.account}:rule/${processEventBusName()}/${ruleName}`;
+}
+
+/**
+ * A CLASSIFICATION ROUTER'S FIXED ROLE NAME: the process bus's policy admits the classification's process source from this role
+ * alone, named by its ARN with no reference to the Assistants stack. The instance's prefix keeps it unique per instance, and a
+ * name past IAM's 64 characters is refused at synth.
+ */
+export function routerRoleName(classification: string): string {
+  const name = `${STACK_PREFIX}-router-${classification}`;
+  if (name.length > 64) throw new Error(`routerRoleName: "${name}" is longer than IAM's 64 characters`);
+  return name;
+}
+
+/**
+ * THE TRIGGER SERVICE'S FIXED ROLE NAME: the process bus's policy admits rule and target writes on its rules from this role alone,
+ * so only the trigger service decides who receives a hand-off.
+ */
+export function eventTriggersRoleName(): string {
+  const name = `${STACK_PREFIX}-event-triggers`;
+  if (name.length > 64) throw new Error(`eventTriggersRoleName: "${name}" is longer than IAM's 64 characters`);
+  return name;
+}
+
+/** A role of this instance by its fixed name, as `aws:PrincipalArn` reads it. */
+const roleArnNamed = (scope: Construct, name: string): string => `arn:aws:iam::${cdk.Stack.of(scope).account}:role/${name}`;
+
+/**
+ * A ROUTER'S OWN HAND-OFF PUT (SPEC-PROCESSES P4; layer two): `events:PutEvents` on the process bus only, pinned to its own
+ * classification's process source, so it is refused another's and holds no put on any other bus for it.
+ */
+export function putOwnProcessSourceStatement(scope: Construct, classification: string): iam.PolicyStatement {
+  return new iam.PolicyStatement({
+    sid: 'PutOnlyItsOwnProcessSource',
+    actions: ['events:PutEvents'],
+    resources: [processEventBusArn(scope)],
+    conditions: { StringEquals: { 'events:source': [processSource(classification)] } },
+  });
+}
+
+/** The rule and target writes the process bus admits from the trigger service's role alone. */
+export const PROCESS_BUS_RULE_WRITES = ['events:PutRule', 'events:PutTargets', 'events:RemoveTargets', 'events:DeleteRule', 'events:TagResource'] as const;
+
+/**
+ * THE PROCESS EVENT BUS (DESIGN-PROCESSES section 12), with deny statements only, as the app's own bus is guarded (`appEventBus`).
+ * Its own policy names no classification, so adding or removing one changes nothing here:
+ *  - PUT: every source that is not a process source is denied to all. Each classification's own source is pinned to its router
+ *    role by that classification's stack (`processBusSenderPolicy`), and a put needs an identity allow, which each router role
+ *    holds for its own source alone, so no principal of the platform can put another classification's or an undeclared one's.
+ *  - SUBSCRIBE: rule and target writes on the bus's rules are denied to every principal but the trigger service's role, so only
+ *    the trigger service decides which rule receives a hand-off.
+ */
+export function createProcessEventBus(scope: Construct): events.EventBus {
+  const bus = new events.EventBus(scope, 'ProcessEventBus', { eventBusName: processEventBusName() });
+  bus.addToResourcePolicy(new iam.PolicyStatement({
+    sid: 'NoOtherSource', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()],
+    actions: ['events:PutEvents'], resources: [bus.eventBusArn],
+    conditions: { StringNotLike: { 'events:source': `${processSource('')}*` } },
+  }));
+  bus.addToResourcePolicy(new iam.PolicyStatement({
+    sid: 'OnlyTheTriggerServiceSubscribes', effect: iam.Effect.DENY, principals: [new iam.AnyPrincipal()],
+    actions: [...PROCESS_BUS_RULE_WRITES], resources: [processBusRuleArn(scope, '*')],
+    conditions: { ArnNotEquals: { 'aws:PrincipalArn': roleArnNamed(scope, eventTriggersRoleName()) } },
+  }));
+  return bus;
+}
+
+/**
+ * A CLASSIFICATION'S OWN SOURCE ON THE PROCESS BUS, pinned to its router role by its own stack: `ae.process.<classification>`
+ * is denied to every principal but that role, named by its fixed ARN, never by a tag (every role of a classification's stack
+ * carries the `classification` tag, and a person's exchanged credentials carry it as a session tag). One statement of the bus's
+ * policy, owned by the stack that owns the classification, so it comes and goes with that stack.
+ */
+export function processBusSenderPolicy(scope: Construct, classification: string): events.CfnEventBusPolicy {
+  return new events.CfnEventBusPolicy(scope, 'ProcessBusOnlyItsRouterPuts', {
+    eventBusName: processEventBusName(),
+    statementId: `OnlyItsRouterPuts-${classification}`,
+    statement: {
+      Sid: `OnlyItsRouterPuts-${classification}`, Effect: 'Deny', Principal: '*', Action: 'events:PutEvents',
+      Resource: `arn:${cdk.Stack.of(scope).partition}:events:${cdk.Stack.of(scope).region}:${cdk.Stack.of(scope).account}:event-bus/${processEventBusName()}`,
+      Condition: { StringEquals: { 'events:source': processSource(classification) }, ArnNotEquals: { 'aws:PrincipalArn': roleArnNamed(scope, routerRoleName(classification)) } },
+    },
+  });
 }
 
 /**

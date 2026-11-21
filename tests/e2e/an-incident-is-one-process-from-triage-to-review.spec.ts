@@ -10,13 +10,13 @@
  *    where it is, with the on-call mentioned;
  *  - the on-call resolves the incident, completes the investigation and then the post-incident review, which starts only after
  *    both, and the team conversation is told "resolved" once;
- * *  - the process view reads the incident as the console shows it: the row for this process id reads ended 1 and succeeded 1,
+ *  - the process view reads the incident as the console shows it: the row for this process id reads ended 1 and succeeded 1,
  *    no run of the process lacks an end, and both runs, the team's and the incident's, are under that one id, each owned by
  *    the ops team; the incident's run ran its review after the investigation, and the team's run, freed at the resolve, ran none;
- *  - the process view's stages are the steps' labels in run order, Incident owner, Customers impacted?, Resolve and Post-incident review among
+ *  - the process view's stages are the steps' labels in run order, Incident owner, Customer impact, Resolve and Post-incident review among
  *    them, each with a time, and no internal move is a stage;
  *  - customer messaging is a track beside the incident (WT130; DESIGN-PROCESSES O26 to O34): in the incident conversation, past
- *    the call offer and the affected accounts, the lead's "Customers impacted" opens the account team's conversation from the incident under the same process id while the incident goes on; Advisor
+ *    the call offer and the affected accounts, naming the accounts opens the account team's conversation from the incident under the same process id while the incident goes on; Advisor
  *    drafts the initial notice, the account team lead approves it within its 15-minute deadline (the time to first notice is
  *    measured from the press), and the incident is told; at resolve the track is told, the lead asks for the final notice on
  *    the card, approves it, and the process completes only once the track has ended too;
@@ -49,7 +49,7 @@ import { withWorkflowFor } from './helpers/version-under-test';
 import { replacingDraft, draftIdOf } from './helpers/profile-draft';
 import { pressCard } from './helpers/workflow-task';
 import { joinMembershipGroup } from './helpers/team-group';
-import { acknowledge, cancelOpenRuns, childrenOfType, forgetChild, isLive, liveTaskAt, opsRoomsOf, posts, press, removeTasksHeldBy, runTasksIn, saysTemplate, ssmValue } from './helpers/ops-incident';
+import { acknowledge, cancelOpenRuns, childrenOfType, forgetChild, isLive, liveTaskAt, opsRoomsOf, postedBy, posts, postsUntil, press, type Post, removeTasksHeldBy, runTasksIn, saysTemplate, ssmValue } from './helpers/ops-incident';
 import { opsIncidentProcess } from '../../demo/portable-assistants/ops-assistant-manifest';
 import { processShapeOf, runStages, stageSummary } from '../../frontend/packages/admin/src/components/admin/processStages';
 
@@ -90,9 +90,11 @@ test.describe.serial('an incident is one process from triage to review (P11, WT1
   let leaveAccountGroup: () => void = () => undefined;
   let tookAccountLead = false;
   const accountLeadBefore: string[] = [];
-  /** The process id the team's triage run started, read from its own task. */
+  /** The process id the alarm started, read from the incident conversation's `lead-task`. */
   let processId = '';
   const inGroupBefore: string[] = [];
+  /** Whether this run changed the on-call group, set the moment it did, so cleanup restores only what was taken. */
+  let tookOnCall = false;
   let leaveTeamGroup: () => void = () => undefined;
   const cognito = (args: string[]) => awsv(['cognito-idp', ...args, '--user-pool-id', userPool]);
 
@@ -118,22 +120,19 @@ test.describe.serial('an incident is one process from triage to review (P11, WT1
     expect(session.status, JSON.stringify(session.body).slice(0, 300)).toBe(200);
     admin = session.body.credentials;
     // THE MOCK ON-CALL: the group holds exactly the lead for this run, and what it held comes back afterwards.
-    for (const u of (cognito(['list-users-in-group', '--group-name', ON_CALL_GROUP])?.Users ?? []) as Array<{ Username: string }>) {
-      inGroupBefore.push(u.Username);
-      cognito(['admin-remove-user-from-group', '--group-name', ON_CALL_GROUP, '--username', u.Username]);
-    }
+    inGroupBefore.push(...((cognito(['list-users-in-group', '--group-name', ON_CALL_GROUP])?.Users ?? []) as Array<{ Username: string }>).map((u) => u.Username));
+    tookOnCall = true;
+    for (const u of inGroupBefore) cognito(['admin-remove-user-from-group', '--group-name', ON_CALL_GROUP, '--username', u]);
     cognito(['admin-add-user-to-group', '--group-name', ON_CALL_GROUP, '--username', opsLead!.email]);
     leaveTeamGroup = joinMembershipGroup(TEAM, opsLead!.email, userPool);
     // THE ACCOUNT TEAM'S LEAD IS THE SAME PERSON FOR THIS RUN: in the messaging type's group, and the one holder of its lead role.
     leaveAccountGroup = joinMembershipGroup(MESSAGING, opsLead!.email, userPool);
     // THE ACCOUNT TEAM LEAD, AS THE ON-CALL: the group holds exactly the lead for this run, and whoever held it (the demo cast's
     // lead, on a deployment the demo runs on) is given it back afterwards.
-    for (const u of (cognito(['list-users-in-group', '--group-name', ACCOUNT_LEAD_GROUP])?.Users ?? []) as Array<{ Username: string }>) {
-      accountLeadBefore.push(u.Username);
-      cognito(['admin-remove-user-from-group', '--group-name', ACCOUNT_LEAD_GROUP, '--username', u.Username]);
-    }
-    cognito(['admin-add-user-to-group', '--group-name', ACCOUNT_LEAD_GROUP, '--username', opsLead!.email]);
+    accountLeadBefore.push(...((cognito(['list-users-in-group', '--group-name', ACCOUNT_LEAD_GROUP])?.Users ?? []) as Array<{ Username: string }>).map((u) => u.Username));
     tookAccountLead = true;
+    for (const u of accountLeadBefore) cognito(['admin-remove-user-from-group', '--group-name', ACCOUNT_LEAD_GROUP, '--username', u]);
+    cognito(['admin-add-user-to-group', '--group-name', ACCOUNT_LEAD_GROUP, '--username', opsLead!.email]);
   });
 
   test.afterAll(async () => {
@@ -142,14 +141,17 @@ test.describe.serial('an incident is one process from triage to review (P11, WT1
     const tryTo = async (what: string, fn: () => unknown) => {
       try { await fn(); } catch (err) { console.warn(`cleanup: could not ${what}: ${(err as Error).message.slice(0, 200)}`); }
     };
-    // SETTLE WHAT THE SPEC OPENED, through the product's own run cancel, before anything is deleted: the incident's runs first,
-    // whose end frees the team's run, then any triage of this alarm still open in the team conversation. A run that failed
-    // before it read the incident conversation still finds the one this alarm opened.
+    // SETTLE WHAT THE SPEC OPENED, through the product's own run cancel, before anything is deleted: customer messaging's runs,
+    // then the incident's, whose end is told to the team conversation and ends the team's run, which holds no task of its own
+    // and waits only on the incident conversation (`hold`). A run that failed before it read the incident conversation still
+    // finds the one this alarm opened. An alarm whose incident conversation never opened leaves the team's run at its `open`
+    // step, which its backstop ends.
     if (!child && leadArn) await tryTo('find the incident conversation', () => { child = opsRoomsOf(leadArn, ALARM)[0] ?? ''; });
     if (!messaging && child) await tryTo('find the customer messaging conversation', () => { messaging = childrenOfType(child, MESSAGING)[0] ?? ''; });
     if (admin && messaging) await tryTo("cancel the customer messaging's open runs", () => cancelOpenRuns(adminIdToken, messaging));
     if (admin && child) await tryTo("cancel the incident's open runs", () => cancelOpenRuns(adminIdToken, child));
-    if (admin && teamRoom && alarmArn) await tryTo("cancel this alarm's open runs in the team conversation", () => cancelOpenRuns(adminIdToken, teamRoom, { keep: (t) => t.resource === alarmArn }));
+    // THE TEAM'S RUN IS NOT LEFT AT `hold`: the incident's end reaches the team conversation, by its events, before anything is deleted.
+    if (child && teamRoom && leadArn) await tryTo('see the team run freed by the incident\'s end', () => postsUntil(teamRoom, leadArn, (p) => p.some((m) => m.text.includes(child.split('/').pop()!) && [saysTemplate('incident-resolved-team'), saysTemplate('incident-ended-unresolved'), saysTemplate('incident-timed-out')].some((says) => says(m.text))), { timeoutMs: 60_000 }));
     if (admin && ruleId) await tryTo('detach the trigger', () => signedCall(adminUrl('admin-conversations', `/admin/event-triggers/${TEAM}/${AT}/${ruleId}/remove`), admin!, 'POST', {}));
     await tryTo('delete the alarm', () => awsv(['cloudwatch', 'delete-alarms', '--alarm-names', ALARM]));
     if (child) await tryTo('remove the tasks the child holds', () => removeTasksHeldBy(child));
@@ -162,7 +164,7 @@ test.describe.serial('an incident is one process from triage to review (P11, WT1
       for (const u of accountLeadBefore) cognito(['admin-add-user-to-group', '--group-name', ACCOUNT_LEAD_GROUP, '--username', u]);
     });
     await tryTo('return the account team group', () => leaveAccountGroup());
-    if (lead && userPool) await tryTo('return the on-call group', () => {
+    if (tookOnCall && lead && userPool) await tryTo('return the on-call group', () => {
       cognito(['admin-remove-user-from-group', '--group-name', ON_CALL_GROUP, '--username', lead!.email]);
       for (const u of inGroupBefore) cognito(['admin-add-user-to-group', '--group-name', ON_CALL_GROUP, '--username', u]);
     });
@@ -231,33 +233,33 @@ test.describe.serial('an incident is one process from triage to review (P11, WT1
     expect(processId, 'the incident runs under the process the alarm started').not.toBe('');
     // THE WHOLE TEAM IS TOLD WHY, with the on-call mentioned and the incident conversation linked: the message the team run's
     // `tell` step posted, named by its own metadata, never by its words.
-    const fromTell = (m: { metadata: string }) => { try { const e = JSON.parse(m.metadata || '{}').eventStep; return e?.workflow === 'incident-triage'; } catch { return false; } };
-    const told = await pollFor(() => Promise.resolve(posts(teamRoom, leadArn).filter((m) => fromTell(m) && m.text.includes(child.split('/').pop()!))), (p) => p.length > 0, { timeoutMs: 90_000, intervalMs: 5_000 });
+    const fromTell = (m: Post) => postedBy(m) === 'incident-triage' && m.text.includes(child.split('/').pop()!);
+    const told = (await postsUntil(teamRoom, leadArn, (p) => p.some(fromTell), { timeoutMs: 90_000 })).filter(fromTell);
     console.log(`[what the team reads] ${told[0]?.text ?? '(none)'}`);
     expect(told, 'the team conversation is told where the incident is').toHaveLength(1);
-    expect(told[0].content, 'the on-call is mentioned').toContain(leadArn.split('/').pop()!);
+    // THE ON-CALL IS NAMED BY THEIR DISPLAY NAME, as an inert mention in the team's line: the line says who owns it, never an id.
+    const onCall = /\*\*On call:\*\* (.+?) owns it/.exec(told[0].text);
+    expect(onCall?.[1]?.trim(), 'the on-call is named').toBeTruthy();
+    expect(told[0].text, 'by name, not by id').not.toContain(leadArn.split('/').pop()!);
   });
 
-  test('triage in the incident conversation: past the call offer, the lead confirms customers are impacted', async () => {
+  test('triage in the incident conversation: past the call offer, naming the affected accounts starts customer messaging', async () => {
     test.setTimeout(600_000);
-    // TRIAGE IS THE INCIDENT CONVERSATION'S: past the call offer (declined here) and once Advisor has named the affected
-    // accounts, the lead is asked whether customers are impacted, and "Customers impacted" starts customer messaging (O27).
+    // TRIAGE IS THE INCIDENT CONVERSATION'S: past the call offer (declined here), once Advisor has named the affected
+    // accounts, customer messaging starts with nobody asked (O27).
     const offer = await liveTaskAt(child, 'offer-call', { timeoutMs: 240_000 });
     expect(offer, "the lead is offered the incident's call").toBeTruthy();
     const declined = await press(token, offer!, 'declined', offer!.taskState || 'offered');
     expect(declined.status, JSON.stringify(declined.body).slice(0, 300)).toBe(200);
-    const impact = await liveTaskAt(child, 'impact-confirm', { timeoutMs: 300_000 });
-    expect(impact, 'the lead is asked whether customers are impacted').toBeTruthy();
     impactAt = Date.now();
-    const confirmed = await press(token, impact!, 'impacted', impact!.taskState || 'asking');
-    expect(confirmed.status, JSON.stringify(confirmed.body).slice(0, 300)).toBe(200);
+    expect(runTasksIn(child).some((t) => t.step === 'impact-confirm'), 'nobody is asked whether customers are impacted').toBe(false);
   });
 
   test('customers impacted: customer messaging opens beside the incident, and its initial notice is approved within its deadline', async () => {
     test.setTimeout(600_000);
     // ONE CONVERSATION, OPENED FROM THE INCIDENT, under the same process id (O28, O32).
-    const opened = await pollFor(() => Promise.resolve(childrenOfType(child, MESSAGING)), (c) => c.length > 0, { timeoutMs: 120_000, intervalMs: 5_000 });
-    expect(opened, "a yes on the lead's card opened one customer messaging conversation").toHaveLength(1);
+    const opened = await pollFor(() => Promise.resolve(childrenOfType(child, MESSAGING)), (c) => c.length > 0, { timeoutMs: 420_000, intervalMs: 5_000 });
+    expect(opened, 'naming the accounts opened one customer messaging conversation').toHaveLength(1);
     messaging = opened[0];
     // THE INCIDENT NEVER WAITED ON IT: its owner's task and first look are there whatever the track is doing.
     expect(runTasksIn(child).some((t) => t.step === 'lead-task' && isLive(t)), 'the incident goes on beside it').toBe(true);
@@ -268,8 +270,7 @@ test.describe.serial('an incident is one process from triage to review (P11, WT1
     expect(approval!.processId, 'the track is the same process').toBe(processId);
     // THE DRAFT IS WHAT THE ACCOUNT TEAM READS: the asked turn is one turn of the primary's (WT118), which opens no task, so
     // the draft is the message that turn posted, named by its own metadata (`eventStep`, the asked intent), never by its words.
-    const askedFor = (m: { metadata: string }) => { try { return JSON.parse(m.metadata || '{}').eventStep?.workflow; } catch { return undefined; } };
-    const drafts = posts(messaging, leadArn).filter((m) => askedFor(m) === 'customer_notice_draft' && !looksLikeTaskPlaceholder(m.text) && m.text.length > 0);
+    const drafts = posts(messaging, leadArn).filter((m) => postedBy(m) === 'customer_notice_draft' && !looksLikeTaskPlaceholder(m.text) && m.text.length > 0);
     console.log(`[what the room reads] the initial notice draft:\n${drafts[0]?.text ?? '(none)'}`);
     expect(drafts.length, 'the initial notice was drafted in the customer messaging conversation').toBeGreaterThan(0);
     // THE DRAFT HAS THE INCIDENT'S FACTS TO WORK FROM (O28): the account team's opening states when it started and its Region,
@@ -289,7 +290,7 @@ test.describe.serial('an incident is one process from triage to review (P11, WT1
     noteProgress('harness', `time to first notice: ${Math.round(firstNoticeMs / 1000)}s`);
     expect(firstNoticeMs, 'the initial notice is approved within its deadline').toBeLessThan(FIRST_NOTICE_MS);
     expect(runTasksIn(messaging).some((t) => t.step === 'initial-revise'), 'no deadline was missed').toBe(false);
-    const told = await pollFor(() => Promise.resolve(posts(child, leadArn)), (p) => p.some((m) => saysTemplate('customer-notice-approved')(m.text)), { timeoutMs: 90_000, intervalMs: 5_000 });
+    const told = await postsUntil(child, leadArn, (p) => p.some((m) => saysTemplate('customer-notice-approved')(m.text)), { timeoutMs: 90_000 });
     expect(told.filter((m) => saysTemplate('customer-notice-approved')(m.text)), 'the incident is told the notice was approved').toHaveLength(1);
     const updates = await liveTaskAt(messaging, 'updates', { timeoutMs: 90_000 });
     expect(updates, 'the account team lead holds the card for the next notice').toBeTruthy();
@@ -299,7 +300,8 @@ test.describe.serial('an incident is one process from triage to review (P11, WT1
     test.setTimeout(480_000);
     const resolved = saysTemplate('incident-resolved-team');
     const otherEndings = [saysTemplate('incident-timed-out'), saysTemplate('incident-ended-unresolved')];
-    const teamTold = () => posts(teamRoom, leadArn).filter((m) => m.text.includes(child.split('/').pop()!));
+    const aboutChild = (m: Post) => m.text.includes(child.split('/').pop()!);
+    const teamTold = () => posts(teamRoom, leadArn).filter(aboutChild);
 
     // RESOLVE, confirmed where the runbook still has steps open (WT128).
     const ownership = runTasksIn(child).find((t) => t.step === 'lead-task' && isLive(t));
@@ -310,7 +312,7 @@ test.describe.serial('an incident is one process from triage to review (P11, WT1
       const confirmed = await pressCard(token, { channelArn: child, taskId: ownership!.taskId, state: 'confirming_resolve', choice: 'resolved' });
       expect(confirmed.status, JSON.stringify(confirmed.body).slice(0, 300)).toBe(200);
     }
-    const told = await pollFor(() => Promise.resolve(teamTold()), (p) => p.some((m) => resolved(m.text)), { timeoutMs: 90_000, intervalMs: 5_000 });
+    const told = (await postsUntil(teamRoom, leadArn, (p) => p.some((m) => aboutChild(m) && resolved(m.text)), { timeoutMs: 90_000 })).filter(aboutChild);
     expect(told.filter((m) => resolved(m.text)), 'the team is told "resolved" at the resolve').toHaveLength(1);
 
     // THE INVESTIGATION STAYS OPEN, and no review starts before it is complete.
@@ -332,7 +334,7 @@ test.describe.serial('an incident is one process from triage to review (P11, WT1
     expect(after.filter(isLive), 'the incident run holds nothing open once the review is done').toEqual([]);
 
     // CUSTOMER MESSAGING WAS TOLD AT THE RESOLVE, and the lead asks for the final notice on the card (O33).
-    const resolvedThere = await pollFor(() => Promise.resolve(posts(messaging, leadArn)), (p) => p.some((m) => saysTemplate('customer-messaging-resolved')(m.text)), { timeoutMs: 90_000, intervalMs: 5_000 });
+    const resolvedThere = await postsUntil(messaging, leadArn, (p) => p.some((m) => saysTemplate('customer-messaging-resolved')(m.text)), { timeoutMs: 90_000 });
     expect(resolvedThere.filter((m) => saysTemplate('customer-messaging-resolved')(m.text)), 'customer messaging is told the incident resolved, once').toHaveLength(1);
     const updates = runTasksIn(messaging).find((t) => t.step === 'updates' && isLive(t));
     expect(updates, 'the lead\'s card is open').toBeTruthy();
@@ -386,13 +388,13 @@ test.describe.serial('an incident is one process from triage to review (P11, WT1
     expect(at('review'), JSON.stringify(steps).slice(0, 300)).toBeGreaterThanOrEqual(0);
     expect(((team.steps as Array<{ step: string }>) ?? []).some((s) => s.step === 'review-draft' || s.step === 'review')).toBe(false);
     // THE STAGES AS THE CONSOLE SHOWS THEM (P9, UX section 5): named by the steps' labels on the version this spec activated, in
-    // run order, Triage in the team conversation and then the incident's, each with a time, read by the console's own functions.
+    // run order, the incident's (the team's run holds none), each with a time, read by the console's own functions.
     const shape = processShapeOf({ eventWorkflows: SHIPPED_EVENT_WORKFLOWS, processes: opsIncidentProcess() }, PROCESS);
     const summary = stageSummary(ended, shape);
     const labels = summary.map((s) => s.label);
     // THE TEAM'S RUN HOLDS NO STAGE OF ITS OWN: the incident's stages come first, customer impact among them.
     expect(summary.some((s) => s.workflow === 'incident-triage'), JSON.stringify(summary).slice(0, 400)).toBe(false);
-    const inOrder = ['Incident owner', 'Customers impacted?', 'Resolve', 'Post-incident review'].map((l) => labels.indexOf(l));
+    const inOrder = ['Incident owner', 'Customer impact', 'Resolve', 'Post-incident review'].map((l) => labels.indexOf(l));
     expect(inOrder.every((i) => i >= 0), `the incident's stages: ${labels.join(', ')}`).toBe(true);
     expect([...inOrder].sort((a, b) => a - b), `the stages run in order: ${labels.join(', ')}`).toEqual(inOrder);
     for (const run of ended) {

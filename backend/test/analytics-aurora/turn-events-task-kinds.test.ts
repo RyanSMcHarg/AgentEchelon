@@ -160,7 +160,7 @@ describe('the task rows carry the turn they belong to', () => {
   });
 });
 
-describe('the open edge has a PRODUCER (found live 2026-08-18 by task-resolution e2e)', () => {
+describe('the open edge has a PRODUCER', () => {
   // The fixtures above synthesize `task_transition: { from: '', to: ... }` - and for two days nothing
   // in production emitted a from-less edge: task CREATION fires no machine transition, so taskTransition
   // stayed undefined on the creation turn, task_opened never fired, and v_task_resolution.opened_at was
@@ -188,7 +188,7 @@ describe('the open edge has a PRODUCER (found live 2026-08-18 by task-resolution
   });
 });
 
-describe('the open edge SURVIVES archival (the third inert link, found live 2026-08-18)', () => {
+describe('the open edge SURVIVES archival', () => {
   // The producer fix alone was not enough: archival's truthiness check (`.from && .to`) dropped the
   // edge whose EMPTY `from` is its meaning, so the declaration died between the worker and the
   // column. Asserted end-of-chain: the archived record carries { from: '', to } intact.

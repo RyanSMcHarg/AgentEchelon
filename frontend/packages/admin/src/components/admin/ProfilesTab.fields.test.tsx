@@ -138,6 +138,8 @@ async function editArea(area: string) {
     identity: 'behavioral', models: 'scope', routing: 'scope', abilities: 'tools', settings: 'settings', welcome: 'workflows', events: 'workflows', messages: 'messages',
   };
   section(at[area]);
+  // THE WORKFLOWS SECTION OPENS ON ITS LIST: the welcome is opened from its row.
+  if (at[area] === 'workflows') fireEvent.click(await screen.findByTestId('assistant-edit-workflow-welcome'));
   return screen.findByTestId(`draft-step-${area}`);
 }
 
@@ -272,6 +274,7 @@ describe('the draft editor, in place', () => {
     expect(note.textContent).toContain('npm run migrate-legacy-copy');
     expect(within(note).queryByRole('textbox')).toBeNull();
     fireEvent.click(screen.getByTestId('draft-retired-copy-clear'));
+    fireEvent.click(screen.getByTestId('draft-retired-copy-clear-confirm-button'));
     expect(screen.queryByTestId('draft-retired-copy')).toBeNull();
     save(step);
     await waitFor(() => expect(svc.editProfileDraft).toHaveBeenCalled());
@@ -511,15 +514,23 @@ describe('workflows by ownership', () => {
     }
   });
 
-  it('copying a platform workflow in saves the events area\'s unsaved canvas layout with it', async () => {
+  it('leaving a workflow with an unsaved canvas edit asks first, and leaving drops it before a copy is saved', async () => {
     await openAdvisor();
     await editArea('events');
+    // The welcome opens on its own form; its steps are on the builder in Workflow mode.
+    const workflowMode = screen.queryByTestId('welcome-mode-workflow');
+    if (workflowMode) fireEvent.click(workflowMode);
     fireEvent.keyDown(await screen.findByTestId('wfb-node-opening'), { key: 'ArrowDown' });
+    // Back to the list: the moved step is unsaved, so leaving asks first, and leaving drops it.
+    fireEvent.click(screen.getByTestId('welcome-focus-back'));
+    expect(screen.getByTestId('workflow-leave-confirm')).toBeTruthy();
+    fireEvent.click(screen.getByTestId('workflow-leave-confirm-button'));
+    expect(screen.queryByTestId('assistant-nav-workflows-unsaved')).toBeNull();
     fireEvent.click(await screen.findByTestId('assistant-copy-incident-watch'));
     await waitFor(() => expect(svc.editProfileDraft).toHaveBeenCalled());
     const patch = vi.mocked(svc.editProfileDraft).mock.calls[0][1];
-    expect(Object.keys(patch.eventWorkflows!).sort()).toEqual(['incident-watch', 'welcome']);
-    expect(patch.layout?.welcome?.opening).toBeDefined();
+    expect(Object.keys(patch.eventWorkflows!)).toContain('incident-watch');
+    expect(patch.layout?.welcome?.opening).toBeUndefined();
   });
 });
 
@@ -727,7 +738,7 @@ describe('activating a draft', () => {
   });
 });
 
-describe('the draft, before and after a first activation (owner decision, 2026-10-24)', () => {
+describe('the draft, before and after a first activation', () => {
   const DRAFT: svc.ProfileDefinitionBody = { ...BODY, persona: 'You advise from the draft.', eventWorkflows: { welcome: welcomeSaying({ text: 'Draft welcome.' }) } };
   const exportsBy = () => vi.mocked(svc.exportProfile).mockImplementation(async (_name, version) =>
     ({ body: version === 'draft' ? DRAFT : BODY } as unknown as svc.ProfileManifest));
@@ -778,7 +789,7 @@ describe('the draft, before and after a first activation (owner decision, 2026-1
     await screen.findByTestId('draft-step-identity');
     for (const [s, controls] of [
       ['behavioral', ['draft-name', 'draft-persona']], ['scope', ['draft-base-model', 'draft-classifier-model']],
-      ['tools', ['draft-tools', 'draft-context-sources']], ['settings', ['draft-guardrail']], ['workflows', ['draft-event-workflows']], ['messages', ['message-templates']],
+      ['tools', ['draft-tools', 'draft-context-sources']], ['settings', ['draft-guardrail']], ['workflows', ['workflows-new']], ['messages', ['message-templates']],
     ] as const) {
       const card = section(s);
       for (const c of controls) expect(within(card).getAllByTestId(c).length, `${s}: ${c}`).toBeGreaterThan(0);

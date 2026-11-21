@@ -32,18 +32,15 @@
  * renders through the runtime's own renderer, so what the editor accepts is what the server accepts.
  */
 import MarkdownHelp from './MarkdownHelp';
-import React, { useState } from 'react';
-import EventTriggerPanel from './EventTriggerPanel';
+import React, { useCallback, useState } from 'react';
+import WorkflowTriggers from './EventTriggerPanel';
 import { useTranslation } from 'react-i18next';
 import {
   MAX_AGENT_DEADLINE_MS,
-  MAX_DEADLINE_MINUTES,
-  MIN_DEADLINE_MINUTES,
   EVENT_TASK_MACHINES,
   EVENTS_NAMING_A_PERSON,
   SHIPPED_EVENT_WORKFLOWS,
   PROPOSAL_OPS,
-  isDeadlineEvent,
   isInvitationEvent,
   inertMention,
   agentStepIsNarrowed,
@@ -63,6 +60,7 @@ import {
   MAX_RING_SECONDS,
   MIN_RING_SECONDS,
   isMeetingAction,
+  type VersionProcess,
 } from '../../../../../../backend/lambda/src/lib/event-workflow.ts';
 import { OWNER_DECIDED_STEP_FIELDS, TASK_STEP_ALONGSIDE,
   MAX_TASK_DEADLINE_MINUTES, MIN_TASK_DEADLINE_MINUTES, TASK_PRIORITIES, machinesAStepMayOpen, workerAssistantRole,
@@ -79,7 +77,7 @@ import { WELCOME_TOKENS } from '../../../../../../backend/lambda/src/lib/welcome
 import WelcomeEditorGuide, { type WelcomePreviewContext } from './WelcomeEditorGuide';
 import { CONVERSATION_TYPES, classificationAllowedForType, eventUnreachableReason, opensWithARun } from '../../../../../../backend/lib/config/conversation-types.ts';
 import { declaredParticipantRoleNames } from '../../../../../../backend/lib/config/participant-roles.ts';
-import { routerHeldVariables, routerHoldsAt, type PickableSource, type PublishedVariables, type VersionVariable } from '../../../../../../backend/lambda/src/lib/variables.ts';
+import { FIXED_SOURCES, routerHeldVariables, routerHoldsAt, type PickableSource, type PublishedVariables, type VersionVariable } from '../../../../../../backend/lambda/src/lib/variables.ts';
 import {
   MEETING_OFFER_MINUTES, STEP_NAME, addStep, atStepLimit, askBeforeMeeting, changeStepKind, convertStep, kindOf, kindsFor, meetingOfferOf, newWorkflow, orderedSteps, removeStep, renameStep, retarget,
   startAt, startMeetingAutomatically, taskPersonAt, unreachableSteps, updateStep, withSteps,
@@ -227,7 +225,25 @@ export function stepReadTools(tools: ToolDescriptor[], versionTools: readonly st
 export const templateNames = (templates: WelcomePromptOption[] | undefined) => ({
   messages: (templates ?? []).filter((x) => x.kind !== 'prompt').map((x) => x.name),
   prompts: (templates ?? []).filter((x) => x.kind === 'prompt').map((x) => x.name),
+  /** The message templates a step may say to the whole conversation: a new step defaults only to one of these. */
+  roomMessages: (templates ?? []).filter((x) => x.kind !== 'prompt' && roomMayRead(x.source)).map((x) => x.name),
 });
+
+/**
+ * WHETHER THE WHOLE CONVERSATION MAY READ A TEMPLATE: it binds no value that describes one person (`describesPerson` in the
+ * shared variables module, the rule `insertionErrors` refuses a room send by), and no context or host field, which the
+ * router reads as describing a person. A template whose fields cannot be read is not judged here; Validate judges it.
+ */
+export function roomMayRead(source: string | undefined): boolean {
+  if (!source) return true;
+  let fields: Record<string, unknown> = {};
+  try { fields = parseTemplate(source).fields ?? {}; } catch { return true; }
+  return !Object.values(fields).some((b) => {
+    const binding = String(b);
+    const kind = binding.split(':')[0];
+    return FIXED_SOURCES[binding]?.describesPerson === true || kind === 'ctx' || kind === 'host' || kind === 'person';
+  });
+}
 
 /** The label of an audience, a participant role's included. */
 export function useAudienceLabel(): (a: string) => string {
@@ -238,44 +254,188 @@ export function useAudienceLabel(): (a: string) => string {
     : t(`admin.workflowEditor.audience_${a.replace(':', '_')}`));
 }
 
-/** CHOOSE, ADD OR COPY A WORKFLOW: the version's own, an empty one under a new name, or a platform workflow copied in. */
+/**
+ * CHOOSE A WORKFLOW: the version's own, from a list. Creating one is never offered beside an open workflow: it is the
+ * Workflows list's + New workflow, which opens its own view (`CreateWorkflow`).
+ */
 export const WorkflowPicker: React.FC<{
   workflows: Workflows;
   selected: string;
   onSelect: (name: string) => void;
-  /** Add a workflow under a name, empty or copied; false when the name is not one the server accepts or is taken. */
-  onAdd: (name: string, from?: EventWorkflow) => boolean;
-}> = ({ workflows, selected, onSelect, onAdd }) => {
+}> = ({ workflows, selected, onSelect }) => {
   const { t: translate } = useTranslation();
   const t = translate as unknown as T;
   const names = Object.keys(workflows);
-  const [newName, setNewName] = useState('');
-  const [copyFrom, setCopyFrom] = useState('');
-  const add = (from?: EventWorkflow) => { if (onAdd(newName, from)) setNewName(''); };
   return (
-    <div className="admin-filter-group">
-      <label><span className="admin-field-label">{t('admin.workflowEditor.workflow')}</span>
-        <select className="select" data-testid="event-workflow-select" value={selected} onChange={(e) => onSelect(e.target.value)}>
-          {!names.length && <option value="" className="select-placeholder" disabled hidden>{t('admin.workflowEditor.none')}</option>}
-          {names.map((n) => <option key={n} value={n}>{n}</option>)}
-        </select>
+    <div className="admin-filter-group" data-testid="event-workflow-picker">
+      {names.length > 0 && (
+        <label><span className="admin-field-label">{t('admin.workflowEditor.workflow')}</span>
+          <select className="select" data-testid="event-workflow-select" value={workflows[selected] ? selected : ''} onChange={(e) => onSelect(e.target.value)}>
+            {!workflows[selected] && <option value="" disabled>{t('admin.triggerForm.choose')}</option>}
+            {names.map((n) => <option key={n} value={n}>{n}</option>)}
+          </select>
+        </label>
+      )}
+    </div>
+  );
+};
+
+/** A workflow to copy, as the create view's choice: the version's own, or the platform's. */
+const copyValue = (own: boolean, name: string): string => `${own ? 'own' : 'platform'}:${name}`;
+
+/**
+ * CREATE A WORKFLOW, AND NOTHING ELSE: its name, and whether it starts empty or as a copy of one of this version's workflows
+ * or the platform's. Start creates it and the parent opens the editor on it; Cancel goes back. No switcher, no trigger
+ * section and no steps show here.
+ */
+export const CreateWorkflow: React.FC<{
+  workflows: Workflows;
+  /** Add a workflow under a name, empty or copied; false when the name is not one the server accepts or is taken. */
+  onAdd: (name: string, from?: EventWorkflow) => boolean;
+  /** Back to where the person came from; absent where there is nothing to go back to. */
+  onCancel?: () => void;
+}> = ({ workflows, onAdd, onCancel }) => {
+  const { t: translate } = useTranslation();
+  const t = translate as unknown as T;
+  const [newName, setNewName] = useState('');
+  const [from, setFrom] = useState<'empty' | 'copy'>('empty');
+  const [copyOf, setCopyOf] = useState('');
+  const [refused, setRefused] = useState(false);
+  const source = (): EventWorkflow | undefined => {
+    if (from !== 'copy' || !copyOf) return undefined;
+    const [kind, ...rest] = copyOf.split(':');
+    const name = rest.join(':');
+    return kind === 'own' ? workflows[name] : SHIPPED_EVENT_WORKFLOWS[name];
+  };
+  const ready = !!newName && (from === 'empty' || !!copyOf);
+  const start = () => { if (ready && !onAdd(newName, source())) setRefused(true); };
+  return (
+    <div className="admin-event-trigger" data-testid="event-workflow-create">
+      <label className="admin-stacked-field"><span className="admin-field-label">{t('admin.workflowEditor.name')}</span>
+        <input type="text" className="input" data-testid="event-workflow-new-name" value={newName} required onChange={(e) => { setNewName(e.target.value.trim()); setRefused(false); }} />
       </label>
-      <label><span className="admin-field-label">{t('admin.workflowEditor.newName')}</span>
-        <input type="text" className="input" data-testid="event-workflow-new-name" value={newName} onChange={(e) => setNewName(e.target.value.trim())} />
-      </label>
-      <button type="button" className="btn-secondary" data-testid="event-workflow-add" disabled={!newName} onClick={() => add()}>
-        {t('admin.workflowEditor.add')}
-      </button>
-      <label><span className="admin-field-label">{t('admin.workflowEditor.copyFrom')}</span>
-        <select className="select" data-testid="event-workflow-copy-from" value={copyFrom} onChange={(e) => setCopyFrom(e.target.value)}>
-          <option value="" className="select-placeholder" disabled hidden>{t('admin.workflowEditor.copyPick')}</option>
-          {Object.keys(SHIPPED_EVENT_WORKFLOWS).map((n) => <option key={n} value={n}>{n}</option>)}
-        </select>
-      </label>
-      <button type="button" className="btn-secondary" data-testid="event-workflow-copy" disabled={!copyFrom || !newName}
-        onClick={() => add(SHIPPED_EVENT_WORKFLOWS[copyFrom])}>
-        {t('admin.workflowEditor.copy')}
-      </button>
+      <fieldset className="admin-event-trigger" data-testid="event-workflow-start-from">
+        <legend className="admin-field-label">{t('admin.workflowEditor.startFrom')}</legend>
+        <label className="admin-check">
+          <input type="radio" name="event-workflow-start-from" data-testid="event-workflow-start-empty" checked={from === 'empty'} onChange={() => setFrom('empty')} />
+          {t('admin.workflowEditor.startEmpty')}
+        </label>
+        <div className="admin-event-trigger-row">
+          <label className="admin-check">
+            <input type="radio" name="event-workflow-start-from" data-testid="event-workflow-start-copy" checked={from === 'copy'} onChange={() => setFrom('copy')} />
+            {t('admin.workflowEditor.startCopyOf')}
+          </label>
+          <select className="select" data-testid="event-workflow-copy-from" disabled={from !== 'copy'} aria-label={t('admin.workflowEditor.startCopyOf')}
+            value={copyOf} onChange={(e) => setCopyOf(e.target.value)}>
+            <option value="" disabled>{t('admin.triggerForm.choose')}</option>
+            {Object.keys(workflows).length > 0 && (
+              <optgroup label={t('admin.workflowEditor.copyOwn')}>
+                {Object.keys(workflows).map((n) => <option key={copyValue(true, n)} value={copyValue(true, n)}>{n}</option>)}
+              </optgroup>
+            )}
+            <optgroup label={t('admin.workflowEditor.copyPlatform')}>
+              {Object.keys(SHIPPED_EVENT_WORKFLOWS).map((n) => <option key={copyValue(false, n)} value={copyValue(false, n)}>{n}</option>)}
+            </optgroup>
+          </select>
+        </div>
+      </fieldset>
+      <div className="admin-event-trigger-row">
+        <button type="button" className="btn-primary" data-testid="event-workflow-add" disabled={!ready} onClick={start}>{t('admin.workflowEditor.start')}</button>
+        {onCancel && <button type="button" className="btn-ghost" data-testid="event-workflow-new-cancel" onClick={onCancel}>{t('admin.workflowEditor.cancel')}</button>}
+      </div>
+      {refused && <span className="admin-field-hint" role="alert" data-testid="event-workflow-new-refused">{t('admin.workflowEditor.nameRefused')}</span>}
+    </div>
+  );
+};
+
+/** The workflows with one renamed in its place, or null when the new name is not one the server accepts or is taken. */
+export function workflowsRenamed(workflows: Workflows, from: string, to: string): Workflows | null {
+  if (!STEP_NAME.test(to) || (to !== from && workflows[to]) || !workflows[from]) return null;
+  return Object.fromEntries(Object.entries(workflows).map(([k, v]) => [k === from ? to : k, v]));
+}
+
+/**
+ * THE VERSION'S PROCESSES WITH A RENAMED WORKFLOW FOLLOWING IT: each process that links it links the new name in its place,
+ * and each metric that measures it names the new name. Null when no process names it, so nothing is patched.
+ */
+export function processesRenamed(processes: Record<string, VersionProcess> | null | undefined, from: string, to: string): Record<string, VersionProcess> | null {
+  if (!processes || from === to) return null;
+  let changed = false;
+  const out = Object.fromEntries(Object.entries(processes).map(([key, p]) => {
+    if (!p.workflows?.includes(from) && !p.metrics?.some((m) => m.workflow === from)) return [key, p];
+    changed = true;
+    return [key, {
+      ...p,
+      workflows: (p.workflows ?? []).map((w) => (w === from ? to : w)),
+      ...(p.metrics ? { metrics: p.metrics.map((m) => (m.workflow === from ? { ...m, workflow: to } : m)) } : {}),
+    }];
+  }));
+  return changed ? out : null;
+}
+
+/**
+ * THE WORKFLOW'S NAME, SAID AS ITS HEADING: an input only once it is clicked, saved or cancelled there. A workflow that rules
+ * start is named by those rules, so it is not renamed while it runs on them.
+ */
+export const WorkflowName: React.FC<{ name: string; wf: EventWorkflow; onRename: (to: string) => boolean }> = ({ name, wf, onRename }) => {
+  const { t: translate } = useTranslation();
+  const t = translate as unknown as T;
+  const [draft, setDraft] = useState<string | null>(null);
+  const [refused, setRefused] = useState(false);
+  const heldByRules = wf.on === 'event-received';
+  if (draft === null) {
+    return (
+      <h4 className="admin-assistant-name" data-testid="event-workflow-name">
+        <button type="button" className="btn-link" data-testid="event-workflow-name-edit" title={t('admin.workflowEditor.renameHint')}
+          onClick={() => { setDraft(name); setRefused(false); }}>{name}</button>
+      </h4>
+    );
+  }
+  const save = () => {
+    if (draft === name) { setDraft(null); return; }
+    if (onRename(draft)) setDraft(null); else setRefused(true);
+  };
+  return (
+    <div className="admin-event-trigger-row" data-testid="event-workflow-rename">
+      <input type="text" className="input" aria-label={t('admin.workflowEditor.rename')} data-testid="event-workflow-rename-input" value={draft} autoFocus
+        onChange={(e) => { setDraft(e.target.value.trim()); setRefused(false); }}
+        onKeyDown={(e) => { if (e.key === 'Enter' && !heldByRules) save(); if (e.key === 'Escape') setDraft(null); }} />
+      <button type="button" className="btn-primary" data-testid="event-workflow-rename-save" disabled={!draft || heldByRules} onClick={save}>{t('admin.workflowEditor.save')}</button>
+      <button type="button" className="btn-ghost" data-testid="event-workflow-rename-cancel" onClick={() => setDraft(null)}>{t('admin.workflowEditor.cancel')}</button>
+      {heldByRules && <span className="admin-field-hint" data-testid="event-workflow-rename-held">{t('admin.workflowEditor.renameHeld')}</span>}
+      {refused && <span className="admin-field-hint" role="alert" data-testid="event-workflow-rename-refused">{t('admin.workflowEditor.nameRefused')}</span>}
+    </div>
+  );
+};
+
+/**
+ * REMOVE THE WORKFLOW, AT THE FOOT OF THE PAGE AND ONLY ONCE CONFIRMED: the console's inline confirm (as Discard draft asks),
+ * naming what is lost. Removing the default welcome runs the built-in one.
+ */
+export const RemoveWorkflow: React.FC<{ name: string; wf: EventWorkflow; onRemove: () => void }> = ({ name, wf, onRemove }) => {
+  const { t: translate } = useTranslation();
+  const t = translate as unknown as T;
+  const [confirming, setConfirming] = useState(false);
+  const requiredWelcome = wf.on === 'assistant-joined' && !wf.types?.length;
+  return (
+    <div className="admin-config-actions" data-testid="event-workflow-remove-area">
+      {requiredWelcome && <span className="admin-field-hint" data-testid="event-workflow-required">{t('admin.workflowEditor.requiredWelcome')}</span>}
+      {!confirming ? (
+        <button type="button" className="btn-danger" data-testid="event-workflow-remove" onClick={() => setConfirming(true)}>
+          {requiredWelcome ? t('admin.workflowEditor.removeWelcome') : t('admin.workflowEditor.remove')}
+        </button>
+      ) : (
+        <section className="admin-import-preview" role="alertdialog" aria-labelledby="event-workflow-remove-title" data-testid="event-workflow-remove-confirm">
+          <h4 id="event-workflow-remove-title">{t('admin.workflowEditor.removeTitle', { name })}</h4>
+          <p>{wf.on === 'event-received' ? t('admin.workflowEditor.removeLostRules') : t('admin.workflowEditor.removeLost')}</p>
+          <div className="admin-config-actions">
+            <button type="button" className="btn-ghost" data-testid="event-workflow-remove-cancel" onClick={() => setConfirming(false)}>{t('admin.workflowEditor.cancel')}</button>
+            <button type="button" className="btn-danger" data-testid="event-workflow-remove-confirm-button" onClick={() => { setConfirming(false); onRemove(); }}>
+              {t('admin.workflowEditor.removeConfirm')}
+            </button>
+          </div>
+        </section>
+      )}
     </div>
   );
 };
@@ -283,82 +443,41 @@ export const WorkflowPicker: React.FC<{
 /** A workflow under a new name, empty or a copy; null when the name is not one the server accepts or is taken. */
 export function workflowsWith(workflows: Workflows, name: string, from: EventWorkflow | undefined, templates: WelcomePromptOption[] | undefined): Workflows | null {
   if (!STEP_NAME.test(name) || workflows[name]) return null;
-  const { messages, prompts } = templateNames(templates);
-  return { ...workflows, [name]: from ? JSON.parse(JSON.stringify(from)) as EventWorkflow : newWorkflow(messages, prompts, workflows) };
+  const { prompts, roomMessages } = templateNames(templates);
+  return { ...workflows, [name]: from ? JSON.parse(JSON.stringify(from)) as EventWorkflow : newWorkflow(roomMessages, prompts, workflows) };
 }
 
-/** WHAT A WORKFLOW RUNS ON: its event, a deadline event's deadline, the conversation types it runs in, and removing it. */
+/** WHAT A WORKFLOW RUNS ON: what starts it and where it runs, set only in the trigger section (`WorkflowTriggers`). */
 export const WorkflowSettings: React.FC<{
   wf: EventWorkflow;
   onPut: (next: EventWorkflow) => void;
-  onRemove: () => void;
   classification?: string;
   /** The workflow's key on the version, which an event trigger names. */
   name?: string;
   /** The assistant whose version holds it, which an event trigger records. */
   assistant?: string;
-}> = ({ name, wf, onPut, onRemove, classification, assistant }) => {
-  const offered = declaredTypesFor(wf.on, classification);
-  // A type the workflow already names stays listed, so an undeclared one can be cleared rather than hidden.
-  const listed = [...offered, ...(wf.types ?? []).filter((x) => !offered.includes(x))];
-  const leftOut = typesLeftOut(wf.on, classification).filter((x) => !listed.includes(x.type));
-  const setTypes = (types: string[]) => { const { types: _old, ...rest } = wf; onPut(types.length ? { ...rest, types } : rest); };
-  const requiredWelcome = wf.on === 'assistant-joined' && !wf.types?.length;
+}> = ({ name, wf, onPut, classification, assistant }) => {
   const { t: translate } = useTranslation();
   const t = translate as unknown as T;
-  return (
-    <div className="admin-filter-group">
-      <label><span className="admin-field-label">{t('admin.workflowEditor.on')}</span>
-        <select className="select" data-testid="event-workflow-on" value={wf.on} onChange={(e) => {
-          const on = e.target.value as EventWorkflow['on'];
-          // A DEADLINE EVENT DECLARES ITS DEADLINE, and no other event does (`eventWorkflowErrors`).
-          const { deadline: _d, ...rest } = wf;
-          onPut(isDeadlineEvent(on) ? { ...rest, on, deadline: wf.deadline ?? { afterMinutes: 3 * 24 * 60 } } : { ...rest, on });
-        }}>
-          <option value="assistant-joined">assistant-joined</option>
-          <option value="conversation-opened">conversation-opened</option>
-          <option value="person-joined">person-joined</option>
-          <option value="invitation-sent">invitation-sent</option>
-          <option value="invitation-unredeemed">invitation-unredeemed</option>
-          <option value="alarm-state-changed">alarm-state-changed</option>
-          <option value="event-received">event-received</option>
-        </select>
-      </label>
-      {isDeadlineEvent(wf.on) && (
-        <label><span className="admin-field-label">{t('admin.workflowEditor.deadlineAfter', { min: MIN_DEADLINE_MINUTES, max: MAX_DEADLINE_MINUTES })}</span>
-          <input type="number" className="input" min={MIN_DEADLINE_MINUTES} max={MAX_DEADLINE_MINUTES} data-testid="event-workflow-deadline-after"
-            value={wf.deadline?.afterMinutes ?? ''}
-            onChange={(e) => onPut({ ...wf, deadline: { afterMinutes: Math.round(Number(e.target.value)) } })} />
-          <span className="admin-field-hint">{t('admin.workflowEditor.deadlineAfterHelp')}</span>
-        </label>
-      )}
-      {wf.on === 'event-received' && name && <EventTriggerPanel workflow={name} typeKey={wf.types?.[0]} assistant={assistant} />}
-      <fieldset className="admin-filter-group" data-testid="event-workflow-types">
-        <legend className="admin-field-label">{t('admin.workflowEditor.types')}</legend>
-        {listed.map((type) => (
-          <label key={type} className="admin-check">
-            <input type="checkbox" data-testid={`event-workflow-type-${type}`} checked={(wf.types ?? []).includes(type)}
-              onChange={(e) => setTypes(e.target.checked ? [...(wf.types ?? []), type] : (wf.types ?? []).filter((x) => x !== type))} />
-            <code>{type}</code>
-          </label>
-        ))}
-        <span className="admin-field-hint">{t('admin.workflowEditor.typesHelp')}{wf.on === 'conversation-opened' ? ` ${t('admin.workflowEditor.typesOpenedHelp')}` : ''}{wf.on === 'event-received' ? ` ${t('admin.workflowEditor.typesEventHelp')}` : ''}</span>
-        {leftOut.length > 0 && (
-          <span className="admin-field-hint" data-testid="event-workflow-types-left-out">
-            {t('admin.workflowEditor.typesLeftOut')}{' '}
-            {leftOut.map((x, i) => (
-              <span key={x.type} data-testid={`event-workflow-type-left-out-${x.type}`}>
-                {i > 0 ? '; ' : ''}<code>{x.type}</code> ({t(`admin.workflowEditor.typeLeftOut_${x.reason}`, { classification: classification ?? '' })})
-              </span>
-            ))}
+  /** The types a workflow on an event may name here: one function per classification, so the trigger section's targets memoize. */
+  const typesFor = useCallback((on: EventWorkflow['on']) => declaredTypesFor(on, classification), [classification]);
+  /** The declared types a workflow on this event may not name here, each with why, said beside the choice of where it runs. */
+  const leftOutFor = (on: EventWorkflow['on']) => {
+    const leftOut = typesLeftOut(on, classification);
+    return leftOut.length > 0 ? (
+      <span className="admin-field-hint" data-testid="event-workflow-types-left-out">
+        {t('admin.workflowEditor.typesLeftOut')}{' '}
+        {leftOut.map((x, i) => (
+          <span key={x.type} data-testid={`event-workflow-type-left-out-${x.type}`}>
+            {i > 0 ? '; ' : ''}<code>{x.type}</code> ({t(`admin.workflowEditor.typeLeftOut_${x.reason}`, { classification: classification ?? '' })})
           </span>
-        )}
-      </fieldset>
-      {requiredWelcome && <span className="admin-field-hint" data-testid="event-workflow-required">{t('admin.workflowEditor.requiredWelcome')}</span>}
-      <button type="button" className="btn-secondary" data-testid="event-workflow-remove" onClick={onRemove}>
-        {requiredWelcome ? t('admin.workflowEditor.removeWelcome') : t('admin.workflowEditor.remove')}
-      </button>
-    </div>
+        ))}
+      </span>
+    ) : null;
+  };
+  return (
+    <WorkflowTriggers name={name ?? ''} wf={wf} onPut={onPut} classification={classification} assistant={assistant}
+      typesFor={typesFor} leftOut={leftOutFor} />
   );
 };
 
@@ -384,7 +503,7 @@ export const StepFields: React.FC<WorkflowOptions & {
   const audienceLabel = useAudienceLabel();
   const def = wf.states[key];
   const keys = Object.keys(wf.states);
-  const { messages, prompts } = templateNames(templates);
+  const { messages, prompts, roomMessages } = templateNames(templates);
   // AN AGENT STEP IS THE ASSISTANT'S OWN TURN (WT118), so it uses only the version's own tools.
   const agentTools = stepReadTools(tools, versionTools, true);
   const promptTools = stepReadTools(tools, versionTools, true);
@@ -475,6 +594,8 @@ export const StepFields: React.FC<WorkflowOptions & {
         {!options.includes(value) && <option value={value}>{value ? t('admin.assistantPage.help.welcomePromptUnlisted', { name: value }) : ''}</option>}
         {options.map((o) => <option key={o} value={o}>{o}</option>)}
       </select>
+      {/* NO TEMPLATE YET (none the whole conversation may read was there to default to): said, so one is chosen. */}
+      {!value && <span className="admin-field-hint" role="alert" data-testid={`${id}-choose`}>{t('admin.workflowEditor.templateChoose')}</span>}
       {sourceOf(value) && <pre className="admin-welcome-preview">{promptPreview(sourceOf(value)!)}</pre>}
     </>
   );
@@ -557,8 +678,8 @@ export const StepFields: React.FC<WorkflowOptions & {
         <label><span className="admin-field-label">{t('admin.workflowEditor.kind')}</span>
           <select className="select" data-testid={`${testId}-kind`} value={kind}
             onChange={(e) => (onWorkflow
-              ? onWorkflow(changeStepKind(wf, key, e.target.value as Kind, messages, prompts))
-              : update(convertStep(def, e.target.value as Kind, messages, prompts, wf.on, wf.types)))}>
+              ? onWorkflow(changeStepKind(wf, key, e.target.value as Kind, roomMessages, prompts))
+              : update(convertStep(def, e.target.value as Kind, roomMessages, prompts, wf.on, wf.types)))}>
             {[...new Set([...kindsFor(wf.on, wf.types), kind])].map((k) => <option key={k} value={k}>{t(`admin.workflowEditor.kind_${k}`)}</option>)}
           </select>
         </label>
@@ -633,6 +754,16 @@ export const StepFields: React.FC<WorkflowOptions & {
               value={Math.round(def.agent.deadlineMs / 1000)}
               onChange={(e) => update({ ...def, agent: { ...def.agent!, deadlineMs: Math.round(Number(e.target.value) * 1000) } })} />
           </label>
+          {/* DELIVERED AS A FILE: the step's output is attached as a Markdown file people download, edit and attach
+              again. Not on a step that proposes, whose output is a card. */}
+          {!def.agent.propose?.length && (
+            <label>
+              <input type="checkbox" data-testid={`${testId}-deliver-file`} checked={def.agent.deliver === 'file'}
+                onChange={(e) => { const { deliver: _d, ...rest } = def.agent!; update({ ...def, agent: e.target.checked ? { ...rest, deliver: 'file' } : rest }); }} />
+              {' '}{t('admin.workflowEditor.deliverFile')}
+              <span className="admin-field-hint">{t('admin.workflowEditor.deliverFileHelp')}</span>
+            </label>
+          )}
           <div>
             <span className="admin-field-label">{t('admin.workflowEditor.tools')}</span>
             {agentTools.map((d) => (
@@ -835,11 +966,20 @@ export const StepFields: React.FC<WorkflowOptions & {
               {/* WHAT IS NEEDED (WT118): one of this assistant's message templates, handed to the owning assistant as the request. */}
               <label><span className="admin-field-label">{t('admin.workflowEditor.taskAsk')}</span>
                 <select className="select" data-testid={`${testId}-task-ask`} value={def.task.ask?.template ?? ''}
-                  onChange={(e) => { const { ask: _a, ...task } = def.task!; update({ ...def, task: e.target.value ? { ...task, ask: { template: e.target.value } } : task }); }}>
+                  onChange={(e) => { const { ask: _a, deliver: _d, ...task } = def.task!; update({ ...def, task: e.target.value ? { ...task, ask: { template: e.target.value }, ...(def.task!.deliver ? { deliver: def.task!.deliver } : {}) } : task }); }}>
                   <option value="">{t('admin.workflowEditor.taskAskNone')}</option>
                   {[...new Set([...messages, ...(def.task.ask?.template ? [def.task.ask.template] : [])])].map((m) => <option key={m} value={m}>{m}</option>)}
                 </select>
               </label>
+              {/* THE ASKED ASSISTANT'S ANSWER AS A FILE, whatever its intent declares: only where the step asks. */}
+              {def.task.ask?.template && (
+                <label>
+                  <input type="checkbox" data-testid={`${testId}-task-deliver-file`} checked={def.task.deliver === 'file'}
+                    onChange={(e) => { const { deliver: _d, ...task } = def.task!; update({ ...def, task: e.target.checked ? { ...task, deliver: 'file' } : task }); }} />
+                  {' '}{t('admin.workflowEditor.deliverFile')}
+                  <span className="admin-field-hint">{t('admin.workflowEditor.deliverFileAskHelp')}</span>
+                </label>
+              )}
               <p className="admin-field-hint" data-testid={`${testId}-task-owner-decides`}>{t('admin.workflowEditor.taskOwnerDecides')}</p>
             </>
           ) : (<>
@@ -958,6 +1098,12 @@ export const StepFields: React.FC<WorkflowOptions & {
           <span className="admin-field-hint">{t('admin.workflowEditor.openHelp')}</span>
         </div>
       )}
+      {def.handoff && (
+        <div className="admin-filter-group" data-testid={`${testId}-handoff`}>
+          <span className="admin-field-label">{t('admin.workflowEditor.handoffStep', { name: def.handoff.name, process: def.handoff.process })}</span>
+          <span className="admin-field-hint">{t('admin.workflowEditor.handoffHelp')}</span>
+        </div>
+      )}
       {isMeetingAction(def.action) && (() => {
         const meeting = def.action;
         // ASK FIRST: an offer step in front of this one, a card for the person asked (`askBeforeMeeting`).
@@ -1047,7 +1193,37 @@ export const StepFields: React.FC<WorkflowOptions & {
   );
 };
 
-/** THE LIST VIEW: every step of the selected workflow in order, each with its controls, and the server's rules beneath. */
+/** What a step is called where a person reads it: its label, else its name. */
+export const stepTitle = (wf: EventWorkflow, key: string): string => wf.states[key]?.label ?? key;
+
+/** What a step does, in plain words, for the head of its card. */
+export function stepSaid(t: T, def: EventStepDef): string {
+  const kind = kindOf(def);
+  if (kind === 'end') return t(`admin.workflowEditor.card.end_${def.disposition ?? 'success'}`);
+  if (kind === 'task') return t('admin.workflowEditor.card.task', { machine: def.task?.machine ?? '' });
+  if (kind === 'handoff') return t('admin.workflowEditor.card.handoff', { name: def.handoff?.name ?? '' });
+  if (kind === 'wait') {
+    const w = def.wait ?? {};
+    if (w.join) return t('admin.workflowEditor.card.waitJoin', { parts: w.join.of.join(', ') });
+    if (w.child !== undefined) return t('admin.workflowEditor.card.waitChild');
+    if (w.alongside !== undefined) return t('admin.workflowEditor.card.waitAlongside');
+    if (w.until !== undefined) return t('admin.workflowEditor.card.waitUntil', { until: w.until });
+    return t('admin.workflowEditor.card.waitMinutes', { minutes: w.minutes ?? 0 });
+  }
+  return t(`admin.workflowEditor.card.kind_${kind}`);
+}
+
+/** Where an edge goes, in plain words: the step's title, the run's end, or the steps a condition chooses among. */
+export function edgeSaid(t: T, wf: EventWorkflow, edge: EventEdge | undefined): string {
+  if (edge === undefined) return t('admin.workflowEditor.card.endRun');
+  if (typeof edge === 'string') return stepTitle(wf, edge);
+  return t('admin.workflowEditor.card.conditioned', { steps: [...new Set(edge.map((a) => stepTitle(wf, a.to)))].join(', ') });
+}
+
+/**
+ * THE LIST VIEW: the selected workflow's name, what starts it, then one card per step in run order, each headed by what the
+ * step is called and does and where it goes next, its fields beneath, and removing the workflow at the foot of the page.
+ */
 const EventWorkflowEditor: React.FC<WorkflowOptions & {
   workflows: Workflows;
   onChange: (next: Workflows | null) => void;
@@ -1056,13 +1232,21 @@ const EventWorkflowEditor: React.FC<WorkflowOptions & {
   onSelect?: (name: string) => void;
   /** The assistant whose version this is: a trigger attached here runs this version's workflow. */
   assistant?: string;
-}> = ({ workflows, onChange, templates, tools, published, variables, versionTools, classification, welcomeContext, initialSelected, onSelect, assistant }) => {
+  /** Open on creating a workflow, as the page's + New workflow asks, and where Cancel goes from there. */
+  startCreating?: boolean;
+  onCancelCreate?: () => void;
+  /** A workflow renamed here, so what else on the version names it (its processes) follows. */
+  onRenamed?: (from: string, to: string) => void;
+}> = ({ workflows, onChange, templates, tools, published, variables, versionTools, classification, welcomeContext, initialSelected, onSelect, assistant, startCreating, onCancelCreate, onRenamed }) => {
   const { t: translate } = useTranslation();
   const t = translate as unknown as T;
   const names = Object.keys(workflows);
   const [selected, setSelectedState] = useState(initialSelected && workflows[initialSelected] ? initialSelected : names[0] ?? '');
   const setSelected = (name: string) => { setSelectedState(name); onSelect?.(name); };
-  const { messages, prompts } = templateNames(templates);
+  // CREATING IS ITS OWN VIEW, opened by the page's + New workflow or by a version with no workflow.
+  const [creatingAsked, setCreating] = useState(!!startCreating);
+  const creating = creatingAsked || !names.length;
+  const { prompts, roomMessages } = templateNames(templates);
   const wf = workflows[selected];
   const errors = wf ? versionEventWorkflowsErrors({ [selected]: wf }, { lookup: routerHeldVariables(variables).lookup }) : [];
 
@@ -1081,42 +1265,59 @@ const EventWorkflowEditor: React.FC<WorkflowOptions & {
 
   return (
     <div className="profiles-persona-field" data-testid="event-workflow-editor">
-      <h4>{t('admin.workflowEditor.title')}</h4>
-      <span className="admin-field-hint">{t('admin.workflowEditor.help')}</span>
-      <WorkflowPicker workflows={workflows} selected={selected} onSelect={setSelected} onAdd={(name, from) => {
-        const next = workflowsWith(workflows, name, from, templates);
-        if (!next) return false;
-        save(next);
-        setSelected(name);
-        return true;
-      }} />
+      {creating ? (
+        <CreateWorkflow workflows={workflows} onCancel={onCancelCreate} onAdd={(name, from) => {
+          const next = workflowsWith(workflows, name, from, templates);
+          if (!next) return false;
+          save(next);
+          setSelected(name);
+          setCreating(false);
+          return true;
+        }} />
+      ) : <WorkflowPicker workflows={workflows} selected={selected} onSelect={setSelected} />}
 
-      {wf && (
+      {wf && !creating && (
         <>
-          <WorkflowSettings name={selected} wf={wf} onPut={put} classification={classification} assistant={assistant} onRemove={() => {
-            const { [selected]: _gone, ...rest } = workflows;
-            save(rest);
-            setSelected(Object.keys(rest)[0] ?? '');
+          <WorkflowName name={selected} wf={wf} onRename={(to) => {
+            const next = workflowsRenamed(workflows, selected, to);
+            if (!next) return false;
+            save(next);
+            if (to !== selected) onRenamed?.(selected, to);
+            setSelected(to);
+            return true;
           }} />
+          <WorkflowSettings name={selected} wf={wf} onPut={put} classification={classification} assistant={assistant} />
 
-          <ol data-testid="event-workflow-steps">
-            {steps.map(([key], i) => (
-              <li key={key} data-testid={`event-workflow-step-${i}`}>
+          <ol className="admin-wfl-steps" data-testid="event-workflow-steps">
+            {steps.map(([key, def], i) => (
+              <li key={key} className="admin-wfl-step" data-testid={`event-workflow-step-${i}`}>
+                <div className="admin-wfl-step-head" data-testid={`event-workflow-step-${i}-head`}>
+                  <span className="admin-chip">{i + 1}</span>
+                  <strong data-testid={`event-workflow-step-${i}-title`}>{stepTitle(wf, key)}</strong>
+                  <span className="admin-muted" data-testid={`event-workflow-step-${i}-said`}>{stepSaid(t, def)}</span>
+                </div>
+                {kindOf(def) !== 'end' && (
+                  <div className="admin-wfl-next" data-testid={`event-workflow-step-${i}-next`}>
+                    <span>{t('admin.workflowEditor.card.next', { to: edgeSaid(t, wf, def.onSuccess) })}</span>
+                    <span>{t('admin.workflowEditor.card.ifFails', { to: edgeSaid(t, wf, def.onFailure) })}</span>
+                    {def.task && <span>{t('admin.workflowEditor.card.ifDeadline', { to: edgeSaid(t, wf, def.onDeadline) })}</span>}
+                  </div>
+                )}
                 {unreached.includes(key) && (
                   <span role="note" className="admin-field-hint" data-testid={`event-workflow-step-${i}-unreached`}>{t('admin.workflowEditor.unreached', { step: key })}</span>
                 )}
                 <StepFields wf={wf} stepKey={key} testId={`event-workflow-step-${i}`} templates={templates} tools={tools} published={published} variables={variables} versionTools={versionTools} classification={classification} welcomeContext={welcomeContext}
-                  onChange={(def) => put(updateStep(wf, key, def))} onWorkflow={put}
+                  onChange={(d) => put(updateStep(wf, key, d))} onWorkflow={put}
                   onRename={(to) => { const next = renameStep(wf, key, to); if (next) put(next); }}
                   headerExtra={(
-                    <>
+                    <div className="admin-filter-group">
                       {i === 0
                         ? <span className="admin-field-hint" data-testid={`event-workflow-step-${i}-is-start`}>{t('admin.workflowBuilder.isStart')}</span>
                         : <button type="button" className="btn-secondary" data-testid={`event-workflow-step-${i}-start`} onClick={() => put(startAt(wf, key))}>{t('admin.workflowBuilder.startHere')}</button>}
                       <button type="button" className="btn-secondary" data-testid={`event-workflow-step-${i}-up`} disabled={i <= 1} onClick={() => move(i, -1)}>{t('admin.workflowEditor.up')}</button>
                       <button type="button" className="btn-secondary" data-testid={`event-workflow-step-${i}-down`} disabled={i === 0 || i === steps.length - 1} onClick={() => move(i, 1)}>{t('admin.workflowEditor.down')}</button>
                       <button type="button" className="btn-secondary" data-testid={`event-workflow-step-${i}-remove`} onClick={() => put(removeStep(wf, key))}>{t('admin.workflowEditor.removeStep')}</button>
-                    </>
+                    </div>
                   )} />
               </li>
             ))}
@@ -1124,16 +1325,21 @@ const EventWorkflowEditor: React.FC<WorkflowOptions & {
           {atStepLimit(wf) && <p className="admin-field-hint" role="status" data-testid="event-workflow-step-limit">{t('admin.workflowBuilder.atStepLimit', { max: MAX_EVENT_WORKFLOW_STEPS })}</p>}
           <div className="admin-filter-group">
             {kindsFor(wf.on, wf.types).map((k) => (
-              <button key={k} type="button" className="btn-secondary" data-testid={`event-workflow-add-${k}`} disabled={atStepLimit(wf)} onClick={() => put(addStep(wf, k, messages, prompts).workflow)}>
+              <button key={k} type="button" className="btn-secondary" data-testid={`event-workflow-add-${k}`} disabled={atStepLimit(wf)} onClick={() => put(addStep(wf, k, roomMessages, prompts).workflow)}>
                 {t(`admin.workflowEditor.add_${k}`)}
               </button>
             ))}
           </div>
           {errors.length > 0 && (
-            <ul role="alert" data-testid="event-workflow-errors">
+            <ul role="alert" className="admin-error" data-testid="event-workflow-errors">
               {errors.map((e) => <li key={e}>{e}</li>)}
             </ul>
           )}
+          <RemoveWorkflow name={selected} wf={wf} onRemove={() => {
+            const { [selected]: _gone, ...rest } = workflows;
+            save(rest);
+            setSelected(Object.keys(rest)[0] ?? '');
+          }} />
         </>
       )}
     </div>

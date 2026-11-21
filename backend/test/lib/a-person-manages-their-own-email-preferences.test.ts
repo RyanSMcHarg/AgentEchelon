@@ -1,5 +1,5 @@
 /**
- * A SIGNED-IN PERSON SEES AND CHANGES THEIR OWN EMAIL PREFERENCES (B9, M-7, owner 2026-10-19).
+ * A SIGNED-IN PERSON SEES AND CHANGES THEIR OWN EMAIL PREFERENCES (B9, M-7).
  *
  *  - `GET /email/preferences/mine` answers every kind in `NOTICE_KINDS`, each transactional kind as always sent;
  *  - `POST` mutes and unmutes one kind, or every kind at once, and refuses a transactional kind;

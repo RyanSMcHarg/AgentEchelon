@@ -10,9 +10,9 @@
  * message each belongs to.
  *
  * The marker was missing by CODE ORDERING rather than by any platform limit: the branch returned four
- * lines before the correlation id was minted. Owner direction, 2026-09-11: "the lambda should match
- * the message it is responding to and at a min have a corr marker... I'd rather have accuracy with
- * delay than mismatching."
+ * lines before the correlation id was minted. A reply matches
+ * the message it responds to and carries at least its correlation marker: accuracy with delay rather
+ * than a mismatch.
  *
  * ── WHAT IS PINNED HERE ─────────────────────────────────────────────────────────────────────────
  *

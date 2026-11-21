@@ -51,9 +51,9 @@ describe('the router verifies the event before anything runs', () => {
     const router = read('lambda/src/router-agent-handler.ts');
     const fn = router.slice(router.indexOf('export async function handleWatchEvent('), router.indexOf('export async function handleDeadlineCancel('));
     const order = [
-      'TRIGGER_RULE_ID.test(rule)', 'refId(r.key)', '(deps.binding ?? watchBindingOf)(rule)', 'source !== binding.source',
-      '(deps.watchOf ?? refWatchOf)(refWatchKey(STATIC_CLASSIFICATION, binding.kind, key), { strict: true })', '(deps.watches ?? conversationWatchesRef)(channelArn, binding.kind, key, binding.type, watch)',
-      "roomRefusal(await readChannelTags(chimeClient, channelArn), 'room')", 'eventWorkflowOwner(', 'workflowFor(served?.version.eventWorkflows, binding.workflow)',
+      'TRIGGER_RULE_ID.test(rule)', '(deps.binding ?? watchBindingOf)(rule, source)', 'source !== binding.source', 'refId(r.key)',
+      '(deps.watchOf ?? refWatchOf)(refWatchKey(STATIC_CLASSIFICATION, binding.kind, key!), { strict: true })', '(deps.watches ?? conversationWatchesRef)(channelArn, binding.kind, key!, binding.type, watch)',
+      "roomRefusal(roomTags, 'room')", 'eventWorkflowOwner(', 'workflowFor(served?.version.eventWorkflows, binding.workflow)',
       'wf.types?.includes(binding.type)', 'eventTypeAllowed(policy, source, detailType)', 'eventAgeRefusal(str(r.at), policy.maxEventAgeSeconds)', 'runWorkflowFor(',
     ].map((t) => fn.indexOf(t));
     expect(order.every((i) => i > -1)).toBe(true);
@@ -124,7 +124,7 @@ describe('one run per rule, key and window, and a continuation checks again', ()
     expect(eventNaturalKey('event-received', ROOM, undefined, undefined, undefined, undefined, { rule: 'abcdef012345', window: 7 })).toBe('rule-abcdef012345-7');
   });
 
-  // A RUN ITS RULE STARTED FINISHES (owner decision, 2026-11-15): the rule and the watch are read before a run starts; its
+  // A RUN ITS RULE STARTED FINISHES: the rule and the watch are read before a run starts; its
   // continuation does not read them again, so detaching a trigger stops new runs and an open one still reaches its end.
   it('lets a run its rule started finish, reading the rule and the watch only before it starts', () => {
     const router = read('lambda/src/router-agent-handler.ts');

@@ -1,5 +1,5 @@
 /**
- * WHAT A TURN CARRIES ON THE ACKNOWLEDGMENT IT CLOSES OUT (ADR-033, owner 2026-09-15).
+ * WHAT A TURN CARRIES ON THE ACKNOWLEDGMENT IT CLOSES OUT (ADR-033).
  *
  * ── THE PROBLEM THIS SOLVES ──────────────────────────────────────────────────────────────────────
  *

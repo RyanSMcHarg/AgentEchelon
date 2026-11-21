@@ -3,10 +3,13 @@
  *
  * Triggered by SNS when an alarm wired to its topic changes state. Raises the alarm's own description and
  * CloudWatch's reason as an `ae.alert` (`lib/admin-notice.ts`), which the `AdminServices` stack posts into
- * the admin notification channel, emailed to the admin roster. When the deployment names people for this alarm (`ALERT_RECIPIENT_ARNS`, AppInstanceUser ARNs),
- * they are emailed the same notice through the one fan-out (`lib/channel-notify.ts` `emailPeople`), whose
- * contacts are resolved by person at send time: that is how an alarm reaches someone on a deployment with
- * no admin channel. One message when it breaks, one when it clears: CloudWatch notifies on state
+ * the admin notification channel, and the notification bridge emails it to the admin roster from the message stream.
+ *
+ * THE ONE ALARM EMAILED DIRECTLY is the one the stream's own silence raises (`archival-pipeline-stopped`, the Notifications
+ * stack, the only wiring that sets `ALERT_RECIPIENT_ARNS`): when the message stream stops, the bridge that emails every
+ * conversation message stops with it, so that alarm's people (AppInstanceUser ARNs) are emailed the same notice through the
+ * one fan-out (`lib/channel-notify.ts` `emailPeople`) as well. Every other alarm reaches email only through the
+ * conversation. One message when it breaks, one when it clears: CloudWatch notifies on state
  * transition, so it does the de-duplication. `INSUFFICIENT_DATA` is not news and is skipped.
  *
  * The alarm's description carries what to do, written where the alarm is defined, so this handler needs

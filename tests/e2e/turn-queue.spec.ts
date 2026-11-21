@@ -1198,7 +1198,7 @@ suite('a turn holds the conversation, and what arrives meanwhile waits', () => {
   });
 
   /**
-   * A STOPPED PRIVATE REQUEST IS NAMED TO THE ROOM WITHOUT BEING DESCRIBED (ADR-033, owner 2026-08-23).
+   * A STOPPED PRIVATE REQUEST IS NAMED TO THE ROOM WITHOUT BEING DESCRIBED (ADR-033).
    *
    * A targeted request makes a PRIVATE task: the other members cannot read the message, so they must
    * not learn its contents from anything the assistant says afterwards. The judged half of a stop is

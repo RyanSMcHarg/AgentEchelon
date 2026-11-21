@@ -67,13 +67,13 @@ async function openAssistant(page: Page, profile: string): Promise<void> {
   await expect(page.locator('.admin-breadcrumb')).toBeVisible({ timeout: 10000 });
 }
 
-/** Show the draft's Workflows section and open its event workflows on the builder, with the test's workflow selected. */
+/** Show the draft's Workflows section, which opens on the list, and open the test's workflow from its row on the builder. */
 async function openWorkflow(page: Page): Promise<void> {
   await page.getByTestId('assistant-mode-draft').click();
   await page.getByTestId('assistant-nav-workflows').click();
+  await page.getByTestId(`assistant-edit-workflow-${WORKFLOW}`).click();
   const events = page.getByTestId('draft-step-events');
   await expect(events.getByTestId('workflow-builder')).toBeVisible({ timeout: 20000 });
-  await events.getByTestId('event-workflow-select').selectOption(WORKFLOW);
   await expect(events.getByTestId('wfb-canvas')).toBeVisible();
 }
 
@@ -101,10 +101,14 @@ test('a workflow made on the canvas keeps where its steps were put, validates an
 
   // ── CREATE on the canvas: a new workflow, run on invitation-sent, which a version declares at most once.
   await page.getByTestId('assistant-nav-workflows').click();
+  await page.getByTestId('workflows-new').click();
   await expect(page.getByTestId('draft-step-events').getByTestId('workflow-builder')).toBeVisible({ timeout: 20000 });
   await page.getByTestId('event-workflow-new-name').fill(WORKFLOW);
   await page.getByTestId('event-workflow-add').click();
-  await page.getByTestId('event-workflow-on').selectOption('invitation-sent');
+  await page.getByTestId('trigger-edit-on').click();
+  await page.getByTestId('trigger-source-ae').click();
+  await page.getByTestId('trigger-event-select').selectOption('on:invitation-sent');
+  await page.getByTestId('trigger-save').click();
   await expect(page.getByTestId('wfb-trigger')).toContainText('invitation-sent');
   await expect(page.getByTestId('wfb-node-opening')).toBeVisible();
   await expect(page.getByTestId('wfb-node-done')).toBeVisible();
@@ -168,6 +172,7 @@ test('a workflow made on the canvas keeps where its steps were put, validates an
   await openWorkflow(page);
   await expect(page.getByTestId('assistant-nav-workflows-changed')).toBeVisible();
   await page.getByTestId('event-workflow-remove').click();
+  await page.getByTestId('event-workflow-remove-confirm-button').click();
   await page.getByTestId('draft-step-events').getByTestId('draft-step-save').click();
   await expect(page.getByTestId('assistant-draft')).toBeVisible();
   await expect(page.getByTestId('assistant-nav-workflows-changed')).toHaveCount(0, { timeout: 30000 });

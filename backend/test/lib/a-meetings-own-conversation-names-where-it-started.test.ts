@@ -45,7 +45,7 @@ describe('the started card in a meeting\'s own conversation', () => {
     });
     expect(card).toContain('started from another conversation, Customer API errors: [open it](?conversation=conv-ops-1)');
     expect(card).toContain('- Now: Customer impact');
-    expect(card).toContain('- Next: Customers impacted?, Cause and recommended action, Mitigation decision, Mitigation change, Recovery check');
+    expect(card).toContain('- Next: Cause and recommended action, Mitigation decision, Mitigation change, Recovery check');
     expect(card).toContain('- Lead: Jordan');
     expect(card).toContain('- [Dashboard](?conversation=conv-ops-1)');
     expect(card).not.toMatch(/this conversation/i);

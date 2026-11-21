@@ -137,10 +137,10 @@ describe('what an assistant and the people in a meeting are told', () => {
     expect(text).toMatch(/never hand over/);
   });
 
-  it.each(['meeting-recording-started', 'meeting-recording-started-media'])('the %s notice says the same: hosts download from the ended card, anyone else asks a host', (name) => {
-    const text = catalog.get(name)!.entry.sections.chat.text;
-    expect(text).toMatch(/hosts download (the transcript|them) from its ended card/);
-    expect(text).toMatch(/anyone else can ask a host/);
+  // THE NOTICES SAY ONLY THAT THE MEETING IS BEING RECORDED; where its files are is the assistant's
+  // guidance above, said to whoever asks.
+  it.each(['meeting-recording-started', 'meeting-recording-started-media'])('the %s notice says only that the meeting is being recorded', (name) => {
+    expect(catalog.get(name)!.entry.sections.chat.text).toBe('This meeting is being recorded.');
   });
 
   it('the app\'s join notices say the same', () => {
@@ -148,8 +148,7 @@ describe('what an assistant and the people in a meeting are told', () => {
     const meeting = JSON.stringify(en);
     for (const key of ['recordingJoinNotice', 'recordingJoinNoticeMedia']) {
       const match = new RegExp(`"${key}":"([^"]*)"`).exec(meeting);
-      expect(match?.[1]).toMatch(/hosts download .* from (its|the meeting's) ended card/);
-      expect(match?.[1]).toMatch(/anyone else can ask a host/);
+      expect(match?.[1]).toBe('This meeting is being recorded.');
     }
   });
 });

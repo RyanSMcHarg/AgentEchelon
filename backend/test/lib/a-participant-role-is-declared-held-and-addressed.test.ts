@@ -130,7 +130,7 @@ describe('the holdings, on the context row (DESIGN-CONVERSATION-TYPES section 6.
     expect(holdingsAtCreation('ops', { forPerson: lead })).toEqual({ lead: { 'lead-1': { origin: 'event' } } });
     expect(holdingsAtCreation('general', { forPerson: lead })).toEqual({});
     expect(read('typed-conversation-from-event.ts')).toMatch(/const participantRoles = holdingsAtCreation\(typeKey, \{\s+forPerson: forUserArn, groups: roleGroups, members: \[forUserArn, \.\.\.humans\],/);
-    expect(read('lib/channel-context-client.ts')).toMatch(/'participantRoles',\n(\s+\/\/[^\n]*\n\s+'watchedAlarm',\n(\s+\/\/[^\n]*\n\s+'watchedRefs',\n)?)?\];/);
+    expect(read('lib/channel-context-client.ts')).toMatch(/'participantRoles',\n(\s+\/\/[^\n]*\n\s+'watchedAlarm',\n(\s+\/\/[^\n]*\n\s+'watchedRefs',\n(\s+\/\/[^\n]*\n\s+'generation',\n)?)?)?\];/);
   });
 
   it('keeps only what the type declares, and never reads a host\'s assertion', () => {

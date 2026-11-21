@@ -100,7 +100,8 @@ describe('its meeting rides every hand-back', () => {
     // The processor hands it back with the step's outcome, from its one copy of the run's identity.
     const processor = read('lambda/src/assistant-async-processor.ts');
     expect(processor.match(/\.\.\.\(req\.meeting \? \{ meeting: req\.meeting \} : \{\}\)/g)).toHaveLength(1);
-    expect(processor.match(/values: req\.values \?\? \{\}, \.\.\.identity,/g)).toHaveLength(2);
+    // Both hand-backs carry it; the step's own adds the file it delivered, which a later approval reads as its first version.
+    expect(processor.match(/values: (req\.values \?\? \{\}|\{ \.\.\.\(req\.values \?\? \{\}\), \.\.\.delivered \}), \.\.\.identity,/g)).toHaveLength(2);
   });
 });
 

@@ -1,6 +1,6 @@
 /**
  * A TARGETED REQUEST MAKES A PRIVATE TASK, AND A PRIVATE TASK IS VISIBLE IN THAT IT EXISTS
- * (ADR-033, amended by the owner 2026-08-23).
+ * (ADR-033).
  *
  * Targeting means the other members of a conversation cannot read the message. The first version of
  * this rule hid the task's row outright, and built, that was worse: the assistant a private task

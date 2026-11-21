@@ -90,7 +90,7 @@ describe('the dashboard reads and draws them', () => {
     expect(queries.every((q) => q.MetricStat?.Metric?.Dimensions === DIMS)).toBe(true);
 
     expect(data?.series.map((s) => [s.key, s.metric])).toEqual([
-      ['alarmMetric', undefined], ['related', 'Team/App/Latency'], ['related', 'Team/App/PacketLoss'],
+      ['alarmMetric', 'Team/App/SuccessRate'], ['related', 'Team/App/Latency'], ['related', 'Team/App/PacketLoss'],
     ]);
     expect(data?.series[1].points).toEqual([{ t: T(1).toISOString(), v: 99 }, { t: T(2).toISOString(), v: 2 }]);
 

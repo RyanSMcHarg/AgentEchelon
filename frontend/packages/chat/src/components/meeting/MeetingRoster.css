@@ -20,7 +20,8 @@
 }
 .ae-meeting-roster-row { display: flex; align-items: center; gap: 8px; padding: 4px; border-radius: 6px; min-height: 28px; }
 .ae-meeting-roster-row--away .ae-meeting-roster-name { color: var(--text-secondary, #71717A); }
-.ae-meeting-roster-row--speaking { box-shadow: inset 2px 0 0 var(--focus-ring, #7C3AED); }
+/* WHO IS SPEAKING: a ring around their avatar, in line with the row, never a rule at its edge. */
+.ae-meeting-roster-row--speaking .ae-meeting-roster-avatar { box-shadow: 0 0 0 2px var(--surface-0, #FFFFFF), 0 0 0 4px var(--focus-ring, #7C3AED); }
 .ae-meeting-roster-avatar {
   flex: 0 0 24px; width: 24px; height: 24px; border-radius: 50%;
   display: inline-flex; align-items: center; justify-content: center;
@@ -28,8 +29,10 @@
 }
 .ae-meeting-roster-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ae-meeting-roster-you { color: var(--text-secondary, #71717A); }
-.ae-meeting-roster-state { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; justify-content: flex-end; }
+/* A PERSON'S LABELS (host, you, away) on one line at the row's end, centred on it. */
+.ae-meeting-roster-state { display: inline-flex; flex: none; flex-wrap: nowrap; align-items: center; gap: 4px; justify-content: flex-end; }
 .ae-meeting-roster-tag {
+  white-space: nowrap; line-height: 1.4;
   padding: 1px 6px; border-radius: 999px; font-size: var(--text-xs, 0.75rem);
   background: var(--surface-100, #F4F4F5); color: var(--text-secondary, #71717A);
   border: 1px solid var(--divider-strong, #8F8F99);

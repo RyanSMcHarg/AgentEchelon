@@ -33,7 +33,7 @@ import { INSTANCE_TAG } from '../tagging';
 import { AUDIENCE_TAG } from '../../lambda/src/lib/channel-classification';
 import { defaultProfileRegistry as profiles } from '../profile-registry';
 import { issuersOf } from './trusted-issuers';
-import { bindTargetOf, GUEST_VISITOR_TYPE } from '../config/conversation-types';
+import { bindTargetOf, CONVERSATION_TYPES, GUEST_VISITOR_TYPE, PATTERN_ROOM_TAG_KEY, classificationAllowedForType, isPatternType } from '../config/conversation-types';
 
 /**
  * The tag a creator carries when its classification is where a path A bind continues a visit (`bindTargetOf`).
@@ -166,6 +166,19 @@ export class ConversationCreator extends Construct {
           statements: [
             ...driftChannelCreateStatements(classification as Classification, appInstanceArn,
               stack.region, stack.account, serviceAdminArn, { linkPostedOnSession: true }),
+            // AN ARCHIVED PATTERN CONVERSATION IS CREATED AGAIN AT ITS ID (DESIGN-EVENT-TARGETS 11.2): its delete is admitted on a
+            // channel in this classification's pattern namespace only, tagged archived and of this classification, and only where
+            // the classification permits a pattern type at all.
+            ...(classificationHasPatternTypes(classification) ? [new iam.PolicyStatement({
+              sid: 'RecreateAnArchivedPatternConversation',
+              actions: ['chime:DeleteChannel'],
+              resources: [`${appInstanceArn}/channel/pat-${classification}-*`],
+              conditions: { StringEquals: { 'aws:ResourceTag/classification': classification, 'aws:ResourceTag/archived': 'true' } },
+            }),
+            new iam.PolicyStatement({ sid: 'RecreateAsTheServiceAdmin', actions: ['chime:DeleteChannel'], resources: [serviceAdminArn] })] : []),
+            // THE TYPES THIS CREATOR STAMPS, bounded by IAM as well as by its code (DESIGN-EVENT-TARGETS 11.2): a create of a type
+            // this classification does not permit is refused, and a pattern conversation's tag names a declared pattern type.
+            ...creatorTypeBounds(classification, appInstanceArn),
             ...(servesVisits ? [
               new iam.PolicyStatement({
                 sid: 'VisitReadAndRetireOwnClassificationChannel',
@@ -268,4 +281,31 @@ export class ConversationCreator extends Construct {
       description: `The ${classification} classification's conversation creator, which a caller finds by name at call time`,
     });
   }
+}
+
+/**
+ * WHAT IAM REFUSES THE CREATOR WHATEVER ITS CODE ASKS: a conversation of a type its classification does not permit, and a
+ * pattern conversation tagged with anything but a declared pattern type. Denies, so no allow elsewhere outweighs them.
+ */
+export function creatorTypeBounds(classification: string, appInstanceArn: string): iam.PolicyStatement[] {
+  const permitted = Object.keys(CONVERSATION_TYPES).filter((k) => classificationAllowedForType(k, classification)).sort();
+  const patterns = permitted.filter((k) => isPatternType(k));
+  const resources = [appInstanceArn, `${appInstanceArn}/channel/*`];
+  return [
+    new iam.PolicyStatement({
+      sid: 'NeverCreateATypeTheClassificationDoesNotPermit', effect: iam.Effect.DENY, actions: ['chime:CreateChannel'], resources,
+      conditions: { StringNotEquals: { 'aws:RequestTag/conversationType': permitted } },
+    }),
+    new iam.PolicyStatement({
+      sid: 'NeverTagAPatternConversationOfAnotherType', effect: iam.Effect.DENY, actions: ['chime:CreateChannel'], resources,
+      conditions: patterns.length
+        ? { StringNotEquals: { [`aws:RequestTag/${PATTERN_ROOM_TAG_KEY}`]: patterns }, Null: { [`aws:RequestTag/${PATTERN_ROOM_TAG_KEY}`]: 'false' } }
+        : { Null: { [`aws:RequestTag/${PATTERN_ROOM_TAG_KEY}`]: 'false' } },
+    }),
+  ];
+}
+
+/** Whether a classification permits any type whose standing conversations a pattern names. */
+export function classificationHasPatternTypes(classification: string): boolean {
+  return Object.keys(CONVERSATION_TYPES).some((k) => classificationAllowedForType(k, classification) && isPatternType(k));
 }

@@ -84,7 +84,7 @@ describe('a team room whose lead role has no single holder', () => {
   it('the creator completes a standing room without its lead, and refuses to open a new one without it', () => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const creator = require('fs').readFileSync(require('path').resolve(__dirname, '../../lambda/src/typed-conversation-from-event.ts'), 'utf8') as string;
-    expect(creator).toMatch(/soleHolderOf\(detail\.conversationType, detail\.forRole\)\.catch\(async \(err\) => \{\s*if \(!detail\.teamRoom\) throw err;\s*await completeTeamRoomWithoutLead/);
+    expect(creator).toMatch(/soleHolderOf\(detail\.conversationType, detail\.forRole\)\.catch\(async \(err\) => \{\s*if \(!detail\.teamRoom && !detail\.patternRoom\) throw err;\s*if \(detail\.patternRoom\) await handBackStandingPatternRoom\(detail, err\);\s*else await completeTeamRoomWithoutLead/);
     const leadless = creator.slice(creator.indexOf('async function completeTeamRoomWithoutLead'), creator.indexOf('/** Hand the run that asked'));
     expect(leadless).toMatch(/if \(!\(await channelStands\(channelArn, bearerArn\)\)\) throw leadErr;/);
     expect(leadless).toContain("leadArn: ''");

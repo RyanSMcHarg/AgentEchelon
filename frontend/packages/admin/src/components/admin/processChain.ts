@@ -142,16 +142,28 @@ function conditionsInto(states: Record<string, Obj>, target: string): Array<{ so
   return [...seen.values()];
 }
 
+/** Whether some edge reaches `target` with no condition: a step that goes on to it whatever happened. */
+function reachedAlways(states: Record<string, Obj>, target: string): boolean {
+  return Object.values(states).some((def) => ['onSuccess', 'onFailure'].some((edge) => {
+    const e = def[edge];
+    if (e === target) return true;
+    return Array.isArray(e) && e.some((branch) => isObj(branch) && branch.to === target && !isObj(branch.when));
+  }));
+}
+
 /** The hand-off from one phase to the next, or null where no open step of `from` starts `to`. */
 export function handoffBetween(workflows: Obj, from: string, to: string): Handoff | null {
   const toTypes = phaseOf(workflows, to).types;
-  // A PHASE MAY OPEN THE NEXT FROM MORE THAN ONE STEP (customer messaging opens at once where triage said so, or later on the
-  // lead's yes): the hand-off is one, reached on any of their conditions.
+  // A PHASE MAY OPEN THE NEXT FROM MORE THAN ONE STEP (customer messaging opens at once where triage said so, or once the
+  // affected accounts are named): the hand-off is one, reached on any of their conditions.
   const opens = opensOf(workflows, from).filter((o) => toTypes.includes(o.type));
   const open = opens[0];
   if (!open) return null;
   const fromStates = statesOf(workflows[from]);
-  const when = [...new Map(opens.flatMap((o) => conditionsInto(fromStates, o.step)).map((c) => [`${c.source}=${c.value}`, c])).values()];
+  // A HAND-OFF SOME STEP REACHES WITH NO CONDITION HAS NONE: it happens whatever the conditions on its other edges say, so
+  // naming them would read as a gate it does not have.
+  const always = opens.some((o) => reachedAlways(fromStates, o.step));
+  const when = always ? [] : [...new Map(opens.flatMap((o) => conditionsInto(fromStates, o.step)).map((c) => [`${c.source}=${c.value}`, c])).values()];
   const sendsIn = (states: Record<string, Obj>, where: string) => Object.values(states)
     .flatMap((d) => (isObj(d.send) && d.send.in === where && str(d.send.template) ? [str(d.send.template)] : []));
   // THE OPENER WAITS ON IT where it waits on its opened conversation (`wait: { child }`), or a join names one of these opens.

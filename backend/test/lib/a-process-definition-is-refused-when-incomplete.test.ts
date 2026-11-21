@@ -1,9 +1,10 @@
 /**
- * A PROCESS DEFINITION IS REFUSED WHEN INCOMPLETE (SPEC-PROCESSES P1, P10; DESIGN-PROCESSES section 2, O22).
+ * A PROCESS DEFINITION IS REFUSED WHEN INCOMPLETE (SPEC-PROCESSES P1, P5, P10; DESIGN-PROCESSES section 2, O37).
  *
  * What it proves: a `processes` entry on a version links only workflows that version declares, and one workflow to one
- * process; an entry declares its label, its workflows and its metrics and nothing else, so a hand-off, which is not built, is
- * refused rather than kept and ignored; a metric names a linked workflow and one of its steps; each refusal is a coded reason the
+ * process; an entry declares its label, its description, its workflows, its hand-offs and its metrics and nothing else; a
+ * hand-off field is one of the closed types, an enum lists values and a ref names a declared connector, so no declaration can
+ * carry free text; a metric names a linked workflow and one of its steps; each refusal is a coded reason the
  * console says from its locale bundle; the entry rides the version (kept by `bodyFrom`, hashed into `configId`); and the
  * process id and edition are the hashes the design names.
  */
@@ -24,10 +25,20 @@ const workflows = {
 const customerRequest: VersionProcess = {
   label: 'Customer request',
   workflows: ['account-desk'],
+  handoffs: {
+    'security-review': {
+      fields: {
+        accountId: { type: 'id' },
+        requestKind: { type: 'enum', values: ['data-export', 'access-change', 'integration'] },
+        dueBy: { type: 'time' },
+        ticket: { type: 'ref', store: 'crm' },
+      },
+    },
+  },
   metrics: [{ id: 'decision-in-2d', label: 'Security decision within 2 days', workflow: 'account-desk', step: 'decided', outcome: 'success', within: 'P2D', target: 0.8 }],
 };
 
-const errs = (processes: unknown) => versionProcessesErrors(processes, workflows);
+const errs = (processes: unknown, connectors: readonly string[] = ['crm']) => versionProcessesErrors(processes, workflows, undefined, { connectors });
 const codes = (processes: unknown) => errs(processes).map((e) => e.split(': ')[1]);
 
 describe('a process is declared on its team\'s version', () => {
@@ -54,11 +65,35 @@ describe('a process is declared on its team\'s version', () => {
   });
 });
 
-describe('an entry declares its label, its workflows and its metrics only (O22)', () => {
-  it('DENY: a hand-off declaration is refused, since no hand-off is built', () => {
-    expect(codes({ p: { label: 'P', workflows: ['account-desk'], handoffs: { h: { fields: { f: { type: 'id' } } } } } })).toEqual(['PROCESSES_SHAPE']);
+describe('a hand-off carries typed fields only (O2)', () => {
+  const withField = (spec: unknown) => ({ p: { label: 'P', workflows: ['account-desk'], handoffs: { h: { fields: { f: spec } } } } });
+
+  it.each(['text', 'string', 'prose', undefined])('DENY: refuses the type %s, so no free text crosses', (type) => {
+    expect(codes(withField({ type }))).toEqual(['HANDOFF_FIELD_TYPE']);
   });
 
+  it('DENY: an enum lists its values', () => {
+    expect(codes(withField({ type: 'enum' }))).toEqual(['HANDOFF_ENUM_EMPTY']);
+    expect(codes(withField({ type: 'enum', values: [] }))).toEqual(['HANDOFF_ENUM_EMPTY']);
+  });
+
+  it('DENY: a ref names a connector the deployment declares', () => {
+    expect(codes(withField({ type: 'ref', store: 'erp' }))).toEqual(['HANDOFF_REF_STORE']);
+    expect(errs(withField({ type: 'ref', store: 'crm' }), [])).toHaveLength(1);
+  });
+
+  it('DENY: a hand-off declares at least one field, and nothing beside its fields', () => {
+    expect(codes({ p: { label: 'P', workflows: ['account-desk'], handoffs: { h: { fields: {} } } } })).toEqual(['HANDOFF_FIELDS']);
+    expect(codes({ p: { label: 'P', workflows: ['account-desk'], handoffs: { h: { fields: { f: { type: 'id' } }, note: 'x' } } } })).toEqual(['HANDOFF_FIELDS']);
+    expect(codes({ p: { label: 'P', workflows: ['account-desk'], handoffs: { 'Bad Name': { fields: { f: { type: 'id' } } } } } })).toEqual(['HANDOFF_NAME']);
+  });
+
+  it('each refusal is a code the console says', () => {
+    for (const c of ['HANDOFF_NAME', 'HANDOFF_FIELDS', 'HANDOFF_FIELD_TYPE', 'HANDOFF_ENUM_EMPTY', 'HANDOFF_REF_STORE', 'HANDOFF_UNDECLARED']) expect(PROCESS_REFUSALS).toContain(c);
+  });
+});
+
+describe('an entry declares its label, its description, its workflows, its hand-offs and its metrics only', () => {
   it('DENY: any other key is refused', () => {
     expect(codes({ p: { label: 'P', workflows: ['account-desk'], severity: 'sev1' } })).toEqual(['PROCESSES_SHAPE']);
   });
@@ -97,7 +132,7 @@ describe('the definition rides the version', () => {
 
   it('validated on save and activate, beside the event workflows', () => {
     const src = readFileSync(resolve(__dirname, '../../lambda/src/lib/profile-lifecycle.ts'), 'utf8');
-    expect(src).toMatch(/versionProcessesErrors\(body\.processes, body\.eventWorkflows, body\.intentWorkflows\)/);
+    expect(src).toMatch(/versionProcessesErrors\(body\.processes, body\.eventWorkflows, body\.intentWorkflows, \{ connectors: declaredConnectors\(\) \}\)/);
   });
 });
 

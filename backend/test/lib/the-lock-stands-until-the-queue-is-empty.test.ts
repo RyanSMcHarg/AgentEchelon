@@ -315,7 +315,7 @@ describe('the handover reads whether the dispatch actually happened', () => {
 });
 
 /**
- * AN AMENDMENT THE FOLD NEVER REACHED IS NOT LOST (maintainer, 2026-09-01).
+ * AN AMENDMENT THE FOLD NEVER REACHED IS NOT LOST.
  *
  * The fold was the only thing that ever cleared `amendments`, so one recorded after the turn passed
  * its checkpoint - the common case, because a short turn reaches that checkpoint before triage has

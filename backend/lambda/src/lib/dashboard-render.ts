@@ -11,7 +11,9 @@
  * never two scales on one chart. Lines are 2px, gridlines hairline, the end point labelled; each point has a hover band
  * with a native tooltip, and a table carries every value. Light and dark are each selected, never an inversion.
  */
+import { conversationRef } from './notify-directive.js';
 import type { DashboardData, DashboardSeries } from './dashboard-data.js';
+import type { RunbookProgress, RunbookStatus } from './runbook-progress.js';
 
 /** Every word the dashboard shows, from the assistant's `dashboard` template. */
 export interface DashboardLabels {
@@ -37,6 +39,57 @@ export interface DashboardLabels {
   unavailable: string;
   values: string;
   time: string;
+  /** The runbook section's heading and its one line (section 8). */
+  runbook?: string;
+  runbookAbout?: string;
+  /** Each status in words, so no status is told by its color alone. */
+  status?: Partial<Record<RunbookStatus, string>>;
+  /** Before a holder's name, and the link that opens a step's card in the conversation. */
+  heldBy?: string;
+  openCard?: string;
+  /** A step's times in words: when it started, and when it settled where it has. */
+  stepTimes?: (started: string, settled?: string) => string;
+}
+
+/** What a render draws beside the telemetry: the runbook, and where its card links lead. */
+export interface DashboardExtras {
+  runbook?: RunbookProgress;
+  /** The conversation a card link opens. Absent, the steps carry no links (the hosted page, which has no app to open). */
+  linkConversation?: string;
+}
+
+/** A step's mark: the shape tells the status as its word does, for a reader who cannot tell the colors apart. */
+const STEP_ICONS: Record<RunbookStatus, string> = {
+  done: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="var(--status-good)"/><path d="m4.8 8.2 2.2 2.2 4.2-4.6" stroke="#fff" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  'in-progress': '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.2" fill="none" stroke="var(--series-1)" stroke-width="1.6"/><path d="M8 1.8a6.2 6.2 0 0 1 0 12.4z" fill="var(--series-1)"/></svg>',
+  waiting: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="var(--status-warning)"/><path d="M8 4.5V8l2.4 1.6" stroke="#0b0b0b" stroke-width="1.6" fill="none" stroke-linecap="round"/></svg>',
+  'not-started': '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.2" fill="none" stroke="var(--axis)" stroke-width="1.6"/></svg>',
+  skipped: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.2" fill="none" stroke="var(--muted)" stroke-width="1.6"/><path d="M5 8h6" stroke="var(--muted)" stroke-width="1.6" stroke-linecap="round"/></svg>',
+  'timed-out': '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="var(--status-warning)"/><path d="M8 4.5v4M8 11v.5" stroke="#0b0b0b" stroke-width="1.6" stroke-linecap="round"/></svg>',
+  failed: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 15 14H1z" fill="var(--status-critical)"/><path d="M8 6v3.5M8 11.5v.5" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>',
+};
+
+/** A card link's address: the conversation and the task, which the chat app resolves to the task's newest card. */
+const ID = /^[A-Za-z0-9_#:.-]{1,200}$/;
+function cardHref(conversationId: string, taskId: string): string | null {
+  if (!ID.test(conversationId) || !ID.test(taskId)) return null;
+  return `?${conversationRef(conversationId)}#task=${encodeURIComponent(taskId)}`;
+}
+
+/** THE RUNBOOK SECTION (section 8): each labelled step, its status in a mark and a word, who holds it, its times and its card. */
+export function renderRunbook(runbook: RunbookProgress | undefined, labels: DashboardLabels, linkConversation?: string): string {
+  if (!runbook?.steps.length || !labels.runbook) return '';
+  const items = runbook.steps.map((st) => {
+    const word = labels.status?.[st.status] ?? st.status;
+    const times = st.startedAt && labels.stepTimes ? labels.stepTimes(hhmm(st.startedAt), st.settledAt ? hhmm(st.settledAt) : undefined) : '';
+    const meta = [st.holder ? `${labels.heldBy ? `${esc(labels.heldBy)} ` : ''}${esc(st.holder)}` : '', times ? esc(times) : ''].filter(Boolean).join(' · ');
+    const href = linkConversation && st.taskId && labels.openCard ? cardHref(linkConversation, st.taskId) : null;
+    return `<li class="step s-${esc(st.status)}">${STEP_ICONS[st.status] ?? ''}<div class="body"><div class="row"><span class="label">${esc(st.label)}</span><span class="word">${esc(word)}</span></div>`
+      + (st.description ? `<div class="desc">${esc(st.description)}</div>` : '')
+      + (meta || href ? `<div class="meta">${meta}${href ? `${meta ? ' · ' : ''}<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${esc(labels.openCard)}</a>` : ''}</div>` : '')
+      + '</div></li>';
+  }).join('');
+  return `<section class="runbook"><h2>${esc(labels.runbook)}</h2>${labels.runbookAbout ? `<p class="about">${esc(labels.runbookAbout)}</p>` : ''}<ol>${items}</ol></section>`;
 }
 
 /** The two chart sizes, in SVG units that render near 1:1: the watched metric wide, each small multiple half as wide. */
@@ -136,6 +189,17 @@ const STYLE = `
 @media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])) .dash{--surface:#1a1a19;--plane:#0d0d0d;--ink:#f0efec;--ink2:#c3c2b7;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--series-1:#3987e5;color-scheme:dark}}
 :root[data-theme="dark"] .dash{--surface:#1a1a19;--plane:#0d0d0d;--ink:#f0efec;--ink2:#c3c2b7;--grid:#2c2c2a;--axis:#383835;--border:rgba(255,255,255,.10);--series-1:#3987e5;color-scheme:dark}
 .dash *{box-sizing:border-box}
+.dash .runbook ol{list-style:none;margin:8px 0 12px;padding:0;background:var(--surface);border:1px solid var(--border);border-radius:8px}
+.dash .runbook li{display:flex;gap:10px;padding:10px 12px;border-top:1px solid var(--border)}
+.dash .runbook li:first-child{border-top:0}
+.dash .runbook li>svg{width:18px;height:18px;flex:none;margin-top:1px}
+.dash .runbook .body{min-width:0;flex:1}
+.dash .runbook .row{display:flex;flex-wrap:wrap;justify-content:space-between;gap:2px 12px}
+.dash .runbook .label{font-weight:600}
+.dash .runbook .word{color:var(--ink2);font-size:13px}
+.dash .runbook .desc,.dash .runbook .meta{color:var(--ink2);font-size:13px}
+.dash .runbook .s-not-started .label,.dash .runbook .s-skipped .label{color:var(--ink2);font-weight:400}
+.dash .runbook a{color:var(--series-1)}
 .dash header{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 16px;align-items:baseline;margin-bottom:12px}
 .dash h1{font-size:18px;margin:0}
 .dash h2{font-size:14px;font-weight:600;color:var(--ink2);margin:12px 0 0}
@@ -182,7 +246,7 @@ export function metricWords(metric: string): string {
 }
 
 /** The dashboard as a fragment: its style and its body, for a sandboxed frame or the hosted page. */
-export function renderDashboardFragment(data: DashboardData, labels: DashboardLabels, lang = 'en'): string {
+export function renderDashboardFragment(data: DashboardData, labels: DashboardLabels, lang = 'en', extras: DashboardExtras = {}): string {
   numbersIn = LANGUAGE_TAG.test(lang) ? lang : 'en';
   const named: Record<Exclude<DashboardSeries['key'], 'related'>, string> = {
     invocations: labels.invocations, errors: labels.errors, throttles: labels.throttles, durationMs: labels.durationMs,
@@ -222,15 +286,15 @@ export function renderDashboardFragment(data: DashboardData, labels: DashboardLa
       + times.map((t) => `<tr><td>${esc(hhmm(t))}</td>${shown.map((c) => { const p = c.series.points.find((q) => q.t === t); return `<td>${p ? esc(fmt(p.v)) : ''}</td>`; }).join('')}</tr>`).join('')
       + '</tbody></table></details>'
     : '';
-  return `<style>${STYLE}</style><main class="dash"><header><h1>${esc(labels.title)}</h1><span class="updated">${esc(labels.updated)}</span></header>${labels.about ? `<p class="about">${esc(labels.about)}</p>` : ''}${tile}${alarmChart}${relatedCharts}${multiples}${table}</main>`;
+  return `<style>${STYLE}</style><main class="dash"><header><h1>${esc(labels.title)}</h1><span class="updated">${esc(labels.updated)}</span></header>${labels.about ? `<p class="about">${esc(labels.about)}</p>` : ''}${tile}${renderRunbook(extras.runbook, labels, extras.linkConversation)}${alarmChart}${relatedCharts}${multiples}${table}</main>`;
 }
 
 /** The content security policy every dashboard document carries: styles inline, nothing loaded, nothing run. */
 export const DASHBOARD_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /** The hosted page: the fragment in a whole document that loads nothing and runs nothing. */
-export function renderDashboardPage(data: DashboardData, labels: DashboardLabels, lang = 'en'): string {
+export function renderDashboardPage(data: DashboardData, labels: DashboardLabels, lang = 'en', extras: DashboardExtras = {}): string {
   return `<!doctype html><html lang="${esc(LANGUAGE_TAG.test(lang) ? lang : 'en')}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">`
     + `<meta http-equiv="Content-Security-Policy" content="${DASHBOARD_CSP}"><meta name="robots" content="noindex"><title>${esc(labels.title)}</title>`
-    + `<style>html,body{margin:0}</style></head><body>${renderDashboardFragment(data, labels, lang)}</body></html>`;
+    + `<style>html,body{margin:0}</style></head><body>${renderDashboardFragment(data, labels, lang, { ...(extras.runbook ? { runbook: extras.runbook } : {}) })}</body></html>`;
 }

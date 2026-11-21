@@ -232,7 +232,7 @@ describe('an absent stage is the start, not an unknown', () => {
 });
 
 /**
- * A QUEUE OF PURELY PRIVATE REQUESTS STILL SHOWS THE STAGE IT IS IN (FR7, owner 2026-09-03).
+ * A QUEUE OF PURELY PRIVATE REQUESTS STILL SHOWS THE STAGE IT IS IN (FR7).
  *
  * `addressing_private` is shown whenever the queue held targeted requests. It was reachable only from
  * `clarifying`, so a queue with private messages and nothing needing an answer went `reviewing` and

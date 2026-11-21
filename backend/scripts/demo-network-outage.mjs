@@ -5,7 +5,7 @@
  *
  * Four metrics in `AgentEchelon/Demo`, dimensions Region and Service (default `us-east-1`, `customer-api`):
  *   SuccessRate (%), LatencyP95 (ms), PacketLoss (%), HealthyHosts (count).
- * The alarm `AgentEchelon-demo-incident` watches SuccessRate < 90 for 2 of 2 one-minute periods. Its name, and so its
+ * The alarm `Customer-API-availability` watches SuccessRate < 90 for 2 of 2 one-minute periods. Its name, and so its
  * ARN, stays the same, so the ops-room trigger attached to it keeps working. It has no actions; setup keeps any it has.
  * The dashboard draws the alarm's metric and finds the other three beside it (same namespace and dimensions).
  *
@@ -30,7 +30,7 @@ import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { CloudWatchClient, DescribeAlarmsCommand, GetMetricDataCommand, PutMetricAlarmCommand, PutMetricDataCommand } from '@aws-sdk/client-cloudwatch';
+import { CloudWatchClient, DeleteAlarmsCommand, DescribeAlarmsCommand, GetMetricDataCommand, PutMetricAlarmCommand, PutMetricDataCommand } from '@aws-sdk/client-cloudwatch';
 import { CloudFormationClient, DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
@@ -155,7 +155,16 @@ async function setup() {
   const after = await readAlarm();
   console.log(`Alarm: ${after.AlarmName} on ${after.MetricName} < ${after.Threshold} for 2 of 2 minutes, state ${after.StateValue}.`);
   console.log(`ARN:   ${after.AlarmArn}${before && before.AlarmArn !== after.AlarmArn ? '  (CHANGED: re-attach the trigger)' : before ? '  (unchanged)' : '  (new: attach the trigger)'}`);
+  // THE ALARM THIS DEMO USED TO CREATE watches the same metric, so left in place it would open a second incident beside this one.
+  const legacy = (await cw.send(new DescribeAlarmsCommand({ AlarmNames: [LEGACY_ALARM_NAME], AlarmTypes: ['MetricAlarm'] }))).MetricAlarms?.[0];
+  if (legacy) {
+    await cw.send(new DeleteAlarmsCommand({ AlarmNames: [LEGACY_ALARM_NAME] }));
+    console.log(`Removed the demo's earlier alarm ${LEGACY_ALARM_NAME}, which watched the same metric. Detach its trigger in the console if one is attached.`);
+  }
 }
+
+/** The name this demo's alarm had before it was named for its service. */
+const LEGACY_ALARM_NAME = 'AgentEchelon-demo-incident';
 
 async function status() {
   const a = await readAlarm();
@@ -178,6 +187,9 @@ switch (opts.command) {
   case 'setup': await setup(); break;
   case 'outage': {
     if (loopRunning()) { console.error('A loop is already running; stop it with Ctrl+C first.'); process.exit(1); }
+    // AN INCIDENT OPENS ON THE ALARM'S CHANGE INTO ALARM: an alarm already there never changes, so the outage would open nothing.
+    const before = await readAlarm();
+    if (before?.StateValue === 'ALARM') { console.error('The alarm is already in ALARM, so an outage would open no incident. Run `reset` until it is OK, then start the outage.'); process.exit(1); }
     const filled = await backfillBaseline(3);
     if (filled) console.log(`Filled ${filled} healthy minutes before the outage.`);
     console.log(`Outage on Region=${opts.region} Service=${opts.service}, ${opts.minutes} minutes at most${opts.recoverOnCall ? `, recovering ${opts.delaySeconds}s after the room's call starts` : '; `recover` ends it'}. Ctrl+C stops.`);

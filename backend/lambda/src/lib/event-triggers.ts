@@ -13,6 +13,7 @@
  */
 import { contentHash12 } from './canonical-json.js';
 import { ALARM_STATE_CHANGE } from '../../../lib/config/event-openers.js';
+import { handoffDetailType, processSource, type AttachedHandoff, type HandoffField } from './event-workflow.js';
 
 /** The tag on a team room saying which type's room it is. */
 export const TEAM_ROOM_TAG = 'team-room';
@@ -139,12 +140,47 @@ export const triggerRuleName = (prefix: string, classification: string, id: stri
  * The rule's one target's input: the room, the workflow and the assistant it was attached for fixed at creation, and the event's
  * references read from the event. The assistant's version runs the workflow (`workflowOwnerOf`).
  */
-export function triggerTargetInput(args: { rule: string; channelArn: string; workflow: string; assistant?: string }): { InputPathsMap: Record<string, string>; InputTemplate: string } {
-  const assistant = args.assistant ? `"assistant":${JSON.stringify(args.assistant)},` : '';
+export function triggerTargetInput(args: {
+  rule: string; channelArn: string; workflow: string; assistant?: string;
+  /** The trigger an edit replaced: its runs are keyed by that rule, so one event matched by both during the swap starts one run. */
+  supersedes?: string;
+  /** A hand-off's trigger: the declaration as it stood at attach, which the receiving router checks every event against. */
+  handoff?: AttachedHandoff;
+}): { InputPathsMap: Record<string, string>; InputTemplate: string } {
+  const assistant = (args.assistant ? `"assistant":${JSON.stringify(args.assistant)},` : '') + (args.supersedes ? `"supersedes":${JSON.stringify(args.supersedes)},` : '');
   return {
-    InputPathsMap: { at: '$.time', source: '$.source', detailType: '$.detail-type', resource: '$.resources[0]' },
-    InputTemplate: `{"aeRuleEvent":{"rule":${JSON.stringify(args.rule)},"channelArn":${JSON.stringify(args.channelArn)},"workflow":${JSON.stringify(args.workflow)},${assistant}"at":<at>,"source":<source>,"detailType":<detailType>,"resource":<resource>}}`,
+    InputPathsMap: { at: '$.time', source: '$.source', detailType: '$.detail-type', resource: '$.resources[0]', ...(args.handoff ? HANDOFF_PATHS : {}) },
+    InputTemplate: `{"aeRuleEvent":{"rule":${JSON.stringify(args.rule)},"channelArn":${JSON.stringify(args.channelArn)},"workflow":${JSON.stringify(args.workflow)},${assistant}"at":<at>,"source":<source>,"detailType":<detailType>,"resource":<resource>${handoffInput(args.handoff)}}}`,
   };
+}
+
+// ── A HAND-OFF'S RULE (DESIGN-PROCESSES sections 4.2 and 12) ─────────────────────────────────────────────────────────
+
+/** The detail paths a hand-off's rule hands on: the process, the hand-off and its fields. Nothing else of the detail. */
+const HANDOFF_PATHS = { processId: '$.detail.processId', process: '$.detail.process', handoff: '$.detail.handoff', fields: '$.detail.fields' };
+
+/** The hand-off part of a rule's input: the declaration as it stood at attach, fixed, and the event's hand-off read from it. */
+function handoffInput(attached: AttachedHandoff | undefined): string {
+  return attached ? `,"handoff":{"attached":${JSON.stringify(attached)},"processId":<processId>,"process":<process>,"handoff":<handoff>,"fields":<fields>}` : '';
+}
+
+/** The longest input template EventBridge accepts on a target: a declaration that would not fit is refused at attach. */
+export const MAX_INPUT_TEMPLATE = 8192;
+
+/** Where a hand-off's key is read: always the process id, fixed by the trigger service and never taken from a request. */
+export const HANDOFF_KEY_PATH = '$.detail.processId';
+
+/**
+ * THE PATTERN OF AN ATTACHED HAND-OFF: the sending classification's exact source and the exact `detail-type`, never a prefix
+ * or a wildcard, on this deployment's instance.
+ */
+export function handoffPattern(sender: string, process: string, name: string, instance: string): EventPattern {
+  return { source: [processSource(sender)], 'detail-type': [handoffDetailType(process, name)], detail: { instance: [instance] } };
+}
+
+/** The declaration a receiving team attaches: the sender's source and `detail-type`, and its declared fields as they stand. */
+export function attachedHandoffOf(sender: string, process: string, name: string, fields: Record<string, HandoffField>): AttachedHandoff {
+  return { source: processSource(sender), detailType: handoffDetailType(process, name), fields };
 }
 
 /**
@@ -182,6 +218,17 @@ export const WATCH_TAG = Object.freeze({
 
 export const watchRuleName = (prefix: string, classification: string, id: string): string => `${prefix}${classification}-watch-${id}`;
 
+/**
+ * THE TAG AN EDITED TRIGGER'S RULE CARRIES: the id of the rule its runs are keyed by, the first rule of the chain of edits. An
+ * edit of an edit keys its runs by that same root, so however many times a trigger is edited, one event during a swap runs once.
+ */
+export const RUN_ROOT_TAG = 'supersedes';
+
+/** The run-key root an edit's new rule takes: the replaced rule's own root where it records one, else the replaced rule. */
+export function editRunRoot(replaces: string, replacedRoot: string | undefined, ruleId: RegExp): string {
+  return typeof replacedRoot === 'string' && ruleId.test(replacedRoot) ? replacedRoot : replaces;
+}
+
 /** The watch rule's short id: the same choice for the same type, workflow, key and assistant is the same rule. */
 export const watchRuleId = (args: { typeKey: string; workflow: string; pattern: EventPattern; kind: string; keyPath: string; assistant?: string }): string => {
   const { assistant, ...rest } = args;
@@ -189,7 +236,7 @@ export const watchRuleId = (args: { typeKey: string; workflow: string; pattern: 
 };
 
 /** The watch rule's tags. Its pattern names exactly one source and detail type, which the router compares with the event. */
-export function watchRuleTags(args: { classification: string; workflow: string; typeKey: string; kind: string; source: string; detailType: string; assistant?: string }): Array<{ Key: string; Value: string }> {
+export function watchRuleTags(args: { classification: string; workflow: string; typeKey: string; kind: string; source: string; detailType: string; assistant?: string; supersedes?: string }): Array<{ Key: string; Value: string }> {
   return [
     { Key: WATCH_TAG.classification, Value: args.classification },
     { Key: WATCH_TAG.workflow, Value: args.workflow },
@@ -198,6 +245,7 @@ export function watchRuleTags(args: { classification: string; workflow: string; 
     { Key: WATCH_TAG.source, Value: args.source },
     { Key: WATCH_TAG.detailType, Value: args.detailType },
     ...(args.assistant ? [{ Key: WATCH_TAG.assistant, Value: args.assistant }] : []),
+    ...(args.supersedes ? [{ Key: RUN_ROOT_TAG, Value: args.supersedes }] : []),
   ];
 }
 
@@ -205,9 +253,21 @@ export function watchRuleTags(args: { classification: string; workflow: string; 
  * The watch rule's one target's input: its id fixed at creation, and the event's references and key read from the event. Every
  * placeholder is unquoted, so EventBridge writes each as the JSON value it is, and the router accepts the key only as an id.
  */
-export function watchTargetInput(args: { rule: string; keyPath: string }): { InputPathsMap: Record<string, string>; InputTemplate: string } {
+export function watchTargetInput(args: {
+  rule: string; keyPath: string; supersedes?: string;
+  /** A connector fact's trigger: its connector, its event id, the person it admitted and the conversation it named go with it. */
+  connector?: boolean;
+  /** A hand-off's trigger: the declaration as it stood at attach, which the receiving router checks every event against. */
+  handoff?: AttachedHandoff;
+}): { InputPathsMap: Record<string, string>; InputTemplate: string } {
+  const supersedes = args.supersedes ? `"supersedes":${JSON.stringify(args.supersedes)},` : '';
+  const fact = args.connector ? ',"fact":{"connectorId":<connectorId>,"eventId":<eventId>,"person":<person>,"conversation":<conversation>}' : '';
   return {
-    InputPathsMap: { at: '$.time', source: '$.source', detailType: '$.detail-type', resource: '$.resources[0]', key: args.keyPath },
-    InputTemplate: `{"aeWatchEvent":{"rule":${JSON.stringify(args.rule)},"at":<at>,"source":<source>,"detailType":<detailType>,"resource":<resource>,"key":<key>}}`,
+    InputPathsMap: {
+      at: '$.time', source: '$.source', detailType: '$.detail-type', resource: '$.resources[0]', key: args.keyPath,
+      ...(args.connector ? { connectorId: '$.detail.connectorId', eventId: '$.detail.eventId', person: '$.detail.admitted[0].personArn', conversation: '$.detail.conversation' } : {}),
+      ...(args.handoff ? HANDOFF_PATHS : {}),
+    },
+    InputTemplate: `{"aeWatchEvent":{"rule":${JSON.stringify(args.rule)},${supersedes}"at":<at>,"source":<source>,"detailType":<detailType>,"resource":<resource>,"key":<key>${fact}${handoffInput(args.handoff)}}}`,
   };
 }

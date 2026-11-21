@@ -43,7 +43,7 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
 // a size cap on the presigned PUT.
 // 10 MiB; matches the frontend cap in frontend/packages/chat/src/services/attachmentService.ts.
 //
-// DELIBERATELY HIGHER THAN WHAT A MODEL CAN READ (owner decision, 2026-09-15). The per-attachment
+// DELIBERATELY HIGHER THAN WHAT A MODEL CAN READ. The per-attachment
 // budget for Amazon Bedrock is 3,750,000 raw bytes (5 MB base64), stated once in
 // backend/lambda/src/lib/attachment-budget.ts. This cap is NOT lowered to match it, because an
 // attachment has uses beyond being read by a model: a 6 MB PDF is still stored, still downloadable by

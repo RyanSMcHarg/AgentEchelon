@@ -19,7 +19,7 @@
  * Recency is not evidence. It is the arrival order of the WORK, and the question is which work the
  * MESSAGE is about - a fact about the message, which recency cannot see.
  *
- * ── AWAITING IS WEAK EVIDENCE, NOT STRONG (maintainer, 2026-09-04) ────────────────────────────────────
+ * ── AWAITING IS WEAK EVIDENCE, NOT STRONG ────────────────────────────────────
  *
  * The runtime treated `awaits` as the license to read a message as an answer, which quietly makes it
  * the strongest signal available: a state saying "I am blocked on this person" became "the next thing
@@ -99,7 +99,7 @@ export function rankReferentCandidates(
     //    without it a side could read its rival's question as the one it just got answered.
     const mine = (c: ReferentCandidate) => (c.assistantId === args.assistantId ? 0 : 1);
     if (mine(a) !== mine(b)) return mine(a) - mine(b);
-    // 2. ACTIVE BEFORE AWAITING (maintainer, 2026-09-04). Work in flight is the live thread between them;
+    // 2. ACTIVE BEFORE AWAITING. Work in flight is the live thread between them;
     //    a parked question is one they may have moved on from.
     //
     //    THIS IS WHY THE CANDIDATES ARE READ BY OWNER (ADR-024 D8). Fed from the assignee partition,

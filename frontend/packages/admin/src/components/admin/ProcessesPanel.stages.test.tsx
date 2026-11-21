@@ -62,7 +62,7 @@ afterEach(() => { delete (window as { matchMedia?: unknown }).matchMedia; });
 const flowNames = () => [...screen.getByTestId('process-stages').querySelectorAll('tbody tr')].map((tr) => tr.querySelector('.admin-process-stage-label')?.textContent);
 /** The processes are listed first; one opens when it is chosen. */
 const openProcess = async () => { fireEvent.click(await screen.findByTestId('process-pick-incident-response')); };
-const shipped = (wf: string) => Object.values(TRIAGE_FIRST_WORKFLOWS[wf].states).filter((s) => (s as { label?: string }).label).map((s) => (s as { label: string }).label);
+const labelsOf = (wf: string) => Object.values(TRIAGE_FIRST_WORKFLOWS[wf].states).filter((s) => (s as { label?: string }).label).map((s) => (s as { label: string }).label);
 
 describe('the list comes first', () => {
   it('lists the process with its owner, opens nothing until it is chosen, and says where a process is created', async () => {
@@ -86,7 +86,7 @@ describe('the process\'s stages', () => {
   it('every stage it declares, Triage first, workflows in the process\'s order; how many runs reached each, and no internal move', async () => {
     render(<ProcessesPanel dateRange={undefined} />);
     await openProcess();
-    await waitFor(() => expect(flowNames()).toEqual([...shipped('incident-triage'), ...shipped('ops-room')]));
+    await waitFor(() => expect(flowNames()).toEqual([...labelsOf('incident-triage'), ...labelsOf('ops-room')]));
     expect(svc.exportProfile).toHaveBeenCalledWith('ops-premium');
     const triage = screen.getByTestId('process-stage-incident-triage-triage');
     expect(triage.textContent).toContain('Stage 1');
@@ -131,7 +131,7 @@ describe('the process\'s stages', () => {
     render(<ProcessesPanel dateRange={undefined} />);
     await openProcess();
     const grid = await screen.findByTestId('process-spent');
-    await waitFor(() => expect(grid.querySelectorAll('thead th')).toHaveLength(1 + shipped('incident-triage').length + shipped('ops-room').length));
+    await waitFor(() => expect(grid.querySelectorAll('thead th')).toHaveLength(1 + labelsOf('incident-triage').length + labelsOf('ops-room').length));
     expect(grid.tagName).toBe('DIV');
     const row = screen.getByTestId(`process-spent-${ID}`);
     // UNDER 10m THE LIGHTEST STEP, 30m TO 1h THE THIRD, in the stages' order; a stage the run did not reach is blank.

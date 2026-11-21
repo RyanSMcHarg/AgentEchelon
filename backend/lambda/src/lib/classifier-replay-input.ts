@@ -77,7 +77,7 @@ export function validateReplayInput(input: ReplayRequest): ValidatedReplayReques
   if (!incumbentModel || !challengerModel) {
     throw new Error('[classifier-replay] both incumbentModel and challengerModel are required');
   }
-  // CATALOG KEYS, NOT BEDROCK IDS (maintainer, 2026-08-10).
+  // CATALOG KEYS, NOT BEDROCK IDS.
   //
   // This took free text and passed it to `ConverseCommand`, so a run only SUCCEEDED if the operator typed
   // a real Bedrock model id. Everything else in the system - profiles and experiment variants alike -

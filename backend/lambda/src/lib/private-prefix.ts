@@ -29,7 +29,7 @@
  *
  * WHAT IT DOES INSTEAD, for the one direction that discloses: a message this module resolves to a
  * member is read back from storage, and one with no `Target` is dropped and its sender told
- * (`enforcePrivateAddressTarget` in `private-command.ts`, owner 2026-09-15). That check lives there
+ * (`enforcePrivateAddressTarget` in `private-command.ts`). That check lives there
  * because it does I/O; this module stays the pure definition of what the text means.
  *
  * The enforcement of PRIVACY itself stays at the composer and at Amazon Chime SDK. A client that sets

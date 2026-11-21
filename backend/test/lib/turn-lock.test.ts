@@ -449,7 +449,7 @@ describe('the kill switch', () => {
  *
  * A stranded lock is recovered by an arriving message taking over a holder whose `holderAt` is past
  * `STALE_AFTER_MS`, counted as `LockTakeover`. An expiry written on enqueue or claim would delete a
- * queue somebody was told was waiting (maintainer, 2026-08-28).
+ * queue somebody was told was waiting.
  */
 describe('the queue record expires on the turn, not on the traffic', () => {
   it('does not refresh the ttl when a message is queued', async () => {
@@ -464,7 +464,7 @@ describe('the queue record expires on the turn, not on the traffic', () => {
 
   it('writes no expiry when the lock is claimed', async () => {
     // The record holds a queue and, once a question has been asked, a person's unanswered turn. An
-    // expiry on it deletes work somebody was told was waiting (maintainer, 2026-08-28).
+    // expiry on it deletes work somebody was told was waiting.
     mockSend.mockReset().mockResolvedValue({});
 
     await lock.claimTurn({ channelArn: CHANNEL, responderId: BOT, correlationId: 'turn-1' });
@@ -611,7 +611,7 @@ describe('being awaited is not a licence to interrupt', () => {
   });
 });
 
-describe('a queue a fold already emptied still ends its drain (live 2026-09-15)', () => {
+describe('a queue a fold already emptied still ends its drain', () => {
   it('removes the claim, the stage and the drain even though nothing is queued', async () => {
     // The resumed answer's fold took every queued id first. Returning early here left the reading's
     // claim held, the answering exit skipped settling the notice, and it read "clearing" for good.

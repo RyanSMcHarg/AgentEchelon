@@ -8,10 +8,12 @@
  * Everyone in the meeting has a tile, laid out as an equal grid or as a speaker stage with a filmstrip; the viewer's
  * choice is remembered in this browser. The room renders only where the deployment serves meetings.
  *
- * BEFORE JOINING, the room says what the service says (`useConversationMeeting`): a meeting that runs offers Join, and
- * End for everyone to its host and the moderators; one that has ended says so, and offers Start again to its host
- * only; one not started offers Start to its host and tells anyone else its host starts it. IN THE MEETING, Leave leaves
- * it running for the others; for its host and the moderators, Leave first asks whether to leave or end it for everyone.
+ * BEFORE JOINING, the room says what the service says (`useConversationMeeting`): a meeting that runs offers Join; one
+ * that has ended says so, and offers Start again to its host only; one not started offers Start to its host and tells
+ * anyone else its host starts it; and Close closes the room without joining. The pre-join screen offers no End for
+ * everyone, to anyone: its host and the moderators end a running meeting they are not in from the conversation's banner
+ * (`MeetingInProgress`, FR50). IN THE MEETING, Leave leaves it running for the others; for its host and the moderators,
+ * Leave first asks whether to leave or end it for everyone.
  *
  * START STARTS THE MEETING when it is pressed (`startNow`), as the sibling project creates the meeting before its pre-join
  * screen: the room's card and ring go out at once, and the device check then joins the meeting already running with the
@@ -43,7 +45,7 @@ import VideoTiles, { type MeetingLayout } from './VideoTiles';
 import { MeetingDeviceMenu, MeetingPreJoin } from './MeetingDevices';
 import { useNarrowWindow } from './meetingPanes';
 import { announce } from '../../services/meetingTranscription';
-import { MeetingChatPanel, MeetingChatToggle, MeetingPaneTabs, PANE_IDS, paneTabId, useMeetingPanes } from './MeetingChatPanel';
+import { MeetingChatPanel, MeetingPaneTabs, PANE_IDS, paneTabId, useMeetingPanes } from './MeetingChatPanel';
 import {
   IconCamera, IconCameraOff, IconCaptions, IconExitFullscreen, IconFullscreen, IconGrid, IconHand, IconLeave, IconMic,
   IconMicOff, IconRecord, IconShare, IconShareStop, IconSpeaker,
@@ -88,8 +90,9 @@ export default function MeetingRoom({
   // rather than falling back to the pre-join screen the session's end would otherwise show.
   const [departing, setDeparting] = useState<null | "leaving" | "ending">(null);
   const [layout, setLayout] = useState<MeetingLayout>(storedLayout);
-  // Joining waits for the device check's one permission request to settle; starting does not.
-  const [devicesReady, setDevicesReady] = useState(true);
+  // Joining waits for the device check's one permission request to settle; starting does not. Unsettled until the check
+  // (`MeetingPreJoin`, on the pre-join screen) first reports, so a start made here never joins ahead of its answer.
+  const [devicesReady, setDevicesReady] = useState(false);
   const [creating, setCreating] = useState(false);
   const chooseLayout = (next: MeetingLayout) => {
     setLayout(next);
@@ -257,20 +260,16 @@ export default function MeetingRoom({
       <MeetingPreJoin onReady={setDevicesReady} />
       <div className="ae-meeting-actions">
         {(running || unread) && !removed ? (
-          <>
-            {/* A START MADE HERE joins by itself once the device check settles; Join stays within reach meanwhile, with
-                the start's own answer. Joining never offers End for everyone, even to a host: a host
-                ends the meeting from inside it, in the Leave dialog. */}
-            {meeting.startedHere ? (
-              <button className="ae-meeting-join-btn" onClick={() => { void meeting.start(channelArn); }} disabled={busy} data-testid="meeting-join-started">
-                {busy ? t('meeting.joining') : t('meeting.join')}
-              </button>
-            ) : (
-              <button className="ae-meeting-join-btn" onClick={() => { void meeting.join(channelArn); }} disabled={busy || !devicesReady}>
-                {busy ? t('meeting.joining') : t(elsewhere ? 'meeting.joinHere' : 'meeting.join')}
-              </button>
-            )}
-          </>
+          // A RUNNING MEETING OFFERS JOIN ONLY, even to its host: End for everyone is in the Leave dialog and the banner.
+          meeting.startedHere ? (
+            <button className="ae-meeting-join-btn" onClick={() => { void meeting.start(channelArn); }} disabled={busy} data-testid="meeting-join-started">
+              {busy ? t('meeting.joining') : t('meeting.join')}
+            </button>
+          ) : (
+            <button className="ae-meeting-join-btn" onClick={() => { void meeting.join(channelArn); }} disabled={busy || !devicesReady}>
+              {busy ? t('meeting.joining') : t(elsewhere ? 'meeting.joinHere' : 'meeting.join')}
+            </button>
+          )
         ) : here.known && here.mayStart && (
           <button className="ae-meeting-join-btn" onClick={() => { void handleStart(); }} disabled={busy || creating}>
             {busy || creating ? t('meeting.starting') : t(here.ended ? 'meeting.startAgain' : 'meeting.start')}
@@ -352,8 +351,6 @@ export default function MeetingRoom({
             {classificationName(meeting.classification)}
           </span>
         )}
-        {/* THE CHAT TOGGLE (FR71): opens and closes the chat panel, counting what arrived while it is closed. */}
-        {chat && <MeetingChatToggle />}
       </header>
 
       <div className="ae-meeting-body" {...panes?.swipe}>

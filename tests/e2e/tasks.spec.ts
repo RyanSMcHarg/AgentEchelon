@@ -592,7 +592,7 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — every tier that
       return open ? { taskId: String(open.taskId), channelArn: String(open.channelArn) } : undefined;
     };
 
-    // ── COMPLETED WORK IS KEPT; WORK IN PROGRESS IS CANCELLED; THEN IT ASKS (ADR-033, owner 2026-09-14) ──
+    // ── COMPLETED WORK IS KEPT; WORK IN PROGRESS IS CANCELLED; THEN IT ASKS (ADR-033) ──
     //
     // `/stop` means "stop what you are doing", so the open report is cancelled at the stop. The report
     // delivered earlier in this test is COMPLETE and is not in the set a stop selects, which is why the

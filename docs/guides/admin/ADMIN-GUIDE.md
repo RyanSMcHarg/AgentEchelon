@@ -177,7 +177,7 @@ All of these surfaces are Aurora-only. In Athena mode the assistant, role and ve
 
 ## Attaching an event trigger
 
-An event trigger is attached from an `event-received` workflow's **What starts this workflow** panel, under **Assistants**, by an admin holding `manage-event-triggers`; what any event may do is the deployment's event policy (`manage-event-policy`). Before attaching one, review the event's structure for the use case: sensitive data stays in the deployment's approved system of record, and the event carries a reference to the record (a ticket id, a document id) that each side reads with its own identity, never the record's content. The rule, why, and an example are in [Designing an event for a use case](WORKFLOW-STEP-REFERENCE.md#designing-an-event-for-a-use-case).
+An event trigger is attached from an `event-received` workflow's **What starts this workflow** panel, under **Assistants**, by an admin holding `manage-event-triggers` (a team member holding `view-event-triggers` sees the triggers attached for their own assistant there, read only); what any event may do is the deployment's event policy (`manage-event-policy`). Before attaching one, review the event's structure for the use case: sensitive data stays in the deployment's approved system of record, and the event carries a reference to the record (a ticket id, a document id) that each side reads with its own identity, never the record's content. The rule, why, and an example are in [Designing an event for a use case](WORKFLOW-STEP-REFERENCE.md#designing-an-event-for-a-use-case).
 
 ## Athena vs Aurora mode
 

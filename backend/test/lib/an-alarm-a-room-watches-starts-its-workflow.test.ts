@@ -98,6 +98,12 @@ describe('the router verifies the change before anything runs', () => {
     })).toEqual({ ran: false, reason: 'the conversation does not watch the alarm at this classification' });
   });
 
+  it('refuses once, rather than retrying for ever, where the watching conversation was deleted', async () => {
+    expect(await handleAlarmStateChanged({ alarmName: 'AgentEchelon-x', state: 'ALARM' }, {
+      watch: async () => ({ room: CHANNEL, classification: 'premium' }), watches: async () => ({}), roomTags: async () => null,
+    })).toEqual({ ran: false, reason: 'the conversation that watches the alarm is gone' });
+  });
+
   it('a record that cannot be read is never an answer: the change throws, so it is delivered again', async () => {
     const throttled = async () => { throw Object.assign(new Error('rate'), { name: 'ThrottlingException' }); };
     await expect(handleAlarmStateChanged({ alarmName: 'AgentEchelon-x', state: 'ALARM' }, { watch: throttled })).rejects.toThrow('rate');
@@ -117,7 +123,7 @@ describe('the router verifies the change before anything runs', () => {
     const fn = router.slice(router.indexOf('export async function handleAlarmStateChanged('), router.indexOf('export async function handleDeadlineCancel('));
     const order = [
       'ALARM_NAME.test(alarmName)', '(deps.watch ?? alarmWatchOf)(alarmWatchKey(alarmName), { strict: true })', '(deps.watches ?? conversationWatches)(channelArn, alarmName)',
-      'roomRefusal(await readChannelTags(chimeClient, channelArn))',
+      '(deps.roomTags ?? standingRoomTags)(channelArn)', 'roomRefusal(roomTags)',
       '(deps.stateNow ?? alarmStateNow)(alarmName, { strict: true })', 'now.state !== r.state', 'eventWorkflowOwner(', "declaredWorkflowOn(served?.version.eventWorkflows, 'alarm-state-changed')", 'runWorkflowFor(',
     ].map((t) => fn.indexOf(t));
     expect(order.every((i) => i > -1)).toBe(true);
@@ -127,7 +133,7 @@ describe('the router verifies the change before anything runs', () => {
     // The watch is the room's own row and the alarm's record, both server-only, read before a run starts.
     expect(router).toMatch(/if \(!watch \|\| watch\.room !== channelArn \|\| watch\.classification !== STATIC_CLASSIFICATION\) return null;/);
     expect(router).toMatch(/if \(!row \|\| row\.watchedAlarm !== alarmName\) return null;/);
-    // A RUN THE ALARM STARTED FINISHES (owner decision, 2026-11-15): its continuation does not re-read the watch, so a
+    // A RUN THE ALARM STARTED FINISHES: its continuation does not re-read the watch, so a
     // conversation that stops watching the alarm stops new runs and an open one still reaches its end.
     const continuation = router.slice(router.indexOf('export async function handleEventContinuation('));
     expect(continuation.slice(0, continuation.indexOf('\n}\n'))).not.toMatch(/conversationWatches\(/);

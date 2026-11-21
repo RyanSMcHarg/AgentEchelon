@@ -1,5 +1,6 @@
 /**
- * A PROCESS AS A FLOW (SPEC-PROCESSES P1), on the shipped incident response: its steps top to bottom, each phase a card with its
+ * A PROCESS AS A FLOW (SPEC-PROCESSES P1), on an incident response that triages in the team conversation first (a fixture
+ * built on the shipped one): its steps top to bottom, each phase a card with its
  * stages down it, each stage naming the party that answers it, a stage's detail on selection, and the hand-offs in order. Nothing
  * in it is a wide table that scrolls sideways.
  */
@@ -70,7 +71,7 @@ describe('a process with parallel work as a flow (a test fixture, not shipped)',
     expect(screen.getByTestId('process-flow-detail').textContent).toContain('waits for all of: alpha-room, beta-room, Notes');
   });
 
-  it('the shipped incident: customer messaging stands beside the incident, as phases 2 to 3', () => {
+  it('the triage-first incident: customer messaging stands beside the incident, as phases 2 to 3', () => {
     render(<ProcessFlow workflows={workflows} process={process} />);
     expect(screen.getByTestId('process-flow-group-2').getAttribute('data-phases')).toBe('2');
     expect(screen.getByTestId('process-flow-group-2').textContent).toContain('Phases 2 to 3, in parallel');

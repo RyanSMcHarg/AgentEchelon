@@ -22,7 +22,7 @@ A run starts on one trigger. Its inputs are the values the router verifies befor
 | `invitation-unredeemed` | `eventWorkflows`, with `deadline: { afterMinutes }` | The invitation is still pending when its deadline fires | The same as `invitation-sent` | `event:person`, `invitation:inviter` |
 | `alarm-state-changed` | `eventWorkflows` | The CloudWatch alarm the conversation watches changes state | `event:alarmName`, `event:alarmState` (`ALARM`, `OK`, `INSUFFICIENT_DATA`), read back from CloudWatch | Nobody |
 | `event-received` | `eventWorkflows`, with `types` naming one team room type | An EventBridge event matches a trigger the console attached to that team room (see [Event triggers and their limits](#event-triggers-and-their-limits)) | `event:source`, `event:detailType`, `event:resource` (the event's first resource), `label` (the resource's short name). Never the event's `detail` | None |
-| `task-reopened` | `eventWorkflows` | A finished task is taken back into a state with a way on | The reopened task and which reopen it is | `requester`, `event:person` (the task's requester) |
+| `task-reopened` | `eventWorkflows` | A finished task is taken back into a state with a way on | The reopened task and which reopen it is, and the values of the run it was reopened from | `requester`, `event:person` (the task's requester) |
 
 Every trigger also gives the run the values the router holds: the conversation's classification, the conversation's type and the version's variables.
 
@@ -90,6 +90,9 @@ Opens one task of a machine (section 4). The run waits for it.
 | `assigned` | Optional, not on a request: `{ template }`, one of this assistant's message templates said privately to the person who holds the task, with its card, and emailed, in place of `workflow-task-assigned` |
 | `endsRun` | Optional, `true`, on a `continue: 'alongside'` step only: the task's settlement ends the run where it stands, on its success terminal, its other open tasks cancelled with the run's end as their reason (`run-ended`), rather than waiting for the run to reach its end |
 | `confirmEnd` | Optional, with `endsRun` only: a state of the machine that awaits the worker and offers choices, with an edge to it from every state that offers a settling choice. A press that would settle the task while the run has not reached its end moves it here, and the worker is asked in the state's notice, which may name the run's open steps (`steps`, by each step's `label`). `ops-room`'s incident owner task declares `confirming_resolve` |
+| `pinned` | Optional, `true`: the step's card is kept in the conversation's pinned band, beside where the conversation stands, and the band's status (open, resolved or ended) is read from this step |
+| `decidedBy` | Optional, on a step a participant role works: 1 to 4 participant roles whose holders may take its choices besides its assignee, and reopen it where its machine's ending declares `reopens`. A press is checked against the conversation's own record of who holds each role, and a step that names deciders is moved by a press only, never by an assistant's turn. On a `pinned` step the band offers its choices to those people, each confirmed before it is sent. `ops-room`'s incident owner task names `on-call:ops`, `secondary:ops` and `lead` |
+| `takes` | Optional, `reopened`, on a `task-reopened` workflow only: the step takes the reopened task, of the step's machine, instead of opening one, so the task's next ending continues this run. A task that ended its run (`endsRun`) ends that run when it reopens, so nothing the run went on to (a review) goes on |
 | `fields` | `form` only: 1 to 8 `{ name, type: text, number or yes-no, required? }` |
 
 A request to an assistant role may declare only `machine`, `for`, `by`, `ask` and `continue`. `visibility`, `priority`, `fields` and `deadline` are the owning assistant's to declare, and a draft that sets one on a request is refused.
@@ -186,7 +189,7 @@ A task's machine is `initial` plus `states`. Each state is a node in the machine
 | `rests` | An idle assistant does not take the step up on its own |
 | `notice` | `{ to: room, requester, worker or { participantRole }, template, email? }`: a message said once each time the task enters the state. `email: true` also sends it by email to who the message addresses, where the deployment declares `notifications`. A private task's update to the room or a role is withheld |
 | `when`, `edgeWhen` | A condition on entering the state, or on one of its edges |
-| `reopens` | Terminal states only: the states the requester may take the finished task back to |
+| `reopens` | Terminal states only: the states the requester may take the finished task back to, or where the step names `decidedBy`, a holder of one of its roles by a press. A workflow on `task-reopened` may name the machine it takes back (`reopens: <machine>`); a reopen runs the one naming its task's machine, else the one naming none |
 | `requesterMoves` | On a state that awaits the worker: its transitions the requester may ask for while the worker holds the task, such as a reschedule or a cancel. The requester's message reaches the task only where a state declares some, and only these moves are taken |
 | `label`, `placeholder` | How the state is named to the person, and what its placeholder says |
 

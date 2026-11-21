@@ -79,13 +79,16 @@ function deps() {
 }
 
 describe('customer impact is a card\'s ending, carried as data (O27)', () => {
-  it('the lead is asked in the incident conversation, and the team conversation asks nothing before it opens', () => {
+  it('nobody is asked: neither conversation holds a customer-impact card, and naming the accounts opens customer messaging', () => {
     expect(Object.values(s(team)).some((st) => 'task' in st)).toBe(false);
-    expect(s(room)['impact-confirm'].task).toMatchObject({ machine: 'customer_impact', by: { participantRole: 'lead' }, assigned: { template: 'customer-impact-confirm' } });
+    expect(Object.values(s(room)).some((st) => (st as { task?: { machine?: string } }).task?.machine === 'customer_impact')).toBe(false);
+    expect(s(room)['customer-impact'].onSuccess).toEqual([{ to: 'runbook-cause', when: { 'event:customerImpact': 'impacted' } }, { to: 'messaging' }]);
   });
 
+  // A VERSION THAT STILL ASKS (its own card) is read as before.
+  const withCard = { ...room, states: { ...room.states, 'impact-confirm': { task: { machine: 'customer_impact', by: { participantRole: 'lead' } }, onSuccess: 'runbook-cause', onFailure: 'runbook-cause' } } } as EventWorkflow;
   it('DENY: only a customer_impact card\'s ending counts: another machine\'s ending in a state of the same name says nothing', () => {
-    const other: EventWorkflow = { ...room, states: { ...room.states, survey: { task: { machine: 'incident_first_look', by: { assistantRole: 'ops' } }, onSuccess: 'done', onFailure: 'done' } } } as EventWorkflow;
+    const other: EventWorkflow = { ...withCard, states: { ...withCard.states, survey: { task: { machine: 'incident_first_look', by: { assistantRole: 'ops' } }, onSuccess: 'done', onFailure: 'done' } } } as EventWorkflow;
     expect(customerImpactOf([{ step: 'survey', outcome: 'task:success:impacted' }], other)).toBeUndefined();
     expect(customerImpactOf([{ step: 'impact-confirm', outcome: 'task:success:not_impacted' }, { step: 'survey', outcome: 'task:success:impacted' }], other)).toBe('not_impacted');
     expect(customerImpactOf([{ step: 'impact-confirm', outcome: 'task:success:impacted' }], undefined)).toBeUndefined();
@@ -93,10 +96,10 @@ describe('customer impact is a card\'s ending, carried as data (O27)', () => {
 
   it('the open step carries the latest ending of a customer_impact card, and nothing a person wrote', () => {
     const card = 'impact-confirm';
-    expect(customerImpactOf([{ step: card, outcome: 'task:success:impacted' }, { step: 'open-messaging', outcome: 'opened' }], room)).toBe('impacted');
-    expect(customerImpactOf([{ step: card, outcome: 'task:success:impacted' }, { step: card, outcome: 'task:success:not_impacted' }], room)).toBe('not_impacted');
-    expect(customerImpactOf([{ step: card, outcome: 'task:deadline' }, { step: card, outcome: 'task:success:acknowledged' }], room)).toBeUndefined();
-    expect(customerImpactOf([{ step: card, outcome: 'task:failure:impacted' }], room)).toBeUndefined();
+    expect(customerImpactOf([{ step: card, outcome: 'task:success:impacted' }, { step: 'open-messaging', outcome: 'opened' }], withCard)).toBe('impacted');
+    expect(customerImpactOf([{ step: card, outcome: 'task:success:impacted' }, { step: card, outcome: 'task:success:not_impacted' }], withCard)).toBe('not_impacted');
+    expect(customerImpactOf([{ step: card, outcome: 'task:deadline' }, { step: card, outcome: 'task:success:acknowledged' }], withCard)).toBeUndefined();
+    expect(customerImpactOf([{ step: card, outcome: 'task:failure:impacted' }], withCard)).toBeUndefined();
     const open = router.slice(router.indexOf('async function openChildConversation('), router.indexOf('async function openWorkflowTaskStep('));
     expect(open).toMatch(/const impact = customerImpactOf\(args\.transitions, workflowFor\(who\.version\?\.eventWorkflows, args\.name\)\);/);
     expect(creator).toMatch(/isCustomerImpact\(detail\.continueRun\?\.values\?\.customerImpact\) \? \{ customerImpact: detail\.continueRun\.values\.customerImpact \}/);
@@ -124,28 +127,25 @@ describe('a yes opens the track once; a no blocks nothing (O28)', () => {
     expect(run.tasks.map((t) => t.step)).not.toContain('impact-confirm');
   });
 
-  it('triage did not say yes: the lead is asked once the accounts are named, and a yes opens it there, once', async () => {
+  it('triage did not say yes: naming the accounts opens customer messaging at once, asking nobody, once', async () => {
     const run = deps();
     const ctx = incident();
     const start = await continueAfter('ops-room', room, ctx, { step: 'investigation', outcome: 'opened' }, run.d);
     expect(start.steps.map((x) => x.step)[0]).toBe('first-look');
     expect(run.opens).toEqual([]);
-    const asked = await continueAfter('ops-room', room, ctx, { step: 'customer-impact', outcome: 'task:success:done' }, run.d);
-    expect(asked.steps.map((x) => x.step)).toEqual(['impact-confirm']);
-    const yes = await continueAfter('ops-room', room, ctx, { step: 'impact-confirm', outcome: 'task:success:impacted' }, run.d);
-    expect(yes.steps.map((x) => x.step)).toEqual(['messaging']);
+    const named = await continueAfter('ops-room', room, ctx, { step: 'customer-impact', outcome: 'task:success:done' }, run.d);
+    expect(named.steps.map((x) => x.step)).toEqual(['messaging']);
     expect(run.opens.map((o) => o.step)).toEqual(['messaging']);
-    await continueAfter('ops-room', room, ctx, { step: 'impact-confirm', outcome: 'task:success:impacted' }, run.d);
+    expect(run.tasks.map((t) => t.machine)).not.toContain('customer_impact');
+    await continueAfter('ops-room', room, ctx, { step: 'customer-impact', outcome: 'task:success:done' }, run.d);
     expect(run.opens).toHaveLength(1);
+    // A LOOKUP THAT FAILED STILL OPENS IT: the incident reaches customers whether or not their accounts could be listed.
+    const failedLookup = deps();
+    const out = await continueAfter('ops-room', room, incident(), { step: 'customer-impact', outcome: 'task:failure:cancelled' }, failedLookup.d);
+    expect(out.steps.map((x) => x.step)).toEqual(['messaging']);
   });
 
-  it('DENY: a no, no answer in time, or an open that failed opens nothing more and the runbook goes on at once', async () => {
-    for (const outcome of ['task:success:not_impacted', 'task:deadline', 'task:failure:cancelled']) {
-      const run = deps();
-      const out = await continueAfter('ops-room', room, incident(), { step: 'impact-confirm', outcome }, run.d);
-      expect(out.steps.map((x) => x.step)).toEqual(['runbook-cause']);
-      expect(run.opens).toEqual([]);
-    }
+  it('DENY: an open that failed opens nothing more, says so, and the runbook goes on at once', async () => {
     const failed = deps();
     const out = await continueAfter('ops-room', room, incident(), { step: 'messaging', outcome: 'failed' }, failed.d);
     // A FAILED OPEN IS TOLD TO THE ROOM, then the runbook goes on.
@@ -204,10 +204,10 @@ describe('the initial notice and its deadline (O29, O30)', () => {
 
   it('the three default notices say what the owner asked of each, and send nothing', () => {
     const say = (name: string) => { const r = renderMessageTemplate(shippedMessageTemplate(name), { label: 'X' }, { sections: ['chat'] }); return r.ok ? r.sections.chat : ''; };
-    expect(say('customer-notice-initial')).toMatch(/What is affected[\s\S]*Since[\s\S]*Next update/);
+    expect(say('customer-notice-initial')).toMatch(/What customers see[\s\S]*Since[\s\S]*Next update/);
     expect(say('customer-notice-update')).toMatch(/Status[\s\S]*What we are doing[\s\S]*Next update/);
     expect(say('customer-notice-final')).toMatch(/Resolved[\s\S]*What you saw[\s\S]*follow-up review/);
-    for (const n of ['customer-notice-initial', 'customer-notice-update', 'customer-notice-final']) expect(say(n)).toMatch(/sent to nobody/);
+    for (const n of ['customer-notice-initial', 'customer-notice-update', 'customer-notice-final']) { expect(say(n)).toMatch(/sent to nobody/); expect(say(n)).toContain('Proposed customer notice: needs account team approval. Not sent.'); }
   });
 });
 

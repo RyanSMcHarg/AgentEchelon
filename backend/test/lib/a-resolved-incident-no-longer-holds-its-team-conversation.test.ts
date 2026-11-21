@@ -118,6 +118,12 @@ describe('the resolve, not the run\'s end, frees the team conversation', () => {
     expect(await openIncidents(TEAM, 'ops')).toEqual([]);
   });
 
+  it('an incident whose conversation was deleted is ended, though the team\'s wait on it is still held; one whose tags cannot be read stays open', async () => {
+    const a = await opened('incident-a');
+    expect(await openIncidents(TEAM, 'ops', { roomTags: async (arn) => (arn === a.child ? null : {}) })).toEqual([]);
+    expect((await openIncidents(TEAM, 'ops', { roomTags: async () => { throw new Error('throttled'); } }))?.map((e) => e.resource)).toEqual([ALARM]);
+  });
+
   it('after a resolve, a new alarm for the same resource is not refused as one already open', async () => {
     const a = await opened('incident-a');
     await tell(a.child, a.runKey, 'success');

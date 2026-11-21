@@ -1,5 +1,5 @@
 /**
- * AN AMENDMENT FOLD IS NOT A REDELIVERY OF THE TURN IT AMENDS (owner-reported, 2026-09-05).
+ * AN AMENDMENT FOLD IS NOT A REDELIVERY OF THE TURN IT AMENDS.
  *
  * This is `a-further-pass-is-not-a-redelivery` one re-dispatch path along, and it is the second time
  * the same shape has cost a live conversation.

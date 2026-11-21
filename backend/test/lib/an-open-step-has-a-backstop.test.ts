@@ -56,12 +56,12 @@ describe('an open step\'s backstop', () => {
     const backstop = await continueAfter('incident-triage', wf, ctx, { step: 'open', outcome: 'timed-out', transitions: [] }, r.deps);
     expect(backstop.ran).toBe(true);
     expect(r.claims.get(continuationClaim('open'))).toBe('timed-out');
-    // THE FAILURE EDGE ENDS THE TEAM'S RUN, saying nothing of an incident that was never opened.
-    expect(r.sent).toEqual([]);
-    expect(r.ended).toEqual(['success']);
+    // THE FAILURE EDGE TELLS THE TEAM THE INCIDENT DID NOT OPEN, and the team's run ends failed.
+    expect(r.sent).toEqual(['tell-not-opened']);
+    expect(r.ended).toEqual(['failure']);
     const late = await continueAfter('incident-triage', wf, { ...ctx, values: { ...ctx.values, conversation_link: '?conversation=c' } }, { step: 'open', outcome: OPEN_STEP_OPENED, transitions: [] }, r.deps);
     expect(late.ran).toBe(false);
-    expect(r.sent).toEqual([]);
+    expect(r.sent).toEqual(['tell-not-opened']);
   });
 
   it('hand-back first: the step goes on, and the backstop that fires later continues nothing', async () => {

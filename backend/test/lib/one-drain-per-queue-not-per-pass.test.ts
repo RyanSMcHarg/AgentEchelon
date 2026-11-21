@@ -1,5 +1,5 @@
 /**
- * ONE DRAIN PER QUEUE, NOT PER PASS (maintainer, 2026-09-03).
+ * ONE DRAIN PER QUEUE, NOT PER PASS.
  *
  * Working a queue is a task - states, legal moves between them, a step that awaits a person, and a
  * point at which it is over - and it was always declared in that shape while declining the task ROW.

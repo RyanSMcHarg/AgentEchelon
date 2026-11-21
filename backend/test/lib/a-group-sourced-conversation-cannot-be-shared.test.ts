@@ -1,5 +1,5 @@
 /**
- * A conversation whose people come from a group refuses sharing (owner decision, 2026-10-05): the
+ * A conversation whose people come from a group refuses sharing: the
  * membership reconcile would silently remove whoever was invited. The refusal reads the server-side
  * context row, never channel Metadata, and gives the same sentence the client's disabled Share tooltip
  * shows.
