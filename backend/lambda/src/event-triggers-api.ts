@@ -464,7 +464,89 @@ export async function switchAdminNotice(notice: AdminNoticeType, enabled: boolea
   }
 }
 
-export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
+/** What manage-profiles names after an activation: the assistant whose triggers are checked against its active version. */
+export interface TriggerSweepRequest { aeTriggerSweep: { assistant: string } }
+
+const isSweepRequest = (event: unknown): event is TriggerSweepRequest => {
+  const e = event as Partial<TriggerSweepRequest & APIGatewayProxyEvent> | null;
+  return !!e && typeof e === 'object' && e.httpMethod === undefined && !!e.aeTriggerSweep && typeof e.aeTriggerSweep.assistant === 'string';
+};
+
+/**
+ * THE WORKFLOWS AN ASSISTANT'S ACTIVE VERSION RUNS ON AN ATTACHED EVENT (`event-received`), read from its active definition by
+ * name (`ReadActiveDefinitions`): inline where the definition holds them, else the names it keeps where they are a body of the
+ * store (`eventWorkflowsListed`). Null where no version is active or the definition cannot be read, so nothing is judged.
+ */
+async function attachableWorkflowsOf(assistant: string): Promise<Set<string> | null> {
+  const res = await ssm.send(new GetParameterCommand({ Name: `${definitionParamName(process.env.SSM_ROOT ?? '', assistant)}:active` })).catch((err) => {
+    const name = (err as { name?: string }).name;
+    if (name === 'ParameterNotFound' || name === 'ParameterVersionLabelNotFound') return undefined;
+    throw err;
+  });
+  if (!res?.Parameter?.Value) return null;
+  try {
+    const def = JSON.parse(res.Parameter.Value) as { eventWorkflows?: Record<string, { on?: unknown }>; eventWorkflowsListed?: Array<{ name: string; on: string }> };
+    const listed = def.eventWorkflows
+      ? Object.entries(def.eventWorkflows).map(([name, wf]) => ({ name, on: wf?.on }))
+      : def.eventWorkflowsListed;
+    if (!Array.isArray(listed)) return null;
+    return new Set(listed.filter((w) => w.on === 'event-received').map((w) => w.name));
+  } catch { return null; }
+}
+
+/**
+ * AN ACTIVATION'S TRIGGER CLEANUP (DESIGN-EVENT-TARGETS section 7): every trigger rule this deployment's trigger service owns
+ * (its prefix, a trigger or watch rule) that was attached for this assistant (its `assistant` tag), whose workflow the
+ * assistant's active version no longer runs on an attached event (it starts on a lifecycle event now, or is gone), is
+ * detached as a removal detaches one: the team conversation's tag, then the rule's target, then the rule. Another assistant's
+ * rule, or one attached for none, is never touched. Each rule that cannot be removed is logged and left, so the next activation
+ * tries again; nothing here fails the activation that named it.
+ */
+export async function sweepAssistantTriggers(assistant: string): Promise<{ removed: string[]; failed: string[] }> {
+  const removed: string[] = [];
+  const failed: string[] = [];
+  if (!ASSISTANT_HANDLE.test(assistant) || !RULE_PREFIX || !APP_INSTANCE_ARN) return { removed, failed };
+  const keep = await attachableWorkflowsOf(assistant).catch(() => null);
+  if (!keep) return { removed, failed };
+  for (const bus of triggerBuses()) {
+    let token: string | undefined;
+    do {
+      const res = await eventbridge.send(new ListRulesCommand({ NamePrefix: RULE_PREFIX, NextToken: token, Limit: 100, ...(bus ? { EventBusName: bus } : {}) }));
+      for (const r of res.Rules ?? []) {
+        const name = r.Name ?? '';
+        const kind = TRIGGER_RULE.exec(name)?.[1];
+        if (!kind || !r.Arn) continue;
+        try {
+          const tagged = await ruleRead(eventbridge.send(new ListTagsForResourceCommand({ ResourceARN: r.Arn })));
+          const tags = Object.fromEntries((tagged?.Tags ?? []).map((t) => [t.Key ?? '', t.Value ?? '']));
+          if (tags.assistant !== assistant || !tags.workflow || keep.has(tags.workflow)) continue;
+          const classification = tags.classification ?? '';
+          const id = name.slice(name.length - 12);
+          // THE TEAM CONVERSATION'S TAG FIRST, so the conversation never names a trigger whose rule is gone.
+          if (kind === 'trigger' && tags['team-room'] && classification) {
+            await chime.send(new UntagResourceCommand({ ResourceARN: teamRoomArn(APP_INSTANCE_ARN, tags['team-room'], classification), TagKeys: [`${EVENT_RULE_TAG_PREFIX}${id}`] }));
+          }
+          await deleteTriggerRule(name);
+          removed.push(id);
+        } catch (err) {
+          failed.push(name);
+          console.warn('[EventTriggers] a trigger the active version no longer runs could not be removed; the next activation tries again', { rule: name, name: (err as Error)?.name });
+        }
+      }
+      token = res.NextToken;
+    } while (token);
+  }
+  if (removed.length || failed.length) console.log(JSON.stringify({ _auditEvent: 'event_triggers_swept_after_activation', assistant, removed, failed }));
+  return { removed, failed };
+}
+
+export const handler = async (event: APIGatewayProxyEvent | TriggerSweepRequest): Promise<APIGatewayProxyResult> => {
+  // AN ACTIVATION'S CLEANUP is a direct invoke from manage-profiles, the one caller granted it; a gateway request always names
+  // its method, so it never reaches this.
+  if (isSweepRequest(event)) {
+    await sweepAssistantTriggers(event.aeTriggerSweep.assistant).catch((err) => console.warn('[EventTriggers] an activation\'s trigger cleanup failed', { name: (err as Error)?.name }));
+    return { statusCode: 200, body: '' };
+  }
   // The deployment's set, read at runtime from the rows its stacks publish, before anything reads a classification.
   await loadProfileRegistry();
   if (event.httpMethod === 'OPTIONS') return http.empty(200, requestOrigin(event));

@@ -64,6 +64,8 @@ export interface AdminAssistantAdministrationProps extends cdk.NestedStackProps 
 export class AdminAssistantAdministration extends cdk.NestedStack {
   /** The profile, ownership, roster and experiment routes, on `AdminApi`. */
   public readonly routes: RouteSpec[] = [];
+  /** The profile lifecycle function, which names an activation's trigger cleanup to the trigger service. */
+  public readonly manageProfilesFn: lambda.IFunction;
 
   constructor(scope: Construct, id: string, props: AdminAssistantAdministrationProps) {
     super(scope, id, { description: props.description });
@@ -186,7 +188,7 @@ export class AdminAssistantAdministration extends cdk.NestedStack {
       },
       managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')],
     });
-    const manageProfilesFn = new lambdaNodeJs.NodejsFunction(this, 'ManageProfilesFunction', {
+    const manageProfilesFn = this.manageProfilesFn = new lambdaNodeJs.NodejsFunction(this, 'ManageProfilesFunction', {
       entry: './lambda/src/manage-profiles.ts',
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,

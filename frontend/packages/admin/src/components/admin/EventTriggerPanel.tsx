@@ -13,7 +13,7 @@
  * on a workflow that runs on `event-received` in the one type its target names. An edit of an attached trigger names the
  * trigger it replaces, which the server removes once the new one stands, so the workflow is never without a trigger. An
  * attached trigger edited into the workflow's own event changes only the draft: its rule keeps starting the active version,
- * and stays listed beside the new event, to be removed here once the draft is activated.
+ * listed beside the new event, and activating the draft removes it (the trigger service's cleanup after an activation).
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -441,7 +441,7 @@ export const WorkflowTriggers: React.FC<WorkflowTriggersProps> = ({ name, wf, on
     try {
       if (isOwnEvent) {
         // THE WORKFLOW'S OWN EVENT IS A DRAFT CHANGE: the attached trigger it replaces keeps starting the active version, so
-        // its rule stands, listed beside the new event, until it is removed here once the draft is activated.
+        // its rule stands, listed beside the new event, until activating the draft removes it.
         if (editingAttached) setKept((k) => [...k.filter((x) => x.trigger.id !== editingAttached.trigger.id), editingAttached]);
         const types = where.type ? where.type.split(',') : [];
         onPut({ ...bare(wf), on: ownEvent!, ...(types.length ? { types } : {}), ...(isDeadlineEvent(ownEvent!) ? { deadline: { afterMinutes: deadline } } : {}) });

@@ -238,7 +238,7 @@ describe('Edit opens the form with the trigger as it is', () => {
     // The active version still runs on the rule, so nothing is removed until a person removes it here.
     expect(svc.removeEventTrigger).not.toHaveBeenCalled();
     expect(screen.getByTestId('trigger-line-on')).toBeTruthy();
-    expect(screen.getByTestId('trigger-line-abc-runs-in')).toHaveTextContent('Still starts the active version. Remove it once the draft is activated.');
+    expect(screen.getByTestId('trigger-line-abc-runs-in')).toHaveTextContent('Still starts the active version. Activating the draft removes it.');
     expect(screen.queryByTestId('trigger-edit-abc')).toBeNull();
     fireEvent.click(screen.getByTestId('trigger-remove-abc'));
     fireEvent.click(screen.getByTestId('trigger-remove-abc-confirm-button'));

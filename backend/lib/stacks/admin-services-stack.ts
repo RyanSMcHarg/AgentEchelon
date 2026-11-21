@@ -153,6 +153,8 @@ const thresholdsText = (text: string): string => (text.startsWith('json64:') ? B
 export class AdminServicesStack extends cdk.Stack implements RouteSource {
   /** Every admin route, on `AdminApi`; the nested stacks' routes are appended to it. */
   public readonly routes: RouteSpec[] = [];
+  /** The trigger service, which removes an activated assistant's stale triggers when manage-profiles names it. */
+  private triggersFn?: lambda.Function;
   /** The console roles, which `AdminApi` grants on exactly the routes their capabilities name. */
   public readonly consoleRoles: Record<AdminRole, iam.IRole>;
   /** The admin plane role, which `AdminApi` grants on its routes by that API's own id (`grantAdminPlaneOnApi`). */
@@ -209,6 +211,13 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
       identities: { tableName: props.identitiesTable.tableName, tableArn: props.identitiesTable.tableArn },
     });
     this.routes.push(...assistants.routes);
+    // AN ACTIVATION'S TRIGGER CLEANUP (DESIGN-EVENT-TARGETS section 7): manage-profiles names the activated assistant to the
+    // trigger service, which removes the rules the active version no longer runs with the grants it already holds. The one
+    // new grant is manage-profiles' invoke of this function, by name.
+    if (this.triggersFn) {
+      this.triggersFn.grantInvoke(assistants.manageProfilesFn);
+      (assistants.manageProfilesFn as lambda.Function).addEnvironment('EVENT_TRIGGERS_FUNCTION', this.triggersFn.functionName);
+    }
 
     const analytics = new AdminAnalytics(this, 'Analytics', {
       appInstanceArn: props.appInstanceArn,
@@ -1386,6 +1395,7 @@ export class AdminServicesStack extends cdk.Stack implements RouteSource {
     // A FIXED NAME (DESIGN-PROCESSES section 12): the process event bus admits rule and target writes from this role's ARN alone,
     // built from the name with no reference to this stack.
     (triggersFn.role!.node.defaultChild as iam.CfnRole).roleName = eventTriggersRoleName();
+    this.triggersFn = triggersFn;
     // THIS INSTANCE'S TRIGGER RULES ONLY: the separator after the prefix keeps a look-alike instance's rules outside the grant.
     // AND ITS WATCH RULES (DESIGN-EVENT-TARGETS section 4): a watched conversation's trigger, whose binding is the rule's own tags.
     // A HAND-OFF'S RULES (DESIGN-PROCESSES section 12) are on the process event bus, under the same prefixes.

@@ -455,6 +455,22 @@ async function readGoldenGate(profileName: string, draft: ProfileDefinition, opt
   };
 }
 
+/**
+ * AN ACTIVATION'S TRIGGER CLEANUP, named to the trigger service (DESIGN-EVENT-TARGETS section 7): the rules attached for this
+ * assistant whose workflow the newly active version no longer runs on an attached event are removed there, against the active
+ * version it reads itself. Asynchronous, and a request that could not be made is logged: the activation stands either way, and
+ * the next one asks again.
+ */
+export async function sweepTriggersAfterActivation(profileName: string, send: (c: InvokeCommand) => Promise<unknown> = (c) => lambdaClient.send(c)): Promise<void> {
+  const fn = process.env.EVENT_TRIGGERS_FUNCTION;
+  if (!fn) return;
+  try {
+    await send(new InvokeCommand({ FunctionName: fn, InvocationType: 'Event', Payload: Buffer.from(JSON.stringify({ aeTriggerSweep: { assistant: profileName } })) }));
+  } catch (err) {
+    console.warn('[manage-profiles] the activation\'s trigger cleanup could not be asked for; the next activation asks again', { profileName, name: (err as Error)?.name });
+  }
+}
+
 /** One RequestResponse call to a classification's GoldenRun function; a function error is thrown, never read as an answer. */
 async function askGoldenRun<T>(arn: string, payload: Record<string, unknown>): Promise<T> {
   const out = await lambdaClient.send(new InvokeCommand({
@@ -1639,6 +1655,8 @@ const handleProfiles = async (event: APIGatewayProxyEvent, context?: { invokedFu
         // The identity carries the name a person reads in the room; the version carries the one the
         // console reads. Activating has to move both or the two disagree until someone notices.
         const identity = await applyNameToIdentity(profileName, r.displayName);
+        // A TRIGGER THE NEW VERSION NO LONGER RUNS ON AN ATTACHED EVENT is removed now, never left starting nothing.
+        await sweepTriggersAfterActivation(profileName);
         return respond(200, { profileName, ...r, ...identity });
       }
       if (path.endsWith('/activate-past-golden-gate')) {
@@ -1676,6 +1694,7 @@ const handleProfiles = async (event: APIGatewayProxyEvent, context?: { invokedFu
           ssm, SSM_ROOT, profileName, catalog(), sub, contextSourceCatalogFor, guardrailCatalogFor, pendingDraft.configId, activatedPastGate,
         );
         const identity = await applyNameToIdentity(profileName, r.displayName);
+        await sweepTriggersAfterActivation(profileName);
         // ANNOUNCED, not only recorded: the other administrators read it in the admin channel. A notice that could not be
         // sent is logged by `postAdminNotice` and does not undo the activation, which the version already records.
         await postAdminNotice(adminNotice({
